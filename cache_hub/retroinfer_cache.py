@@ -259,6 +259,14 @@ class retroinfer_cache(KV_Cache):
                 torch.empty((self.batch_size, self.kv_head, self.input_length-self.static_pattern_total+self.input_length_new, self.head_dim),
                             dtype=self.dtype, pin_memory=True).contiguous()
             )
+        try:
+            list_stride = self.input_length - self.static_pattern_total + self.input_length_new
+            elem_bytes = torch.tensor([], dtype=self.dtype).element_size()
+            kv_bytes = 2 * self.layer_num * self.batch_size * self.kv_head * list_stride * self.head_dim * elem_bytes
+            kv_gib = kv_bytes / (1024 ** 3)
+            print(f"[MEM] RetroInfer list_keys/values pinned estimate: {kv_gib:.2f} GiB")
+        except Exception:
+            pass
         self.list_stride = self.input_length-self.static_pattern_total+self.input_length_new
         for ldx in range(self.layer_num):
             self.wave_buffer[ldx].set_kv(self.list_keys[ldx], self.list_values[ldx], self.offload_keys, self.offload_values)

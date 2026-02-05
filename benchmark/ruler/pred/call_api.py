@@ -46,6 +46,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import traceback
 from utils import load_data
+import resource
+import subprocess as sp
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 sys.path.append(PROJECT_ROOT)
 from model_hub import LlamaModel, QwenModel
@@ -73,9 +75,51 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.cuda.manual_seed_all(seed)
 
+def _get_rss_mb():
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024 ** 2)
+    except Exception:
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        return float(parts[1]) / 1024.0  # kB -> MB
+        except Exception:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            return float(usage.ru_maxrss) / 1024.0  # kB -> MB on Linux
+    return None
+
+
+def _get_gpu_mem_mb():
+    try:
+        result = sp.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"],
+            check=True,
+            stdout=sp.PIPE,
+            stderr=sp.DEVNULL,
+            text=True,
+        )
+        values = [v.strip() for v in result.stdout.splitlines() if v.strip()]
+        return ",".join(values) if values else None
+    except Exception:
+        return None
+
+
+def _log_mem(tag):
+    rss = _get_rss_mb()
+    gpu = _get_gpu_mem_mb()
+    rss_str = f"{rss:.1f} MB" if rss is not None else "N/A"
+    gpu_str = f"{gpu} MB" if gpu is not None else "N/A"
+    print(f"[MEM] {tag} | RSS={rss_str} | GPU={gpu_str}")
+
 
 class HuggingFaceModel:
     def __init__(self, model_name, max_len, max_new_len, attn_type, dtype, device, budget_ratio, estimate_ratio, synthetic_len) -> None:
+        print(f"[TIME] model init start: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        _log_mem("model.init.start")
         if 'Llama' in model_name:
             llm = LlamaModel(model_name,
                 max_length=max_len+max_new_len,
@@ -97,6 +141,8 @@ class HuggingFaceModel:
         self.budget_ratio = budget_ratio
         self.estimate_ratio = estimate_ratio
         self.synthetic_len = synthetic_len
+        _log_mem("model.init.end")
+        print(f"[TIME] model init end: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     def __call__(self, prompt: str, **kwargs) -> Dict[str, List[str]]:
         generated_text = get_pred(
@@ -160,6 +206,9 @@ def get_pred(
         attn_type,
         budget_ratio=budget_ratio,
         estimate_ratio=estimate_ratio,
+        token_budget_ratio=args.token_budget_ratio,
+        q_knn=args.q_knn,
+        key_degree=args.key_degree,
     )
 
     out = llm.generate(attention_type=attn_type,
@@ -197,6 +246,8 @@ def get_output(llm, outputs_parallel, idx, index, input, outputs, others, trunca
 
 def main(args):
     start_time = time.time()
+    print(f"[TIME] call_api start: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    _log_mem("call_api.start")
     
     curr_folder = os.path.dirname(os.path.abspath(__file__))
     
@@ -237,6 +288,7 @@ def main(args):
     dtype = torch.float16 if args.dtype == 'fp16' else torch.bfloat16
     llm = get_llm(args.model_name, args.max_len, config['tokens_to_generate'], args.attn_type, dtype, args.device, 
                   budget_ratio=args.budget_ratio, estimate_ratio=args.estimate_ratio, synthetic_len=args.synthetic_len,)
+    _log_mem("call_api.after_model")
     
     threads = []
     outputs_parallel = [{} for _ in range(len(data))]
@@ -275,6 +327,8 @@ def main(args):
                 if len(outputs_parallel[computed_idx]) > 0:
                     fout.write(json.dumps(outputs_parallel[computed_idx]) + '\n')
 
+    _log_mem("call_api.end")
+    print(f"[TIME] call_api end: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")
 
 if __name__ == '__main__':
@@ -300,7 +354,7 @@ if __name__ == '__main__':
             choices=["Qwen/Qwen2.5-7B-Instruct", "gradientai/Llama-3-8B-Instruct-Gradient-1048k", "meta-llama/Llama-3.1-8B-Instruct", "Qwen/Qwen2.5-72B-Instruct"], \
             help="huggingface model name")
     parser.add_argument("--attn_type", type=str, default="Full_Flash_Attn",                                                      \
-            choices=["Full_Flash_Attn", "RetroInfer"],                                  \
+            choices=["Full_Flash_Attn", "RetroInfer", "RetrievalAttention"],                                  \
             help="Attention method")
     parser.add_argument("--max_len", type=int, default=128000)
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")

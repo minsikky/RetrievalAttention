@@ -8,8 +8,15 @@ import torch.nn.functional as F
 import flashinfer
 from transformers import AutoTokenizer, Qwen2ForCausalLM, Qwen2Config
 from .LLM import LLM
-from cache_hub import flash_attn_cache, retroinfer_cache
-from attn_hub import prefill_full_flash_attn, decode_full_flash_attn, retroinfer_prefill_attn, retroinfer_decode_attn
+from cache_hub import flash_attn_cache, retroinfer_cache, retrievalattention_cache
+from attn_hub import (
+    prefill_full_flash_attn,
+    decode_full_flash_attn,
+    retroinfer_prefill_attn,
+    retroinfer_decode_attn,
+    retrievalattention_prefill_attn,
+    retrievalattention_decode_attn,
+)
 
 
 
@@ -123,7 +130,12 @@ class QwenModel(LLM):
 
 
     def init_model(self):
-        hf_qwen = Qwen2ForCausalLM.from_pretrained(self.model_name, torch_dtype=self.dtype)
+        low_cpu_mem_usage = os.getenv("LOW_CPU_MEM_USAGE", "0") == "1"
+        hf_qwen = Qwen2ForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=self.dtype,
+            low_cpu_mem_usage=low_cpu_mem_usage,
+        )
 
         self.num_gpus = torch.cuda.device_count() if self.device_map == 'auto' else 1
         if self.device_map == 'auto' and self.num_gpus == 1:
@@ -238,6 +250,27 @@ class QwenModel(LLM):
                 num_gpus = self.num_gpus,
                 model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1))
             )
+        elif self.attention_type == 'RetrievalAttention':
+            ra_config = qwen_config.get(self.attention_type)
+            self.kv_cache = retrievalattention_cache(
+                valid_start=valid_start,
+                layer_num=self.num_layers,
+                batch_size=self.batch_size,
+                max_length=self.max_new_length + real_input_length,
+                num_key_value_heads=self.num_key_value_heads,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                dtype=self.dtype,
+                layer_mapping=self.layer_mapping,
+                max_new_length=self.max_new_length,
+                static_pattern_start=ra_config["static_pattern_start"],
+                static_pattern_end=ra_config["static_pattern_end"],
+                q_knn=ra_config["q_knn"],
+                key_degree=ra_config["key_degree"],
+                token_budget=ra_config["token_budget"],
+                num_gpus=self.num_gpus,
+                model_size=int(re.search(r'(\d+)[B]', self.model_name).group(1)),
+            )
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
 
@@ -247,6 +280,8 @@ class QwenModel(LLM):
         if self.attention_type == 'Full_Flash_Attn':
             self.kv_cache.move_gpu()
         elif self.attention_type == 'RetroInfer':
+            self.kv_cache.prepare_cache()
+        elif self.attention_type == 'RetrievalAttention':
             self.kv_cache.prepare_cache()
         torch.cuda.empty_cache()
 
@@ -278,6 +313,8 @@ class QwenModel(LLM):
             attn_out = prefill_full_flash_attn(query_states, key_states, value_states, causal=True)
         elif self.attention_type == 'RetroInfer':
             attn_out = retroinfer_prefill_attn(query_states, key_states, value_states, causal=True)
+        elif self.attention_type == 'RetrievalAttention':
+            attn_out = retrievalattention_prefill_attn(query_states, key_states, value_states, causal=True)
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
         return attn_out
@@ -288,6 +325,8 @@ class QwenModel(LLM):
             attn_out = decode_full_flash_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
         elif self.attention_type == 'RetroInfer':
             attn_out = retroinfer_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
+        elif self.attention_type == 'RetrievalAttention':
+            attn_out = retrievalattention_decode_attn(query_states, key_states, value_states, layer_idx, self.kv_cache)
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
         return attn_out

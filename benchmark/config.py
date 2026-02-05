@@ -10,6 +10,9 @@ sys.path.append(PROJECT_ROOT)
 def parse_attn_args(parser: argparse.ArgumentParser):
     parser.add_argument("--budget_ratio", type=float, default=0.018, help="ratio of budget")
     parser.add_argument("--estimate_ratio", type=float, default=0.25, help="ratio of estimated clusters for RetriveInfer")
+    parser.add_argument("--token_budget_ratio", type=float, default=None, help="ratio of token budget for RetrievalAttention")
+    parser.add_argument("--q_knn", type=int, default=32, help="K for query-to-key KNN in RetrievalAttention")
+    parser.add_argument("--key_degree", type=int, default=64, help="Degree cap for K–K graph in RetrievalAttention")
 
     return parser
 
@@ -22,6 +25,9 @@ def generate_config(
     estimate_ratio=0.25,
     # default retrieve infer configs
     n_segments=None,
+    token_budget_ratio=None,
+    q_knn=32,
+    key_degree=64,
 ):
     aprox_cluster_size = 16
 
@@ -54,4 +60,14 @@ def generate_config(
 
         print(original_config[attn_type])
     
+    if attn_type == 'RetrievalAttention':
+        if token_budget_ratio is None:
+            token_budget_ratio = budget_ratio
+        avg_cluster_size = max(1, int((context_len - (original_config[attn_type]["static_pattern_start"] + original_config[attn_type]["static_pattern_end"])) / n_clusters))
+        token_budget = max(1, int(nprobe * avg_cluster_size))
+        original_config[attn_type]['token_budget'] = token_budget
+        original_config[attn_type]['q_knn'] = q_knn
+        original_config[attn_type]['key_degree'] = key_degree
+        print(original_config[attn_type])
+
     return original_config

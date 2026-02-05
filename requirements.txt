@@ -19,3 +19,4 @@ scipy==1.13.0
 
 jieba==0.42.1
 fuzzywuzzy==0.18.0
+faiss-cpu

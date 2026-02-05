@@ -25,7 +25,7 @@ dataset2maxlen = json.load(open("config/dataset2maxlen.json", "r"))
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--attn_type", type=str, default="Full_Flash_Attn",                                                     \
-                        choices=["Full_Flash_Attn", "RetroInfer"],                          \
+                        choices=["Full_Flash_Attn", "RetroInfer", "RetrievalAttention"],                          \
                         help="Attention method")
     parser.add_argument('--model', type=str, default=None, choices=
                         ["llama-3-8b-1048k", "qwen2.5-7b", "llama-3.1-8b", "qwen2.5-72b"])
@@ -54,6 +54,9 @@ def get_pred(llm, data, max_new_tokens, prompt_format, model_name, out_path, arg
             attn_type,
             budget_ratio=args.budget_ratio,
             estimate_ratio=args.estimate_ratio,
+            token_budget_ratio=args.token_budget_ratio,
+            q_knn=args.q_knn,
+            key_degree=args.key_degree,
         )
 
         out = llm.generate(

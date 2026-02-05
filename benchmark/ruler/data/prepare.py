@@ -41,6 +41,8 @@ import math
 import yaml
 from pathlib import Path
 import nltk
+import resource
+import subprocess as sp
 try:
     nltk.data.find('tokenizers/punkt')
 except LookupError:
@@ -63,9 +65,51 @@ Templates = {
     'RWKV': "User: hi\n\nAssistant: Hi. I am your assistant and I will provide expert full response in full details. Please feel free to ask any question and I will always answer it\n\nUser: {task_template}\n\nAssistant:",
 }
 
+def _get_rss_mb():
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024 ** 2)
+    except Exception:
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        return float(parts[1]) / 1024.0  # kB -> MB
+        except Exception:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            return float(usage.ru_maxrss) / 1024.0  # kB -> MB on Linux
+    return None
+
+
+def _get_gpu_mem_mb():
+    try:
+        result = sp.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,nounits,noheader"],
+            check=True,
+            stdout=sp.PIPE,
+            stderr=sp.DEVNULL,
+            text=True,
+        )
+        values = [v.strip() for v in result.stdout.splitlines() if v.strip()]
+        return ",".join(values) if values else None
+    except Exception:
+        return None
+
+
+def _log_mem(tag):
+    rss = _get_rss_mb()
+    gpu = _get_gpu_mem_mb()
+    rss_str = f"{rss:.1f} MB" if rss is not None else "N/A"
+    gpu_str = f"{gpu} MB" if gpu is not None else "N/A"
+    print(f"[MEM] {tag} | RSS={rss_str} | GPU={gpu_str}")
+
 
 def main(args):
     start_time = time.time()
+    print(f"[TIME] prepare.py start: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    _log_mem("prepare.start")
     curr_folder = os.path.dirname(os.path.abspath(__file__))
     
     try:
@@ -119,12 +163,16 @@ def main(args):
         --template "{config['template']}"
         """
         print(command)
+        print(f"[TIME] data generation start: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        _log_mem("prepare.before_subprocess")
         result = subprocess.run(command, 
                                 shell=True, 
                                 check=True, 
                                 stdout=subprocess.PIPE, 
                                 stderr=subprocess.PIPE, 
                                 text=True)
+        _log_mem("prepare.after_subprocess")
+        print(f"[TIME] data generation end: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         
         if result.returncode == 0:
             print("Output:")
@@ -138,6 +186,8 @@ def main(args):
     save_file = args.save_dir / args.task / f"{args.subset}.jsonl"
     print(f"Prepare {args.task} with lines: {args.num_samples} to {save_file}")
     print(f"Used time: {round((time.time() - start_time) / 60, 1)} minutes")
+    _log_mem("prepare.end")
+    print(f"[TIME] prepare.py end: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

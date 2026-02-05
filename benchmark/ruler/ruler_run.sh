@@ -22,7 +22,8 @@ fi
 # Root Directories
 ROOT_DIR="./ruler_eval_result" # the path that stores generated task samples and model predictions.
 
-NUM_SAMPLES=200
+# Allow override for quick latency estimation, e.g. NUM_SAMPLES=20 bash ruler_run.sh ...
+NUM_SAMPLES=${NUM_SAMPLES:-200}
 MAX_SEQ_LENGTH=${4}
 ATTN_TYPE=${3}
 DEVICE=auto
@@ -57,18 +58,56 @@ mkdir -p ${DATA_DIR}
 mkdir -p ${PRED_DIR}
 
 TASK=${5}
-python -u data/prepare.py \
-    --save_dir ${DATA_DIR} \
-    --benchmark ${BENCHMARK} \
-    --task ${TASK} \
-    --tokenizer_path ${TOKENIZER_PATH} \
-    --tokenizer_type ${TOKENIZER_TYPE} \
-    --max_seq_length ${MAX_SEQ_LENGTH} \
-    --model_template_type ${MODEL_TEMPLATE_TYPE} \
-    --num_samples ${NUM_SAMPLES} \
-    ${REMOVE_NEWLINE_TAB}
+FORCE_PRED="${FORCE_PRED:-0}"
+DATA_FILE="${DATA_DIR}/${TASK}/validation.jsonl"
+REUSE_DATA="${REUSE_DATA:-1}"
+FORCE_PREPARE="${FORCE_PREPARE:-0}"
+
+if [ "${REUSE_DATA}" = "1" ] && [ "${FORCE_PREPARE}" = "0" ] && [ -f "${DATA_FILE}" ]; then
+    LINE_COUNT=$(wc -l < "${DATA_FILE}" || echo 0)
+    if [ "${LINE_COUNT}" -ge "${NUM_SAMPLES}" ]; then
+        echo "[INFO] Reusing existing data file: ${DATA_FILE} (lines: ${LINE_COUNT})"
+    else
+        echo "[INFO] Existing data file has ${LINE_COUNT} lines, need ${NUM_SAMPLES}; regenerating."
+        PREP_START=$(date +%s)
+        echo "[TIME] data prep start: $(date)"
+        python -u data/prepare.py \
+            --save_dir ${DATA_DIR} \
+            --benchmark ${BENCHMARK} \
+            --task ${TASK} \
+            --tokenizer_path ${TOKENIZER_PATH} \
+            --tokenizer_type ${TOKENIZER_TYPE} \
+            --max_seq_length ${MAX_SEQ_LENGTH} \
+            --model_template_type ${MODEL_TEMPLATE_TYPE} \
+            --num_samples ${NUM_SAMPLES} \
+            ${REMOVE_NEWLINE_TAB}
+        PREP_END=$(date +%s)
+        echo "[TIME] data prep end: $(date) | elapsed $((PREP_END - PREP_START))s"
+    fi
+else
+    PREP_START=$(date +%s)
+    echo "[TIME] data prep start: $(date)"
+    python -u data/prepare.py \
+        --save_dir ${DATA_DIR} \
+        --benchmark ${BENCHMARK} \
+        --task ${TASK} \
+        --tokenizer_path ${TOKENIZER_PATH} \
+        --tokenizer_type ${TOKENIZER_TYPE} \
+        --max_seq_length ${MAX_SEQ_LENGTH} \
+        --model_template_type ${MODEL_TEMPLATE_TYPE} \
+        --num_samples ${NUM_SAMPLES} \
+        ${REMOVE_NEWLINE_TAB}
+    PREP_END=$(date +%s)
+    echo "[TIME] data prep end: $(date) | elapsed $((PREP_END - PREP_START))s"
+fi
 
 DTYPE=${6}
+PRED_START=$(date +%s)
+echo "[TIME] prediction start: $(date)"
+if [ "${FORCE_PRED}" = "1" ]; then
+    echo "[INFO] FORCE_PRED=1 -> removing existing prediction file"
+    rm -f "${PRED_DIR}/${TASK}.jsonl"
+fi
 python -u pred/call_api.py \
     --model_name ${MODEL_NAME} \
     --attn_type ${ATTN_TYPE} \
@@ -85,7 +124,13 @@ python -u pred/call_api.py \
     --estimate_ratio ${ESTIMATE_RATIO} \
     --synthetic_len ${MAX_SEQ_LENGTH} \
 
+PRED_END=$(date +%s)
+echo "[TIME] prediction end: $(date) | elapsed $((PRED_END - PRED_START))s"
+
+EVAL_START=$(date +%s)
+echo "[TIME] evaluation start: $(date)"
 python -u eval/evaluate.py \
     --data_dir ${PRED_DIR} \
     --benchmark ${BENCHMARK}
-
+EVAL_END=$(date +%s)
+echo "[TIME] evaluation end: $(date) | elapsed $((EVAL_END - EVAL_START))s"

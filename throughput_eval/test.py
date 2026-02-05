@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda:0", help="Device")
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16"], help="Dtype")
     parser.add_argument("--attn_type", type=str, default="Full_Flash_Attn",                                                 \
-                        choices=["Full_Flash_Attn", "RetroInfer"], help="Attention method")
+                        choices=["Full_Flash_Attn", "RetroInfer", "RetrievalAttention"], help="Attention method")
     parser.add_argument("--model_name", type=str, default="gradientai/Llama-3-8B-Instruct-Gradient-1048k",                  \
                         choices=["gradientai/Llama-3-8B-Instruct-Gradient-1048k", "Qwen/Qwen2.5-7B-Instruct",               \
                         "Qwen/Qwen2.5-72B-Instruct", "meta-llama/Llama-3.1-8B-Instruct"], help="huggingface model name")
@@ -76,6 +76,10 @@ def generate_config(model_name, context_len, attn_type):
         original_config[attn_type]['nprobe'] = nprobe
         original_config[attn_type]['cache_cluster_num'] = nprobe*3
         original_config[attn_type]['max_compute_cluster_num'] = int(n_clusters/4)
+    if attn_type == 'RetrievalAttention':
+        avg_cluster_size = max(int((context_len - (original_config[attn_type]["static_pattern_start"] + original_config[attn_type]["static_pattern_end"])) / n_clusters), 1)
+        token_budget = max(int(nprobe * avg_cluster_size), 1)
+        original_config[attn_type]['token_budget'] = token_budget
     
     if attn_type != "Full_Flash_Attn":
         print(original_config[attn_type])

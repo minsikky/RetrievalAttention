@@ -9,5 +9,12 @@
         "max_compute_cluster_num": 2048,
         "cache_unit_size": 8,
         "cache_cluster_num": 450
+    },
+    "RetrievalAttention": {
+        "static_pattern_start": 4,
+        "static_pattern_end": 64,
+        "q_knn": 32,
+        "key_degree": 64,
+        "token_budget": 0
     }
 }

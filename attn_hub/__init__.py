@@ -1,3 +1,4 @@
 
 from .flash_attn import prefill_full_flash_attn, decode_full_flash_attn
 from .retroinfer_attn import retroinfer_prefill_attn, retroinfer_decode_attn
+from .retrievalattention_attn import retrievalattention_prefill_attn, retrievalattention_decode_attn
