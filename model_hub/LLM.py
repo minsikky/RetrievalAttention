@@ -104,7 +104,12 @@ class LLM:
         key_states, value_states = self.kv_cache.prefill_update_kv_cache(query_states, key_states, value_states, layer_idx, start_bdx)
         torch.cuda.empty_cache()
 
-        temp_attn_out = self.prefill_attention(query_states, key_states, value_states)
+        temp_attn_out = self.prefill_attention(
+            query_states,
+            key_states,
+            value_states,
+            layer_idx=layer_idx,
+        )
 
         self.kv_cache.sync(layer_idx, start_bdx)
 
@@ -256,11 +261,17 @@ class LLM:
                         prof.step()
 
                     decode_end = time.time()
+                    decode_total = decode_end - decode_start
                     print(colored(
-                        f"Decoding latency: {round((decode_end - decode_start) * 1000 / (self.max_new_length - 1), 2)} ms/step, "
-                        f"Throughput: {round(self.batch_size * (self.max_new_length - 1) / (decode_end - decode_start), 2)} tokens/s\n",
+                        f"Decoding total latency: {round(decode_total, 4)} s, "
+                        f"Decoding latency: {round(decode_total * 1000 / (self.max_new_length - 1), 2)} ms/step, "
+                        f"Throughput: {round(self.batch_size * (self.max_new_length - 1) / decode_total, 2)} tokens/s\n",
                         'green'
                     ))
+                    if hasattr(self, "kv_cache") and hasattr(self.kv_cache, "report_decode_profile"):
+                        decode_profile_msg = self.kv_cache.report_decode_profile(reset=True)
+                        if decode_profile_msg:
+                            print(decode_profile_msg)
                     self._log_mem("decode.end")
             except Exception as e:
                 print(f"[WARN] Profiler disabled due to error: {e}")
@@ -286,11 +297,17 @@ class LLM:
                 outputs_ids.append(output_ids)
 
             decode_end = time.time()
+            decode_total = decode_end - decode_start
             print(colored(
-                f"Decoding latency: {round((decode_end - decode_start) * 1000 / (self.max_new_length - 1), 2)} ms/step, "
-                f"Throughput: {round(self.batch_size * (self.max_new_length - 1) / (decode_end - decode_start), 2)} tokens/s\n",
+                f"Decoding total latency: {round(decode_total, 4)} s, "
+                f"Decoding latency: {round(decode_total * 1000 / (self.max_new_length - 1), 2)} ms/step, "
+                f"Throughput: {round(self.batch_size * (self.max_new_length - 1) / decode_total, 2)} tokens/s\n",
                 'green'
             ))
+            if hasattr(self, "kv_cache") and hasattr(self.kv_cache, "report_decode_profile"):
+                decode_profile_msg = self.kv_cache.report_decode_profile(reset=True)
+                if decode_profile_msg:
+                    print(decode_profile_msg)
             self._log_mem("decode.end")
         
         outputs_ids = torch.cat(outputs_ids, dim=-1).tolist()

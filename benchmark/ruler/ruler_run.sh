@@ -102,6 +102,17 @@ else
 fi
 
 DTYPE=${6}
+TOKEN_BUDGET_OVERRIDE="${TOKEN_BUDGET_OVERRIDE:-}"
+TOKEN_BUDGET_RATIO="${TOKEN_BUDGET_RATIO:-}"
+
+EXTRA_RETRIEVAL_ARGS=()
+if [ -n "${TOKEN_BUDGET_OVERRIDE}" ]; then
+    EXTRA_RETRIEVAL_ARGS+=(--token_budget_override "${TOKEN_BUDGET_OVERRIDE}")
+fi
+if [ -n "${TOKEN_BUDGET_RATIO}" ]; then
+    EXTRA_RETRIEVAL_ARGS+=(--token_budget_ratio "${TOKEN_BUDGET_RATIO}")
+fi
+
 PRED_START=$(date +%s)
 echo "[TIME] prediction start: $(date)"
 if [ "${FORCE_PRED}" = "1" ]; then
@@ -123,6 +134,7 @@ python -u pred/call_api.py \
     --budget_ratio ${BUDGET_RATIO} \
     --estimate_ratio ${ESTIMATE_RATIO} \
     --synthetic_len ${MAX_SEQ_LENGTH} \
+    "${EXTRA_RETRIEVAL_ARGS[@]}"
 
 PRED_END=$(date +%s)
 echo "[TIME] prediction end: $(date) | elapsed $((PRED_END - PRED_START))s"

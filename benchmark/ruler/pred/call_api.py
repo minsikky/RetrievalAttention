@@ -207,6 +207,7 @@ def get_pred(
         budget_ratio=budget_ratio,
         estimate_ratio=estimate_ratio,
         token_budget_ratio=args.token_budget_ratio,
+        token_budget_override=args.token_budget_override,
         q_knn=args.q_knn,
         key_degree=args.key_degree,
     )

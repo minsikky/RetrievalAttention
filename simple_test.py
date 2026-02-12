@@ -33,6 +33,12 @@ def parse_args():
                         choices=["gradientai/Llama-3-8B-Instruct-Gradient-1048k", "Qwen/Qwen2.5-7B-Instruct",               \
                         "Qwen/Qwen2.5-72B-Instruct", "meta-llama/Llama-3.1-8B-Instruct"], help="huggingface model name")
     parser.add_argument("--data_path", type=str, default="", help="Input json file path")
+    parser.add_argument(
+        "--token_budget_override",
+        type=int,
+        default=None,
+        help="Fixed RetrievalAttention token budget. If unset, use ratio-derived budget.",
+    )
     args = parser.parse_args()
     
     return args
@@ -55,7 +61,7 @@ def load_model(model_name, max_len, dtype, device):
     return llm
 
 
-def generate_config(model_name, context_len, attn_type):
+def generate_config(model_name, context_len, attn_type, token_budget_override=None):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     MODEL_NAME = model_name.split("/")[-1]+'.json'
     CONFIG_FILE = os.path.join(CONFIG_DIR, MODEL_NAME)
@@ -77,8 +83,11 @@ def generate_config(model_name, context_len, attn_type):
         original_config[attn_type]['cache_cluster_num'] = nprobe*3
         original_config[attn_type]['max_compute_cluster_num'] = max(int(n_clusters/4), nprobe)
     if attn_type == 'RetrievalAttention':
-        avg_cluster_size = max(int((context_len - (original_config[attn_type]["static_pattern_start"] + original_config[attn_type]["static_pattern_end"])) / n_clusters), 1)
-        token_budget = max(int(nprobe * avg_cluster_size), 1)
+        if token_budget_override is not None and token_budget_override > 0:
+            token_budget = int(token_budget_override)
+        else:
+            avg_cluster_size = max(int((context_len - (original_config[attn_type]["static_pattern_start"] + original_config[attn_type]["static_pattern_end"])) / n_clusters), 1)
+            token_budget = max(int(nprobe * avg_cluster_size), 1)
         original_config[attn_type]['token_budget'] = token_budget
         # keep q_knn/key_degree from config if present
     
@@ -136,9 +145,19 @@ if __name__ == "__main__":
     print(colored(f"Input length: {input_len}", 'yellow'))
 
     if data_path == "":
-        attn_config = generate_config(model_name, 122880, attn_type)
+        attn_config = generate_config(
+            model_name,
+            122880,
+            attn_type,
+            token_budget_override=args.token_budget_override,
+        )
     else:
-        attn_config = generate_config(model_name, input_len, attn_type)
+        attn_config = generate_config(
+            model_name,
+            input_len,
+            attn_type,
+            token_budget_override=args.token_budget_override,
+        )
 
     llm = load_model(model_name, max_len, dtype, device)
     out = llm.generate(attention_type=attn_type,

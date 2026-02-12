@@ -33,6 +33,12 @@ def parse_args():
                         "Qwen/Qwen2.5-72B-Instruct", "meta-llama/Llama-3.1-8B-Instruct"], help="huggingface model name")
     parser.add_argument("--task_name", type=str, default="multivalue", choices=["NIAH", "fwe", "vt", "qa1"],                \
                         help="Test task name")
+    parser.add_argument(
+        "--token_budget_override",
+        type=int,
+        default=None,
+        help="Fixed RetrievalAttention token budget. If unset, use ratio-derived budget.",
+    )
     args = parser.parse_args()
     
     return args
@@ -55,7 +61,7 @@ def load_model(model_name, max_len, dtype, device):
     return llm
 
 
-def generate_config(model_name, context_len, attn_type):
+def generate_config(model_name, context_len, attn_type, token_budget_override=None):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     MODEL_NAME = model_name.split("/")[-1]+'.json'
     CONFIG_FILE = os.path.join(CONFIG_DIR, MODEL_NAME)
@@ -77,8 +83,11 @@ def generate_config(model_name, context_len, attn_type):
         original_config[attn_type]['cache_cluster_num'] = nprobe*3
         original_config[attn_type]['max_compute_cluster_num'] = int(n_clusters/4)
     if attn_type == 'RetrievalAttention':
-        avg_cluster_size = max(int((context_len - (original_config[attn_type]["static_pattern_start"] + original_config[attn_type]["static_pattern_end"])) / n_clusters), 1)
-        token_budget = max(int(nprobe * avg_cluster_size), 1)
+        if token_budget_override is not None and token_budget_override > 0:
+            token_budget = int(token_budget_override)
+        else:
+            avg_cluster_size = max(int((context_len - (original_config[attn_type]["static_pattern_start"] + original_config[attn_type]["static_pattern_end"])) / n_clusters), 1)
+            token_budget = max(int(nprobe * avg_cluster_size), 1)
         original_config[attn_type]['token_budget'] = token_budget
     
     if attn_type != "Full_Flash_Attn":
@@ -106,14 +115,24 @@ if __name__ == "__main__":
         data = json.load(open(TEST_FILE))[0]
         prompt = data['input']
         groundtruth = data['answer']
-        attn_config = generate_config(model_name, args.context_len, attn_type)
+        attn_config = generate_config(
+            model_name,
+            args.context_len,
+            attn_type,
+            token_budget_override=args.token_budget_override,
+        )
     else:
         TEST_DIR = os.path.join(PROJECT_ROOT, "throughput_eval")
         TEST_FILE = os.path.join(TEST_DIR, f"test_data/{task_name}.json")
         data = json.load(open(TEST_FILE))
         prompt = data['input']
         groundtruth = data['outputs']
-        attn_config = generate_config(model_name, 120000, attn_type)
+        attn_config = generate_config(
+            model_name,
+            120000,
+            attn_type,
+            token_budget_override=args.token_budget_override,
+        )
     
     prompts = [prompt for _ in range(batch_size)]
     tokenizer = AutoTokenizer.from_pretrained(model_name)

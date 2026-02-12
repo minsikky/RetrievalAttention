@@ -308,13 +308,20 @@ class QwenModel(LLM):
         return hidden_states
 
     
-    def prefill_attention(self, query_states, key_states, value_states):
+    def prefill_attention(self, query_states, key_states, value_states, layer_idx):
         if self.attention_type == 'Full_Flash_Attn':
             attn_out = prefill_full_flash_attn(query_states, key_states, value_states, causal=True)
         elif self.attention_type == 'RetroInfer':
             attn_out = retroinfer_prefill_attn(query_states, key_states, value_states, causal=True)
         elif self.attention_type == 'RetrievalAttention':
-            attn_out = retrievalattention_prefill_attn(query_states, key_states, value_states, causal=True)
+            attn_out = retrievalattention_prefill_attn(
+                query_states,
+                key_states,
+                value_states,
+                causal=True,
+                layer_idx=layer_idx,
+                retrievalattention_cache=self.kv_cache,
+            )
         else:
             raise ValueError(f"Unsupported attention type: {self.attention_type}")
         return attn_out
