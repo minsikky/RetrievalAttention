@@ -216,6 +216,7 @@ class LLM:
     def inference(self, inputs_ids):
         outputs_ids = []    # multi iteration, multi request
         output_ids = []     # single iteration, multi request
+        decode_steps = max(0, self.max_new_length - 1)
         
         print("Start prefilling ...")
         self._log_mem("prefill.start")
@@ -254,24 +255,28 @@ class LLM:
                     self._log_mem("decode.start")
                     decode_start = time.time()
 
-                    for _ in range(self.max_new_length-1):
-                        logits = self.decode_forward(inputs_ids=output_ids)
-                        output_ids = logits.argmax(dim=-1)
-                        outputs_ids.append(output_ids)
-                        prof.step()
+                    if decode_steps > 0:
+                        for _ in range(decode_steps):
+                            logits = self.decode_forward(inputs_ids=output_ids)
+                            output_ids = logits.argmax(dim=-1)
+                            outputs_ids.append(output_ids)
+                            prof.step()
 
-                    decode_end = time.time()
-                    decode_total = decode_end - decode_start
-                    print(colored(
-                        f"Decoding total latency: {round(decode_total, 4)} s, "
-                        f"Decoding latency: {round(decode_total * 1000 / (self.max_new_length - 1), 2)} ms/step, "
-                        f"Throughput: {round(self.batch_size * (self.max_new_length - 1) / decode_total, 2)} tokens/s\n",
-                        'green'
-                    ))
-                    if hasattr(self, "kv_cache") and hasattr(self.kv_cache, "report_decode_profile"):
-                        decode_profile_msg = self.kv_cache.report_decode_profile(reset=True)
-                        if decode_profile_msg:
-                            print(decode_profile_msg)
+                        decode_end = time.time()
+                        decode_total = decode_end - decode_start
+                        decode_total_safe = max(decode_total, 1e-9)
+                        print(colored(
+                            f"Decoding total latency: {round(decode_total, 4)} s, "
+                            f"Decoding latency: {round(decode_total * 1000 / decode_steps, 2)} ms/step, "
+                            f"Throughput: {round(self.batch_size * decode_steps / decode_total_safe, 2)} tokens/s\n",
+                            'green'
+                        ))
+                        if hasattr(self, "kv_cache") and hasattr(self.kv_cache, "report_decode_profile"):
+                            decode_profile_msg = self.kv_cache.report_decode_profile(reset=True)
+                            if decode_profile_msg:
+                                print(decode_profile_msg)
+                    else:
+                        print(colored("Decoding skipped (max_new_length <= 1)\n", 'green'))
                     self._log_mem("decode.end")
             except Exception as e:
                 print(f"[WARN] Profiler disabled due to error: {e}")
@@ -291,23 +296,27 @@ class LLM:
             self._log_mem("decode.start")
             decode_start = time.time()
 
-            for _ in range(self.max_new_length-1):
-                logits = self.decode_forward(inputs_ids=output_ids)
-                output_ids = logits.argmax(dim=-1)
-                outputs_ids.append(output_ids)
+            if decode_steps > 0:
+                for _ in range(decode_steps):
+                    logits = self.decode_forward(inputs_ids=output_ids)
+                    output_ids = logits.argmax(dim=-1)
+                    outputs_ids.append(output_ids)
 
-            decode_end = time.time()
-            decode_total = decode_end - decode_start
-            print(colored(
-                f"Decoding total latency: {round(decode_total, 4)} s, "
-                f"Decoding latency: {round(decode_total * 1000 / (self.max_new_length - 1), 2)} ms/step, "
-                f"Throughput: {round(self.batch_size * (self.max_new_length - 1) / decode_total, 2)} tokens/s\n",
-                'green'
-            ))
-            if hasattr(self, "kv_cache") and hasattr(self.kv_cache, "report_decode_profile"):
-                decode_profile_msg = self.kv_cache.report_decode_profile(reset=True)
-                if decode_profile_msg:
-                    print(decode_profile_msg)
+                decode_end = time.time()
+                decode_total = decode_end - decode_start
+                decode_total_safe = max(decode_total, 1e-9)
+                print(colored(
+                    f"Decoding total latency: {round(decode_total, 4)} s, "
+                    f"Decoding latency: {round(decode_total * 1000 / decode_steps, 2)} ms/step, "
+                    f"Throughput: {round(self.batch_size * decode_steps / decode_total_safe, 2)} tokens/s\n",
+                    'green'
+                ))
+                if hasattr(self, "kv_cache") and hasattr(self.kv_cache, "report_decode_profile"):
+                    decode_profile_msg = self.kv_cache.report_decode_profile(reset=True)
+                    if decode_profile_msg:
+                        print(decode_profile_msg)
+            else:
+                print(colored("Decoding skipped (max_new_length <= 1)\n", 'green'))
             self._log_mem("decode.end")
         
         outputs_ids = torch.cat(outputs_ids, dim=-1).tolist()

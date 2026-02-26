@@ -39,9 +39,48 @@ def parse_args():
         default=None,
         help="Fixed RetrievalAttention token budget. If unset, use ratio-derived budget.",
     )
+    parser.add_argument(
+        "--recall_only",
+        action="store_true",
+        help="Run prefill/index build only and report KNN parity recall summary.",
+    )
+    parser.add_argument(
+        "--recall_input_tokens",
+        type=int,
+        default=8192,
+        help="Input token length for recall-only mode.",
+    )
+    parser.add_argument(
+        "--recall_min_recall",
+        type=float,
+        default=None,
+        help="Optional minimum weighted recall threshold for recall-only mode.",
+    )
     args = parser.parse_args()
     
     return args
+
+
+def build_recall_only_inputs(tokenizer, batch_size: int, token_len: int):
+    token_len = max(1, int(token_len))
+    vocab_size = int(len(tokenizer))
+    if vocab_size <= 8:
+        raise RuntimeError(f"Unexpectedly small tokenizer vocab_size={vocab_size}")
+
+    bos_id = tokenizer.bos_token_id
+    if bos_id is None:
+        bos_id = tokenizer.eos_token_id
+    if bos_id is None:
+        bos_id = 1
+    bos_id = int(max(0, min(vocab_size - 1, int(bos_id))))
+
+    low = 8 if vocab_size > 16 else 1
+    span = max(1, vocab_size - low)
+    base = (torch.arange(token_len, dtype=torch.long) % span) + low
+    base[0] = bos_id
+    input_ids = base.unsqueeze(0).repeat(int(batch_size), 1)
+    attention_mask = torch.ones((int(batch_size), token_len), dtype=torch.long)
+    return input_ids, attention_mask
 
 
 def load_model(model_name, max_len, dtype, device):
@@ -107,66 +146,103 @@ if __name__ == "__main__":
     dtype = torch.float16 if args.dtype=='fp16' else torch.bfloat16
     device = args.device
     data_path = args.data_path
-
-    # load input data
-    if data_path == "":
-        TEST_FILE = os.path.join(PROJECT_ROOT, "simple_test_data.json")
-    else:
-        TEST_FILE = os.path.join(PROJECT_ROOT, f"{data_path}")
-    print(colored(f"Loading test data from {TEST_FILE}", 'yellow'))
-    data = json.load(open(TEST_FILE))   # [{"input": str, "outputs": str}, ...]
-    prompt = []
-    groundtruth = []
-    for dd in data:
-        prompt.append(dd['input'])
-        groundtruth.append(dd['outputs'])
-    
-    # copy to fit batch size
-    copy_round = math.ceil(batch_size/len(prompt))
-    prompts = []
-    groundtruths = []
-    for i in range(copy_round):
-        prompts.extend(prompt)
-        groundtruths.extend(groundtruth)
-    prompts = prompts[:batch_size]
-    groundtruths = groundtruths[:batch_size]
-
-    # tokenize input data
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True)
-    input_ids = inputs.input_ids
-    attention_masks = inputs.attention_mask
 
-    input_len = input_ids.shape[1]
-    gen_len = args.gen_len
-    max_len = input_len + gen_len
-    print(colored(f"Input length: {input_len}", 'yellow'))
-
-    if data_path == "":
-        attn_config = generate_config(
-            model_name,
-            122880,
-            attn_type,
-            token_budget_override=args.token_budget_override,
+    if args.recall_only:
+        input_ids, attention_masks = build_recall_only_inputs(
+            tokenizer=tokenizer,
+            batch_size=batch_size,
+            token_len=args.recall_input_tokens,
         )
-    else:
+        groundtruths = []
+        gen_len = 1
+        input_len = input_ids.shape[1]
+        max_len = input_len + gen_len
+        print(colored(f"Recall-only mode: input_tokens={input_len}, gen_len={gen_len}", "yellow"))
         attn_config = generate_config(
             model_name,
             input_len,
             attn_type,
             token_budget_override=args.token_budget_override,
         )
+    else:
+        # load input data
+        if data_path == "":
+            TEST_FILE = os.path.join(PROJECT_ROOT, "simple_test_data.json")
+        else:
+            TEST_FILE = os.path.join(PROJECT_ROOT, f"{data_path}")
+        print(colored(f"Loading test data from {TEST_FILE}", 'yellow'))
+        data = json.load(open(TEST_FILE))   # [{"input": str, "outputs": str}, ...]
+        prompt = []
+        groundtruth = []
+        for dd in data:
+            prompt.append(dd['input'])
+            groundtruth.append(dd['outputs'])
+        
+        # copy to fit batch size
+        copy_round = math.ceil(batch_size/len(prompt))
+        prompts = []
+        groundtruths = []
+        for _ in range(copy_round):
+            prompts.extend(prompt)
+            groundtruths.extend(groundtruth)
+        prompts = prompts[:batch_size]
+        groundtruths = groundtruths[:batch_size]
+
+        # tokenize input data
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+        input_ids = inputs.input_ids
+        attention_masks = inputs.attention_mask
+
+        input_len = input_ids.shape[1]
+        gen_len = args.gen_len
+        max_len = input_len + gen_len
+        print(colored(f"Input length: {input_len}", 'yellow'))
+
+        if data_path == "":
+            attn_config = generate_config(
+                model_name,
+                122880,
+                attn_type,
+                token_budget_override=args.token_budget_override,
+            )
+        else:
+            attn_config = generate_config(
+                model_name,
+                input_len,
+                attn_type,
+                token_budget_override=args.token_budget_override,
+            )
 
     llm = load_model(model_name, max_len, dtype, device)
     out = llm.generate(attention_type=attn_type,
         inputs_ids = input_ids.to(llm.layers[0].device),
         attention_masks = attention_masks.to(llm.layers[0].device),
         max_new_length=gen_len, attn_config=attn_config)
-    
-    result = tokenizer.batch_decode(out, skip_special_tokens=True)
-    for gt, res in zip(groundtruths, result):
-        print(colored(f"Answer: {gt}", 'yellow'))
-        print(f"{[res]}")
+
+    if args.recall_only:
+        parity_summary = None
+        if hasattr(llm, "kv_cache") and hasattr(llm.kv_cache, "get_parity_summary"):
+            parity_summary = llm.kv_cache.get_parity_summary(reset=False)
+        print("[RECALL] parity_summary_json=" + json.dumps(parity_summary, sort_keys=True))
+        if args.recall_min_recall is not None:
+            if parity_summary is None:
+                raise RuntimeError("recall_min_recall set but parity summary is unavailable.")
+            recall_weighted = parity_summary.get("recall_weighted", None)
+            if recall_weighted is None:
+                raise RuntimeError(
+                    "recall_min_recall set but parity summary has no recall_weighted value."
+                )
+            if float(recall_weighted) < float(args.recall_min_recall):
+                raise RuntimeError(
+                    f"recall_weighted={float(recall_weighted):.6f} below threshold "
+                    f"{float(args.recall_min_recall):.6f}"
+                )
+    else:
+        result = tokenizer.batch_decode(out, skip_special_tokens=True)
+        for gt, res in zip(groundtruths, result):
+            print(colored(f"Answer: {gt}", 'yellow'))
+            print(f"{[res]}")
     

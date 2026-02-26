@@ -19,6 +19,13 @@ try:
 except Exception:
     fused_qk_topk_triton = None
 
+from .roargraph_cpp_backend import (
+    build_roar_graph_csr_cpp,
+    search_roar_graph_csr_cpp,
+    roargraph_cpp_available,
+    roargraph_cpp_import_error,
+)
+
 
 class retrievalattention_cache(KV_Cache):
     """
@@ -66,6 +73,24 @@ class retrievalattention_cache(KV_Cache):
         self.debug = os.environ.get("RETRIEVALATTN_DEBUG", "0") == "1"
         self.assert_nonempty = os.environ.get("RETRIEVALATTN_ASSERT_NONEMPTY", "0") == "1"
         self.validate_parity = os.environ.get("RETRIEVALATTN_VALIDATE_PARITY", "0") == "1"
+        try:
+            self.parity_layers = int(os.environ.get("RETRIEVALATTN_PARITY_LAYERS", "1"))
+        except Exception:
+            self.parity_layers = 1
+        self.parity_layers = max(1, self.parity_layers)
+        try:
+            self.parity_heads = int(os.environ.get("RETRIEVALATTN_PARITY_HEADS", "1"))
+        except Exception:
+            self.parity_heads = 1
+        self.parity_heads = max(1, self.parity_heads)
+        try:
+            self.parity_sample = int(os.environ.get("RETRIEVALATTN_PARITY_SAMPLE", "256"))
+        except Exception:
+            self.parity_sample = 256
+        self.parity_sample = max(1, self.parity_sample)
+        self.parity_query_indices = np.empty((0,), dtype=np.int32)
+        self.parity_query_count = 0
+        self._parity_query_indices_torch = None
         self.decode_profile = os.environ.get("RETRIEVALATTN_DECODE_PROFILE", "0") == "1"
         self.debug_decode_steps = int(os.environ.get("RETRIEVALATTN_DEBUG_STEPS", "3"))
         self.decode_index_mode = os.environ.get("RETRIEVALATTN_DECODE_INDEX", "faiss")
@@ -157,6 +182,69 @@ class retrievalattention_cache(KV_Cache):
             self.roar_max_query_per_pivot = 0
         self.roar_max_query_per_pivot = max(0, self.roar_max_query_per_pivot)
         self.roar_log = os.environ.get("RETRIEVALATTN_ROAR_LOG", "1") == "1"
+        self.roar_backend = os.environ.get("RETRIEVALATTN_ROAR_BACKEND", "auto").strip().lower()
+        if self.roar_backend not in {"auto", "cpp", "python"}:
+            print(
+                f"[RetrievalAttention] WARNING: unknown RETRIEVALATTN_ROAR_BACKEND={self.roar_backend}. "
+                "Falling back to auto."
+            )
+            self.roar_backend = "auto"
+        try:
+            self.roar_cpp_threads = int(os.environ.get("RETRIEVALATTN_ROAR_CPP_THREADS", "0"))
+        except Exception:
+            self.roar_cpp_threads = 0
+        self.roar_cpp_threads = max(0, self.roar_cpp_threads)
+        self.decode_backend = os.environ.get("RETRIEVALATTN_DECODE_BACKEND", "auto").strip().lower()
+        if self.decode_backend not in {"auto", "python", "roar_cpp"}:
+            print(
+                f"[RetrievalAttention] WARNING: unknown RETRIEVALATTN_DECODE_BACKEND={self.decode_backend}. "
+                "Falling back to auto."
+            )
+            self.decode_backend = "auto"
+        try:
+            self.roar_decode_lpq = int(os.environ.get("RETRIEVALATTN_ROAR_DECODE_LPQ", "0"))
+        except Exception:
+            self.roar_decode_lpq = 0
+        self.roar_decode_lpq = max(0, self.roar_decode_lpq)
+        try:
+            self.roar_decode_init = int(os.environ.get("RETRIEVALATTN_ROAR_DECODE_INIT", "64"))
+        except Exception:
+            self.roar_decode_init = 64
+        self.roar_decode_init = max(1, self.roar_decode_init)
+        try:
+            self.roar_decode_max_cmps = int(os.environ.get("RETRIEVALATTN_ROAR_DECODE_MAX_CMPS", "0"))
+        except Exception:
+            self.roar_decode_max_cmps = 0
+        self.roar_decode_max_cmps = max(0, self.roar_decode_max_cmps)
+        try:
+            self.roar_decode_max_hops = int(os.environ.get("RETRIEVALATTN_ROAR_DECODE_MAX_HOPS", "0"))
+        except Exception:
+            self.roar_decode_max_hops = 0
+        self.roar_decode_max_hops = max(0, self.roar_decode_max_hops)
+        try:
+            self.roar_decode_threads = int(os.environ.get("RETRIEVALATTN_ROAR_DECODE_THREADS", "0"))
+        except Exception:
+            self.roar_decode_threads = 0
+        self.roar_decode_threads = max(0, self.roar_decode_threads)
+        self._roar_cpp_available = roargraph_cpp_available()
+        if self.roar_backend == "cpp" and not self._roar_cpp_available:
+            cpp_err = roargraph_cpp_import_error()
+            raise RuntimeError(
+                "RETRIEVALATTN_ROAR_BACKEND=cpp requested but RoarGraph C++ extension is unavailable. "
+                "Build it with: "
+                "`module load python/3.10.4 && source .venv/bin/activate && "
+                "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+                + (f". Import error: {cpp_err}" if cpp_err is not None else "")
+            )
+        if self.decode_backend == "roar_cpp" and not self._roar_cpp_available:
+            cpp_err = roargraph_cpp_import_error()
+            raise RuntimeError(
+                "RETRIEVALATTN_DECODE_BACKEND=roar_cpp requested but RoarGraph C++ extension is unavailable. "
+                "Build it with: "
+                "`module load python/3.10.4 && source .venv/bin/activate && "
+                "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+                + (f". Import error: {cpp_err}" if cpp_err is not None else "")
+            )
         legacy_graph_hops = os.environ.get("RETRIEVALATTN_GRAPH_HOPS")
         if legacy_graph_hops not in (None, ""):
             print(
@@ -241,6 +329,22 @@ class retrievalattention_cache(KV_Cache):
         except Exception:
             self.fa_shadow_sample = 256
         self.fa_shadow_sample = max(1, self.fa_shadow_sample)
+        default_head_mode = "q_head" if self.fa_fused_prefill else "kv_head"
+        raw_head_mode = os.environ.get("RETRIEVALATTN_RETRIEVAL_HEAD_MODE", default_head_mode).strip().lower()
+        if raw_head_mode not in {"kv_head", "q_head"}:
+            print(
+                f"[RetrievalAttention] WARNING: unknown RETRIEVALATTN_RETRIEVAL_HEAD_MODE={raw_head_mode}. "
+                f"Falling back to {default_head_mode}."
+            )
+            raw_head_mode = default_head_mode
+        if raw_head_mode == "q_head" and not self.fa_fused_prefill:
+            print(
+                "[RetrievalAttention] WARNING: q_head retrieval mode currently requires fused prefill build; "
+                "falling back to kv_head mode."
+            )
+            raw_head_mode = "kv_head"
+        self.retrieval_head_mode = raw_head_mode
+        self.retrieval_heads = self.num_heads if self.retrieval_head_mode == "q_head" else self.kv_head
         self.fused_prefill_overlap = os.environ.get("RETRIEVALATTN_FUSED_PREFILL_OVERLAP", "1") == "1"
         try:
             self.fused_prefill_overlap_workers = int(
@@ -287,6 +391,20 @@ class retrievalattention_cache(KV_Cache):
             "visited_total": 0,
             "candidates_total": 0,
         }
+        self._parity_records = []
+        self._parity_lock = threading.Lock()
+
+        if self.validate_parity:
+            self.parity_query_indices = self._build_parity_sample_indices(
+                sample_n=self.parity_sample,
+                total=self.input_length,
+                causal_ref=True,
+            )
+            self.parity_query_count = int(self.parity_query_indices.shape[0])
+            if self.parity_query_count > 0:
+                self._parity_query_indices_torch = torch.from_numpy(
+                    self.parity_query_indices.astype(np.int64, copy=False)
+                )
 
         # CPU storage for full K/V (including future decode slots)
         total_len = self.input_length + self.max_new_length
@@ -309,6 +427,17 @@ class retrievalattention_cache(KV_Cache):
         else:
             self.cpu_queries = None
 
+        # Optional sampled per-Q-head query storage for parity checks.
+        self.cpu_queries_qhead_samples = [None for _ in range(self.layer_num)]
+        if self.validate_parity and self.parity_query_count > 0:
+            parity_layers_take = min(self.layer_num, self.parity_layers)
+            for ldx in range(parity_layers_take):
+                self.cpu_queries_qhead_samples[ldx] = torch.empty(
+                    (self.num_heads, self.parity_query_count, self.head_dim),
+                    dtype=self.dtype,
+                    pin_memory=True,
+                )
+
         # Static GPU KV (prefix + suffix window)
         self.static_gpu_keys = [
             torch.empty((self.kv_head, self.static_pattern_total, self.head_dim),
@@ -321,11 +450,15 @@ class retrievalattention_cache(KV_Cache):
             for ldx in range(self.layer_num)
         ]
 
-        # ANN index and K–K graph per layer/head
+        # Decode seed indexes are keyed by KV-head (shared keys in GQA).
         self.indexes = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        # K-token graphs are shared per KV head (not per q-head).
         self.graphs = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self.hub_seeds = [[[] for _ in range(self.kv_head)] for _ in range(self.layer_num)]
-        self.prev_decode_seeds = [[[] for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        # Warm-start seeds remain retrieval-head keyed (per q-head in q_head mode).
+        self.prev_decode_seeds = [[[] for _ in range(self.retrieval_heads)] for _ in range(self.layer_num)]
+        self._decode_key_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._decode_cpp_warned = False
         self.fused_prefill_knn = [None for _ in range(self.layer_num)]
         self.fused_prefill_profiles = [None for _ in range(self.layer_num)]
         self._fused_prefill_executor = None
@@ -365,6 +498,20 @@ class retrievalattention_cache(KV_Cache):
             return F.normalize(x, dim=-1)
         return x
 
+    def _retrieval_head_to_kv_head(self, head_idx: int) -> int:
+        head_idx = int(head_idx)
+        if self.retrieval_head_mode == "q_head":
+            if head_idx < 0 or head_idx >= self.num_heads:
+                raise IndexError(
+                    f"Invalid retrieval q-head index={head_idx} (num_heads={self.num_heads})"
+                )
+            return int(head_idx // self.group_size)
+        if head_idx < 0 or head_idx >= self.kv_head:
+            raise IndexError(
+                f"Invalid retrieval kv-head index={head_idx} (kv_head={self.kv_head})"
+            )
+        return head_idx
+
     def _knn_recall_at_k(self, a: np.ndarray, b: np.ndarray, k: int) -> float:
         """
         Mean recall@k between two knn index arrays of shape [N, k].
@@ -381,6 +528,118 @@ class retrievalattention_cache(KV_Cache):
             sb = set(int(x) for x in b[i, :k].tolist())
             recalls.append(len(sa.intersection(sb)) / float(k))
         return float(np.mean(recalls))
+
+    def _should_run_parity_for(self, ldx: int, hdx: int) -> bool:
+        if not self.validate_parity or faiss is None:
+            return False
+        if ldx < 0 or hdx < 0:
+            return False
+        if ldx >= self.parity_layers:
+            return False
+        if hdx >= self.parity_heads:
+            return False
+        return True
+
+    def _record_parity(self, layer_idx: int, head_idx: int, sample_n: int, recall: float, k: int):
+        record = {
+            "layer": int(layer_idx),
+            "head": int(head_idx),
+            "sample": int(sample_n),
+            "k": int(k),
+            "recall": float(recall),
+        }
+        with self._parity_lock:
+            self._parity_records.append(record)
+
+    def _build_parity_sample_indices(self, sample_n: int, total: int, causal_ref: bool) -> np.ndarray:
+        total = int(total)
+        sample_n = int(sample_n)
+        if total <= 0 or sample_n <= 0:
+            return np.empty((0,), dtype=np.int32)
+        start = int(self.q_knn - 1) if causal_ref else 0
+        if start >= total:
+            start = 0
+        candidates = np.arange(start, total, dtype=np.int32)
+        if candidates.size <= sample_n:
+            return candidates
+        take = np.linspace(0, candidates.size - 1, num=sample_n, dtype=np.int64)
+        return np.ascontiguousarray(candidates[take], dtype=np.int32)
+
+    def _causal_topk_ref_np(self, queries: np.ndarray, keys: np.ndarray, query_indices: np.ndarray, k: int) -> np.ndarray:
+        """
+        Exact causal top-k reference for sampled query rows.
+        For each sampled query index qi, only keys [0, qi] are valid.
+        """
+        if queries.size == 0 or keys.size == 0 or query_indices.size == 0:
+            return np.empty((0, max(1, int(k))), dtype=np.int32)
+        k = max(1, int(k))
+        scores = np.matmul(queries.astype(np.float32, copy=False), keys.astype(np.float32, copy=False).T)
+        out = np.empty((queries.shape[0], k), dtype=np.int32)
+        for ridx in range(queries.shape[0]):
+            qidx = int(query_indices[ridx])
+            k_limit = min(int(scores.shape[1]), qidx + 1)
+            if k_limit <= 0:
+                out[ridx, :] = 0
+                continue
+            row = scores[ridx, :k_limit]
+            take_k = min(k, k_limit)
+            if take_k == k_limit:
+                top_local = np.arange(k_limit, dtype=np.int32)
+            else:
+                top_local = np.argpartition(row, -take_k)[-take_k:].astype(np.int32, copy=False)
+            if take_k < k:
+                # Should not happen for our sampling policy; keep shape-stable anyway.
+                padded = np.empty((k,), dtype=np.int32)
+                padded[:take_k] = top_local
+                padded[take_k:] = top_local[-1]
+                out[ridx, :] = padded
+            else:
+                out[ridx, :] = top_local
+        return out
+
+    def get_parity_summary(self, reset: bool = False) -> dict:
+        with self._parity_lock:
+            records = list(self._parity_records)
+            if reset:
+                self._parity_records.clear()
+        if not records:
+            return {
+                "enabled": bool(self.validate_parity),
+                "layers_limit": int(self.parity_layers),
+                "heads_limit": int(self.parity_heads),
+                "sample_limit": int(self.parity_sample),
+                "records": 0,
+                "total_sample": 0,
+                "recall_mean": None,
+                "recall_weighted": None,
+                "recall_min": None,
+                "recall_max": None,
+                "details": [],
+            }
+
+        recalls = [float(x["recall"]) for x in records]
+        samples = [max(0, int(x["sample"])) for x in records]
+        total_sample = int(sum(samples))
+        if total_sample > 0:
+            weighted = float(
+                sum(float(recalls[i]) * float(samples[i]) for i in range(len(records)))
+                / float(total_sample)
+            )
+        else:
+            weighted = float(np.mean(recalls))
+        return {
+            "enabled": bool(self.validate_parity),
+            "layers_limit": int(self.parity_layers),
+            "heads_limit": int(self.parity_heads),
+            "sample_limit": int(self.parity_sample),
+            "records": int(len(records)),
+            "total_sample": int(total_sample),
+            "recall_mean": float(np.mean(recalls)),
+            "recall_weighted": float(weighted),
+            "recall_min": float(np.min(recalls)),
+            "recall_max": float(np.max(recalls)),
+            "details": records,
+        }
 
     def _empty_graph_csr(self):
         offsets = np.zeros(self.input_length + 1, dtype=np.uint32)
@@ -748,7 +1007,167 @@ class retrievalattention_cache(KV_Cache):
             return offsets, neighbors, weights
         return offsets, neighbors
 
+    def _should_use_roar_cpp_backend(self) -> bool:
+        if self.roar_backend == "python":
+            return False
+        available = roargraph_cpp_available()
+        self._roar_cpp_available = bool(available)
+        if self.roar_backend == "cpp":
+            if not available:
+                cpp_err = roargraph_cpp_import_error()
+                raise RuntimeError(
+                    "RETRIEVALATTN_ROAR_BACKEND=cpp requested but RoarGraph C++ extension is unavailable. "
+                    "Build it with: "
+                    "`module load python/3.10.4 && source .venv/bin/activate && "
+                    "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+                    + (f". Import error: {cpp_err}" if cpp_err is not None else "")
+                )
+            return True
+        return bool(available)
+
+    def _should_use_roar_cpp_decode_backend(self, graph_is_csr: bool) -> bool:
+        if not graph_is_csr:
+            return False
+        if self.decode_backend == "python":
+            return False
+        available = roargraph_cpp_available()
+        self._roar_cpp_available = bool(available)
+        if self.decode_backend == "roar_cpp":
+            if not available:
+                cpp_err = roargraph_cpp_import_error()
+                raise RuntimeError(
+                    "RETRIEVALATTN_DECODE_BACKEND=roar_cpp requested but RoarGraph C++ extension is unavailable. "
+                    "Build it with: "
+                    "`module load python/3.10.4 && source .venv/bin/activate && "
+                    "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+                    + (f". Import error: {cpp_err}" if cpp_err is not None else "")
+                )
+            return True
+        return bool(available)
+
+    def _get_decode_key_array(self, ldx: int, hdx: int):
+        cached = self._decode_key_cache[ldx][hdx]
+        if cached is not None:
+            return cached["array"], cached["dtype"]
+
+        key_tensor = self.cpu_keys[ldx][hdx, :self.input_length, :]
+        if not key_tensor.is_contiguous():
+            key_tensor = key_tensor.contiguous()
+
+        key_dtype = "fp32"
+        key_view_tensor = None
+        if key_tensor.dtype == torch.float32:
+            key_array = key_tensor.numpy()
+            key_dtype = "fp32"
+        elif key_tensor.dtype == torch.float16:
+            key_array = key_tensor.numpy()
+            key_dtype = "fp16"
+        elif key_tensor.dtype == torch.bfloat16:
+            key_view_tensor = key_tensor.view(torch.uint16)
+            key_array = key_view_tensor.numpy()
+            key_dtype = "bf16"
+        else:
+            key_tensor = key_tensor.float().contiguous()
+            key_array = key_tensor.numpy()
+            key_dtype = "fp32"
+
+        key_array = np.ascontiguousarray(key_array)
+        self._decode_key_cache[ldx][hdx] = {
+            "tensor": key_tensor,
+            "view_tensor": key_view_tensor,
+            "array": key_array,
+            "dtype": key_dtype,
+        }
+        return key_array, key_dtype
+
+    def _build_graph_csr_from_knn_roar_cpp(self, knn: np.ndarray, keys_cpu: np.ndarray):
+        meta = {
+            "builder": "roar_cpp",
+            "backend": "cpp",
+            "bipartite_sec": 0.0,
+            "projection_sec": 0.0,
+            "enhance_sec": 0.0,
+            "csr_sec": 0.0,
+            "total_sec": 0.0,
+            "active_queries": 0,
+            "active_pivots": 0,
+            "projected_nodes": 0,
+            "enhanced_nodes": 0,
+            "stop_reason": "ok",
+        }
+        total_start = time.time()
+        empty_graph = self._empty_graph_csr()
+        if knn.size == 0 or knn.shape[1] == 0:
+            meta["stop_reason"] = "empty_knn"
+            meta["total_sec"] = time.time() - total_start
+            return empty_graph, meta
+        if keys_cpu is None:
+            raise RuntimeError("Roar graph builder (cpp) requires keys_cpu but got None.")
+
+        num_tokens = self.input_length
+        keys = np.ascontiguousarray(keys_cpu, dtype=np.float32)
+        if keys.shape[0] < num_tokens:
+            raise RuntimeError(
+                f"Roar graph builder keys_cpu too short: got {keys.shape[0]}, need {num_tokens}"
+            )
+        knn_arr = np.ascontiguousarray(knn, dtype=np.int32)
+
+        nq = min(max(1, int(self.roar_nq)), int(knn_arr.shape[1]))
+        degree_cap = max(1, int(self.roar_m))
+        cand_limit = max(1, int(self.roar_l))
+        enhance_limit = max(1, int(self.roar_enhance_l))
+
+        offsets, neighbors, cpp_meta = build_roar_graph_csr_cpp(
+            knn_arr,
+            keys,
+            dynamic_start=self.dynamic_start,
+            dynamic_end=self.dynamic_end,
+            nq=nq,
+            degree_cap=degree_cap,
+            cand_limit=cand_limit,
+            enable_enhance=bool(self.roar_enable_enhance),
+            enhance_limit=enhance_limit,
+            entry_mode=self.roar_entry,
+            max_query_per_pivot=int(self.roar_max_query_per_pivot),
+            num_threads=int(self.roar_cpp_threads),
+        )
+
+        offsets = np.ascontiguousarray(offsets, dtype=np.uint32)
+        neighbors = np.ascontiguousarray(neighbors, dtype=np.int32)
+        if offsets.shape[0] != (num_tokens + 1):
+            raise RuntimeError(
+                f"Invalid roar cpp offsets length: got {offsets.shape[0]}, expected {num_tokens + 1}"
+            )
+        if int(offsets[-1]) != int(neighbors.shape[0]):
+            raise RuntimeError(
+                f"Invalid roar cpp CSR sizes: offsets[-1]={int(offsets[-1])}, neighbors={int(neighbors.shape[0])}"
+            )
+
+        if isinstance(cpp_meta, dict):
+            meta.update(cpp_meta)
+        meta["builder"] = str(meta.get("builder", "roar_cpp"))
+        meta["backend"] = "cpp"
+        meta["total_sec"] = float(meta.get("total_sec", time.time() - total_start))
+
+        if self.graph_return_weights:
+            weights = np.ones((neighbors.shape[0],), dtype=self.graph_weight_dtype)
+            return (offsets, neighbors, weights), meta
+        return (offsets, neighbors), meta
+
     def _build_graph_csr_from_knn_roar(self, knn: np.ndarray, keys_cpu: np.ndarray):
+        if self._should_use_roar_cpp_backend():
+            try:
+                return self._build_graph_csr_from_knn_roar_cpp(knn, keys_cpu)
+            except Exception as exc:
+                if self.roar_backend == "cpp":
+                    raise
+                print(
+                    "[RetrievalAttention] WARNING: RoarGraph cpp builder failed; "
+                    f"falling back to python builder. error={exc}"
+                )
+        return self._build_graph_csr_from_knn_roar_python(knn, keys_cpu)
+
+    def _build_graph_csr_from_knn_roar_python(self, knn: np.ndarray, keys_cpu: np.ndarray):
         """
         RoarGraph-like construction:
           1) query->base links + base->query bridge
@@ -987,11 +1406,11 @@ class retrievalattention_cache(KV_Cache):
         """
         Register fused-prefill top-k indices produced during prefill attention.
         Accepted shapes:
-          [1, seq, kv_head, q_knn]
-          [seq, kv_head, q_knn]
-          [kv_head, seq, q_knn]
+          [1, seq, retrieval_heads, q_knn]
+          [seq, retrieval_heads, q_knn]
+          [retrieval_heads, seq, q_knn]
         Stored format:
-          [seq, kv_head, q_knn] int32 contiguous (on CPU).
+          [seq, retrieval_heads, q_knn] int32 contiguous (on CPU).
         """
         ldx = int(layer_idx)
         if ldx < 0 or ldx >= self.layer_num:
@@ -1014,15 +1433,34 @@ class retrievalattention_cache(KV_Cache):
                 f"fused prefill top-k must be rank-3 or rank-4, got shape={tuple(arr.shape)}"
             )
 
-        if arr.shape[0] == self.input_length and arr.shape[1] == self.kv_head:
+        if arr.shape[0] == self.input_length:
             norm = arr
-        elif arr.shape[0] == self.kv_head and arr.shape[1] == self.input_length:
+        elif arr.shape[1] == self.input_length:
             norm = np.transpose(arr, (1, 0, 2))
         else:
             raise RuntimeError(
                 "fused prefill top-k shape does not match expected layout "
-                f"(input_length={self.input_length}, kv_head={self.kv_head}), got {tuple(arr.shape)}"
+                f"(input_length={self.input_length}), got {tuple(arr.shape)}"
             )
+
+        in_heads = int(norm.shape[1])
+        if in_heads != self.retrieval_heads:
+            if in_heads == self.num_heads and self.retrieval_heads == self.kv_head:
+                # Backward-compat bridge: per-q-head fused output -> kv-head mode.
+                take = np.arange(0, self.num_heads, self.group_size, dtype=np.int64)
+                norm = np.take(norm, indices=take, axis=1)
+                in_heads = int(norm.shape[1])
+            elif in_heads == self.kv_head and self.retrieval_heads == self.num_heads:
+                # Backward-compat bridge: legacy kv-head fused output -> q-head mode.
+                norm = np.repeat(norm, repeats=self.group_size, axis=1)
+                in_heads = int(norm.shape[1])
+            if in_heads != self.retrieval_heads:
+                raise RuntimeError(
+                    "fused prefill top-k head dimension mismatch: "
+                    f"input_heads={in_heads}, expected_retrieval_heads={self.retrieval_heads}, "
+                    f"num_heads={self.num_heads}, kv_head={self.kv_head}, "
+                    f"head_mode={self.retrieval_head_mode}, shape={tuple(arr.shape)}"
+                )
 
         if norm.shape[2] < self.q_knn:
             raise RuntimeError(
@@ -1076,6 +1514,13 @@ class retrievalattention_cache(KV_Cache):
         if self.cpu_queries is None:
             print(
                 "[RetrievalAttention] fused shadow compare skipped: cpu_queries are not stored.",
+                flush=True,
+            )
+            return
+        if self.retrieval_head_mode == "q_head":
+            print(
+                "[RetrievalAttention] fused shadow compare skipped in q_head mode "
+                "(legacy grouped baseline mismatch).",
                 flush=True,
             )
             return
@@ -1224,13 +1669,16 @@ class retrievalattention_cache(KV_Cache):
         prof = profile if isinstance(profile, dict) else {}
         self._check_fused_score_mode_compat(prof)
         per_head_topk = None
+        per_kv_topk = None
         layer_topk = prof.get("topk_sec", prof.get("fused_sec"))
         if layer_topk is not None:
             try:
                 layer_topk = float(layer_topk)
-                per_head_topk = layer_topk / float(self.kv_head)
+                per_head_topk = layer_topk / float(self.retrieval_heads)
+                per_kv_topk = layer_topk / float(self.kv_head)
             except Exception:
                 per_head_topk = None
+                per_kv_topk = None
 
         if self._profile_enabled() and prof:
             print(
@@ -1239,12 +1687,39 @@ class retrievalattention_cache(KV_Cache):
             )
 
         try:
-            for hdx in range(self.kv_head):
-                head_start = time.time()
-                knn = np.ascontiguousarray(layer_knn[:, hdx, :], dtype=np.int32)
-                head_prof = {"topk_sec": per_head_topk} if per_head_topk is not None else {}
-                result = self._finalize_gpu_head_build(ldx, hdx, knn, head_prof, head_start)
-                self._commit_head_build_result(result)
+            if self.retrieval_head_mode == "q_head":
+                # Build one shared K-token graph per KV head by merging grouped q-head knn rows.
+                for kv_hdx in range(self.kv_head):
+                    qh_start = int(kv_hdx * self.group_size)
+                    qh_end = min(int(qh_start + self.group_size), int(self.num_heads))
+                    if qh_start >= qh_end:
+                        continue
+                    head_start = time.time()
+                    knn_group = np.ascontiguousarray(layer_knn[:, qh_start:qh_end, :], dtype=np.int32)
+                    knn = np.ascontiguousarray(knn_group.reshape(-1, knn_group.shape[-1]), dtype=np.int32)
+                    head_prof = dict(prof) if isinstance(prof, dict) else {}
+                    if per_kv_topk is not None:
+                        head_prof["topk_sec"] = per_kv_topk
+                    result = self._finalize_gpu_head_build(
+                        ldx,
+                        kv_hdx,
+                        knn,
+                        head_prof,
+                        head_start,
+                        kv_hdx_override=kv_hdx,
+                        graph_hdx_override=kv_hdx,
+                        parity_hdx_override=qh_start,
+                    )
+                    self._commit_head_build_result(result)
+            else:
+                for hdx in range(self.retrieval_heads):
+                    head_start = time.time()
+                    knn = np.ascontiguousarray(layer_knn[:, hdx, :], dtype=np.int32)
+                    head_prof = dict(prof) if isinstance(prof, dict) else {}
+                    if per_head_topk is not None:
+                        head_prof["topk_sec"] = per_head_topk
+                    result = self._finalize_gpu_head_build(ldx, hdx, knn, head_prof, head_start)
+                    self._commit_head_build_result(result)
 
             with self._fused_prefill_lock:
                 self._fused_prefill_done[ldx] = True
@@ -1264,23 +1739,56 @@ class retrievalattention_cache(KV_Cache):
         finally:
             layer_knn = None
 
-    def _finalize_gpu_head_build(self, ldx: int, hdx: int, knn: np.ndarray, prof: dict, head_start: float):
+    def _finalize_gpu_head_build(
+        self,
+        ldx: int,
+        hdx: int,
+        knn: np.ndarray,
+        prof: dict,
+        head_start: float,
+        kv_hdx_override: int = None,
+        graph_hdx_override: int = None,
+        parity_hdx_override: int = None,
+    ):
         """
         CPU-side postprocess for one GPU-topk head:
         decode seed index + optional parity + CSR graph projection.
         """
+        kv_hdx = int(kv_hdx_override) if kv_hdx_override is not None else self._retrieval_head_to_kv_head(hdx)
+        graph_hdx = int(graph_hdx_override) if graph_hdx_override is not None else kv_hdx
+        parity_hdx = int(parity_hdx_override) if parity_hdx_override is not None else hdx
+        knn_for_parity = knn
+        if int(knn.shape[0]) != int(self.input_length):
+            # Fused q_head graph build may merge multiple q-head rows per KV head.
+            # For parity, use the first q-head slice from the merged block.
+            if (
+                self.retrieval_head_mode == "q_head"
+                and int(self.input_length) > 0
+                and knn.ndim == 2
+                and (int(knn.shape[0]) % int(self.input_length)) == 0
+            ):
+                qh_merged = int(knn.shape[0]) // int(self.input_length)
+                if qh_merged > 0:
+                    knn_for_parity = np.ascontiguousarray(
+                        knn.reshape(self.input_length, qh_merged, knn.shape[-1])[:, 0, :],
+                        dtype=np.int32,
+                    )
         decode_index = None
         keys_cpu = None
         need_graph_keys = (self.graph_builder == "roar")
+        run_parity = (
+            int(knn_for_parity.shape[0]) == int(self.input_length)
+            and self._should_run_parity_for(ldx, parity_hdx)
+        )
         need_keys_cpu = (
             need_graph_keys
             or
             self.decode_index_mode == "faiss"
-            or (self.validate_parity and ldx == 0 and hdx == 0 and faiss is not None)
+            or run_parity
         )
         if need_keys_cpu:
             keys_cpu = (
-                self.cpu_keys[ldx][hdx, :self.input_length, :]
+                self.cpu_keys[ldx][kv_hdx, :self.input_length, :]
                 .detach()
                 .float()
                 .cpu()
@@ -1294,29 +1802,113 @@ class retrievalattention_cache(KV_Cache):
                 raise RuntimeError(
                     "RETRIEVALATTN_DECODE_INDEX=faiss requires faiss-cpu."
                 )
-            decode_index = faiss.IndexFlatIP(self.head_dim)
-            decode_index.add(keys_cpu)
+            if self.indexes[ldx][kv_hdx] is None:
+                decode_index = faiss.IndexFlatIP(self.head_dim)
+                decode_index.add(keys_cpu)
 
         parity_msg = None
-        if self.validate_parity and ldx == 0 and hdx == 0 and faiss is not None:
-            sample_n = min(256, self.input_length)
-            queries_cpu = (
-                self.cpu_queries[ldx][hdx, :sample_n, :]
-                .detach()
-                .float()
-                .cpu()
-                .numpy()
-                .astype(np.float32)
-            )
-            queries_cpu = self._score_transform_np(queries_cpu)
-            ref_index = faiss.IndexFlatIP(self.head_dim)
-            ref_index.add(keys_cpu)
-            _, ref_knn = ref_index.search(queries_cpu, self.q_knn)
-            rec = self._knn_recall_at_k(knn[:sample_n], ref_knn, self.q_knn)
-            parity_msg = (
-                f"[RetrievalAttention] parity layer=0 head=0 sample={sample_n} "
-                f"recall@{self.q_knn}={rec:.4f}"
-            )
+        if run_parity:
+            qhead_buf_precheck = None
+            if ldx < len(self.cpu_queries_qhead_samples):
+                qhead_buf_precheck = self.cpu_queries_qhead_samples[ldx]
+            if self.cpu_queries is None and qhead_buf_precheck is None:
+                raise RuntimeError(
+                    "Parity validation requested but prefill queries are unavailable."
+                )
+            if self.parity_query_indices is not None and self.parity_query_indices.size > 0:
+                sample_idx_all = np.ascontiguousarray(self.parity_query_indices, dtype=np.int32)
+            else:
+                sample_n_req = min(self.parity_sample, self.input_length, int(knn_for_parity.shape[0]))
+                sample_idx_all = self._build_parity_sample_indices(
+                    sample_n=sample_n_req,
+                    total=int(knn_for_parity.shape[0]),
+                    causal_ref=True,
+                )
+            valid_mask = sample_idx_all < int(knn_for_parity.shape[0])
+            sample_idx = np.ascontiguousarray(sample_idx_all[valid_mask], dtype=np.int32)
+            sample_pos = np.ascontiguousarray(np.nonzero(valid_mask)[0], dtype=np.int32)
+            profile_path = str(prof.get("path", "")).strip().lower()
+            use_causal_ref = (profile_path == "native_kernel_fused")
+            if sample_idx.size > 0:
+                sample_n = int(sample_idx.shape[0])
+                knn_sample = np.ascontiguousarray(knn_for_parity[sample_idx, :self.q_knn], dtype=np.int32)
+                per_q_head_recalls = []
+                qhead_buf = None
+                if ldx < len(self.cpu_queries_qhead_samples):
+                    qhead_buf = self.cpu_queries_qhead_samples[ldx]
+                if qhead_buf is not None:
+                    if self.retrieval_head_mode == "q_head":
+                        qh_start = int(parity_hdx)
+                        qh_end = min(int(parity_hdx + 1), int(self.num_heads))
+                    else:
+                        qh_start = int(kv_hdx * self.group_size)
+                        qh_end = min(int(qh_start + self.group_size), int(self.num_heads))
+                    q_group = (
+                        qhead_buf[qh_start:qh_end, sample_pos, :]
+                        .detach()
+                        .float()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32)
+                    )
+                    if q_group.ndim == 3 and q_group.shape[0] > 0:
+                        if not use_causal_ref:
+                            ref_index = faiss.IndexFlatIP(self.head_dim)
+                            ref_index.add(keys_cpu)
+                        for qhi in range(q_group.shape[0]):
+                            q_queries = self._score_transform_np(q_group[qhi])
+                            if use_causal_ref:
+                                ref_knn = self._causal_topk_ref_np(
+                                    queries=q_queries,
+                                    keys=keys_cpu,
+                                    query_indices=sample_idx,
+                                    k=self.q_knn,
+                                )
+                            else:
+                                _, ref_knn = ref_index.search(q_queries, self.q_knn)
+                            rec_qh = self._knn_recall_at_k(knn_sample, ref_knn, self.q_knn)
+                            per_q_head_recalls.append(float(rec_qh))
+
+                if len(per_q_head_recalls) == 0:
+                    # Fallback: legacy grouped-query parity.
+                    queries_cpu = (
+                        self.cpu_queries[ldx][kv_hdx, sample_idx, :]
+                        .detach()
+                        .float()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32)
+                    )
+                    queries_cpu = self._score_transform_np(queries_cpu)
+                    if use_causal_ref:
+                        ref_knn = self._causal_topk_ref_np(
+                            queries=queries_cpu,
+                            keys=keys_cpu,
+                            query_indices=sample_idx,
+                            k=self.q_knn,
+                        )
+                    else:
+                        ref_index = faiss.IndexFlatIP(self.head_dim)
+                        ref_index.add(keys_cpu)
+                        _, ref_knn = ref_index.search(queries_cpu, self.q_knn)
+                    rec = self._knn_recall_at_k(knn_sample, ref_knn, self.q_knn)
+                    rec_min = rec
+                    rec_max = rec
+                    mode_tag = "grouped_fallback"
+                    qh_count = 1
+                else:
+                    rec = float(np.mean(per_q_head_recalls))
+                    rec_min = float(np.min(per_q_head_recalls))
+                    rec_max = float(np.max(per_q_head_recalls))
+                    mode_tag = "per_q_head_mean"
+                    qh_count = len(per_q_head_recalls)
+                self._record_parity(ldx, parity_hdx, sample_n, rec, self.q_knn)
+                parity_msg = (
+                    f"[RetrievalAttention] parity layer={ldx} head={parity_hdx} sample={sample_n} "
+                    f"recall@{self.q_knn}={rec:.4f} "
+                    f"range=[{rec_min:.4f},{rec_max:.4f}] qh={qh_count} mode={mode_tag} "
+                    f"causal_ref={int(use_causal_ref)}"
+                )
 
         proj_start = time.time()
         graph, graph_meta = self._build_graph_csr_from_knn(knn, keys_cpu=keys_cpu)
@@ -1335,6 +1927,9 @@ class retrievalattention_cache(KV_Cache):
         return {
             "ldx": ldx,
             "hdx": hdx,
+            "kv_hdx": kv_hdx,
+            "graph_hdx": graph_hdx,
+            "parity_hdx": parity_hdx,
             "decode_index": decode_index,
             "graph": graph,
             "hub_seeds": hub_seeds,
@@ -1354,9 +1949,13 @@ class retrievalattention_cache(KV_Cache):
         """
         ldx = int(result["ldx"])
         hdx = int(result["hdx"])
-        self.indexes[ldx][hdx] = result["decode_index"]
-        self.graphs[ldx][hdx] = result["graph"]
-        self.hub_seeds[ldx][hdx] = list(result.get("hub_seeds", []))
+        kv_hdx = int(result.get("kv_hdx", self._retrieval_head_to_kv_head(hdx)))
+        graph_hdx = int(result.get("graph_hdx", kv_hdx))
+        decode_index = result.get("decode_index")
+        if decode_index is not None:
+            self.indexes[ldx][kv_hdx] = decode_index
+        self.graphs[ldx][graph_hdx] = result["graph"]
+        self.hub_seeds[ldx][graph_hdx] = list(result.get("hub_seeds", []))
 
         parity_msg = result.get("parity_msg")
         if parity_msg:
@@ -1370,7 +1969,7 @@ class retrievalattention_cache(KV_Cache):
         graph_meta = result.get("graph_meta")
         extra = ""
         if isinstance(graph_meta, dict) and (
-            (graph_builder == "roar" and self.roar_log)
+            (graph_builder in {"roar", "roar_cpp"} and self.roar_log)
             or (str(graph_meta.get("stop_reason", "ok")) != "ok")
         ):
             extra = (
@@ -1385,7 +1984,8 @@ class retrievalattention_cache(KV_Cache):
                 f"stop={graph_meta.get('stop_reason', 'ok')}"
             )
         print(
-            f"[RetrievalAttention] index built layer={ldx} head={hdx} "
+            f"[RetrievalAttention] index built layer={ldx} head={graph_hdx} "
+            f"kv_head={kv_hdx} "
             f"time={result['head_elapsed']:.2f}s topk={topk_str} proj={result['proj_elapsed']:.2f}s "
             f"edges={graph_edges} weighted={graph_weighted}{extra}"
         )
@@ -1415,6 +2015,21 @@ class retrievalattention_cache(KV_Cache):
             # [seq, kv_head, head_dim] -> [kv_head, seq, head_dim]
             queries = queries.transpose(0, 1).contiguous()
             self.cpu_queries[layer_idx][:, :self.input_length, :].copy_(queries, non_blocking=True)
+
+        # Store sampled per-Q-head queries for parity validation.
+        qhead_sample_buf = None
+        if layer_idx < len(self.cpu_queries_qhead_samples):
+            qhead_sample_buf = self.cpu_queries_qhead_samples[layer_idx]
+        if qhead_sample_buf is not None and self._parity_query_indices_torch is not None:
+            full_q = query_states[0, valid_start:valid_start + self.input_length, :, :]  # [seq, num_heads, dim]
+            parity_idx = self._parity_query_indices_torch
+            if parity_idx.numel() > 0:
+                if parity_idx.device != full_q.device:
+                    parity_idx = parity_idx.to(full_q.device, non_blocking=True)
+                parity_idx = torch.clamp(parity_idx, min=0, max=max(0, full_q.shape[0] - 1))
+                q_samples = torch.index_select(full_q, 0, parity_idx)  # [S, num_heads, dim]
+                q_samples = q_samples.transpose(0, 1).contiguous()      # [num_heads, S, dim]
+                qhead_sample_buf[:, :q_samples.shape[1], :].copy_(q_samples, non_blocking=True)
 
         # Build static GPU KV (prefix + suffix)
         prefix = key_states[0, valid_start:valid_start + self.static_pattern_start, :, :].transpose(0, 1).contiguous()
@@ -1515,9 +2130,12 @@ class retrievalattention_cache(KV_Cache):
             mode = "gpu_topk" if use_gpu_topk else "faiss_cpu"
         print(
             f"[RetrievalAttention] Building ANN indexes (layers={self.layer_num}, kv_heads={self.kv_head}, "
+            f"retrieval_heads={self.retrieval_heads}, retrieval_head_mode={self.retrieval_head_mode}, "
             f"tokens={self.input_length}, mode={mode}, decode_index={self.decode_index_mode}, "
             f"seed_mode={self.seed_mode}, query_mode={self.query_mode}, score_mode={self.score_mode}, "
             f"graph_builder={self.graph_builder}, "
+            f"roar_backend={self.roar_backend}, roar_cpp_available={int(self._roar_cpp_available)}, "
+            f"roar_cpp_threads={self.roar_cpp_threads}, "
             f"graph_weighted={int(self.graph_weighted)}, clique_m={self.graph_clique_m}, "
             f"graph_return_weights={int(self.graph_return_weights)}, graph_weight_dtype={self.graph_weight_dtype_name}, "
             f"roar_nq={self.roar_nq}, roar_l={self.roar_l}, roar_m={self.roar_m}, "
@@ -1598,7 +2216,7 @@ class retrievalattention_cache(KV_Cache):
                 )
 
             self.cpu_queries = None
-            self.prev_decode_seeds = [[[] for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+            self.prev_decode_seeds = [[[] for _ in range(self.retrieval_heads)] for _ in range(self.layer_num)]
             self._built = True
             return
 
@@ -1620,19 +2238,46 @@ class retrievalattention_cache(KV_Cache):
                         layer_topk = float(layer_topk)
                     except Exception:
                         layer_topk = None
-                per_head_topk = (layer_topk / float(self.kv_head)) if layer_topk is not None else None
+                per_head_topk = (layer_topk / float(self.retrieval_heads)) if layer_topk is not None else None
+                per_kv_topk = (layer_topk / float(self.kv_head)) if layer_topk is not None else None
                 if profile_enabled and profile:
                     print(
                         f"[RetrievalAttention] flashattn fused profile layer={ldx}: {profile}",
                         flush=True,
                     )
 
-                for hdx in range(self.kv_head):
-                    head_start = time.time()
-                    knn = np.ascontiguousarray(layer_knn[:, hdx, :], dtype=np.int32)
-                    prof = {"topk_sec": per_head_topk} if per_head_topk is not None else {}
-                    result = self._finalize_gpu_head_build(ldx, hdx, knn, prof, head_start)
-                    self._commit_head_build_result(result)
+                if self.retrieval_head_mode == "q_head":
+                    for kv_hdx in range(self.kv_head):
+                        qh_start = int(kv_hdx * self.group_size)
+                        qh_end = min(int(qh_start + self.group_size), int(self.num_heads))
+                        if qh_start >= qh_end:
+                            continue
+                        head_start = time.time()
+                        knn_group = np.ascontiguousarray(layer_knn[:, qh_start:qh_end, :], dtype=np.int32)
+                        knn = np.ascontiguousarray(knn_group.reshape(-1, knn_group.shape[-1]), dtype=np.int32)
+                        prof = dict(profile) if isinstance(profile, dict) else {}
+                        if per_kv_topk is not None:
+                            prof["topk_sec"] = per_kv_topk
+                        result = self._finalize_gpu_head_build(
+                            ldx,
+                            kv_hdx,
+                            knn,
+                            prof,
+                            head_start,
+                            kv_hdx_override=kv_hdx,
+                            graph_hdx_override=kv_hdx,
+                            parity_hdx_override=qh_start,
+                        )
+                        self._commit_head_build_result(result)
+                else:
+                    for hdx in range(self.retrieval_heads):
+                        head_start = time.time()
+                        knn = np.ascontiguousarray(layer_knn[:, hdx, :], dtype=np.int32)
+                        prof = dict(profile) if isinstance(profile, dict) else {}
+                        if per_head_topk is not None:
+                            prof["topk_sec"] = per_head_topk
+                        result = self._finalize_gpu_head_build(ldx, hdx, knn, prof, head_start)
+                        self._commit_head_build_result(result)
 
                 # Free per-layer fused KNN/prof to reduce host memory pressure.
                 self.fused_prefill_knn[ldx] = None
@@ -1768,7 +2413,7 @@ class retrievalattention_cache(KV_Cache):
                         extra = ""
                         graph_builder = str(graph_meta.get("builder", self.graph_builder)) if isinstance(graph_meta, dict) else self.graph_builder
                         if isinstance(graph_meta, dict) and (
-                            (graph_builder == "roar" and self.roar_log)
+                            (graph_builder in {"roar", "roar_cpp"} and self.roar_log)
                             or (str(graph_meta.get("stop_reason", "ok")) != "ok")
                         ):
                             extra = (
@@ -1824,7 +2469,7 @@ class retrievalattention_cache(KV_Cache):
         self._shutdown_fused_prefill_executor()
         with self._fused_prefill_lock:
             self._fused_prefill_futures.clear()
-        self.prev_decode_seeds = [[[] for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self.prev_decode_seeds = [[[] for _ in range(self.retrieval_heads)] for _ in range(self.layer_num)]
         self._built = True
 
     def _gpu_topk_knn(
@@ -2175,6 +2820,7 @@ class retrievalattention_cache(KV_Cache):
         Retrieve token indices using seed search + adaptive best-first K-K graph expansion.
         Final candidate list is reranked with the configured retrieval score mode.
         """
+        kv_hdx = self._retrieval_head_to_kv_head(hdx)
         profile = None
         total_start = None
         if self.decode_profile:
@@ -2198,8 +2844,8 @@ class retrievalattention_cache(KV_Cache):
                 profile["total_sec"] = time.perf_counter() - total_start
             return tokens, profile
 
-        index = self.indexes[ldx][hdx]
-        graph = self.graphs[ldx][hdx]
+        index = self.indexes[ldx][kv_hdx]
+        graph = self.graphs[ldx][kv_hdx]
         graph_is_csr = isinstance(graph, tuple) and len(graph) >= 2
         if graph_is_csr:
             graph_offsets = graph[0]
@@ -2249,7 +2895,7 @@ class retrievalattention_cache(KV_Cache):
                         "Set RETRIEVALATTN_DECODE_INDEX=faiss for stable quality."
                     )
                     self._fallback_seed_warned = True
-                k = self.cpu_keys[ldx][hdx, :self.input_length, :].detach().float().cpu()
+                k = self.cpu_keys[ldx][kv_hdx, :self.input_length, :].detach().float().cpu()
                 k = self._score_transform_torch(k)
                 scores = torch.matmul(q_seed_cpu, k.transpose(0, 1))  # [num_q, num_tokens]
                 k_take = min(seed_k, scores.shape[1])
@@ -2272,7 +2918,7 @@ class retrievalattention_cache(KV_Cache):
             prev_tokens = self.prev_decode_seeds[ldx][hdx]
             if prev_tokens:
                 seed_candidates.extend(prev_tokens[:self.seed_prev_k])
-            hub_tokens = self.hub_seeds[ldx][hdx]
+            hub_tokens = self.hub_seeds[ldx][kv_hdx]
             if hub_tokens and self.seed_hub_k > 0:
                 seed_candidates.extend(hub_tokens[:self.seed_hub_k])
 
@@ -2308,7 +2954,7 @@ class retrievalattention_cache(KV_Cache):
 
             if filtered:
                 idx = torch.tensor(filtered, dtype=torch.long, device="cpu")
-                seed_kv = torch.index_select(self.cpu_keys[ldx][hdx], 0, idx).detach().float().cpu()
+                seed_kv = torch.index_select(self.cpu_keys[ldx][kv_hdx], 0, idx).detach().float().cpu()
                 seed_kv = self._score_transform_torch(seed_kv)
                 seed_sim = torch.matmul(q_seed_cpu, seed_kv.transpose(0, 1))
                 if self.rerank_agg == "mean":
@@ -2349,46 +2995,9 @@ class retrievalattention_cache(KV_Cache):
         candidates = []
         seen = set()
         candidate_scores = {}
-        frontier = []
-        frontier_best_by_node = {}
-        expanded = set()
         visited_count = 0
-        stability_steps = 0
-        prev_topk_ids = None
 
-        def push_frontier(tok: int, score: float):
-            prev = frontier_best_by_node.get(tok)
-            if prev is None or score > prev:
-                frontier_best_by_node[tok] = score
-                heapq.heappush(frontier, (-score, tok))
-
-        def pop_frontier_batch(max_items: int):
-            batch = []
-            while frontier and len(batch) < max_items:
-                neg_score, tok = heapq.heappop(frontier)
-                score = -float(neg_score)
-                best = frontier_best_by_node.get(tok)
-                if best is None:
-                    continue
-                if score < (best - 1e-8):
-                    continue
-                if tok in expanded:
-                    continue
-                batch.append((tok, score))
-            return batch
-
-        def frontier_best_score() -> float:
-            while frontier:
-                neg_score, tok = frontier[0]
-                score = -float(neg_score)
-                best = frontier_best_by_node.get(tok)
-                if best is None or score < (best - 1e-8) or tok in expanded:
-                    heapq.heappop(frontier)
-                    continue
-                return score
-            return -float("inf")
-
-        # Prime candidates/frontier with seeds ranked by ANN score.
+        # Prime candidates with seeds ranked by ANN score.
         for tok, score in seed_ranked:
             if len(candidates) >= candidate_target:
                 break
@@ -2398,108 +3007,211 @@ class retrievalattention_cache(KV_Cache):
                 seen.add(tok)
                 score_f = float(score)
                 candidate_scores[tok] = score_f
-                push_frontier(tok, score_f)
 
         stop_reason = "graph_disabled"
 
-        # Adaptive best-first graph expansion.
         graph_start = time.perf_counter() if profile is not None else None
         if self.graph_expand and graph is not None:
-            stop_reason = "frontier_exhausted"
-            while frontier and len(candidates) < candidate_target and visited_count < self.max_visits:
-                batch = pop_frontier_batch(self.expand_width)
-                if not batch:
-                    break
-                expand_nodes = [tok for tok, _score in batch]
-                for tok in expand_nodes:
-                    expanded.add(tok)
-                    visited_count += 1
-                    if visited_count >= self.max_visits:
-                        break
-
-                new_tokens = []
-                new_token_set = set()
-                for tok in expand_nodes:
-                    if len(candidates) + len(new_tokens) >= candidate_target:
-                        break
-                    if graph_is_csr:
-                        row_start = int(graph_offsets[tok])
-                        row_end = int(graph_offsets[tok + 1])
-                        nb_iter = graph_neighbors[row_start:row_end]
+            use_cpp_decode = self._should_use_roar_cpp_decode_backend(graph_is_csr)
+            if use_cpp_decode:
+                try:
+                    init_take = min(len(seed_ranked), max(1, self.roar_decode_init))
+                    init_ids = np.asarray([int(tok) for tok, _ in seed_ranked[:init_take]], dtype=np.int32)
+                    init_scores = np.asarray([float(score) for _, score in seed_ranked[:init_take]], dtype=np.float32)
+                    lpq = int(self.roar_decode_lpq) if self.roar_decode_lpq > 0 else int(candidate_target)
+                    lpq = max(self.token_budget, lpq)
+                    lpq = min(self.input_length, lpq)
+                    topk_take = min(candidate_target, lpq)
+                    max_hops = int(self.roar_decode_max_hops) if self.roar_decode_max_hops > 0 else int(self.max_visits)
+                    max_cmps = int(self.roar_decode_max_cmps)
+                    key_arr, key_dtype = self._get_decode_key_array(ldx, kv_hdx)
+                    q_seed_np = np.ascontiguousarray(q_seed_cpu.numpy(), dtype=np.float32)
+                    ids_cpp, scores_cpp, meta_cpp = search_roar_graph_csr_cpp(
+                        query=q_seed_np,
+                        keys=key_arr,
+                        offsets=graph_offsets,
+                        neighbors=graph_neighbors,
+                        init_ids=init_ids,
+                        init_scores=init_scores,
+                        topk=topk_take,
+                        lpq=lpq,
+                        max_cmps=max_cmps,
+                        max_hops=max_hops,
+                        dynamic_start=self.dynamic_start,
+                        dynamic_end=self.dynamic_end,
+                        num_threads=int(self.roar_decode_threads),
+                        score_agg=self.rerank_agg,
+                        key_dtype=key_dtype,
+                    )
+                    if isinstance(meta_cpp, dict):
+                        stop_reason = str(meta_cpp.get("stop_reason", "roar_cpp"))
+                        visited_count = int(meta_cpp.get("hops", meta_cpp.get("visited", 0)))
                     else:
-                        nb_iter = graph[tok]
-                    for nb in nb_iter:
-                        nb = int(nb)
-                        if nb in static_indices or nb in seen or nb in new_token_set:
-                            continue
-                        new_tokens.append(nb)
-                        new_token_set.add(nb)
-                        if len(candidates) + len(new_tokens) >= candidate_target:
-                            break
-                if new_tokens:
-                    idx = torch.tensor(new_tokens, dtype=torch.long, device="cpu")
-                    new_k = torch.index_select(self.cpu_keys[ldx][hdx], 0, idx).detach().float().cpu()
-                    new_k = self._score_transform_torch(new_k)
-                    new_scores = torch.matmul(q_seed_cpu, new_k.transpose(0, 1))
-                    if self.rerank_agg == "mean":
-                        agg_new = new_scores.mean(dim=0)
-                    else:
-                        agg_new = new_scores.max(dim=0).values
-
-                    for i, tok in enumerate(new_tokens):
+                        stop_reason = "roar_cpp"
+                        visited_count = 0
+                    ids_cpp = np.asarray(ids_cpp, dtype=np.int32)
+                    scores_cpp = np.asarray(scores_cpp, dtype=np.float32)
+                    for i in range(ids_cpp.shape[0]):
                         if len(candidates) >= candidate_target:
+                            stop_reason = "candidate_cap"
                             break
-                        tok = int(tok)
-                        if tok in seen:
+                        tok = int(ids_cpp[i])
+                        if tok in static_indices or tok in seen:
                             continue
-                        score = float(agg_new[i].item())
+                        score = float(scores_cpp[i]) if i < scores_cpp.shape[0] else -1e9
                         candidates.append(tok)
                         seen.add(tok)
                         candidate_scores[tok] = score
-                        push_frontier(tok, score)
+                    if len(candidates) >= candidate_target and stop_reason == "frontier_empty":
+                        stop_reason = "candidate_cap"
+                except Exception as exc:
+                    if self.decode_backend == "roar_cpp":
+                        raise
+                    if not self._decode_cpp_warned:
+                        print(
+                            "[RetrievalAttention] WARNING: decode roar cpp search failed; "
+                            f"falling back to python traversal. error={exc}"
+                        )
+                        self._decode_cpp_warned = True
+                    use_cpp_decode = False
 
-                if self.frontier_topn > 0 and len(frontier) > (self.frontier_topn * 4):
-                    trimmed = []
-                    for tok, score in frontier_best_by_node.items():
+            if not use_cpp_decode:
+                frontier = []
+                frontier_best_by_node = {}
+                expanded = set()
+                stability_steps = 0
+                prev_topk_ids = None
+
+                def push_frontier(tok: int, score: float):
+                    prev = frontier_best_by_node.get(tok)
+                    if prev is None or score > prev:
+                        frontier_best_by_node[tok] = score
+                        heapq.heappush(frontier, (-score, tok))
+
+                def pop_frontier_batch(max_items: int):
+                    batch = []
+                    while frontier and len(batch) < max_items:
+                        neg_score, tok = heapq.heappop(frontier)
+                        score = -float(neg_score)
+                        best = frontier_best_by_node.get(tok)
+                        if best is None:
+                            continue
+                        if score < (best - 1e-8):
+                            continue
                         if tok in expanded:
                             continue
-                        trimmed.append((-score, tok))
-                    if len(trimmed) > self.frontier_topn:
-                        trimmed.sort()
-                        trimmed = trimmed[: self.frontier_topn]
-                    frontier = trimmed
-                    heapq.heapify(frontier)
+                        batch.append((tok, score))
+                    return batch
 
-                if len(candidates) >= candidate_target:
-                    stop_reason = "candidate_cap"
-                    break
-                if visited_count >= self.max_visits:
-                    stop_reason = "max_visits"
-                    break
+                def frontier_best_score() -> float:
+                    while frontier:
+                        neg_score, tok = frontier[0]
+                        score = -float(neg_score)
+                        best = frontier_best_by_node.get(tok)
+                        if best is None or score < (best - 1e-8) or tok in expanded:
+                            heapq.heappop(frontier)
+                            continue
+                        return score
+                    return -float("inf")
 
-                if visited_count >= self.min_visits:
-                    ranked_items = sorted(candidate_scores.items(), key=lambda x: x[1], reverse=True)
-                    topk_items = ranked_items[: min(self.token_budget, len(ranked_items))]
-                    current_topk_ids = tuple(tok for tok, _ in topk_items)
-                    if prev_topk_ids is not None and current_topk_ids == prev_topk_ids:
-                        stability_steps += 1
-                    else:
-                        stability_steps = 0
-                    prev_topk_ids = current_topk_ids
+                for tok, score in candidate_scores.items():
+                    push_frontier(int(tok), float(score))
 
-                    if len(topk_items) >= self.token_budget:
-                        kth_score = float(topk_items[-1][1])
-                    else:
-                        kth_score = -float("inf")
-                    frontier_best = frontier_best_score()
-                    if (
-                        stability_steps >= self.stop_patience
-                        and frontier_best <= (kth_score - self.stop_margin)
-                    ):
-                        stop_reason = "stability_gap"
+                stop_reason = "frontier_exhausted"
+                while frontier and len(candidates) < candidate_target and visited_count < self.max_visits:
+                    batch = pop_frontier_batch(self.expand_width)
+                    if not batch:
                         break
-            if not frontier and stop_reason == "frontier_exhausted":
-                stop_reason = "frontier_empty"
+                    expand_nodes = [tok for tok, _score in batch]
+                    for tok in expand_nodes:
+                        expanded.add(tok)
+                        visited_count += 1
+                        if visited_count >= self.max_visits:
+                            break
+
+                    new_tokens = []
+                    new_token_set = set()
+                    for tok in expand_nodes:
+                        if len(candidates) + len(new_tokens) >= candidate_target:
+                            break
+                        if graph_is_csr:
+                            row_start = int(graph_offsets[tok])
+                            row_end = int(graph_offsets[tok + 1])
+                            nb_iter = graph_neighbors[row_start:row_end]
+                        else:
+                            nb_iter = graph[tok]
+                        for nb in nb_iter:
+                            nb = int(nb)
+                            if nb in static_indices or nb in seen or nb in new_token_set:
+                                continue
+                            new_tokens.append(nb)
+                            new_token_set.add(nb)
+                            if len(candidates) + len(new_tokens) >= candidate_target:
+                                break
+                    if new_tokens:
+                        idx = torch.tensor(new_tokens, dtype=torch.long, device="cpu")
+                        new_k = torch.index_select(self.cpu_keys[ldx][kv_hdx], 0, idx).detach().float().cpu()
+                        new_k = self._score_transform_torch(new_k)
+                        new_scores = torch.matmul(q_seed_cpu, new_k.transpose(0, 1))
+                        if self.rerank_agg == "mean":
+                            agg_new = new_scores.mean(dim=0)
+                        else:
+                            agg_new = new_scores.max(dim=0).values
+
+                        for i, tok in enumerate(new_tokens):
+                            if len(candidates) >= candidate_target:
+                                break
+                            tok = int(tok)
+                            if tok in seen:
+                                continue
+                            score = float(agg_new[i].item())
+                            candidates.append(tok)
+                            seen.add(tok)
+                            candidate_scores[tok] = score
+                            push_frontier(tok, score)
+
+                    if self.frontier_topn > 0 and len(frontier) > (self.frontier_topn * 4):
+                        trimmed = []
+                        for tok, score in frontier_best_by_node.items():
+                            if tok in expanded:
+                                continue
+                            trimmed.append((-score, tok))
+                        if len(trimmed) > self.frontier_topn:
+                            trimmed.sort()
+                            trimmed = trimmed[: self.frontier_topn]
+                        frontier = trimmed
+                        heapq.heapify(frontier)
+
+                    if len(candidates) >= candidate_target:
+                        stop_reason = "candidate_cap"
+                        break
+                    if visited_count >= self.max_visits:
+                        stop_reason = "max_visits"
+                        break
+
+                    if visited_count >= self.min_visits:
+                        ranked_items = sorted(candidate_scores.items(), key=lambda x: x[1], reverse=True)
+                        topk_items = ranked_items[: min(self.token_budget, len(ranked_items))]
+                        current_topk_ids = tuple(tok for tok, _ in topk_items)
+                        if prev_topk_ids is not None and current_topk_ids == prev_topk_ids:
+                            stability_steps += 1
+                        else:
+                            stability_steps = 0
+                        prev_topk_ids = current_topk_ids
+
+                        if len(topk_items) >= self.token_budget:
+                            kth_score = float(topk_items[-1][1])
+                        else:
+                            kth_score = -float("inf")
+                        frontier_best = frontier_best_score()
+                        if (
+                            stability_steps >= self.stop_patience
+                            and frontier_best <= (kth_score - self.stop_margin)
+                        ):
+                            stop_reason = "stability_gap"
+                            break
+                if not frontier and stop_reason == "frontier_exhausted":
+                    stop_reason = "frontier_empty"
         elif self.graph_expand and graph is None:
             stop_reason = "graph_missing"
         if profile is not None:
@@ -2511,7 +3223,7 @@ class retrievalattention_cache(KV_Cache):
         rerank_start = time.perf_counter() if profile is not None else None
         if self.rerank:
             idx = torch.tensor(candidates, dtype=torch.long, device="cpu")
-            cand_k = torch.index_select(self.cpu_keys[ldx][hdx], 0, idx).detach().float().cpu()
+            cand_k = torch.index_select(self.cpu_keys[ldx][kv_hdx], 0, idx).detach().float().cpu()
             cand_k = self._score_transform_torch(cand_k)
             q_rank = self._score_transform_torch(q_group.detach().float().cpu())
             scores = torch.matmul(q_rank, cand_k.transpose(0, 1))
@@ -2576,15 +3288,23 @@ class retrievalattention_cache(KV_Cache):
 
         device = self.layer_mapping[str(layer_idx)]
         q = query_states[0, 0]  # [num_heads, head_dim]
-        q = q.view(self.kv_head, self.group_size, self.head_dim)
+        q_grouped = q.view(self.kv_head, self.group_size, self.head_dim)
 
         outputs = []
         scale = 1.0 / math.sqrt(self.head_dim)
         empty_heads = 0
         dynamic_counts = []
+        head_count = self.retrieval_heads
 
-        for hdx in range(self.kv_head):
-            q_group = q[hdx]  # [group_size, head_dim]
+        for hdx in range(head_count):
+            kv_hdx = self._retrieval_head_to_kv_head(hdx)
+            if self.retrieval_head_mode == "q_head":
+                q_group = q[hdx]  # [head_dim]
+                q_attn = q_group.unsqueeze(0)  # [1, head_dim]
+            else:
+                q_group = q_grouped[hdx]  # [group_size, head_dim]
+                q_attn = q_group
+
             token_ids, retrieve_profile = self._retrieve_tokens(layer_idx, hdx, q_group)
             if self.decode_profile and retrieve_profile is not None:
                 self._decode_profile_stats["retrieve_total_sec"] += float(retrieve_profile["total_sec"])
@@ -2602,8 +3322,8 @@ class retrievalattention_cache(KV_Cache):
             gather_start = time.perf_counter() if self.decode_profile else None
             if token_ids:
                 idx = torch.tensor(token_ids, dtype=torch.long, device="cpu")
-                dyn_k = torch.index_select(self.cpu_keys[layer_idx][hdx], 0, idx).to(device, non_blocking=True)
-                dyn_v = torch.index_select(self.cpu_values[layer_idx][hdx], 0, idx).to(device, non_blocking=True)
+                dyn_k = torch.index_select(self.cpu_keys[layer_idx][kv_hdx], 0, idx).to(device, non_blocking=True)
+                dyn_v = torch.index_select(self.cpu_values[layer_idx][kv_hdx], 0, idx).to(device, non_blocking=True)
             else:
                 dyn_k = None
                 dyn_v = None
@@ -2611,8 +3331,8 @@ class retrievalattention_cache(KV_Cache):
                 self._decode_profile_stats["gather_total_sec"] += (time.perf_counter() - gather_start)
 
             # Static KV on GPU
-            static_k = self.static_gpu_keys[layer_idx][hdx]
-            static_v = self.static_gpu_values[layer_idx][hdx]
+            static_k = self.static_gpu_keys[layer_idx][kv_hdx]
+            static_v = self.static_gpu_values[layer_idx][kv_hdx]
 
             if dyn_k is not None:
                 k = torch.cat([static_k, dyn_k], dim=0)
@@ -2621,19 +3341,19 @@ class retrievalattention_cache(KV_Cache):
                 k = static_k
                 v = static_v
 
-            # Attention: q_group [G, D], k [T, D] -> [G, T]
+            # Attention: q_attn [G, D] (or [1, D] in q_head mode), k [T, D] -> [G, T]
             attn_start = time.perf_counter() if self.decode_profile else None
-            scores = torch.matmul(q_group, k.transpose(0, 1)) * scale
+            scores = torch.matmul(q_attn, k.transpose(0, 1)) * scale
             scores = scores.float()
             attn = torch.softmax(scores, dim=-1).to(v.dtype)
-            out = torch.matmul(attn, v)  # [G, D]
+            out = torch.matmul(attn, v)  # [G, D] or [1, D]
             if self.decode_profile:
                 self._decode_profile_stats["attn_total_sec"] += (time.perf_counter() - attn_start)
             outputs.append(out)
             if self.decode_profile:
                 self._decode_profile_stats["heads"] += 1
 
-        if self.assert_nonempty and empty_heads == self.kv_head:
+        if self.assert_nonempty and empty_heads == head_count:
             raise RuntimeError(
                 f"[RetrievalAttention] Empty dynamic retrieval for all heads at decode step={self.decode_pos}, "
                 f"layer={layer_idx}. Check decode seed index path."
@@ -2642,7 +3362,7 @@ class retrievalattention_cache(KV_Cache):
             avg_dyn = float(sum(dynamic_counts)) / float(len(dynamic_counts)) if dynamic_counts else 0.0
             print(
                 f"[RetrievalAttention][debug] step={self.decode_pos} layer={layer_idx} "
-                f"empty_heads={empty_heads}/{self.kv_head} avg_dynamic={avg_dyn:.1f}"
+                f"empty_heads={empty_heads}/{head_count} avg_dynamic={avg_dyn:.1f}"
             )
 
         if self.decode_profile:
