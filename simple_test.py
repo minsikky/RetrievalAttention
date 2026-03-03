@@ -106,6 +106,20 @@ def generate_config(model_name, context_len, attn_type, token_budget_override=No
     CONFIG_FILE = os.path.join(CONFIG_DIR, MODEL_NAME)
     with open(CONFIG_FILE, "r") as f:
         original_config = json.load(f)
+
+    # Upstream configs may not include RetrievalAttention entries.
+    if attn_type == "RetrievalAttention" and attn_type not in original_config:
+        default_static_start = int(os.environ.get("RETRIEVALATTN_STATIC_PATTERN_START", "128"))
+        default_static_end = int(os.environ.get("RETRIEVALATTN_STATIC_PATTERN_END", "512"))
+        default_q_knn = int(os.environ.get("RETRIEVALATTN_Q_KNN", "8"))
+        default_key_degree = int(os.environ.get("RETRIEVALATTN_KEY_DEGREE", "8"))
+        original_config[attn_type] = {
+            "static_pattern_start": max(0, default_static_start),
+            "static_pattern_end": max(0, default_static_end),
+            "q_knn": max(1, default_q_knn),
+            "key_degree": max(1, default_key_degree),
+            "token_budget": 1,
+        }
     
     n_clusters = max(int(context_len/16), 1)
     n_segments = max(int(context_len/8192), 1)

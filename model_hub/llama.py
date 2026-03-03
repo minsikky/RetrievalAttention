@@ -5,7 +5,13 @@ import torch.nn.functional as F
 import flashinfer
 from transformers import AutoTokenizer, LlamaForCausalLM, LlamaConfig
 from .LLM import LLM
-from cache_hub import flash_attn_cache, retroinfer_cache, retroinfer_cache_gpu, retrievalattention_cache
+from cache_hub import (
+    flash_attn_cache,
+    retroinfer_cache,
+    retroinfer_cache_gpu,
+    retroinfer_cache_gpu_import_error,
+    retrievalattention_cache,
+)
 from attn_hub import full_decode_attn, retroinfer_decode_attn, \
                      full_prefill_attn, prefill_xattn, prefill_minfer, \
                      retrievalattention_prefill_attn, retrievalattention_decode_attn
@@ -182,6 +188,11 @@ class LlamaModel(LLM):
             retroinfer_config = llama_config.get(self.attention_type)
 
             if retroinfer_config['gpu_only'] == True:   # GPU-only version
+                if retroinfer_cache_gpu is None:
+                    raise ImportError(
+                        "RetroInfer gpu_only requires retroinfer_cache_gpu, but it failed to import. "
+                        f"Underlying error: {retroinfer_cache_gpu_import_error}"
+                    )
                 self.kv_cache = retroinfer_cache_gpu(
                     valid_start = valid_start,
                     layer_num = self.num_layers,
@@ -251,6 +262,7 @@ class LlamaModel(LLM):
                 q_knn = retrieval_config["q_knn"],
                 key_degree = retrieval_config["key_degree"],
                 token_budget = retrieval_config["token_budget"],
+                prefill_bsz = self.prefill_bsz,
                 num_gpus = self.num_gpus,
                 model_size = int(re.search(r'(\d+)[B]', self.model_name).group(1))
             )
@@ -342,7 +354,7 @@ class LlamaModel(LLM):
                 self.kv_cache.valid_length = self.kv_cache.valid_length_dict[next_device]
         elif self.attention_type == 'RetroInfer':
             if hidden_states.shape[1] == 1:
-                if isinstance(self.kv_cache, retroinfer_cache_gpu):
+                if retroinfer_cache_gpu is not None and isinstance(self.kv_cache, retroinfer_cache_gpu):
                     self.kv_cache.gemm_o = self.kv_cache.gemm_o_dict[next_device]
                     self.kv_cache.softmax_o = self.kv_cache.softmax_o_dict[next_device]
                     self.kv_cache.norm = self.kv_cache.norm_dict[next_device]

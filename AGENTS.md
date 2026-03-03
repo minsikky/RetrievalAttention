@@ -31,6 +31,24 @@ Current active experiment is RetrievalAttention-style ANN retrieval for `Llama-3
 - Roar-style graph builder is implemented and selectable:
   - `RETRIEVALATTN_GRAPH_BUILDER=roar|legacy`
   - default in `test.sh`: `roar`.
+- Roar graph-build backend now supports C++ acceleration via local extension:
+  - `RETRIEVALATTN_ROAR_BACKEND=cpp|python|auto`
+  - default in run scripts: `cpp` (fails fast if extension is missing).
+  - extension source/build path: `third_party/RoarGraph/python_ext`.
+  - build command:
+    - `module load python/3.10.4`
+    - `source .venv/bin/activate`
+    - `python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`
+- Decode traversal now supports the same C++ extension path:
+  - `RETRIEVALATTN_DECODE_BACKEND=auto|python|roar_cpp` (`auto` default),
+  - C++ decode search runs only for CSR graphs and falls back to Python traversal in `auto` mode if C++ fails,
+  - `roar_cpp` mode is strict and fails fast if the extension is missing/unusable.
+- Decode C++ search controls:
+  - `RETRIEVALATTN_ROAR_DECODE_INIT` (seed count passed to C++ queue, default `64`),
+  - `RETRIEVALATTN_ROAR_DECODE_LPQ` (queue capacity override, `0` => candidate-target driven),
+  - `RETRIEVALATTN_ROAR_DECODE_MAX_CMPS` (`0` => uncapped),
+  - `RETRIEVALATTN_ROAR_DECODE_MAX_HOPS` (`0` => uses `RETRIEVALATTN_MAX_VISITS`),
+  - `RETRIEVALATTN_ROAR_DECODE_THREADS` (OpenMP thread override in decode C++ call).
 
 ## Important caution (quality)
 - Decode seeding now defaults to `RETRIEVALATTN_SEED_MODE=graph_only`:
@@ -41,7 +59,13 @@ Current active experiment is RetrievalAttention-style ANN retrieval for `Llama-3
 - If decode index is missing while running faiss seed mode, output quality can collapse (e.g., repeated `[INST]` patterns).
 
 ## Important caution (latency)
-- Decode traversal now uses adaptive best-first expansion (not fixed-hop).
+- Decode traversal now has two backends:
+  - C++ Roar-style bounded queue traversal (`RETRIEVALATTN_DECODE_BACKEND=auto|roar_cpp`),
+  - Python adaptive best-first traversal fallback (`RETRIEVALATTN_DECODE_BACKEND=python` or auto fallback).
+- Default behavior (`auto`) prefers C++ on CSR graphs and avoids hard failures by falling back to Python if the call fails.
+- Python adaptive traversal remains available and still uses:
+  - `RETRIEVALATTN_EXPAND_WIDTH`, `RETRIEVALATTN_MIN_VISITS`, `RETRIEVALATTN_MAX_VISITS`,
+  - `RETRIEVALATTN_STOP_PATIENCE`, `RETRIEVALATTN_STOP_MARGIN`, `RETRIEVALATTN_FRONTIER_TOPN`.
 - Default adaptive limits can still be expensive if fanout is high.
 - Tune `RETRIEVALATTN_MIN_VISITS` / `RETRIEVALATTN_MAX_VISITS` / `RETRIEVALATTN_EXPAND_WIDTH` first when decode is too slow.
 - `test.sh` now uses latency-safe defaults for adaptive decode:
@@ -66,7 +90,8 @@ Current active experiment is RetrievalAttention-style ANN retrieval for `Llama-3
   - `candidates_total` stayed around `78-80M`,
   - only ~31% of candidate evaluations become visited nodes, so decode bottleneck is now traversal fanout/candidate processing.
 - Current priority:
-  - update decode traversal from adaptive frontier expansion to Roar/HNSW-style beam-search traversal while preserving retrieval budget fairness.
+  - measure C++ decode traversal (`RETRIEVALATTN_DECODE_BACKEND=auto`) vs Python fallback on the same seed/budget settings.
+  - if `graph` time is still dominant, tune `RETRIEVALATTN_ROAR_DECODE_LPQ` / `MAX_HOPS` / `MAX_CMPS` first before changing retrieval budget.
 
 ## Key code locations
 - Retrieval prototype cache: `cache_hub/retrievalattention_cache.py`

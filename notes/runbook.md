@@ -1,9 +1,204 @@
 # Runbook
 
+## Current runtime contract (2026-02-26)
+- RetrievalAttention prefill/index build is fused-only.
+- Required components:
+  - flash-attn build exporting `flash_attn_with_kvcache_retrieval`,
+  - RoarGraph C++ extension (`third_party/RoarGraph/python_ext`).
+- Deprecated runtime toggles are no longer active in `test.sh`:
+  - `RETRIEVALATTN_GPU_TOPK`,
+  - `RETRIEVALATTN_CUSTOM_QK_TOPK*`,
+  - `RETRIEVALATTN_GRAPH_BUILDER`,
+  - `RETRIEVALATTN_ROAR_BACKEND`,
+  - `RETRIEVALATTN_Q_BLOCK`, `RETRIEVALATTN_K_BLOCK`,
+  - `RETRIEVALATTN_OVERLAP`, `RETRIEVALATTN_LAYER_GPU_CACHE`.
+- `RETRIEVALATTN_FA_SHADOW_COMPARE` is deprecated and ignored in fused-only runtime.
+- Holdout recall controls:
+  - `RETRIEVALATTN_GRAPH_TRAIN_FRAC` (`0.0~1.0`): fraction of query rows used to build K-graph.
+  - `RETRIEVALATTN_GRAPH_SPLIT` (`stratified|random|contiguous`): train/holdout query split policy when `GRAPH_TRAIN_FRAC < 1.0`.
+  - `RETRIEVALATTN_GRAPH_SPLIT_SEED` (int): RNG seed used by non-contiguous split modes.
+  - `RETRIEVALATTN_PARITY_HOLDOUT_ONLY` (`0|1`): when enabled, parity/recall samples only from holdout rows.
+  - `RETRIEVALATTN_TRAVERSAL_EVAL` (`0|1`): run traversal-efficiency eval during parity (forced to `1` in `RECALL_ONLY=1` mode).
+  - `RETRIEVALATTN_TRAVERSAL_EVAL_SAMPLE`: max sampled queries for traversal-efficiency eval.
+
 ## Standard simple run
 ```bash
 sbatch test.sh
 ```
+
+## Tiny recall-only run (prefill/index only)
+Use this to iterate on graph/index algorithms without full decode latency.
+```bash
+RECALL_ONLY=1 \
+RECALL_INPUT_TOKENS=8192 \
+RETRIEVALATTN_VALIDATE_PARITY=1 \
+RETRIEVALATTN_PARITY_LAYERS=1 \
+RETRIEVALATTN_PARITY_HEADS=1 \
+RETRIEVALATTN_PARITY_SAMPLE=256 \
+sbatch test.sh
+```
+Holdout variant (recommended for graph quality):
+```bash
+RECALL_ONLY=1 \
+RECALL_INPUT_TOKENS=8192 \
+RETRIEVALATTN_VALIDATE_PARITY=1 \
+RETRIEVALATTN_GRAPH_TRAIN_FRAC=0.9 \
+RETRIEVALATTN_GRAPH_SPLIT=stratified \
+RETRIEVALATTN_GRAPH_SPLIT_SEED=1234 \
+RETRIEVALATTN_PARITY_HOLDOUT_ONLY=1 \
+RETRIEVALATTN_PARITY_LAYERS=1 \
+RETRIEVALATTN_PARITY_HEADS=1 \
+RETRIEVALATTN_PARITY_SAMPLE=256 \
+sbatch test.sh
+```
+Strict-metric target config (achieved >=0.95 near 3% traversal):
+```bash
+RECALL_ONLY=1 \
+RECALL_INPUT_TOKENS=8192 \
+RETRIEVALATTN_VALIDATE_PARITY=1 \
+RETRIEVALATTN_GRAPH_TRAIN_FRAC=0.9 \
+RETRIEVALATTN_GRAPH_SPLIT=stratified \
+RETRIEVALATTN_GRAPH_SPLIT_SEED=1234 \
+RETRIEVALATTN_PARITY_HOLDOUT_ONLY=1 \
+RETRIEVALATTN_TRAVERSAL_EVAL=1 \
+RETRIEVALATTN_TRAVERSAL_EVAL_SAMPLE=128 \
+RETRIEVALATTN_EXPAND_WIDTH=24 \
+RETRIEVALATTN_MIN_VISITS=32 \
+RETRIEVALATTN_MAX_VISITS=256 \
+RETRIEVALATTN_CAND_MULT=2 \
+RETRIEVALATTN_ROAR_M=32 \
+RETRIEVALATTN_ROAR_L=20 \
+RETRIEVALATTN_ROAR_ENHANCE_L=20 \
+RETRIEVALATTN_ROAR_MAX_QUERY_PER_PIVOT=0 \
+RETRIEVALATTN_SEED_HUB_K=256 \
+RETRIEVALATTN_SEED_TAIL_K=128 \
+sbatch test.sh
+```
+Traversal saturation diagnostic (same holdout split):
+```bash
+# T1: baseline traversal
+RECALL_ONLY=1 \
+RECALL_INPUT_TOKENS=8192 \
+RETRIEVALATTN_GRAPH_TRAIN_FRAC=0.9 \
+RETRIEVALATTN_PARITY_HOLDOUT_ONLY=1 \
+RETRIEVALATTN_PARITY_LAYERS=1 \
+RETRIEVALATTN_PARITY_HEADS=1 \
+RETRIEVALATTN_PARITY_SAMPLE=256 \
+RETRIEVALATTN_TRAVERSAL_EVAL=1 \
+RETRIEVALATTN_TRAVERSAL_EVAL_SAMPLE=128 \
+RETRIEVALATTN_EXPAND_WIDTH=48 \
+RETRIEVALATTN_MIN_VISITS=96 \
+RETRIEVALATTN_MAX_VISITS=2048 \
+sbatch test.sh
+
+# T2: larger traversal budget
+RECALL_ONLY=1 \
+RECALL_INPUT_TOKENS=8192 \
+RETRIEVALATTN_GRAPH_TRAIN_FRAC=0.9 \
+RETRIEVALATTN_PARITY_HOLDOUT_ONLY=1 \
+RETRIEVALATTN_PARITY_LAYERS=1 \
+RETRIEVALATTN_PARITY_HEADS=1 \
+RETRIEVALATTN_PARITY_SAMPLE=256 \
+RETRIEVALATTN_TRAVERSAL_EVAL=1 \
+RETRIEVALATTN_TRAVERSAL_EVAL_SAMPLE=128 \
+RETRIEVALATTN_EXPAND_WIDTH=96 \
+RETRIEVALATTN_MIN_VISITS=1024 \
+RETRIEVALATTN_MAX_VISITS=8192 \
+RETRIEVALATTN_CAND_MULT=8 \
+sbatch test.sh
+
+# T3: near-exhaustive traversal stress
+RECALL_ONLY=1 \
+RECALL_INPUT_TOKENS=8192 \
+RETRIEVALATTN_GRAPH_TRAIN_FRAC=0.9 \
+RETRIEVALATTN_PARITY_HOLDOUT_ONLY=1 \
+RETRIEVALATTN_PARITY_LAYERS=1 \
+RETRIEVALATTN_PARITY_HEADS=1 \
+RETRIEVALATTN_PARITY_SAMPLE=256 \
+RETRIEVALATTN_TRAVERSAL_EVAL=1 \
+RETRIEVALATTN_TRAVERSAL_EVAL_SAMPLE=128 \
+RETRIEVALATTN_EXPAND_WIDTH=128 \
+RETRIEVALATTN_MIN_VISITS=4096 \
+RETRIEVALATTN_MAX_VISITS=32768 \
+RETRIEVALATTN_CAND_MULT=16 \
+sbatch test.sh
+```
+Interpretation rule:
+1. If `trav_recall` reaches >0.9 with modest `trav_visit_rate`, graph is usable and decode policy/seeding is the main bottleneck.
+2. If `trav_recall` stays low even when `trav_visit_rate` is very high (approaching full search), graph construction is the primary issue.
+
+Optional gate:
+```bash
+RECALL_ONLY=1 \
+RECALL_MIN_RECALL=0.95 \
+sbatch test.sh
+```
+
+## Decode complexity-regime sweep (N up to 64k)
+Purpose:
+- compare `O(N)`, `O(sqrt(N))`, and `O(log N)` traversal-budget families,
+- primary metric: minimum `trav_visit_rate` that reaches strict `trav_recall >= 0.95`,
+- first-pass prefill scaling: scale `ROAR_M` with `N` only (`L/E` fixed).
+
+Stage 1 (coarse sweep, single split seed):
+```bash
+python benchmark/submit_decode_complexity_sweep.py \
+  --prefix dcs_stage1 \
+  --out_tsv notes/decode_complexity_stage1_$(date +%F).tsv \
+  --sizes 8192,16384,32768,65536 \
+  --families linear,sqrt,log \
+  --linear_rates 0.01,0.02,0.03,0.05 \
+  --sqrt_coeffs 1.0,2.0,3.0,4.0 \
+  --log_coeffs 8,12,16,24 \
+  --base_roar_m 32 \
+  --base_roar_l 20 \
+  --base_roar_enhance_l 16 \
+  --m_scale_ref_tokens 8192 \
+  --m_scale_exponent 0.5 \
+  --split_seeds 1234 \
+  --partition spgpu
+```
+
+After runs finish:
+```bash
+python benchmark/collect_recall_sweep.py \
+  --jobs_tsv notes/decode_complexity_stage1_$(date +%F).tsv \
+  --out_csv notes/decode_complexity_stage1_$(date +%F).csv \
+  --log_pattern "slurm-{name}-{job_id}.out"
+```
+
+```bash
+python benchmark/summarize_decode_complexity.py \
+  --in_csv notes/decode_complexity_stage1_$(date +%F).csv \
+  --target_recall 0.95 \
+  --out_frontier_csv notes/decode_complexity_stage1_frontier_$(date +%F).csv \
+  --out_regime_csv notes/decode_complexity_stage1_regime_$(date +%F).csv \
+  --out_json notes/decode_complexity_stage1_report_$(date +%F).json
+```
+
+Stage 2 (confirm finalists with multiple split seeds):
+```bash
+python benchmark/submit_decode_complexity_sweep.py \
+  --prefix dcs_stage2 \
+  --out_tsv notes/decode_complexity_stage2_$(date +%F).tsv \
+  --sizes 8192,16384,32768,65536 \
+  --families linear,sqrt,log \
+  --linear_rates 0.02,0.03 \
+  --sqrt_coeffs 2.0,3.0 \
+  --log_coeffs 12,16 \
+  --base_roar_m 32 \
+  --base_roar_l 20 \
+  --base_roar_enhance_l 16 \
+  --m_scale_ref_tokens 8192 \
+  --m_scale_exponent 0.5 \
+  --split_seeds 1234,4321,9999 \
+  --partition spgpu
+```
+
+Interpretation:
+1. `mean_visit_rate_at_target` is the main comparison key across regimes.
+2. `obs_alpha` from `summarize_decode_complexity.py` estimates observed decode scaling using `trav_visited_mean`.
+3. If `obs_alpha` is low but hit-rate is poor, the regime is too aggressive and fails quality targets at larger `N`.
 
 ## FlashAttention fork build (compute node only)
 - Do not run flash-attn build from login node; login node has no CUDA toolkit.
@@ -16,11 +211,28 @@ sbatch install_2.sh
   - activates `.venv`,
   - resolves `CUDA_HOME` from `which nvcc`,
   - runs `pip install --no-build-isolation -v -e third_party/flash-attn-ra`.
+- After changing retrieval kernel C++/CUDA sources, rebuild is required before runs.
 
 ## Interactive Python setup (shell)
 ```bash
 module load python/3.10.4
 source .venv/bin/activate
+```
+
+## RoarGraph C++ graph-builder extension
+- Source path: `third_party/RoarGraph/python_ext/roargraph_builder.cpp`
+- Build once per environment:
+```bash
+module load python/3.10.4
+source .venv/bin/activate
+python third_party/RoarGraph/python_ext/setup.py build_ext --inplace
+```
+- Default run scripts (`test.sh`, `benchmark/ruler/ruler_run_wrapper.sh`) now use:
+  - `RETRIEVALATTN_ROAR_BACKEND=cpp`
+  - and fail early if the extension import is missing.
+- Force Python fallback for debug:
+```bash
+RETRIEVALATTN_ROAR_BACKEND=python sbatch test.sh
 ```
 
 ## Recommended RetrievalAttention debug run
@@ -48,6 +260,7 @@ sbatch test.sh
 RETRIEVALATTN_GPU_TOPK=1 \
 RETRIEVALATTN_LAYER_GPU_CACHE=1 \
 RETRIEVALATTN_DECODE_INDEX=faiss \
+RETRIEVALATTN_DECODE_BACKEND=auto \
 RETRIEVALATTN_SEED_MODE=graph_only \
 RETRIEVALATTN_SCORE_MODE=ip \
 RETRIEVALATTN_GRAPH_BUILDER=roar \
@@ -142,6 +355,10 @@ Decision rule:
 - `RETRIEVALATTN_GPU_TOPK`: enable GPU topk build.
 - `RETRIEVALATTN_CUSTOM_QK_TOPK`: opt-in Triton custom fused qk+topk kernel path (currently frozen/experimental; not recommended for active runs).
 - `RETRIEVALATTN_FA_FUSED_PREFILL`: use FlashAttention fused-prefill retrieval path (expects flash-attn API `flash_attn_with_kvcache_retrieval` from a custom build/fork).
+- `RETRIEVALATTN_RETRIEVAL_HEAD_MODE`: retrieval indexing mode (`q_head` or `kv_head`; fused path default is `q_head`).
+  - `q_head`: fused top-k is expected as `[seq, num_heads, q_knn]`.
+  - `kv_head`: legacy behavior keyed by KV heads.
+  - current graph design is shared per KV head in both modes; `q_head` mainly controls per-head retrieval/seed/rerank behavior.
 - `RETRIEVALATTN_FA_SHADOW_COMPARE`: in fused-prefill mode, run sampled parity check vs baseline GPU-topk (layer0/head0).
 - `RETRIEVALATTN_FA_SHADOW_SAMPLE`: number of sampled queries used in fused shadow compare.
 - `RETRIEVALATTN_FUSED_PREFILL_OVERLAP`: overlap CPU finalize (index/graph build) with ongoing fused prefill (`1` default).
@@ -166,6 +383,14 @@ Decision rule:
 - `RETRIEVALATTN_ROAR_ENTRY`: enhancement entry policy (`hub|max_degree|self`).
 - `RETRIEVALATTN_ROAR_MAX_QUERY_PER_PIVOT`: optional cap of bridge queries per pivot (`0` disables cap).
 - `RETRIEVALATTN_ROAR_LOG`: emit per-stage Roar build metrics in head logs.
+- `RETRIEVALATTN_ROAR_BACKEND`: Roar builder backend selector (`cpp` recommended, `python`, `auto`).
+- `RETRIEVALATTN_ROAR_CPP_THREADS`: thread override for C++ Roar builder (`0` lets OpenMP decide).
+- `RETRIEVALATTN_DECODE_BACKEND`: decode traversal backend (`auto` default, `python`, `roar_cpp`).
+- `RETRIEVALATTN_ROAR_DECODE_INIT`: number of seed tokens sent to C++ decode queue.
+- `RETRIEVALATTN_ROAR_DECODE_LPQ`: C++ decode queue capacity (`0` => candidate target).
+- `RETRIEVALATTN_ROAR_DECODE_MAX_CMPS`: max neighbor-score evaluations in C++ decode (`0` => uncapped).
+- `RETRIEVALATTN_ROAR_DECODE_MAX_HOPS`: max expanded nodes in C++ decode (`0` => follow `RETRIEVALATTN_MAX_VISITS`).
+- `RETRIEVALATTN_ROAR_DECODE_THREADS`: OpenMP thread override for C++ decode call.
 - `RETRIEVALATTN_GRAPH_WEIGHTED`: weighted graph projection from prefill top-k (`1` default).
 - `RETRIEVALATTN_GRAPH_CLIQUE_M`: clique-lite projection width among top candidates per query row (default `6`).
 - `RETRIEVALATTN_GRAPH_RETURN_WEIGHTS`: store CSR edge weights as a third graph tensor (`0` default; decode traversal currently ignores weights).
@@ -188,7 +413,14 @@ Decision rule:
 - `RETRIEVALATTN_DEBUG`: print decode seed/dynamic retrieval diagnostics.
 - `RETRIEVALATTN_ASSERT_NONEMPTY`: fail if all heads have empty dynamic retrieval.
 - `RETRIEVALATTN_VALIDATE_PARITY`: run sampled parity check vs faiss.
+- `RETRIEVALATTN_PARITY_LAYERS`: number of starting layers included in parity sampling.
+- `RETRIEVALATTN_PARITY_HEADS`: number of starting KV-heads per layer included in parity sampling.
+- `RETRIEVALATTN_PARITY_SAMPLE`: per-head sampled query count for parity.
 - `RETRIEVALATTN_DECODE_PROFILE`: print end-of-decode critical-path breakdown (`retrieve`, `gather`, `attn`, `other`).
+  - includes traversal efficiency fields: `space/head`, `visited/head`, `visit_rate`, `prune_rate`, `cand/visit`.
+- `RECALL_ONLY`: run `simple_test.py` in prefill/index-only recall mode (`gen_len` forced to 1; no decode loop).
+- `RECALL_INPUT_TOKENS`: synthetic input length used when `RECALL_ONLY=1`.
+- `RECALL_MIN_RECALL`: optional weighted recall threshold; run fails if below target.
 - `RETRIEVALATTN_Q_BLOCK`, `RETRIEVALATTN_K_BLOCK`: block sizes for GPU topk.
 - `RETRIEVALATTN_HEAD_PIPELINE`: enable per-head GPU/CPU pipelining for index build.
 - `RETRIEVALATTN_HEAD_PIPELINE_DEPTH`: max in-flight heads for pipelined finalize.

@@ -1,5 +1,177 @@
 # Findings Log
 
+## 2026-03-03 update (decode complexity sweep automation)
+- Added sweep submission automation:
+  - `benchmark/submit_decode_complexity_sweep.py`
+  - submits matrix jobs across `N`, regime families (`linear`, `sqrt`, `log`), and split seeds,
+  - emits a TSV manifest (`job_id`, regime params, traversal budget knobs, scaled graph params).
+- Added post-run regime summarizer:
+  - `benchmark/summarize_decode_complexity.py`
+  - ingests `collect_recall_sweep.py` CSV output and computes:
+    - per-`(regime, N)` frontier (minimum visit-rate row meeting target recall),
+    - per-regime hit-rate and `mean_visit_rate_at_target`,
+    - observed scaling exponent (`obs_alpha`) from `trav_visited_mean` vs `N`,
+    - configured scaling exponent (`cfg_alpha`) from `max_visits` vs `N`.
+- Added runbook section:
+  - stage-1 coarse sweep command,
+  - collection/summarization commands,
+  - stage-2 multi-seed confirmation command.
+- Current default protocol in new scripts:
+  - holdout split on queries only (`train_frac=0.9`, `split=stratified`, `PARITY_HOLDOUT_ONLY=1`),
+  - strict traversal metric target (`trav_recall >= 0.95`),
+  - first-pass graph scaling: `ROAR_M` scales with `N` (sqrt law), `ROAR_L/E` fixed.
+
+## 2026-02-27 update (strict traversal recall metric + graph sweep)
+- Traversal recall metric was tightened to strict top-k:
+  - `trav_recall` now compares `retrieved[:k]` vs exact reference top-k.
+  - previous coverage-style metric is retained as `trav_recall_cov`.
+- Traversal eval now disables seed-floor forcing during eval-only retrieval:
+  - decode runtime behavior unchanged,
+  - strict metric now reflects ranking quality instead of seed-floor ordering artifacts.
+- Added reusable sweep parser updates (`benchmark/collect_recall_sweep.py`):
+  - supports arbitrary TSV columns,
+  - extracts graph-build overhead from logs (`graph_build_time/proj/edges` aggregates).
+- Graph-construction strict sweep at ~3% traversal budget (`max_visits=256`, fixed traversal knobs):
+  - `roar_m/l/enhance_l = 8/4/4`: strict recall `0.8584` @ `2.72%`.
+  - `12/8/8`: `0.9082` @ `2.71%`.
+  - `16/12/12`: `0.9160` @ `2.70%`.
+  - `24/16/16`: `0.9414` @ `2.68%`.
+  - `32/20/20`: `0.9541` @ `2.67%` (best in sweep).
+- Confirmation runs for best config (`32/20/20`) on different split seeds:
+  - seed `4321`: `0.9561` @ `2.67%`,
+  - seed `9999`: `0.9678` @ `2.68%`.
+- Conclusion:
+  - target achieved: strict recall `>=0.95` near `3%` traversal budget.
+
+## 2026-02-27 update (query holdout split semantics fix)
+- Confirmed graph build is already query-holdout-only (keys are not held out), but split policy was contiguous:
+  - train queries: prefix rows,
+  - holdout queries: suffix rows.
+- Under causal reference, contiguous-prefix train under-covers late-position keys, which can collapse holdout traversal recall for tail-heavy holdout.
+- Implemented configurable query split policy in `cache_hub/retrievalattention_cache.py`:
+  - `RETRIEVALATTN_GRAPH_SPLIT=stratified|random|contiguous`,
+  - `RETRIEVALATTN_GRAPH_SPLIT_SEED=<int>`,
+  - default set to `stratified` for recall experiments.
+- `test.sh` now exports these flags and logs them at run start.
+- Parity summary now includes `graph_split_mode` and `graph_split_seed` for run traceability.
+
+## 2026-02-27 update (fused top-k parity gap root cause)
+- Investigated non-trivial fused top-k parity gap (~7% vs exact causal reference).
+- Root causes found in flash-attn retrieval kernel (`third_party/flash-attn-ra/csrc/flash_attn/src/flash_fwd_kernel.h`):
+  - retrieval candidates were inserted **before** causal/local masking, so masked future positions could pollute top-k.
+  - lock path used bounded spin (`kMaxSpinIters=1024`) and could drop candidates under contention, making top-k best-effort rather than exact.
+- Fix applied in kernel source:
+  - enforce causal/local window filtering before insertion in `retrieval_update_fragment_topk`.
+  - switch to exact lock behavior (no candidate drop on contention) in `retrieval_topk_insert_locked`.
+- Operational note:
+  - this fix is in the flash-attn fork source and requires rebuilding/installing that fork before new runs.
+  - expected tradeoff: better parity correctness, potential top-k runtime increase due stricter locking.
+
+## 2026-02-27 update (traversal recall metric mismatch)
+- T1/T2/T3 traversal saturation runs showed:
+  - parity recall stayed `1.0`,
+  - traversal recall stayed around `0.0117` despite increased visit rate (`~5.4% -> ~21.2%`).
+- Root cause in metric definition:
+  - traversal eval compared retrieval output (decode path: non-causal, dynamic-key-only search) against parity reference top-k (causal full-key top-k).
+  - this is not an apples-to-apples objective, so traversal recall was artificially depressed and flat.
+- Fix in `cache_hub/retrievalattention_cache.py`:
+  - added `_decode_dynamic_topk_ref_np(...)` for exact dynamic-range decode-style reference,
+  - traversal eval now uses this decode-space reference (`trav_ref=decode_dynamic` in parity log),
+  - parity recall path remains unchanged (still causal reference for fused-topk correctness).
+
+## 2026-02-26 update (legacy path cleanup)
+- Simplified RetrievalAttention runtime to fused-prefill-only index build path.
+- Removed cache-runtime custom Triton qk+topk path and dead non-fused prepare-cache branches.
+- Tightened FlashAttention wrapper to a single API contract using `flash_attn_with_kvcache_retrieval`.
+- Simplified launch scripts to remove inactive legacy toggles and require RoarGraph C++ extension by default.
+- Outcome:
+  - lower configuration surface for active experiments,
+  - less risk of accidental fallback to stale/unsupported build paths.
+
+## 2026-02-26 update (q-head fused retrieval shape + head-mapped downstream structures)
+- Implemented fused prefill top-k shape migration from KV-head to q-head:
+  - fused registration now expects retrieval-head dimension (`retrieval_heads`), defaulting to `num_heads` in fused mode.
+  - temporary compatibility bridges were used during migration:
+    - q-head fused output can be collapsed to kv-head mode by selecting one q-head per GQA group,
+    - legacy kv-head fused output can be expanded to q-head mode by group repeat.
+- Native flash-attn retrieval kernel path updated accordingly:
+  - retrieval output buffers now allocate head dimension as `num_heads` (q-head),
+  - kernel-side retrieval accumulation now writes per-q-head (no KV-head gate), while KV norm lookup still maps by GQA ratio.
+- Cache/index data-structure split is now explicit:
+  - decode Faiss index: KV-head keyed,
+  - graph + hub seeds: KV-head keyed (shared by grouped q-heads),
+  - previous decode seeds: retrieval-head keyed.
+- Decode compute path now supports per-q-head retrieval in `RETRIEVALATTN_RETRIEVAL_HEAD_MODE=q_head`:
+  - retrieval/traversal/rerank per query head,
+  - graph/hub and KV gather both use mapped KV head.
+- Fused q-head graph build now merges grouped q-head top-k rows per KV head and builds one shared KV-head graph.
+- Expected behavior:
+  - better objective alignment with “retrieval should be per q-head” requirement.
+  - increased graph build cost proportional to retrieval-head count vs KV-head mode.
+- Operational caveat:
+  - requires rebuilding flash-attn fork after C++/CUDA changes; old builds will not match new expected fused shape.
+
+## 2026-02-26 update (parity semantics switched to per-q-head)
+- Parity validation now supports per-`q`-head comparison for each KV group head:
+  - for a validated KV head, collect all grouped query heads (`group_size`),
+  - compute per-query-head top-k reference,
+  - report mean recall plus min/max range across grouped query heads.
+- Causal-aware reference remains enabled for native fused prefill parity (`causal_ref=1`).
+- Latest run (`slurm-43878067.out`) with this mode:
+  - `parity layer=0 head=0 sample=256 recall@32=0.5788 range=[0.3884,0.8604] qh=4 mode=per_q_head_mean causal_ref=1`.
+
+## 2026-02-26 update (recall-only validation path)
+- Implemented a tiny recall-only path for fast algorithm A/B without full decode:
+  - `simple_test.py --recall_only --recall_input_tokens <N>`.
+  - uses synthetic token IDs, runs prefill + index build, then reports parity summary JSON.
+- Added parity aggregation in RetrievalAttention cache:
+  - collects per-layer/head sampled recall records,
+  - exports `get_parity_summary(reset=False)` with mean/min/max/weighted recall.
+- Parity scope is now configurable (`RETRIEVALATTN_PARITY_LAYERS`, `RETRIEVALATTN_PARITY_HEADS`, `RETRIEVALATTN_PARITY_SAMPLE`) instead of fixed `layer=0/head=0`.
+- `test.sh` now supports `RECALL_ONLY=1` and can enforce a threshold gate via `RECALL_MIN_RECALL`.
+
+## 2026-02-13 update (decode C++ traversal backend)
+- Added decode-side C++ traversal API to the Roar extension:
+  - `search_graph_csr(query, keys, offsets, neighbors, init_ids, init_scores, ...)`.
+- Added Python wrapper:
+  - `search_roar_graph_csr_cpp(...)` in `cache_hub/roargraph_cpp_backend.py`.
+- RetrievalAttention decode integration:
+  - new env selector: `RETRIEVALATTN_DECODE_BACKEND=auto|python|roar_cpp`,
+  - `auto` uses C++ on CSR graphs and falls back to Python traversal if runtime call fails,
+  - strict `roar_cpp` mode errors out on missing/broken extension.
+- Implemented low-memory key handling:
+  - decode C++ path reads existing CPU key storage directly,
+  - bf16 path uses `torch.bfloat16 -> torch.uint16 view -> numpy` (no float32 shadow copy).
+- Added decode C++ knobs:
+  - `RETRIEVALATTN_ROAR_DECODE_INIT`,
+  - `RETRIEVALATTN_ROAR_DECODE_LPQ`,
+  - `RETRIEVALATTN_ROAR_DECODE_MAX_CMPS`,
+  - `RETRIEVALATTN_ROAR_DECODE_MAX_HOPS`,
+  - `RETRIEVALATTN_ROAR_DECODE_THREADS`.
+- Smoke/validation results:
+  - extension rebuild succeeded after changes,
+  - fp32 and bf16 search calls returned valid top-k + metadata,
+  - fixed duplicate candidate IDs by adding duplicate-handling in C++ queue insert.
+
+## 2026-02-12 update (RoarGraph C++ graph-build backend)
+- Implemented a C++ backend for Roar-style graph construction and wired it into RetrievalAttention cache build flow.
+- Added extension source/build path:
+  - `third_party/RoarGraph/python_ext/roargraph_builder.cpp`
+  - `third_party/RoarGraph/python_ext/setup.py`
+- Added Python loader/wrapper:
+  - `cache_hub/roargraph_cpp_backend.py`
+- Builder selection now supports:
+  - `RETRIEVALATTN_ROAR_BACKEND=cpp|python|auto`
+- Run-script defaults now use C++ backend and fail-fast on missing extension import:
+  - `test.sh`
+  - `benchmark/ruler/ruler_run_wrapper.sh`
+- Smoke result:
+  - extension build succeeded,
+  - direct extension call returned valid CSR (`offsets`, `neighbors`) and meta (`builder=roar_cpp`, `stop_reason=ok`).
+- Expected impact:
+  - reduce graph-build wall time by eliminating Python-loop overhead in projection/enhancement stages.
+  - next bottleneck remains decode traversal (`graph` stage in decode profile), requiring separate optimization.
+
 ## 2026-02-02 to 2026-02-04 summary
 
 ### Environment / setup

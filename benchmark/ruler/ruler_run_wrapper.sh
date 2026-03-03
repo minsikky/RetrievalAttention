@@ -48,7 +48,6 @@ ENABLE_PROFILER="${ENABLE_PROFILER:-0}"
 PROFILER_DIR="${PROFILER_DIR:-ruler_eval_result/profiling}"
 FORCE_PRED="${FORCE_PRED:-1}"
 PROFILER_SAFE="${PROFILER_SAFE:-0}"
-RETRIEVALATTN_ROAR_BACKEND="${RETRIEVALATTN_ROAR_BACKEND:-cpp}"
 RETRIEVALATTN_ROAR_CPP_THREADS="${RETRIEVALATTN_ROAR_CPP_THREADS:-${SLURM_CPUS_PER_TASK:-0}}"
 
 echo "[INFO] MODEL_NAME=${MODEL_NAME}"
@@ -70,7 +69,6 @@ echo "[INFO] ENABLE_PROFILER=${ENABLE_PROFILER}"
 echo "[INFO] PROFILER_DIR=${PROFILER_DIR}"
 echo "[INFO] FORCE_PRED=${FORCE_PRED}"
 echo "[INFO] PROFILER_SAFE=${PROFILER_SAFE}"
-echo "[INFO] RETRIEVALATTN_ROAR_BACKEND=${RETRIEVALATTN_ROAR_BACKEND}"
 echo "[INFO] RETRIEVALATTN_ROAR_CPP_THREADS=${RETRIEVALATTN_ROAR_CPP_THREADS}"
 echo "[INFO] Python: $(which python)"
 python -V
@@ -81,7 +79,6 @@ print("[INFO] torch version:", torch.__version__)
 print("[INFO] torch file:", torch.__file__)
 PY
 
-if [ "${RETRIEVALATTN_ROAR_BACKEND}" = "cpp" ]; then
 python - <<'PY'
 import os
 import sys
@@ -95,7 +92,7 @@ try:
     import roargraph_builder_ext  # noqa: F401
     print(f"[INFO] RoarGraph C++ extension import OK from: {ext_dir}")
 except Exception as exc:
-    print("[ERROR] RETRIEVALATTN_ROAR_BACKEND=cpp but extension import failed.")
+    print("[ERROR] RoarGraph C++ extension import failed.")
     print("[ERROR] Build it with:")
     print("[ERROR]   module load python/3.10.4")
     print("[ERROR]   source .venv/bin/activate")
@@ -103,7 +100,6 @@ except Exception as exc:
     print(f"[ERROR] Import error: {exc}")
     raise SystemExit(2)
 PY
-fi
 
 # Preflight CPU memory estimate and Slurm request check (RetroInfer only)
 if [ "${ATTN_TYPE}" = "RetroInfer" ]; then
@@ -224,7 +220,6 @@ FORCE_PRED="${FORCE_PRED}" \
 PROFILER_SAFE="${PROFILER_SAFE}" \
 TOKEN_BUDGET_OVERRIDE="${TOKEN_BUDGET_OVERRIDE}" \
 TOKEN_BUDGET_RATIO="${TOKEN_BUDGET_RATIO}" \
-RETRIEVALATTN_ROAR_BACKEND="${RETRIEVALATTN_ROAR_BACKEND}" \
 RETRIEVALATTN_ROAR_CPP_THREADS="${RETRIEVALATTN_ROAR_CPP_THREADS}" \
 bash ./ruler_run.sh \
   "${MODEL_NAME}" \

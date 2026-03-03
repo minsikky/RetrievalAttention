@@ -1,50 +1,7 @@
-import inspect
 import os
-from typing import Any, Dict, Tuple
 
 from flash_attn import flash_attn_with_kvcache
-
-try:
-    from flash_attn import flash_attn_with_kvcache_retrieval  # type: ignore
-except Exception:
-    try:
-        from flash_attn.flash_attn_interface import (  # type: ignore
-            flash_attn_with_kvcache_retrieval,
-        )
-    except Exception:
-        flash_attn_with_kvcache_retrieval = None
-
-
-def _extract_fused_prefill_outputs(payload: Any) -> Tuple[Any, Any, Dict[str, Any]]:
-    """
-    Normalize possible return formats from fused FlashAttention wrappers:
-      1) (attn_out, topk_idx)
-      2) (attn_out, topk_idx, profile_dict)
-      3) dict with keys for output/index/profile
-    """
-    if isinstance(payload, tuple):
-        if len(payload) == 2:
-            return payload[0], payload[1], {}
-        if len(payload) >= 3:
-            profile = payload[2] if isinstance(payload[2], dict) else {}
-            return payload[0], payload[1], profile
-
-    if isinstance(payload, dict):
-        out = payload.get("out", payload.get("attn_out"))
-        idx = payload.get(
-            "retrieval_topk_idx",
-            payload.get("topk_idx", payload.get("ra_topk_idx")),
-        )
-        profile = payload.get("profile", {})
-        if out is None or idx is None:
-            raise RuntimeError(
-                "fused prefill FlashAttention returned dict without required out/topk fields."
-            )
-        if not isinstance(profile, dict):
-            profile = {}
-        return out, idx, profile
-
-    raise RuntimeError("Unsupported return format from fused prefill FlashAttention API.")
+from flash_attn import flash_attn_with_kvcache_retrieval
 
 
 def _call_flash_attn_fused_prefill(
@@ -54,42 +11,25 @@ def _call_flash_attn_fused_prefill(
     causal,
     retrievalattention_cache,
 ):
-    if flash_attn_with_kvcache_retrieval is None:
+    payload = flash_attn_with_kvcache_retrieval(
+        q=query_states,
+        k_cache=key_states,
+        v_cache=value_states,
+        causal=causal,
+        retrieval_topk=int(retrievalattention_cache.q_knn),
+        retrieval_group_size=int(retrievalattention_cache.group_size),
+        retrieval_normalize=bool(getattr(retrievalattention_cache, "score_normalize", False)),
+        return_retrieval_idx=True,
+    )
+    if not isinstance(payload, tuple) or len(payload) < 2:
         raise RuntimeError(
-            "RETRIEVALATTN_FA_FUSED_PREFILL=1 requires a flash-attn build "
-            "that exports flash_attn_with_kvcache_retrieval."
+            "flash_attn_with_kvcache_retrieval must return (attn_out, retrieval_topk_idx[, profile])."
         )
 
-    base_kwargs = {
-        "q": query_states,
-        "k_cache": key_states,
-        "v_cache": value_states,
-        "causal": causal,
-    }
-    optional_value_by_name = {
-        "retrieval_topk": int(retrievalattention_cache.q_knn),
-        "k_top": int(retrievalattention_cache.q_knn),
-        "retrieval_k": int(retrievalattention_cache.q_knn),
-        "ra_topk": int(retrievalattention_cache.q_knn),
-        "retrieval_group_size": int(retrievalattention_cache.group_size),
-        "group_size": int(retrievalattention_cache.group_size),
-        "retrieval_normalize": bool(getattr(retrievalattention_cache, "score_normalize", False)),
-        "return_retrieval_idx": True,
-        "return_topk_idx": True,
-    }
-
-    call_kwargs = dict(base_kwargs)
-    try:
-        sig = inspect.signature(flash_attn_with_kvcache_retrieval)
-        for name, value in optional_value_by_name.items():
-            if name in sig.parameters:
-                call_kwargs[name] = value
-    except Exception:
-        # Some extension symbols may not expose an inspectable signature.
-        pass
-
-    payload = flash_attn_with_kvcache_retrieval(**call_kwargs)
-    return _extract_fused_prefill_outputs(payload)
+    attn_out = payload[0]
+    topk_idx = payload[1]
+    profile = payload[2] if len(payload) >= 3 and isinstance(payload[2], dict) else {}
+    return attn_out, topk_idx, profile
 
 
 def retrievalattention_prefill_attn(
@@ -100,10 +40,8 @@ def retrievalattention_prefill_attn(
     layer_idx,
     retrievalattention_cache,
 ):
-    fused_enabled = retrievalattention_cache.uses_flashattn_fused_prefill()
-
     # Use full attention during prefill to obtain accurate outputs.
-    if not fused_enabled:
+    if not retrievalattention_cache.uses_flashattn_fused_prefill():
         attn_out = flash_attn_with_kvcache(
             q=query_states,
             k_cache=key_states,

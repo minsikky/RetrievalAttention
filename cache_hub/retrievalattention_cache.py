@@ -14,11 +14,6 @@ try:
 except Exception:
     faiss = None
 
-try:
-    from .fused_qk_topk_kernel import fused_qk_topk_triton
-except Exception:
-    fused_qk_topk_triton = None
-
 from .roargraph_cpp_backend import (
     build_roar_graph_csr_cpp,
     search_roar_graph_csr_cpp,
@@ -50,10 +45,23 @@ class retrievalattention_cache(KV_Cache):
         q_knn: int,
         key_degree: int,
         token_budget: int,
+        prefill_bsz: int,
         num_gpus: int,
         model_size: int,
     ) -> None:
-        super().__init__(layer_num, batch_size, max_length, num_key_value_heads, num_heads, head_dim, dtype, layer_mapping, num_gpus, model_size)
+        super().__init__(
+            layer_num,
+            batch_size,
+            max_length,
+            num_key_value_heads,
+            num_heads,
+            head_dim,
+            dtype,
+            layer_mapping,
+            prefill_bsz,
+            num_gpus,
+            model_size,
+        )
         self.valid_start = valid_start
 
         self.static_pattern_start = static_pattern_start
@@ -88,6 +96,31 @@ class retrievalattention_cache(KV_Cache):
         except Exception:
             self.parity_sample = 256
         self.parity_sample = max(1, self.parity_sample)
+        self.traversal_eval = os.environ.get("RETRIEVALATTN_TRAVERSAL_EVAL", "0") == "1"
+        try:
+            self.traversal_eval_sample = int(os.environ.get("RETRIEVALATTN_TRAVERSAL_EVAL_SAMPLE", "64"))
+        except Exception:
+            self.traversal_eval_sample = 64
+        self.traversal_eval_sample = max(1, self.traversal_eval_sample)
+        try:
+            self.graph_train_frac = float(os.environ.get("RETRIEVALATTN_GRAPH_TRAIN_FRAC", "1.0"))
+        except Exception:
+            self.graph_train_frac = 1.0
+        if not np.isfinite(self.graph_train_frac):
+            self.graph_train_frac = 1.0
+        self.graph_train_frac = max(0.0, min(1.0, self.graph_train_frac))
+        self.graph_split_mode = os.environ.get("RETRIEVALATTN_GRAPH_SPLIT", "stratified").strip().lower()
+        if self.graph_split_mode not in {"contiguous", "random", "stratified"}:
+            print(
+                f"[RetrievalAttention] WARNING: unknown RETRIEVALATTN_GRAPH_SPLIT={self.graph_split_mode}. "
+                "Falling back to stratified."
+            )
+            self.graph_split_mode = "stratified"
+        try:
+            self.graph_split_seed = int(os.environ.get("RETRIEVALATTN_GRAPH_SPLIT_SEED", "1234"))
+        except Exception:
+            self.graph_split_seed = 1234
+        self.parity_holdout_only = os.environ.get("RETRIEVALATTN_PARITY_HOLDOUT_ONLY", "0") == "1"
         self.parity_query_indices = np.empty((0,), dtype=np.int32)
         self.parity_query_count = 0
         self._parity_query_indices_torch = None
@@ -122,13 +155,7 @@ class retrievalattention_cache(KV_Cache):
         self.score_normalize = (self.score_mode == "cosine")
         self.graph_expand = os.environ.get("RETRIEVALATTN_GRAPH_EXPAND", "1") == "1"
         self.graph_weighted = os.environ.get("RETRIEVALATTN_GRAPH_WEIGHTED", "1") == "1"
-        self.graph_builder = os.environ.get("RETRIEVALATTN_GRAPH_BUILDER", "legacy").strip().lower()
-        if self.graph_builder not in {"legacy", "roar"}:
-            print(
-                f"[RetrievalAttention] WARNING: unknown RETRIEVALATTN_GRAPH_BUILDER={self.graph_builder}. "
-                "Falling back to legacy."
-            )
-            self.graph_builder = "legacy"
+        self.graph_builder = "roar"
         try:
             self.graph_clique_m = int(os.environ.get("RETRIEVALATTN_GRAPH_CLIQUE_M", "6"))
         except Exception:
@@ -182,25 +209,13 @@ class retrievalattention_cache(KV_Cache):
             self.roar_max_query_per_pivot = 0
         self.roar_max_query_per_pivot = max(0, self.roar_max_query_per_pivot)
         self.roar_log = os.environ.get("RETRIEVALATTN_ROAR_LOG", "1") == "1"
-        self.roar_backend = os.environ.get("RETRIEVALATTN_ROAR_BACKEND", "auto").strip().lower()
-        if self.roar_backend not in {"auto", "cpp", "python"}:
-            print(
-                f"[RetrievalAttention] WARNING: unknown RETRIEVALATTN_ROAR_BACKEND={self.roar_backend}. "
-                "Falling back to auto."
-            )
-            self.roar_backend = "auto"
+        self.roar_backend = "cpp"
         try:
             self.roar_cpp_threads = int(os.environ.get("RETRIEVALATTN_ROAR_CPP_THREADS", "0"))
         except Exception:
             self.roar_cpp_threads = 0
         self.roar_cpp_threads = max(0, self.roar_cpp_threads)
-        self.decode_backend = os.environ.get("RETRIEVALATTN_DECODE_BACKEND", "auto").strip().lower()
-        if self.decode_backend not in {"auto", "python", "roar_cpp"}:
-            print(
-                f"[RetrievalAttention] WARNING: unknown RETRIEVALATTN_DECODE_BACKEND={self.decode_backend}. "
-                "Falling back to auto."
-            )
-            self.decode_backend = "auto"
+        self.decode_backend = "roar_cpp"
         try:
             self.roar_decode_lpq = int(os.environ.get("RETRIEVALATTN_ROAR_DECODE_LPQ", "0"))
         except Exception:
@@ -227,29 +242,14 @@ class retrievalattention_cache(KV_Cache):
             self.roar_decode_threads = 0
         self.roar_decode_threads = max(0, self.roar_decode_threads)
         self._roar_cpp_available = roargraph_cpp_available()
-        if self.roar_backend == "cpp" and not self._roar_cpp_available:
+        if not self._roar_cpp_available:
             cpp_err = roargraph_cpp_import_error()
             raise RuntimeError(
-                "RETRIEVALATTN_ROAR_BACKEND=cpp requested but RoarGraph C++ extension is unavailable. "
+                "RoarGraph C++ extension is required but unavailable. "
                 "Build it with: "
                 "`module load python/3.10.4 && source .venv/bin/activate && "
                 "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
                 + (f". Import error: {cpp_err}" if cpp_err is not None else "")
-            )
-        if self.decode_backend == "roar_cpp" and not self._roar_cpp_available:
-            cpp_err = roargraph_cpp_import_error()
-            raise RuntimeError(
-                "RETRIEVALATTN_DECODE_BACKEND=roar_cpp requested but RoarGraph C++ extension is unavailable. "
-                "Build it with: "
-                "`module load python/3.10.4 && source .venv/bin/activate && "
-                "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
-                + (f". Import error: {cpp_err}" if cpp_err is not None else "")
-            )
-        legacy_graph_hops = os.environ.get("RETRIEVALATTN_GRAPH_HOPS")
-        if legacy_graph_hops not in (None, ""):
-            print(
-                "[RetrievalAttention] WARNING: RETRIEVALATTN_GRAPH_HOPS is deprecated and ignored. "
-                "Adaptive best-first graph traversal is used instead."
             )
         try:
             self.expand_width = int(os.environ.get("RETRIEVALATTN_EXPAND_WIDTH", "64"))
@@ -322,29 +322,24 @@ class retrievalattention_cache(KV_Cache):
         except Exception:
             self.seed_tail_k = 32
         self.seed_tail_k = max(0, self.seed_tail_k)
-        self.fa_fused_prefill = os.environ.get("RETRIEVALATTN_FA_FUSED_PREFILL", "0") == "1"
-        self.fa_shadow_compare = os.environ.get("RETRIEVALATTN_FA_SHADOW_COMPARE", "0") == "1"
-        try:
-            self.fa_shadow_sample = int(os.environ.get("RETRIEVALATTN_FA_SHADOW_SAMPLE", "256"))
-        except Exception:
-            self.fa_shadow_sample = 256
-        self.fa_shadow_sample = max(1, self.fa_shadow_sample)
-        default_head_mode = "q_head" if self.fa_fused_prefill else "kv_head"
-        raw_head_mode = os.environ.get("RETRIEVALATTN_RETRIEVAL_HEAD_MODE", default_head_mode).strip().lower()
-        if raw_head_mode not in {"kv_head", "q_head"}:
-            print(
-                f"[RetrievalAttention] WARNING: unknown RETRIEVALATTN_RETRIEVAL_HEAD_MODE={raw_head_mode}. "
-                f"Falling back to {default_head_mode}."
+        self.fa_fused_prefill = True
+        raw_fused_prefill = os.environ.get("RETRIEVALATTN_FA_FUSED_PREFILL", "1").strip()
+        if raw_fused_prefill not in {"", "1"}:
+            raise RuntimeError(
+                "Only fused prefill mode is supported. "
+                "RETRIEVALATTN_FA_FUSED_PREFILL must be 1."
             )
-            raw_head_mode = default_head_mode
-        if raw_head_mode == "q_head" and not self.fa_fused_prefill:
+        raw_shadow_compare = os.environ.get("RETRIEVALATTN_FA_SHADOW_COMPARE", "0").strip()
+        if raw_shadow_compare in {"1", "true", "True"}:
             print(
-                "[RetrievalAttention] WARNING: q_head retrieval mode currently requires fused prefill build; "
-                "falling back to kv_head mode."
+                "[RetrievalAttention] WARNING: RETRIEVALATTN_FA_SHADOW_COMPARE is deprecated "
+                "and ignored in fused-only runtime.",
+                flush=True,
             )
-            raw_head_mode = "kv_head"
-        self.retrieval_head_mode = raw_head_mode
-        self.retrieval_heads = self.num_heads if self.retrieval_head_mode == "q_head" else self.kv_head
+        self.fa_shadow_compare = False
+        self.fa_shadow_sample = 0
+        self.retrieval_head_mode = "q_head"
+        self.retrieval_heads = self.num_heads
         self.fused_prefill_overlap = os.environ.get("RETRIEVALATTN_FUSED_PREFILL_OVERLAP", "1") == "1"
         try:
             self.fused_prefill_overlap_workers = int(
@@ -362,19 +357,8 @@ class retrievalattention_cache(KV_Cache):
         self._fused_async_enabled = (
             self.fa_fused_prefill
             and self.fused_prefill_overlap
-            and (not self.fa_shadow_compare)
         )
-        if self.fa_fused_prefill and self.fused_prefill_overlap and self.fa_shadow_compare:
-            print(
-                "[RetrievalAttention] WARNING: fused prefill overlap is disabled because "
-                "RETRIEVALATTN_FA_SHADOW_COMPARE=1 requires synchronous shadow check.",
-                flush=True,
-            )
-        self._store_prefill_queries = (
-            (not self.fa_fused_prefill)
-            or self.fa_shadow_compare
-            or self.validate_parity
-        )
+        self._store_prefill_queries = bool(self.validate_parity)
         self._fallback_seed_warned = False
 
         self._decode_profile_stats = {
@@ -390,15 +374,27 @@ class retrievalattention_cache(KV_Cache):
             "attn_total_sec": 0.0,
             "visited_total": 0,
             "candidates_total": 0,
+            "search_space_total": 0,
+            "search_space_heads": 0,
+            "visited_ratio_sum": 0.0,
+            "visited_ratio_count": 0,
         }
         self._parity_records = []
         self._parity_lock = threading.Lock()
+        self.graph_train_query_indices, self.graph_holdout_query_indices = self._build_graph_query_split_indices(
+            total=self.input_length,
+            train_frac=self.graph_train_frac,
+        )
 
         if self.validate_parity:
+            parity_candidates = None
+            if self.parity_holdout_only and self.graph_holdout_query_indices.size > 0:
+                parity_candidates = self.graph_holdout_query_indices
             self.parity_query_indices = self._build_parity_sample_indices(
                 sample_n=self.parity_sample,
                 total=self.input_length,
                 causal_ref=True,
+                candidate_indices=parity_candidates,
             )
             self.parity_query_count = int(self.parity_query_indices.shape[0])
             if self.parity_query_count > 0:
@@ -540,7 +536,15 @@ class retrievalattention_cache(KV_Cache):
             return False
         return True
 
-    def _record_parity(self, layer_idx: int, head_idx: int, sample_n: int, recall: float, k: int):
+    def _record_parity(
+        self,
+        layer_idx: int,
+        head_idx: int,
+        sample_n: int,
+        recall: float,
+        k: int,
+        traversal: dict = None,
+    ):
         record = {
             "layer": int(layer_idx),
             "head": int(head_idx),
@@ -548,10 +552,179 @@ class retrievalattention_cache(KV_Cache):
             "k": int(k),
             "recall": float(recall),
         }
+        if isinstance(traversal, dict) and traversal:
+            record.update({
+                "trav_samples": int(traversal.get("samples", 0)),
+                "trav_recall": float(traversal.get("recall", 0.0)),
+                "trav_recall_cov": float(traversal.get("recall_cov", 0.0)),
+                "trav_visited_mean": float(traversal.get("visited_mean", 0.0)),
+                "trav_visit_rate": float(traversal.get("visit_rate", 0.0)),
+                "trav_prune_rate": float(traversal.get("prune_rate", 0.0)),
+                "trav_cand_per_visit": float(traversal.get("cand_per_visit", 0.0)),
+            })
         with self._parity_lock:
             self._parity_records.append(record)
 
-    def _build_parity_sample_indices(self, sample_n: int, total: int, causal_ref: bool) -> np.ndarray:
+    def _evaluate_traversal_efficiency(
+        self,
+        ldx: int,
+        hdx: int,
+        kv_hdx: int,
+        queries_np: np.ndarray,
+        ref_knn_np: np.ndarray,
+        graph,
+        decode_index,
+    ):
+        if queries_np is None or ref_knn_np is None:
+            return None
+        queries = np.ascontiguousarray(queries_np, dtype=np.float32)
+        ref_knn = np.ascontiguousarray(ref_knn_np, dtype=np.int32)
+        if queries.ndim != 2 or ref_knn.ndim != 2:
+            return None
+        n = min(int(queries.shape[0]), int(ref_knn.shape[0]))
+        if n <= 0:
+            return None
+
+        eval_n = min(n, int(self.traversal_eval_sample))
+        if eval_n < n:
+            take = np.linspace(0, n - 1, num=eval_n, dtype=np.int64)
+            queries = np.ascontiguousarray(queries[take, :], dtype=np.float32)
+            ref_knn = np.ascontiguousarray(ref_knn[take, :], dtype=np.int32)
+        else:
+            eval_n = n
+
+        prev_index = self.indexes[ldx][kv_hdx]
+        prev_graph = self.graphs[ldx][kv_hdx]
+        if decode_index is not None:
+            self.indexes[ldx][kv_hdx] = decode_index
+        if graph is not None:
+            self.graphs[ldx][kv_hdx] = graph
+
+        recalls = []
+        recalls_cov = []
+        visited_vals = []
+        visit_rates = []
+        cand_per_visit_vals = []
+        k = max(1, int(self.q_knn))
+        try:
+            for ridx in range(eval_n):
+                q_t = torch.from_numpy(queries[ridx])
+                tokens, prof = self._retrieve_tokens(
+                    ldx,
+                    hdx,
+                    q_t,
+                    update_decode_state=False,
+                    enforce_seed_floor=False,
+                )
+                prof = prof if isinstance(prof, dict) else {}
+                visited = max(0, int(prof.get("visited", 0)))
+                candidates = max(0, int(prof.get("candidates", 0)))
+                search_space = max(0, int(prof.get("search_space", 0)))
+
+                gt = set(int(x) for x in ref_knn[ridx, :k].tolist())
+                retrieved_topk = set(int(x) for x in tokens[:k])
+                retrieved_cov = set(int(x) for x in tokens)
+                rec = (len(gt.intersection(retrieved_topk)) / float(k)) if k > 0 else 0.0
+                rec_cov = (len(gt.intersection(retrieved_cov)) / float(k)) if k > 0 else 0.0
+                recalls.append(float(rec))
+                recalls_cov.append(float(rec_cov))
+                visited_vals.append(float(visited))
+                if search_space > 0:
+                    visit_rates.append(float(visited) / float(search_space))
+                if visited > 0:
+                    cand_per_visit_vals.append(float(candidates) / float(visited))
+        finally:
+            self.indexes[ldx][kv_hdx] = prev_index
+            self.graphs[ldx][kv_hdx] = prev_graph
+
+        if len(recalls) == 0:
+            return None
+        visit_rate = float(np.mean(visit_rates)) if visit_rates else 0.0
+        return {
+            "samples": int(len(recalls)),
+            "recall": float(np.mean(recalls)),
+            "recall_cov": float(np.mean(recalls_cov)) if recalls_cov else 0.0,
+            "visited_mean": float(np.mean(visited_vals)) if visited_vals else 0.0,
+            "visit_rate": visit_rate,
+            "prune_rate": max(0.0, 1.0 - visit_rate),
+            "cand_per_visit": float(np.mean(cand_per_visit_vals)) if cand_per_visit_vals else 0.0,
+        }
+
+    def _build_graph_query_split_indices(self, total: int, train_frac: float):
+        total = int(total)
+        if total <= 0:
+            empty = np.empty((0,), dtype=np.int32)
+            return empty, empty
+
+        frac = float(train_frac)
+        if frac >= 1.0:
+            train = np.arange(total, dtype=np.int32)
+            holdout = np.empty((0,), dtype=np.int32)
+            return train, holdout
+        # Keep at least one query row for graph construction to avoid empty-graph runs.
+        n_train = int(round(float(total) * max(0.0, frac)))
+        n_train = max(1, n_train)
+        if total > 1 and frac < 1.0:
+            n_train = min(total - 1, n_train)
+        else:
+            n_train = min(total, n_train)
+
+        if self.graph_split_mode == "contiguous":
+            train = np.arange(0, n_train, dtype=np.int32)
+            holdout = np.arange(n_train, total, dtype=np.int32)
+            return train, holdout
+
+        rng = np.random.default_rng(self.graph_split_seed)
+        if self.graph_split_mode == "random":
+            perm = rng.permutation(total).astype(np.int32, copy=False)
+            train = np.sort(perm[:n_train]).astype(np.int32, copy=False)
+            holdout = np.sort(perm[n_train:]).astype(np.int32, copy=False)
+            return np.ascontiguousarray(train), np.ascontiguousarray(holdout)
+
+        # Stratified split: sample train rows across the full sequence to avoid
+        # contiguous-prefix bias under causal references.
+        if n_train >= total:
+            train = np.arange(total, dtype=np.int32)
+            holdout = np.empty((0,), dtype=np.int32)
+            return train, holdout
+
+        bin_edges = np.linspace(0, total, num=n_train + 1, dtype=np.float64)
+        picks = []
+        for i in range(n_train):
+            lo = int(bin_edges[i])
+            hi = int(bin_edges[i + 1])
+            if hi <= lo:
+                hi = min(total, lo + 1)
+            if hi <= lo:
+                lo = max(0, min(total - 1, lo))
+                hi = lo + 1
+            if (hi - lo) <= 1:
+                picks.append(lo)
+            else:
+                picks.append(lo + int(rng.integers(0, hi - lo)))
+
+        train = np.unique(np.asarray(picks, dtype=np.int32))
+        if train.shape[0] < n_train:
+            all_idx = np.arange(total, dtype=np.int32)
+            remaining = np.setdiff1d(all_idx, train, assume_unique=True)
+            need = int(n_train - train.shape[0])
+            if remaining.shape[0] <= need:
+                extra = remaining
+            else:
+                extra = np.sort(rng.choice(remaining, size=need, replace=False).astype(np.int32, copy=False))
+            train = np.sort(np.concatenate([train, extra]).astype(np.int32, copy=False))
+
+        all_idx = np.arange(total, dtype=np.int32)
+        holdout = np.setdiff1d(all_idx, train, assume_unique=True).astype(np.int32, copy=False)
+        return np.ascontiguousarray(train), np.ascontiguousarray(holdout)
+
+    def _build_parity_sample_indices(
+        self,
+        sample_n: int,
+        total: int,
+        causal_ref: bool,
+        candidate_indices: np.ndarray = None,
+    ) -> np.ndarray:
         total = int(total)
         sample_n = int(sample_n)
         if total <= 0 or sample_n <= 0:
@@ -559,11 +732,50 @@ class retrievalattention_cache(KV_Cache):
         start = int(self.q_knn - 1) if causal_ref else 0
         if start >= total:
             start = 0
-        candidates = np.arange(start, total, dtype=np.int32)
+        if candidate_indices is None:
+            candidates = np.arange(start, total, dtype=np.int32)
+        else:
+            candidates = np.asarray(candidate_indices, dtype=np.int32)
+            if candidates.size == 0:
+                return np.empty((0,), dtype=np.int32)
+            candidates = candidates[(candidates >= start) & (candidates < total)]
+            if candidates.size == 0:
+                return np.empty((0,), dtype=np.int32)
+            candidates = np.unique(candidates)
         if candidates.size <= sample_n:
             return candidates
         take = np.linspace(0, candidates.size - 1, num=sample_n, dtype=np.int64)
         return np.ascontiguousarray(candidates[take], dtype=np.int32)
+
+    def _select_graph_knn_rows(self, knn: np.ndarray) -> np.ndarray:
+        """
+        Select training query rows used for graph projection.
+        Supports both:
+          [input_length, q_knn]
+          [input_length * qh_merged, q_knn] (merged q-head rows).
+        """
+        if knn.ndim != 2 or knn.shape[0] <= 0:
+            return knn
+
+        train_idx = self.graph_train_query_indices
+        if train_idx is None or train_idx.size == 0:
+            return knn
+
+        row_count = int(knn.shape[0])
+        if row_count == int(self.input_length):
+            if train_idx.size == row_count:
+                return knn
+            return np.ascontiguousarray(knn[train_idx, :], dtype=np.int32)
+
+        if row_count % int(self.input_length) != 0:
+            return knn
+
+        qh_merged = row_count // int(self.input_length)
+        if train_idx.size == int(self.input_length):
+            return knn
+        knn_3d = knn.reshape(int(self.input_length), int(qh_merged), int(knn.shape[1]))
+        knn_train = knn_3d[train_idx, :, :].reshape(-1, int(knn.shape[1]))
+        return np.ascontiguousarray(knn_train, dtype=np.int32)
 
     def _causal_topk_ref_np(self, queries: np.ndarray, keys: np.ndarray, query_indices: np.ndarray, k: int) -> np.ndarray:
         """
@@ -597,6 +809,42 @@ class retrievalattention_cache(KV_Cache):
                 out[ridx, :] = top_local
         return out
 
+    def _decode_dynamic_topk_ref_np(self, queries: np.ndarray, keys: np.ndarray, k: int) -> np.ndarray:
+        """
+        Exact decode-style top-k reference over the dynamic key range only.
+        This matches retrieval candidate space used by `_retrieve_tokens`.
+        """
+        k = max(1, int(k))
+        if queries.size == 0 or keys.size == 0:
+            return np.empty((0, k), dtype=np.int32)
+
+        d_start = int(self.dynamic_start)
+        d_end = int(self.dynamic_end)
+        if d_end <= d_start:
+            return np.empty((queries.shape[0], k), dtype=np.int32)
+
+        keys_dyn = np.ascontiguousarray(keys[d_start:d_end, :], dtype=np.float32)
+        if keys_dyn.shape[0] <= 0:
+            return np.empty((queries.shape[0], k), dtype=np.int32)
+
+        q = np.ascontiguousarray(queries.astype(np.float32, copy=False))
+        scores = np.matmul(q, keys_dyn.T)
+        take_k = min(k, int(keys_dyn.shape[0]))
+        if take_k <= 0:
+            return np.empty((queries.shape[0], k), dtype=np.int32)
+
+        idx_local = np.argpartition(scores, -take_k, axis=1)[:, -take_k:]
+        idx_abs = idx_local.astype(np.int32, copy=False) + np.int32(d_start)
+        if take_k == k:
+            return np.ascontiguousarray(idx_abs, dtype=np.int32)
+
+        # Pad when dynamic span is smaller than k.
+        out = np.empty((queries.shape[0], k), dtype=np.int32)
+        out[:, :take_k] = idx_abs
+        pad_val = idx_abs[:, -1:] if take_k > 0 else np.int32(max(0, d_start))
+        out[:, take_k:] = pad_val
+        return out
+
     def get_parity_summary(self, reset: bool = False) -> dict:
         with self._parity_lock:
             records = list(self._parity_records)
@@ -608,12 +856,19 @@ class retrievalattention_cache(KV_Cache):
                 "layers_limit": int(self.parity_layers),
                 "heads_limit": int(self.parity_heads),
                 "sample_limit": int(self.parity_sample),
+                "parity_holdout_only": bool(self.parity_holdout_only),
+                "graph_train_frac": float(self.graph_train_frac),
+                "graph_split_mode": str(self.graph_split_mode),
+                "graph_split_seed": int(self.graph_split_seed),
+                "graph_train_queries": int(self.graph_train_query_indices.size),
+                "graph_holdout_queries": int(self.graph_holdout_query_indices.size),
                 "records": 0,
                 "total_sample": 0,
                 "recall_mean": None,
                 "recall_weighted": None,
                 "recall_min": None,
                 "recall_max": None,
+                "traversal": None,
                 "details": [],
             }
 
@@ -627,17 +882,45 @@ class retrievalattention_cache(KV_Cache):
             )
         else:
             weighted = float(np.mean(recalls))
+        trav_records = [r for r in records if int(r.get("trav_samples", 0)) > 0]
+        traversal_summary = None
+        if trav_records:
+            trav_samples = [max(0, int(r.get("trav_samples", 0))) for r in trav_records]
+            trav_total = int(sum(trav_samples))
+            if trav_total > 0:
+                def _wavg(key):
+                    return float(
+                        sum(float(trav_records[i].get(key, 0.0)) * float(trav_samples[i]) for i in range(len(trav_records)))
+                        / float(trav_total)
+                    )
+                traversal_summary = {
+                    "records": int(len(trav_records)),
+                    "total_sample": trav_total,
+                    "recall_mean": _wavg("trav_recall"),
+                    "recall_cov_mean": _wavg("trav_recall_cov"),
+                    "visited_mean": _wavg("trav_visited_mean"),
+                    "visit_rate_mean": _wavg("trav_visit_rate"),
+                    "prune_rate_mean": _wavg("trav_prune_rate"),
+                    "cand_per_visit_mean": _wavg("trav_cand_per_visit"),
+                }
         return {
             "enabled": bool(self.validate_parity),
             "layers_limit": int(self.parity_layers),
             "heads_limit": int(self.parity_heads),
             "sample_limit": int(self.parity_sample),
+            "parity_holdout_only": bool(self.parity_holdout_only),
+            "graph_train_frac": float(self.graph_train_frac),
+            "graph_split_mode": str(self.graph_split_mode),
+            "graph_split_seed": int(self.graph_split_seed),
+            "graph_train_queries": int(self.graph_train_query_indices.size),
+            "graph_holdout_queries": int(self.graph_holdout_query_indices.size),
             "records": int(len(records)),
             "total_sample": int(total_sample),
             "recall_mean": float(np.mean(recalls)),
             "recall_weighted": float(weighted),
             "recall_min": float(np.min(recalls)),
             "recall_max": float(np.max(recalls)),
+            "traversal": traversal_summary,
             "details": records,
         }
 
@@ -656,10 +939,7 @@ class retrievalattention_cache(KV_Cache):
           graph: CSR graph tuple
           meta: dict with builder name and stage timings/stats
         """
-        builder = self.graph_builder
-        if builder == "roar":
-            return self._build_graph_csr_from_knn_roar(knn, keys_cpu)
-        return self._build_graph_csr_from_knn_legacy(knn)
+        return self._build_graph_csr_from_knn_roar(knn, keys_cpu)
 
     def _build_graph_csr_from_knn_legacy(self, knn: np.ndarray):
         """
@@ -1008,42 +1288,34 @@ class retrievalattention_cache(KV_Cache):
         return offsets, neighbors
 
     def _should_use_roar_cpp_backend(self) -> bool:
-        if self.roar_backend == "python":
-            return False
         available = roargraph_cpp_available()
         self._roar_cpp_available = bool(available)
-        if self.roar_backend == "cpp":
-            if not available:
-                cpp_err = roargraph_cpp_import_error()
-                raise RuntimeError(
-                    "RETRIEVALATTN_ROAR_BACKEND=cpp requested but RoarGraph C++ extension is unavailable. "
-                    "Build it with: "
-                    "`module load python/3.10.4 && source .venv/bin/activate && "
-                    "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
-                    + (f". Import error: {cpp_err}" if cpp_err is not None else "")
-                )
-            return True
-        return bool(available)
+        if not available:
+            cpp_err = roargraph_cpp_import_error()
+            raise RuntimeError(
+                "RoarGraph C++ extension is required but unavailable. "
+                "Build it with: "
+                "`module load python/3.10.4 && source .venv/bin/activate && "
+                "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+                + (f". Import error: {cpp_err}" if cpp_err is not None else "")
+            )
+        return True
 
     def _should_use_roar_cpp_decode_backend(self, graph_is_csr: bool) -> bool:
         if not graph_is_csr:
             return False
-        if self.decode_backend == "python":
-            return False
         available = roargraph_cpp_available()
         self._roar_cpp_available = bool(available)
-        if self.decode_backend == "roar_cpp":
-            if not available:
-                cpp_err = roargraph_cpp_import_error()
-                raise RuntimeError(
-                    "RETRIEVALATTN_DECODE_BACKEND=roar_cpp requested but RoarGraph C++ extension is unavailable. "
-                    "Build it with: "
-                    "`module load python/3.10.4 && source .venv/bin/activate && "
-                    "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
-                    + (f". Import error: {cpp_err}" if cpp_err is not None else "")
-                )
-            return True
-        return bool(available)
+        if not available:
+            cpp_err = roargraph_cpp_import_error()
+            raise RuntimeError(
+                "RoarGraph C++ extension is required but unavailable. "
+                "Build it with: "
+                "`module load python/3.10.4 && source .venv/bin/activate && "
+                "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+                + (f". Import error: {cpp_err}" if cpp_err is not None else "")
+            )
+        return True
 
     def _get_decode_key_array(self, ldx: int, hdx: int):
         cached = self._decode_key_cache[ldx][hdx]
@@ -1155,17 +1427,8 @@ class retrievalattention_cache(KV_Cache):
         return (offsets, neighbors), meta
 
     def _build_graph_csr_from_knn_roar(self, knn: np.ndarray, keys_cpu: np.ndarray):
-        if self._should_use_roar_cpp_backend():
-            try:
-                return self._build_graph_csr_from_knn_roar_cpp(knn, keys_cpu)
-            except Exception as exc:
-                if self.roar_backend == "cpp":
-                    raise
-                print(
-                    "[RetrievalAttention] WARNING: RoarGraph cpp builder failed; "
-                    f"falling back to python builder. error={exc}"
-                )
-        return self._build_graph_csr_from_knn_roar_python(knn, keys_cpu)
+        self._should_use_roar_cpp_backend()
+        return self._build_graph_csr_from_knn_roar_cpp(knn, keys_cpu)
 
     def _build_graph_csr_from_knn_roar_python(self, knn: np.ndarray, keys_cpu: np.ndarray):
         """
@@ -1445,22 +1708,12 @@ class retrievalattention_cache(KV_Cache):
 
         in_heads = int(norm.shape[1])
         if in_heads != self.retrieval_heads:
-            if in_heads == self.num_heads and self.retrieval_heads == self.kv_head:
-                # Backward-compat bridge: per-q-head fused output -> kv-head mode.
-                take = np.arange(0, self.num_heads, self.group_size, dtype=np.int64)
-                norm = np.take(norm, indices=take, axis=1)
-                in_heads = int(norm.shape[1])
-            elif in_heads == self.kv_head and self.retrieval_heads == self.num_heads:
-                # Backward-compat bridge: legacy kv-head fused output -> q-head mode.
-                norm = np.repeat(norm, repeats=self.group_size, axis=1)
-                in_heads = int(norm.shape[1])
-            if in_heads != self.retrieval_heads:
-                raise RuntimeError(
-                    "fused prefill top-k head dimension mismatch: "
-                    f"input_heads={in_heads}, expected_retrieval_heads={self.retrieval_heads}, "
-                    f"num_heads={self.num_heads}, kv_head={self.kv_head}, "
-                    f"head_mode={self.retrieval_head_mode}, shape={tuple(arr.shape)}"
-                )
+            raise RuntimeError(
+                "fused prefill top-k head dimension mismatch: "
+                f"input_heads={in_heads}, expected_retrieval_heads={self.retrieval_heads}, "
+                f"num_heads={self.num_heads}, kv_head={self.kv_head}, "
+                f"head_mode={self.retrieval_head_mode}, shape={tuple(arr.shape)}"
+            )
 
         if norm.shape[2] < self.q_knn:
             raise RuntimeError(
@@ -1504,52 +1757,6 @@ class retrievalattention_cache(KV_Cache):
 
         self.fused_prefill_knn[ldx] = norm
         self.fused_prefill_profiles[ldx] = profile_dict
-
-    def _run_fused_shadow_compare(self, layer_idx: int, layer_knn: np.ndarray):
-        """
-        Sampled shadow parity check between fused-prefill KNN and baseline GPU-topk KNN.
-        """
-        if not self.fa_shadow_compare:
-            return
-        if self.cpu_queries is None:
-            print(
-                "[RetrievalAttention] fused shadow compare skipped: cpu_queries are not stored.",
-                flush=True,
-            )
-            return
-        if self.retrieval_head_mode == "q_head":
-            print(
-                "[RetrievalAttention] fused shadow compare skipped in q_head mode "
-                "(legacy grouped baseline mismatch).",
-                flush=True,
-            )
-            return
-
-        ldx = int(layer_idx)
-        hdx = 0
-        sample_n = min(self.fa_shadow_sample, self.input_length)
-        if sample_n <= 0:
-            return
-        if layer_knn.shape[0] < sample_n:
-            sample_n = layer_knn.shape[0]
-        if sample_n <= 0:
-            return
-
-        device = self.layer_mapping[str(ldx)]
-        baseline_knn, _ = self._gpu_topk_knn(
-            keys=self.cpu_keys[ldx][hdx, :self.input_length, :],
-            queries=self.cpu_queries[ldx][hdx, :sample_n, :],
-            device=device,
-            already_normalized=False,
-            force_torch_path=True,
-        )
-        fused_knn = np.ascontiguousarray(layer_knn[:sample_n, hdx, :], dtype=np.int32)
-        rec = self._knn_recall_at_k(fused_knn, baseline_knn, self.q_knn)
-        print(
-            f"[RetrievalAttention] fused_shadow layer={ldx} head={hdx} "
-            f"sample={sample_n} recall@{self.q_knn}={rec:.4f}",
-            flush=True,
-        )
 
     def _get_allocated_cpu_count(self) -> int:
         """
@@ -1668,16 +1875,13 @@ class retrievalattention_cache(KV_Cache):
         layer_start = time.time()
         prof = profile if isinstance(profile, dict) else {}
         self._check_fused_score_mode_compat(prof)
-        per_head_topk = None
         per_kv_topk = None
         layer_topk = prof.get("topk_sec", prof.get("fused_sec"))
         if layer_topk is not None:
             try:
                 layer_topk = float(layer_topk)
-                per_head_topk = layer_topk / float(self.retrieval_heads)
                 per_kv_topk = layer_topk / float(self.kv_head)
             except Exception:
-                per_head_topk = None
                 per_kv_topk = None
 
         if self._profile_enabled() and prof:
@@ -1687,39 +1891,29 @@ class retrievalattention_cache(KV_Cache):
             )
 
         try:
-            if self.retrieval_head_mode == "q_head":
-                # Build one shared K-token graph per KV head by merging grouped q-head knn rows.
-                for kv_hdx in range(self.kv_head):
-                    qh_start = int(kv_hdx * self.group_size)
-                    qh_end = min(int(qh_start + self.group_size), int(self.num_heads))
-                    if qh_start >= qh_end:
-                        continue
-                    head_start = time.time()
-                    knn_group = np.ascontiguousarray(layer_knn[:, qh_start:qh_end, :], dtype=np.int32)
-                    knn = np.ascontiguousarray(knn_group.reshape(-1, knn_group.shape[-1]), dtype=np.int32)
-                    head_prof = dict(prof) if isinstance(prof, dict) else {}
-                    if per_kv_topk is not None:
-                        head_prof["topk_sec"] = per_kv_topk
-                    result = self._finalize_gpu_head_build(
-                        ldx,
-                        kv_hdx,
-                        knn,
-                        head_prof,
-                        head_start,
-                        kv_hdx_override=kv_hdx,
-                        graph_hdx_override=kv_hdx,
-                        parity_hdx_override=qh_start,
-                    )
-                    self._commit_head_build_result(result)
-            else:
-                for hdx in range(self.retrieval_heads):
-                    head_start = time.time()
-                    knn = np.ascontiguousarray(layer_knn[:, hdx, :], dtype=np.int32)
-                    head_prof = dict(prof) if isinstance(prof, dict) else {}
-                    if per_head_topk is not None:
-                        head_prof["topk_sec"] = per_head_topk
-                    result = self._finalize_gpu_head_build(ldx, hdx, knn, head_prof, head_start)
-                    self._commit_head_build_result(result)
+            # Build one shared K-token graph per KV head by merging grouped q-head knn rows.
+            for kv_hdx in range(self.kv_head):
+                qh_start = int(kv_hdx * self.group_size)
+                qh_end = min(int(qh_start + self.group_size), int(self.num_heads))
+                if qh_start >= qh_end:
+                    continue
+                head_start = time.time()
+                knn_group = np.ascontiguousarray(layer_knn[:, qh_start:qh_end, :], dtype=np.int32)
+                knn = np.ascontiguousarray(knn_group.reshape(-1, knn_group.shape[-1]), dtype=np.int32)
+                head_prof = dict(prof) if isinstance(prof, dict) else {}
+                if per_kv_topk is not None:
+                    head_prof["topk_sec"] = per_kv_topk
+                result = self._finalize_gpu_head_build(
+                    ldx,
+                    kv_hdx,
+                    knn,
+                    head_prof,
+                    head_start,
+                    kv_hdx_override=kv_hdx,
+                    graph_hdx_override=kv_hdx,
+                    parity_hdx_override=qh_start,
+                )
+                self._commit_head_build_result(result)
 
             with self._fused_prefill_lock:
                 self._fused_prefill_done[ldx] = True
@@ -1807,6 +2001,9 @@ class retrievalattention_cache(KV_Cache):
                 decode_index.add(keys_cpu)
 
         parity_msg = None
+        parity_record = None
+        traversal_queries = None
+        traversal_ref_knn = None
         if run_parity:
             qhead_buf_precheck = None
             if ldx < len(self.cpu_queries_qhead_samples):
@@ -1857,6 +2054,11 @@ class retrievalattention_cache(KV_Cache):
                             ref_index.add(keys_cpu)
                         for qhi in range(q_group.shape[0]):
                             q_queries = self._score_transform_np(q_group[qhi])
+                            trav_ref_knn = self._decode_dynamic_topk_ref_np(
+                                queries=q_queries,
+                                keys=keys_cpu,
+                                k=self.q_knn,
+                            )
                             if use_causal_ref:
                                 ref_knn = self._causal_topk_ref_np(
                                     queries=q_queries,
@@ -1868,6 +2070,9 @@ class retrievalattention_cache(KV_Cache):
                                 _, ref_knn = ref_index.search(q_queries, self.q_knn)
                             rec_qh = self._knn_recall_at_k(knn_sample, ref_knn, self.q_knn)
                             per_q_head_recalls.append(float(rec_qh))
+                            if traversal_queries is None and trav_ref_knn.shape[0] == q_queries.shape[0]:
+                                traversal_queries = q_queries
+                                traversal_ref_knn = trav_ref_knn
 
                 if len(per_q_head_recalls) == 0:
                     # Fallback: legacy grouped-query parity.
@@ -1880,6 +2085,11 @@ class retrievalattention_cache(KV_Cache):
                         .astype(np.float32)
                     )
                     queries_cpu = self._score_transform_np(queries_cpu)
+                    trav_ref_knn = self._decode_dynamic_topk_ref_np(
+                        queries=queries_cpu,
+                        keys=keys_cpu,
+                        k=self.q_knn,
+                    )
                     if use_causal_ref:
                         ref_knn = self._causal_topk_ref_np(
                             queries=queries_cpu,
@@ -1891,6 +2101,9 @@ class retrievalattention_cache(KV_Cache):
                         ref_index = faiss.IndexFlatIP(self.head_dim)
                         ref_index.add(keys_cpu)
                         _, ref_knn = ref_index.search(queries_cpu, self.q_knn)
+                    if traversal_queries is None and trav_ref_knn.shape[0] == queries_cpu.shape[0]:
+                        traversal_queries = queries_cpu
+                        traversal_ref_knn = trav_ref_knn
                     rec = self._knn_recall_at_k(knn_sample, ref_knn, self.q_knn)
                     rec_min = rec
                     rec_max = rec
@@ -1902,17 +2115,58 @@ class retrievalattention_cache(KV_Cache):
                     rec_max = float(np.max(per_q_head_recalls))
                     mode_tag = "per_q_head_mean"
                     qh_count = len(per_q_head_recalls)
-                self._record_parity(ldx, parity_hdx, sample_n, rec, self.q_knn)
+                parity_record = {
+                    "sample_n": int(sample_n),
+                    "recall": float(rec),
+                }
+                split_tag = "holdout" if self.parity_holdout_only else "all_queries"
                 parity_msg = (
                     f"[RetrievalAttention] parity layer={ldx} head={parity_hdx} sample={sample_n} "
                     f"recall@{self.q_knn}={rec:.4f} "
                     f"range=[{rec_min:.4f},{rec_max:.4f}] qh={qh_count} mode={mode_tag} "
-                    f"causal_ref={int(use_causal_ref)}"
+                    f"causal_ref={int(use_causal_ref)} split={split_tag}"
                 )
 
         proj_start = time.time()
-        graph, graph_meta = self._build_graph_csr_from_knn(knn, keys_cpu=keys_cpu)
+        knn_graph = self._select_graph_knn_rows(knn)
+        graph, graph_meta = self._build_graph_csr_from_knn(knn_graph, keys_cpu=keys_cpu)
         hub_seeds = self._build_hub_seeds_from_graph(graph)
+        traversal_metrics = None
+        if (
+            parity_record is not None
+            and self.traversal_eval
+            and traversal_queries is not None
+            and traversal_ref_knn is not None
+        ):
+            traversal_metrics = self._evaluate_traversal_efficiency(
+                ldx=ldx,
+                hdx=parity_hdx,
+                kv_hdx=kv_hdx,
+                queries_np=traversal_queries,
+                ref_knn_np=traversal_ref_knn,
+                graph=graph,
+                decode_index=decode_index,
+            )
+            if traversal_metrics is not None and parity_msg is not None:
+                parity_msg = (
+                    f"{parity_msg} "
+                    f"trav_ref=decode_dynamic "
+                    f"trav_sample={int(traversal_metrics.get('samples', 0))} "
+                    f"trav_recall_strict@{self.q_knn}={float(traversal_metrics.get('recall', 0.0)):.4f} "
+                    f"trav_recall_cov@{self.q_knn}={float(traversal_metrics.get('recall_cov', 0.0)):.4f} "
+                    f"visited={float(traversal_metrics.get('visited_mean', 0.0)):.1f} "
+                    f"visit_rate={100.0 * float(traversal_metrics.get('visit_rate', 0.0)):.2f}% "
+                    f"prune_rate={100.0 * float(traversal_metrics.get('prune_rate', 0.0)):.2f}%"
+                )
+        if parity_record is not None:
+            self._record_parity(
+                ldx,
+                parity_hdx,
+                int(parity_record["sample_n"]),
+                float(parity_record["recall"]),
+                self.q_knn,
+                traversal=traversal_metrics,
+            )
         graph_edges = 0
         graph_has_weights = False
         if isinstance(graph, tuple) and len(graph) >= 2:
@@ -2051,46 +2305,28 @@ class retrievalattention_cache(KV_Cache):
         """
         Build ANN indexes and projected K–K graph. Free query storage afterwards.
         """
-        use_gpu_topk = os.environ.get("RETRIEVALATTN_GPU_TOPK", "0") == "1"
-        use_fused_prefill = self.fa_fused_prefill
         if self._built:
             return
-
         if self.decode_index_mode == "faiss" and faiss is None:
             raise RuntimeError("RETRIEVALATTN_DECODE_INDEX=faiss requires faiss-cpu.")
-        if faiss is None and not use_gpu_topk and not use_fused_prefill:
-            raise RuntimeError("faiss is not installed. Please install faiss-cpu to use RetrievalAttention.")
-
-        if use_fused_prefill:
-            if self._fused_async_enabled:
-                missing_layers = [
-                    ldx for ldx in range(self.layer_num)
-                    if not self._fused_prefill_submitted[ldx]
-                ]
-            else:
-                missing_layers = [ldx for ldx in range(self.layer_num) if self.fused_prefill_knn[ldx] is None]
-            if missing_layers:
-                raise RuntimeError(
-                    "RETRIEVALATTN_FA_FUSED_PREFILL=1 but fused prefill KNN is missing for layers: "
-                    f"{missing_layers}. Ensure fused prefill attention path is active."
-                )
+        if self._fused_async_enabled:
+            missing_layers = [
+                ldx for ldx in range(self.layer_num)
+                if not self._fused_prefill_submitted[ldx]
+            ]
+        else:
+            missing_layers = [
+                ldx for ldx in range(self.layer_num)
+                if self.fused_prefill_knn[ldx] is None
+            ]
+        if missing_layers:
+            raise RuntimeError(
+                "Fused prefill KNN is missing for layers: "
+                f"{missing_layers}. Ensure fused prefill attention path is active."
+            )
 
         start_ts = time.time()
-        pipeline_requested = (
-            use_gpu_topk
-            and (not use_fused_prefill)
-            and os.environ.get("RETRIEVALATTN_HEAD_PIPELINE", "1") == "1"
-        )
-        try:
-            pipeline_depth = max(1, int(os.environ.get("RETRIEVALATTN_HEAD_PIPELINE_DEPTH", "1")))
-        except Exception:
-            pipeline_depth = 1
-        try:
-            pipeline_min_cpus = max(1, int(os.environ.get("RETRIEVALATTN_HEAD_PIPELINE_MIN_CPUS", "2")))
-        except Exception:
-            pipeline_min_cpus = 2
         cpu_cap = self._get_allocated_cpu_count()
-        pipeline_enabled = pipeline_requested and (cpu_cap >= pipeline_min_cpus)
         profile_enabled = os.environ.get("RETRIEVALATTN_PROFILE", "1") == "1"
 
         # Enable Faiss threads within scheduler CPU allocation.
@@ -2100,7 +2336,7 @@ class retrievalattention_cache(KV_Cache):
             try:
                 num_threads, usable_cpu_for_faiss = self._resolve_faiss_threads(
                     cpu_cap=cpu_cap,
-                    pipeline_enabled=pipeline_enabled,
+                    pipeline_enabled=False,
                 )
                 faiss.omp_set_num_threads(num_threads)
             except Exception:
@@ -2113,25 +2349,15 @@ class retrievalattention_cache(KV_Cache):
             )
         else:
             thread_msg = f", cpu_cap={cpu_cap}, faiss_cpu_budget={usable_cpu_for_faiss}"
-        pipeline_msg = (
-            f", pipeline_requested={int(pipeline_requested)}, "
-            f"pipeline_enabled={int(pipeline_enabled)}, "
-            f"pipeline_depth={pipeline_depth}, "
-            f"pipeline_min_cpus={pipeline_min_cpus}"
-        )
         fused_overlap_msg = (
             f", fused_overlap_cfg={int(self.fused_prefill_overlap)}, "
             f"fused_overlap_enabled={int(self._fused_async_enabled)}, "
             f"fused_overlap_workers={self.fused_prefill_overlap_workers}"
         )
-        if use_fused_prefill:
-            mode = "flashattn_fused_prefill"
-        else:
-            mode = "gpu_topk" if use_gpu_topk else "faiss_cpu"
         print(
             f"[RetrievalAttention] Building ANN indexes (layers={self.layer_num}, kv_heads={self.kv_head}, "
             f"retrieval_heads={self.retrieval_heads}, retrieval_head_mode={self.retrieval_head_mode}, "
-            f"tokens={self.input_length}, mode={mode}, decode_index={self.decode_index_mode}, "
+            f"tokens={self.input_length}, mode=flashattn_fused_prefill, decode_index={self.decode_index_mode}, "
             f"seed_mode={self.seed_mode}, query_mode={self.query_mode}, score_mode={self.score_mode}, "
             f"graph_builder={self.graph_builder}, "
             f"roar_backend={self.roar_backend}, roar_cpp_available={int(self._roar_cpp_available)}, "
@@ -2149,16 +2375,18 @@ class retrievalattention_cache(KV_Cache):
             f"seed_ratio={self.seed_ratio:.2f}, cand_mult={self.candidate_multiplier}, "
             f"seed_k_mult={self.seed_k_mult}, seed_prev_k={self.seed_prev_k}, "
             f"seed_hub_k={self.seed_hub_k}, seed_tail_k={self.seed_tail_k}, "
-            f"fused_prefill={int(use_fused_prefill)}, "
-            f"fused_shadow={int(self.fa_shadow_compare)}){thread_msg}{pipeline_msg}{fused_overlap_msg}"
+            f"graph_train_frac={self.graph_train_frac:.3f}, "
+            f"graph_split={self.graph_split_mode}, graph_split_seed={self.graph_split_seed}, "
+            f"graph_train_queries={int(self.graph_train_query_indices.size)}, "
+            f"graph_holdout_queries={int(self.graph_holdout_query_indices.size)}, "
+            f"parity_holdout_only={int(self.parity_holdout_only)}, "
+            f"traversal_eval={int(self.traversal_eval)}, "
+            f"traversal_eval_sample={self.traversal_eval_sample}, "
+            f"fused_prefill=1, "
+            f"fused_shadow={int(self.fa_shadow_compare)}){thread_msg}{fused_overlap_msg}"
         )
-        if pipeline_requested and not pipeline_enabled:
-            print(
-                f"[RetrievalAttention] head pipeline auto-disabled: cpu_cap={cpu_cap} < "
-                f"pipeline_min_cpus={pipeline_min_cpus}"
-            )
 
-        if use_fused_prefill and self._fused_async_enabled:
+        if self._fused_async_enabled:
             wait_total = 0.0
             wait_count = 0
             first_error_msg = None
@@ -2214,255 +2442,24 @@ class retrievalattention_cache(KV_Cache):
                     f"waits={wait_count} wait_total={wait_total:.2f}s wait_avg={avg_wait:.2f}s",
                     flush=True,
                 )
-
-            self.cpu_queries = None
-            self.prev_decode_seeds = [[[] for _ in range(self.retrieval_heads)] for _ in range(self.layer_num)]
-            self._built = True
-            return
-
-        for ldx in range(self.layer_num):
-            layer_start = time.time()
-
-            if use_fused_prefill:
+        else:
+            for ldx in range(self.layer_num):
+                layer_start = time.time()
                 layer_knn = self.fused_prefill_knn[ldx]
                 if layer_knn is None:
                     raise RuntimeError(f"Missing fused prefill KNN for layer={ldx}")
-                profile = self.fused_prefill_profiles[ldx] if isinstance(self.fused_prefill_profiles[ldx], dict) else {}
-                self._check_fused_score_mode_compat(profile)
-                if self.fa_shadow_compare and ldx == 0:
-                    self._run_fused_shadow_compare(ldx, layer_knn)
-
-                layer_topk = profile.get("topk_sec", profile.get("fused_sec"))
-                if layer_topk is not None:
-                    try:
-                        layer_topk = float(layer_topk)
-                    except Exception:
-                        layer_topk = None
-                per_head_topk = (layer_topk / float(self.retrieval_heads)) if layer_topk is not None else None
-                per_kv_topk = (layer_topk / float(self.kv_head)) if layer_topk is not None else None
-                if profile_enabled and profile:
-                    print(
-                        f"[RetrievalAttention] flashattn fused profile layer={ldx}: {profile}",
-                        flush=True,
-                    )
-
-                if self.retrieval_head_mode == "q_head":
-                    for kv_hdx in range(self.kv_head):
-                        qh_start = int(kv_hdx * self.group_size)
-                        qh_end = min(int(qh_start + self.group_size), int(self.num_heads))
-                        if qh_start >= qh_end:
-                            continue
-                        head_start = time.time()
-                        knn_group = np.ascontiguousarray(layer_knn[:, qh_start:qh_end, :], dtype=np.int32)
-                        knn = np.ascontiguousarray(knn_group.reshape(-1, knn_group.shape[-1]), dtype=np.int32)
-                        prof = dict(profile) if isinstance(profile, dict) else {}
-                        if per_kv_topk is not None:
-                            prof["topk_sec"] = per_kv_topk
-                        result = self._finalize_gpu_head_build(
-                            ldx,
-                            kv_hdx,
-                            knn,
-                            prof,
-                            head_start,
-                            kv_hdx_override=kv_hdx,
-                            graph_hdx_override=kv_hdx,
-                            parity_hdx_override=qh_start,
-                        )
-                        self._commit_head_build_result(result)
-                else:
-                    for hdx in range(self.retrieval_heads):
-                        head_start = time.time()
-                        knn = np.ascontiguousarray(layer_knn[:, hdx, :], dtype=np.int32)
-                        prof = dict(profile) if isinstance(profile, dict) else {}
-                        if per_head_topk is not None:
-                            prof["topk_sec"] = per_head_topk
-                        result = self._finalize_gpu_head_build(ldx, hdx, knn, prof, head_start)
-                        self._commit_head_build_result(result)
-
-                # Free per-layer fused KNN/prof to reduce host memory pressure.
-                self.fused_prefill_knn[ldx] = None
-                self.fused_prefill_profiles[ldx] = None
-
+                profile = (
+                    self.fused_prefill_profiles[ldx]
+                    if isinstance(self.fused_prefill_profiles[ldx], dict)
+                    else {}
+                )
+                self._finalize_fused_layer(ldx, layer_knn, profile)
                 layer_elapsed = time.time() - layer_start
                 total_elapsed = time.time() - start_ts
-                print(f"[RetrievalAttention] layer {ldx} done in {layer_elapsed:.2f}s (total {total_elapsed:.2f}s)")
-                continue
-
-            layer_gpu_cache = os.environ.get("RETRIEVALATTN_LAYER_GPU_CACHE", "1") == "1" and use_gpu_topk
-            keys_layer_gpu = None
-            queries_layer_gpu = None
-            if layer_gpu_cache and self.cpu_queries is not None:
-                try:
-                    device = self.layer_mapping[str(ldx)]
-                    keys_layer_gpu = self.cpu_keys[ldx][:, :self.input_length, :].detach().float().to(device, non_blocking=True)
-                    queries_layer_gpu = self.cpu_queries[ldx][:, :self.input_length, :].detach().float().to(device, non_blocking=True)
-                    keys_layer_gpu = self._score_transform_torch(keys_layer_gpu)
-                    queries_layer_gpu = self._score_transform_torch(queries_layer_gpu)
-                    torch.cuda.synchronize(device=device)
-                except Exception as exc:
-                    print(f"[RetrievalAttention] layer {ldx} GPU cache failed, fallback to streaming: {exc}")
-                    keys_layer_gpu = None
-                    queries_layer_gpu = None
-
-            use_head_pipeline = pipeline_enabled
-            pipeline_executor = ThreadPoolExecutor(max_workers=1) if use_head_pipeline else None
-            pending_head_futures = []
-            pipeline_submit_count = 0
-            pipeline_wait_count = 0
-            pipeline_wait_sec_total = 0.0
-            try:
-                for hdx in range(self.kv_head):
-                    head_start = time.time()
-                    if use_gpu_topk and profile_enabled:
-                        print(
-                            f"[RetrievalAttention] gpu_topk begin layer={ldx} head={hdx}",
-                            flush=True,
-                        )
-                    if use_gpu_topk:
-                        device = self.layer_mapping[str(ldx)]
-                        if keys_layer_gpu is not None and queries_layer_gpu is not None:
-                            knn, prof = self._gpu_topk_knn(
-                                keys=keys_layer_gpu[hdx],
-                                queries=queries_layer_gpu[hdx],
-                                device=device,
-                                already_normalized=True,
-                            )
-                        else:
-                            if self.cpu_queries is None:
-                                raise RuntimeError(
-                                    "cpu_queries are unavailable for GPU-topk build. "
-                                    "Disable RETRIEVALATTN_FA_FUSED_PREFILL or enable fused registration."
-                                )
-                            knn, prof = self._gpu_topk_knn(
-                                keys=self.cpu_keys[ldx][hdx, :self.input_length, :],
-                                queries=self.cpu_queries[ldx][hdx, :self.input_length, :],
-                                device=device,
-                                already_normalized=False,
-                            )
-
-                        if pipeline_executor is not None:
-                            pending_head_futures.append(
-                                pipeline_executor.submit(
-                                    self._finalize_gpu_head_build,
-                                    ldx,
-                                    hdx,
-                                    knn,
-                                    prof,
-                                    head_start,
-                                )
-                            )
-                            pipeline_submit_count += 1
-                            while len(pending_head_futures) > pipeline_depth:
-                                wait_start = time.time()
-                                done = pending_head_futures.pop(0).result()
-                                pipeline_wait_sec_total += time.time() - wait_start
-                                pipeline_wait_count += 1
-                                self._commit_head_build_result(done)
-                        else:
-                            result = self._finalize_gpu_head_build(ldx, hdx, knn, prof, head_start)
-                            self._commit_head_build_result(result)
-                    else:
-                        if self.cpu_queries is None:
-                            raise RuntimeError(
-                                "cpu_queries are unavailable for CPU index build."
-                            )
-                        keys = (
-                            self.cpu_keys[ldx][hdx, :self.input_length, :]
-                            .detach()
-                            .float()
-                            .cpu()
-                            .numpy()
-                            .astype(np.float32)
-                        )
-                        queries = (
-                            self.cpu_queries[ldx][hdx, :self.input_length, :]
-                            .detach()
-                            .float()
-                            .cpu()
-                            .numpy()
-                            .astype(np.float32)
-                        )
-
-                        keys = self._score_transform_np(keys)
-                        queries = self._score_transform_np(queries)
-
-                        index = faiss.IndexFlatIP(self.head_dim)
-                        index.add(keys)
-                        self.indexes[ldx][hdx] = index if self.decode_index_mode == "faiss" else None
-
-                        # Q->K KNN (exact on CPU)
-                        _, knn = index.search(queries, self.q_knn)
-                        prof = {"topk_sec": time.time() - head_start}
-
-                        proj_start = time.time()
-                        graph, graph_meta = self._build_graph_csr_from_knn(knn, keys_cpu=keys)
-                        self.graphs[ldx][hdx] = graph
-                        self.hub_seeds[ldx][hdx] = self._build_hub_seeds_from_graph(graph)
-                        graph_edges = 0
-                        graph_weighted = 0
-                        if isinstance(graph, tuple) and len(graph) >= 2:
-                            graph_offsets = graph[0]
-                            if graph_offsets is not None and graph_offsets.shape[0] > 0:
-                                graph_edges = int(graph_offsets[-1])
-                            graph_weighted = int(len(graph) >= 3)
-
-                        head_elapsed = time.time() - head_start
-                        proj_elapsed = time.time() - proj_start
-                        topk_elapsed = prof.get("topk_sec", None)
-                        topk_str = f"{topk_elapsed:.2f}s" if topk_elapsed is not None else "n/a"
-                        extra = ""
-                        graph_builder = str(graph_meta.get("builder", self.graph_builder)) if isinstance(graph_meta, dict) else self.graph_builder
-                        if isinstance(graph_meta, dict) and (
-                            (graph_builder in {"roar", "roar_cpp"} and self.roar_log)
-                            or (str(graph_meta.get("stop_reason", "ok")) != "ok")
-                        ):
-                            extra = (
-                                f" builder={graph_builder} "
-                                f"bip={float(graph_meta.get('bipartite_sec', 0.0)):.2f}s "
-                                f"enh={float(graph_meta.get('enhance_sec', 0.0)):.2f}s "
-                                f"csr={float(graph_meta.get('csr_sec', 0.0)):.2f}s "
-                                f"active_q={int(graph_meta.get('active_queries', 0))} "
-                                f"active_p={int(graph_meta.get('active_pivots', 0))} "
-                                f"nodes={int(graph_meta.get('projected_nodes', 0))} "
-                                f"enh_nodes={int(graph_meta.get('enhanced_nodes', 0))} "
-                                f"stop={graph_meta.get('stop_reason', 'ok')}"
-                            )
-                        print(
-                            f"[RetrievalAttention] index built layer={ldx} head={hdx} "
-                            f"time={head_elapsed:.2f}s topk={topk_str} proj={proj_elapsed:.2f}s "
-                            f"edges={graph_edges} weighted={graph_weighted}{extra}"
-                        )
-
-                for pending in pending_head_futures:
-                    wait_start = time.time()
-                    done = pending.result()
-                    pipeline_wait_sec_total += time.time() - wait_start
-                    pipeline_wait_count += 1
-                    self._commit_head_build_result(done)
-            finally:
-                if pipeline_executor is not None:
-                    pipeline_executor.shutdown(wait=True)
-
-            if use_head_pipeline:
-                avg_wait = (
-                    pipeline_wait_sec_total / float(pipeline_wait_count)
-                    if pipeline_wait_count > 0
-                    else 0.0
-                )
                 print(
-                    f"[RetrievalAttention] pipeline layer={ldx} submits={pipeline_submit_count} "
-                    f"waits={pipeline_wait_count} wait_total={pipeline_wait_sec_total:.2f}s "
-                    f"wait_avg={avg_wait:.2f}s depth={pipeline_depth}"
+                    f"[RetrievalAttention] layer {ldx} done in {layer_elapsed:.2f}s "
+                    f"(total {total_elapsed:.2f}s)"
                 )
-
-            layer_elapsed = time.time() - layer_start
-            total_elapsed = time.time() - start_ts
-            print(f"[RetrievalAttention] layer {ldx} done in {layer_elapsed:.2f}s (total {total_elapsed:.2f}s)")
-
-            if keys_layer_gpu is not None or queries_layer_gpu is not None:
-                del keys_layer_gpu
-                del queries_layer_gpu
-                torch.cuda.empty_cache()
 
         # Free queries to save CPU memory after graph/index finalize.
         self.cpu_queries = None
@@ -2472,272 +2469,6 @@ class retrievalattention_cache(KV_Cache):
         self.prev_decode_seeds = [[[] for _ in range(self.retrieval_heads)] for _ in range(self.layer_num)]
         self._built = True
 
-    def _gpu_topk_knn(
-        self,
-        keys: torch.Tensor,
-        queries: torch.Tensor,
-        device: str,
-        already_normalized: bool = False,
-        force_torch_path: bool = False,
-    ):
-        """
-        Exact blockwise Q·K^T on GPU with running top-k per query.
-        Returns knn indices as numpy int32 array [num_queries, q_knn].
-        """
-        q_block = int(os.environ.get("RETRIEVALATTN_Q_BLOCK", "512"))
-        k_block = int(os.environ.get("RETRIEVALATTN_K_BLOCK", "4096"))
-        custom_kernel = (not force_torch_path) and (os.environ.get("RETRIEVALATTN_CUSTOM_QK_TOPK", "0") == "1")
-        custom_max_block_q = 64
-        custom_max_block_k = 256
-        custom_max_launch_q_chunk = 1024
-        custom_block_q = int(
-            os.environ.get(
-                "RETRIEVALATTN_CUSTOM_QK_TOPK_BLOCK_Q",
-                str(min(max(1, q_block), custom_max_block_q)),
-            )
-        )
-        custom_block_q = max(1, custom_block_q)
-        custom_launch_q_chunk = int(
-            os.environ.get(
-                "RETRIEVALATTN_CUSTOM_QK_TOPK_LAUNCH_Q_CHUNK",
-                str(custom_max_launch_q_chunk),
-            )
-        )
-        custom_launch_q_chunk = max(0, custom_launch_q_chunk)
-        custom_block_d = int(os.environ.get("RETRIEVALATTN_CUSTOM_QK_TOPK_BLOCK_D", "32"))
-        custom_block_k = int(
-            os.environ.get(
-                "RETRIEVALATTN_CUSTOM_QK_TOPK_BLOCK_K",
-                str(min(max(1, k_block), custom_max_block_k)),
-            )
-        )
-        custom_block_k = max(1, custom_block_k)
-        profile = os.environ.get("RETRIEVALATTN_PROFILE", "1") == "1"
-        overlap = os.environ.get("RETRIEVALATTN_OVERLAP", "1") == "1"
-
-        q = queries.detach().float()
-        k = keys.detach().float()
-        q_on_gpu = q.is_cuda
-        k_on_gpu = k.is_cuda
-        overlap = overlap and not (q_on_gpu and k_on_gpu)
-
-        num_q = q.shape[0]
-        num_k = k.shape[0]
-        k_top = self.q_knn
-
-        req_block_q = custom_block_q
-        req_block_k = custom_block_k
-        req_launch_q_chunk = custom_launch_q_chunk
-        custom_block_q = min(custom_block_q, custom_max_block_q)
-        custom_block_k = min(custom_block_k, custom_max_block_k)
-        if custom_launch_q_chunk > 0:
-            custom_launch_q_chunk = min(custom_launch_q_chunk, custom_max_launch_q_chunk)
-        custom_launch_q_chunk = max(custom_block_q, custom_launch_q_chunk) if custom_launch_q_chunk > 0 else 0
-        if profile and (
-            custom_block_q != req_block_q
-            or custom_block_k != req_block_k
-            or custom_launch_q_chunk != req_launch_q_chunk
-        ):
-            print(
-                "[RetrievalAttention] custom_fused auto-tune: "
-                f"block_q {req_block_q}->{custom_block_q}, "
-                f"block_k {req_block_k}->{custom_block_k}, "
-                f"launch_q_chunk {req_launch_q_chunk}->{custom_launch_q_chunk}",
-                flush=True,
-            )
-
-        if custom_kernel:
-            if fused_qk_topk_triton is None:
-                raise RuntimeError(
-                    "[RetrievalAttention] custom qk+topk kernel requested but import failed."
-                )
-
-            t_total = time.time()
-            t_transfer = 0.0
-            with torch.no_grad():
-                if not q_on_gpu:
-                    t0 = time.time()
-                    q = q.to(device, non_blocking=True)
-                    t_transfer += time.time() - t0
-                if not k_on_gpu:
-                    t0 = time.time()
-                    k = k.to(device, non_blocking=True)
-                    t_transfer += time.time() - t0
-
-                if profile:
-                    print(
-                        "[RetrievalAttention] gpu_topk(custom_fused) launch: "
-                        f"q={num_q} k={num_k} k_top={k_top} "
-                        f"block_q={custom_block_q} block_k={custom_block_k} block_d={custom_block_d} "
-                        f"launch_q_chunk={custom_launch_q_chunk}",
-                        flush=True,
-                    )
-                try:
-                    _, idx = fused_qk_topk_triton(
-                        q,
-                        k,
-                        k_top=k_top,
-                        normalize=(self.score_normalize and (not already_normalized)),
-                        block_q=custom_block_q,
-                        block_k=custom_block_k,
-                        block_d=custom_block_d,
-                        launch_q_chunk=custom_launch_q_chunk,
-                        verbose=profile,
-                        return_scores=False,
-                    )
-                except Exception as exc:
-                    raise RuntimeError(
-                        "[RetrievalAttention] custom qk+topk kernel failed"
-                    ) from exc
-
-                total = time.time() - t_total
-                if profile:
-                    print(
-                        f"[RetrievalAttention] gpu_topk(custom_fused) profile: "
-                        f"total={total:.2f}s transfer={t_transfer:.2f}s fused={total - t_transfer:.2f}s",
-                        flush=True,
-                    )
-                knn_out = idx.to(torch.int64).cpu().numpy().astype(np.int32, copy=False)
-                return knn_out, {
-                    "total_sec": total,
-                    "transfer_sec": t_transfer,
-                    "matmul_sec": 0.0,
-                    "topk_sec": max(0.0, total - t_transfer),
-                    "fused_sec": max(0.0, total - t_transfer),
-                    "path": "custom_fused",
-                }
-
-        knn_out_gpu = torch.empty((num_q, k_top), dtype=torch.int64, device=device)
-        t_total = time.time()
-        t_transfer = 0.0
-        t_matmul = 0.0
-        t_topk = 0.0
-        with torch.no_grad():
-            transfer_stream = None
-            if overlap and torch.cuda.is_available():
-                transfer_stream = torch.cuda.Stream(device=device)
-
-            for q_start in range(0, num_q, q_block):
-                q_end = min(num_q, q_start + q_block)
-                if q_on_gpu:
-                    q_chunk = q[q_start:q_end]
-                else:
-                    t0 = time.time()
-                    q_chunk = q[q_start:q_end].to(device, non_blocking=True)
-                    t_transfer += time.time() - t0
-                if self.score_normalize and not already_normalized:
-                    q_chunk = F.normalize(q_chunk, dim=-1)
-
-                top_scores = torch.full((q_chunk.shape[0], k_top), -1e9, device=device)
-                top_indices = torch.full((q_chunk.shape[0], k_top), -1, device=device, dtype=torch.int64)
-
-                if transfer_stream is None:
-                    for k_start in range(0, num_k, k_block):
-                        k_end = min(num_k, k_start + k_block)
-                        if k_on_gpu:
-                            k_chunk = k[k_start:k_end]
-                        else:
-                            t0 = time.time()
-                            k_chunk = k[k_start:k_end].to(device, non_blocking=True)
-                            t_transfer += time.time() - t0
-                        if self.score_normalize and not already_normalized:
-                            k_chunk = F.normalize(k_chunk, dim=-1)
-
-                        t0 = time.time()
-                        scores = torch.matmul(q_chunk, k_chunk.transpose(0, 1))  # [Bq, Bk]
-                        t_matmul += time.time() - t0
-                        t0 = time.time()
-                        vals, idx = torch.topk(
-                            scores,
-                            k=min(k_top, k_chunk.shape[0]),
-                            dim=1,
-                            sorted=False,
-                        )
-                        idx = idx + k_start
-                        t_topk += time.time() - t0
-
-                        # Merge with running top-k
-                        merged_scores = torch.cat([top_scores, vals], dim=1)
-                        merged_idx = torch.cat([top_indices, idx], dim=1)
-                        t0 = time.time()
-                        new_vals, new_pos = torch.topk(merged_scores, k=k_top, dim=1)
-                        top_scores = new_vals
-                        top_indices = torch.gather(merged_idx, 1, new_pos)
-                        t_topk += time.time() - t0
-                else:
-                    # Prefetch first k-block
-                    k_start = 0
-                    k_end = min(num_k, k_block)
-                    with torch.cuda.stream(transfer_stream):
-                        if k_on_gpu:
-                            k_chunk = k[k_start:k_end]
-                        else:
-                            t0 = time.time()
-                            k_chunk = k[k_start:k_end].to(device, non_blocking=True)
-                            t_transfer += time.time() - t0
-                        if self.score_normalize and not already_normalized:
-                            k_chunk = F.normalize(k_chunk, dim=-1)
-
-                    while k_start < num_k:
-                        # Wait for the current k_chunk to be ready
-                        torch.cuda.current_stream(device=device).wait_stream(transfer_stream)
-
-                        # Use current k_chunk for compute
-                        t0 = time.time()
-                        scores = torch.matmul(q_chunk, k_chunk.transpose(0, 1))  # [Bq, Bk]
-                        t_matmul += time.time() - t0
-                        t0 = time.time()
-                        vals, idx = torch.topk(
-                            scores,
-                            k=min(k_top, k_chunk.shape[0]),
-                            dim=1,
-                            sorted=False,
-                        )
-                        idx = idx + k_start
-                        t_topk += time.time() - t0
-
-                        # Merge with running top-k
-                        merged_scores = torch.cat([top_scores, vals], dim=1)
-                        merged_idx = torch.cat([top_indices, idx], dim=1)
-                        t0 = time.time()
-                        new_vals, new_pos = torch.topk(merged_scores, k=k_top, dim=1)
-                        top_scores = new_vals
-                        top_indices = torch.gather(merged_idx, 1, new_pos)
-                        t_topk += time.time() - t0
-
-                        # Prefetch next k-block
-                        k_start_next = k_start + k_block
-                        if k_start_next >= num_k:
-                            break
-                        k_end_next = min(num_k, k_start_next + k_block)
-                        with torch.cuda.stream(transfer_stream):
-                            if k_on_gpu:
-                                k_chunk = k[k_start_next:k_end_next]
-                            else:
-                                t0 = time.time()
-                                k_chunk = k[k_start_next:k_end_next].to(device, non_blocking=True)
-                                t_transfer += time.time() - t0
-                            if self.score_normalize and not already_normalized:
-                                k_chunk = F.normalize(k_chunk, dim=-1)
-
-                        k_start = k_start_next
-
-                knn_out_gpu[q_start:q_end] = top_indices
-
-        total = time.time() - t_total
-        if profile:
-            print(
-                f"[RetrievalAttention] gpu_topk profile: total={total:.2f}s "
-                f"transfer={t_transfer:.2f}s matmul={t_matmul:.2f}s topk={t_topk:.2f}s"
-            )
-        knn_out = knn_out_gpu.cpu().numpy().astype(np.int32, copy=False)
-        return knn_out, {
-            "total_sec": total,
-            "transfer_sec": t_transfer,
-            "matmul_sec": t_matmul,
-            "topk_sec": t_topk,
-        }
-
     def sync(self, layer_idx, start_bdx):
         """
         Keep interface compatibility with other KV caches.
@@ -2746,7 +2477,15 @@ class retrievalattention_cache(KV_Cache):
         return
 
     def reset_decode_profile(self):
-        int_keys = {"calls", "heads", "visited_total", "candidates_total"}
+        int_keys = {
+            "calls",
+            "heads",
+            "visited_total",
+            "candidates_total",
+            "search_space_total",
+            "search_space_heads",
+            "visited_ratio_count",
+        }
         for key in self._decode_profile_stats:
             if key in int_keys:
                 self._decode_profile_stats[key] = 0
@@ -2765,13 +2504,42 @@ class retrievalattention_cache(KV_Cache):
         gather = float(stats["gather_total_sec"])
         attn = float(stats["attn_total_sec"])
         other = max(0.0, total - retrieve - gather - attn)
+        heads = int(stats["heads"])
+        visited_total = int(stats["visited_total"])
+        candidates_total = int(stats["candidates_total"])
+        search_space_total = int(stats["search_space_total"])
+        search_space_heads = int(stats["search_space_heads"])
+        visited_ratio_sum = float(stats["visited_ratio_sum"])
+        visited_ratio_count = int(stats["visited_ratio_count"])
 
         def pct(v: float) -> float:
             return 100.0 * v / total if total > 0 else 0.0
 
+        visited_per_head = (
+            float(visited_total) / float(heads)
+            if heads > 0 else 0.0
+        )
+        search_space_per_head = (
+            float(search_space_total) / float(search_space_heads)
+            if search_space_heads > 0 else 0.0
+        )
+        visit_rate_weighted = (
+            float(visited_total) / float(search_space_total)
+            if search_space_total > 0 else 0.0
+        )
+        visit_rate_mean = (
+            float(visited_ratio_sum) / float(visited_ratio_count)
+            if visited_ratio_count > 0 else 0.0
+        )
+        prune_rate_weighted = max(0.0, 1.0 - visit_rate_weighted)
+        cand_per_visit = (
+            float(candidates_total) / float(visited_total)
+            if visited_total > 0 else 0.0
+        )
+
         msg = (
             "[RetrievalAttention] decode_profile "
-            f"calls={int(stats['calls'])} heads={int(stats['heads'])} "
+            f"calls={int(stats['calls'])} heads={heads} "
             f"total={total:.3f}s | "
             f"retrieve={retrieve:.3f}s ({pct(retrieve):.1f}%) "
             f"[seed={stats['retrieve_seed_sec']:.3f}s, "
@@ -2781,8 +2549,14 @@ class retrievalattention_cache(KV_Cache):
             f"gather={gather:.3f}s ({pct(gather):.1f}%) | "
             f"attn={attn:.3f}s ({pct(attn):.1f}%) | "
             f"other={other:.3f}s ({pct(other):.1f}%) | "
-            f"visited_total={int(stats['visited_total'])} "
-            f"candidates_total={int(stats['candidates_total'])}"
+            f"visited_total={visited_total} "
+            f"candidates_total={candidates_total} | "
+            f"traversal=[space/head={search_space_per_head:.1f}, "
+            f"visited/head={visited_per_head:.1f}, "
+            f"visit_rate={100.0 * visit_rate_weighted:.2f}%, "
+            f"visit_rate_mean={100.0 * visit_rate_mean:.2f}%, "
+            f"prune_rate={100.0 * prune_rate_weighted:.2f}%, "
+            f"cand/visit={cand_per_visit:.2f}x]"
         )
         if reset:
             self.reset_decode_profile()
@@ -2815,7 +2589,14 @@ class retrievalattention_cache(KV_Cache):
 
         return None, None
 
-    def _retrieve_tokens(self, ldx, hdx, query_group):
+    def _retrieve_tokens(
+        self,
+        ldx,
+        hdx,
+        query_group,
+        update_decode_state: bool = True,
+        enforce_seed_floor: bool = True,
+    ):
         """
         Retrieve token indices using seed search + adaptive best-first K-K graph expansion.
         Final candidate list is reranked with the configured retrieval score mode.
@@ -2833,14 +2614,24 @@ class retrievalattention_cache(KV_Cache):
                 "finalize_sec": 0.0,
                 "visited": 0,
                 "candidates": 0,
+                "search_space": 0,
+                "visited_ratio": 0.0,
                 "stop_reason": "n/a",
             }
 
         def finish(tokens, stop_reason: str, visited: int = 0, candidates: int = 0):
             if profile is not None:
                 profile["stop_reason"] = stop_reason
-                profile["visited"] = int(visited)
-                profile["candidates"] = int(candidates)
+                visited_i = max(0, int(visited))
+                candidates_i = max(0, int(candidates))
+                search_space = max(0, int(self.dynamic_end - self.dynamic_start))
+                profile["visited"] = visited_i
+                profile["candidates"] = candidates_i
+                profile["search_space"] = search_space
+                profile["visited_ratio"] = (
+                    float(visited_i) / float(search_space)
+                    if search_space > 0 else 0.0
+                )
                 profile["total_sec"] = time.perf_counter() - total_start
             return tokens, profile
 
@@ -3238,11 +3029,12 @@ class retrievalattention_cache(KV_Cache):
         if profile is not None:
             profile["rerank_sec"] += time.perf_counter() - rerank_start
 
-        # Enforce seed floor in final list.
+        # Enforce seed floor in final list (decode path). Traversal-eval strict
+        # top-k quality can disable this to avoid rank distortion from seed forcing.
         finalize_start = time.perf_counter() if profile is not None else None
         final = []
         final_set = set()
-        if seed_floor > 0:
+        if enforce_seed_floor and seed_floor > 0:
             for tok in ranked:
                 if tok in selected_seed_set and tok not in final_set:
                     final.append(tok)
@@ -3257,7 +3049,7 @@ class retrievalattention_cache(KV_Cache):
             if len(final) >= self.token_budget:
                 break
 
-        if self.debug and self.decode_pos < self.debug_decode_steps and ldx == 0:
+        if self.debug and update_decode_state and self.decode_pos < self.debug_decode_steps and ldx == 0:
             expanded_cnt = sum(1 for tok in candidates if tok not in selected_seed_set)
             print(
                 f"[RetrievalAttention][debug] step={self.decode_pos} layer={ldx} head={hdx} "
@@ -3265,10 +3057,11 @@ class retrievalattention_cache(KV_Cache):
                 f"visited={visited_count} candidates={len(candidates)} "
                 f"dynamic={len(final)} stop_reason={stop_reason}"
             )
-        if final:
-            self.prev_decode_seeds[ldx][hdx] = list(final[: self.seed_prev_k])
-        else:
-            self.prev_decode_seeds[ldx][hdx] = []
+        if update_decode_state:
+            if final:
+                self.prev_decode_seeds[ldx][hdx] = list(final[: self.seed_prev_k])
+            else:
+                self.prev_decode_seeds[ldx][hdx] = []
         if profile is not None:
             profile["finalize_sec"] += time.perf_counter() - finalize_start
 
@@ -3314,6 +3107,14 @@ class retrievalattention_cache(KV_Cache):
                 self._decode_profile_stats["retrieve_finalize_sec"] += float(retrieve_profile["finalize_sec"])
                 self._decode_profile_stats["visited_total"] += int(retrieve_profile["visited"])
                 self._decode_profile_stats["candidates_total"] += int(retrieve_profile["candidates"])
+                search_space = max(0, int(retrieve_profile.get("search_space", 0)))
+                self._decode_profile_stats["search_space_total"] += search_space
+                if search_space > 0:
+                    self._decode_profile_stats["search_space_heads"] += 1
+                self._decode_profile_stats["visited_ratio_sum"] += float(
+                    retrieve_profile.get("visited_ratio", 0.0)
+                )
+                self._decode_profile_stats["visited_ratio_count"] += 1
             if len(token_ids) == 0:
                 empty_heads += 1
             dynamic_counts.append(len(token_ids))

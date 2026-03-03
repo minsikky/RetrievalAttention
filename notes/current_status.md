@@ -6,6 +6,90 @@
 - Target model for iteration: `meta-llama/Llama-3.1-8B-Instruct`.
 - Primary benchmark flow now: `test.sh` first, then RULER subset/full.
 
+## 2026-02-26 update (runtime cleanup: fused-only path)
+- RetrievalAttention runtime is now intentionally **fused-only** for prefill index build:
+  - no non-fused CPU/GPU top-k build path in `prepare_cache()`,
+  - no Triton custom qk+topk fallback path in cache runtime.
+- FlashAttention integration is now strict:
+  - `attn_hub/retrievalattention_attn.py` requires `flash_attn_with_kvcache_retrieval` directly from installed flash-attn,
+  - wrapper expects tuple return `(attn_out, retrieval_topk_idx[, profile])`.
+- Fused registration is now strict q-head contract:
+  - accepted fused top-k head dimension must match `retrieval_heads` (`num_heads` in current runtime),
+  - previous q-head/kv-head compatibility reshapes were removed.
+- Shadow compare path is deprecated/ignored:
+  - `RETRIEVALATTN_FA_SHADOW_COMPARE` is ignored with warning.
+- Run scripts simplified:
+  - removed legacy knobs from `test.sh` (GPU-topk/custom-kernel/graph-builder/backend selectors),
+  - `benchmark/ruler/ruler_run_wrapper.sh` now unconditionally validates RoarGraph C++ extension.
+
+## 2026-02-26 update (holdout recall mode)
+- Added holdout-aware graph quality evaluation without changing model path:
+  - `RETRIEVALATTN_GRAPH_TRAIN_FRAC`: use only a prefix fraction of query rows for graph construction.
+  - `RETRIEVALATTN_PARITY_HOLDOUT_ONLY=1`: parity samples only unseen holdout query rows.
+- This allows recall checks on queries not used to build the K-graph.
+
+## 2026-02-26 update (fused output-shape + downstream head-structure migration)
+- Fused prefill retrieval output is now migrated to **per-q-head** layout:
+  - expected shape in cache registration: `[seq, num_heads, q_knn]` (or equivalent transposed forms).
+  - this replaces prior per-KV-head fused layout.
+- Downstream head structures are now split by role:
+  - decode seed index storage (`self.indexes`) remains **KV-head keyed** (shared keys in GQA),
+  - graph / hub-seed structures are **KV-head keyed** (shared K-token graph per KV head),
+  - previous decode seeds remain **retrieval-head keyed**.
+- Added retrieval-head to KV-head mapping in cache:
+  - `q_head` mode maps `retrieval_head // group_size -> kv_head`,
+  - `kv_head` mode is identity.
+- Decode path now supports true per-q-head retrieval:
+  - in `q_head` mode, retrieval + graph traversal run per query head,
+  - graph/hub lookup uses mapped KV head (shared graph),
+  - dynamic/static KV gather also uses mapped KV head.
+- Fused prefill graph build behavior in `q_head` mode:
+  - grouped q-head top-k rows are merged per KV head before graph projection,
+  - one graph is built per KV head from the merged rows.
+- `prepare_cache()` logging now reports:
+  - `retrieval_heads`, `retrieval_head_mode` alongside `kv_heads`.
+- Compatibility note (historical):
+  - flash-attn fork native retrieval kernel was updated to emit per-q-head top-k.
+  - temporary q-head/kv-head reshape bridges were used during migration and later removed in fused-only cleanup.
+
+## 2026-02-26 update (tiny recall-only harness for fast iteration)
+- Added parity summary API in `cache_hub/retrievalattention_cache.py`:
+  - `get_parity_summary(reset=False)` returns aggregate recall stats and per-layer/head records.
+- Parity sampling scope is now configurable:
+  - `RETRIEVALATTN_PARITY_LAYERS`
+  - `RETRIEVALATTN_PARITY_HEADS`
+  - `RETRIEVALATTN_PARITY_SAMPLE`
+- Removed hardcoded parity check on only `layer=0/head=0`; parity now runs for the configured scope.
+- Added recall-only mode in `simple_test.py`:
+  - flags: `--recall_only --recall_input_tokens --recall_min_recall`.
+  - behavior: synthetic token input -> prefill/index build -> parity summary print; skips decode loop.
+- Wired `test.sh` for recall-only runs:
+  - env flags: `RECALL_ONLY`, `RECALL_INPUT_TOKENS`, `RECALL_MIN_RECALL`.
+  - when `RECALL_ONLY=1`, script auto-forces `RETRIEVALATTN_VALIDATE_PARITY=1`.
+
+## 2026-02-13 latest update (decode C++ traversal integration)
+- Implemented decode-side RoarGraph C++ search path in extension:
+  - new binding: `search_graph_csr(...)` in `third_party/RoarGraph/python_ext/roargraph_builder.cpp`,
+  - supports `fp32`, `fp16`, and `bf16` key storage (bf16 via uint16 bit-view to avoid float32 duplication).
+- Added Python wrapper:
+  - `cache_hub/roargraph_cpp_backend.py::search_roar_graph_csr_cpp(...)`.
+- Integrated into decode retrieval flow in `cache_hub/retrievalattention_cache.py`:
+  - new selector: `RETRIEVALATTN_DECODE_BACKEND=auto|python|roar_cpp` (default `auto`),
+  - C++ path is used for CSR graphs; `auto` mode falls back to Python traversal on runtime error,
+  - strict `roar_cpp` mode fails fast if extension is missing/unusable.
+- Added decode C++ traversal controls:
+  - `RETRIEVALATTN_ROAR_DECODE_INIT` (default `64`),
+  - `RETRIEVALATTN_ROAR_DECODE_LPQ` (`0` => candidate target),
+  - `RETRIEVALATTN_ROAR_DECODE_MAX_CMPS` (`0` => uncapped),
+  - `RETRIEVALATTN_ROAR_DECODE_MAX_HOPS` (`0` => use `RETRIEVALATTN_MAX_VISITS`),
+  - `RETRIEVALATTN_ROAR_DECODE_THREADS`.
+- Validation completed:
+  - extension rebuilt successfully with `module load python/3.10.4 && source .venv/bin/activate && python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`,
+  - local smoke tests passed for `fp32` and `bf16` decode search paths,
+  - fixed duplicate-ID issue in C++ decode queue insertion.
+- Immediate next run task:
+  - run `sbatch test.sh` and compare decode profile (`seed`, `graph`, `visited_total`, `candidates_total`) against previous Python-traversal logs.
+
 ## 2026-02-12 latest update (Roar graph-build integration)
 - Implemented Roar-style graph construction path in `cache_hub/retrievalattention_cache.py`:
   - builder dispatch: `RETRIEVALATTN_GRAPH_BUILDER=legacy|roar`,
@@ -30,6 +114,26 @@
   - CPU finalize (`index built layer=... head=...`) lags significantly with `fused_overlap_workers=1`,
   - interpretation: graph construction/finalize on CPU is the active bottleneck, not GPU top-k generation.
 
+## 2026-02-12 update (RoarGraph C++ backend for graph build)
+- Implemented C++ graph-build backend and integrated it into `cache_hub/retrievalattention_cache.py`:
+  - runtime selector: `RETRIEVALATTN_ROAR_BACKEND=cpp|python|auto`,
+  - cpp path uses module `roargraph_builder_ext` from `third_party/RoarGraph/python_ext`,
+  - python Roar builder remains as fallback/debug path.
+- Added backend loader: `cache_hub/roargraph_cpp_backend.py`.
+- Added extension build artifacts/sources:
+  - `third_party/RoarGraph/python_ext/roargraph_builder.cpp`,
+  - `third_party/RoarGraph/python_ext/setup.py`.
+- Run scripts now default to C++ backend and fail fast if missing:
+  - `test.sh`,
+  - `benchmark/ruler/ruler_run_wrapper.sh`.
+- Build command:
+  - `module load python/3.10.4`
+  - `source .venv/bin/activate`
+  - `python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`
+- Local smoke status:
+  - extension build succeeded,
+  - direct `build_graph_csr(...)` smoke call returned valid CSR and metadata.
+
 ## Immediate next step (locked)
 - Decode still uses adaptive best-first frontier traversal (not paper-style beam traversal yet).
 - Next implementation target is decode traversal refactor to beam-search style on top of current graph:
@@ -37,7 +141,7 @@
   - keep retrieval budget fairness (`token_budget=100`) fixed for A/B,
   - compare `legacy` vs `roar` graph builders under the same decode traversal settings first, then switch decode traversal algorithm.
 - Parallel track after this:
-  - evaluate porting CPU-hot graph/traversal routines to C++ (RoarGraph-inspired kernels) to remove Python-loop bottlenecks.
+  - evaluate porting decode traversal hot path to C++ as well (graph build path is now C++-backed).
 
 ## 2026-02-10 latest update (decode optimization focus)
 - Implemented decode seed refactor to avoid full-scan seed search by default:
