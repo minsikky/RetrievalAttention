@@ -209,7 +209,26 @@ class retrievalattention_cache(KV_Cache):
             self.roar_max_query_per_pivot = 0
         self.roar_max_query_per_pivot = max(0, self.roar_max_query_per_pivot)
         self.roar_log = os.environ.get("RETRIEVALATTN_ROAR_LOG", "1") == "1"
-        self.roar_backend = "cpp"
+        raw_roar_backend = os.environ.get("RETRIEVALATTN_ROAR_BACKEND", "cpp").strip().lower()
+        if raw_roar_backend in {"cpp", "roar_cpp"}:
+            self.roar_backend = "cpp"
+        elif raw_roar_backend in {"python", "py"}:
+            self.roar_backend = "python"
+        elif raw_roar_backend in {"python_gpu", "py_gpu", "gpu_python"}:
+            self.roar_backend = "python_gpu"
+        else:
+            print(
+                f"[RetrievalAttention] WARNING: unknown RETRIEVALATTN_ROAR_BACKEND={raw_roar_backend}. "
+                "Falling back to cpp."
+            )
+            self.roar_backend = "cpp"
+        self.roar_python_gpu_enabled = (self.roar_backend == "python_gpu")
+        self.roar_python_gpu_device = os.environ.get("RETRIEVALATTN_ROAR_PY_GPU_DEVICE", "cuda").strip()
+        try:
+            self.roar_python_gpu_batch = int(os.environ.get("RETRIEVALATTN_ROAR_PY_GPU_BATCH", "256"))
+        except Exception:
+            self.roar_python_gpu_batch = 256
+        self.roar_python_gpu_batch = max(1, self.roar_python_gpu_batch)
         try:
             self.roar_cpp_threads = int(os.environ.get("RETRIEVALATTN_ROAR_CPP_THREADS", "0"))
         except Exception:
@@ -242,7 +261,7 @@ class retrievalattention_cache(KV_Cache):
             self.roar_decode_threads = 0
         self.roar_decode_threads = max(0, self.roar_decode_threads)
         self._roar_cpp_available = roargraph_cpp_available()
-        if not self._roar_cpp_available:
+        if self.roar_backend == "cpp" and not self._roar_cpp_available:
             cpp_err = roargraph_cpp_import_error()
             raise RuntimeError(
                 "RoarGraph C++ extension is required but unavailable. "
@@ -251,6 +270,21 @@ class retrievalattention_cache(KV_Cache):
                 "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
                 + (f". Import error: {cpp_err}" if cpp_err is not None else "")
             )
+        if self.roar_python_gpu_enabled:
+            if not torch.cuda.is_available():
+                print(
+                    "[RetrievalAttention] WARNING: RETRIEVALATTN_ROAR_BACKEND=python_gpu requested but CUDA is unavailable. "
+                    "Falling back to python backend."
+                )
+                self.roar_backend = "python"
+                self.roar_python_gpu_enabled = False
+            elif not self.roar_python_gpu_device.startswith("cuda"):
+                print(
+                    f"[RetrievalAttention] WARNING: RETRIEVALATTN_ROAR_PY_GPU_DEVICE={self.roar_python_gpu_device} "
+                    "is not a CUDA device. Falling back to python backend."
+                )
+                self.roar_backend = "python"
+                self.roar_python_gpu_enabled = False
         try:
             self.expand_width = int(os.environ.get("RETRIEVALATTN_EXPAND_WIDTH", "64"))
         except Exception:
@@ -329,6 +363,17 @@ class retrievalattention_cache(KV_Cache):
                 "Only fused prefill mode is supported. "
                 "RETRIEVALATTN_FA_FUSED_PREFILL must be 1."
             )
+        self.fa_graph_fused = os.environ.get("RETRIEVALATTN_FA_GRAPH_FUSED", "0") == "1"
+        self.fa_graph_fused_require = os.environ.get("RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE", "0") == "1"
+        self.fa_graph_fused_check = os.environ.get("RETRIEVALATTN_FA_GRAPH_FUSED_CHECK", "1") == "1"
+        self.fa_graph_debug = os.environ.get("RETRIEVALATTN_FA_GRAPH_DEBUG", "0") == "1"
+        try:
+            self.fa_graph_fused_quality_floor = float(
+                os.environ.get("RETRIEVALATTN_FA_GRAPH_FUSED_QUALITY_FLOOR", "0.90")
+            )
+        except Exception:
+            self.fa_graph_fused_quality_floor = 0.90
+        self.fa_graph_fused_quality_floor = max(0.0, min(1.0, self.fa_graph_fused_quality_floor))
         raw_shadow_compare = os.environ.get("RETRIEVALATTN_FA_SHADOW_COMPARE", "0").strip()
         if raw_shadow_compare in {"1", "true", "True"}:
             print(
@@ -340,6 +385,17 @@ class retrievalattention_cache(KV_Cache):
         self.fa_shadow_sample = 0
         self.retrieval_head_mode = "q_head"
         self.retrieval_heads = self.num_heads
+        self.kv_graph_ab = os.environ.get("RETRIEVALATTN_KV_GRAPH_AB", "0") == "1"
+        try:
+            self.kv_graph_ab_q_block = int(os.environ.get("RETRIEVALATTN_KV_GRAPH_AB_Q_BLOCK", "512"))
+        except Exception:
+            self.kv_graph_ab_q_block = 512
+        self.kv_graph_ab_q_block = max(1, self.kv_graph_ab_q_block)
+        try:
+            self.kv_graph_ab_k_block = int(os.environ.get("RETRIEVALATTN_KV_GRAPH_AB_K_BLOCK", "4096"))
+        except Exception:
+            self.kv_graph_ab_k_block = 4096
+        self.kv_graph_ab_k_block = max(1, self.kv_graph_ab_k_block)
         self.fused_prefill_overlap = os.environ.get("RETRIEVALATTN_FUSED_PREFILL_OVERLAP", "1") == "1"
         try:
             self.fused_prefill_overlap_workers = int(
@@ -425,6 +481,7 @@ class retrievalattention_cache(KV_Cache):
 
         # Optional sampled per-Q-head query storage for parity checks.
         self.cpu_queries_qhead_samples = [None for _ in range(self.layer_num)]
+        self.cpu_queries_qhead_full = [None for _ in range(self.layer_num)]
         if self.validate_parity and self.parity_query_count > 0:
             parity_layers_take = min(self.layer_num, self.parity_layers)
             for ldx in range(parity_layers_take):
@@ -433,6 +490,12 @@ class retrievalattention_cache(KV_Cache):
                     dtype=self.dtype,
                     pin_memory=True,
                 )
+                if self.kv_graph_ab:
+                    self.cpu_queries_qhead_full[ldx] = torch.empty(
+                        (self.num_heads, self.input_length, self.head_dim),
+                        dtype=self.dtype,
+                        pin_memory=True,
+                    )
 
         # Static GPU KV (prefix + suffix window)
         self.static_gpu_keys = [
@@ -457,6 +520,8 @@ class retrievalattention_cache(KV_Cache):
         self._decode_cpp_warned = False
         self.fused_prefill_knn = [None for _ in range(self.layer_num)]
         self.fused_prefill_profiles = [None for _ in range(self.layer_num)]
+        self.fused_prefill_graph_neighbors = [None for _ in range(self.layer_num)]
+        self.fused_prefill_graph_profiles = [None for _ in range(self.layer_num)]
         self._fused_prefill_executor = None
         self._fused_prefill_futures = {}
         self._fused_prefill_submitted = [False for _ in range(self.layer_num)]
@@ -466,6 +531,7 @@ class retrievalattention_cache(KV_Cache):
         self._fused_prefill_done_count = 0
         self._fused_prefill_lock = threading.Lock()
         self._faiss_threads_async_configured = False
+        self._kv_graph_ab_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
 
         # Track suffix window positions
         self.suffix_start = max(0, self.input_length - self.static_pattern_end)
@@ -544,6 +610,7 @@ class retrievalattention_cache(KV_Cache):
         recall: float,
         k: int,
         traversal: dict = None,
+        extras: dict = None,
     ):
         record = {
             "layer": int(layer_idx),
@@ -562,6 +629,8 @@ class retrievalattention_cache(KV_Cache):
                 "trav_prune_rate": float(traversal.get("prune_rate", 0.0)),
                 "trav_cand_per_visit": float(traversal.get("cand_per_visit", 0.0)),
             })
+        if isinstance(extras, dict) and extras:
+            record.update(extras)
         with self._parity_lock:
             self._parity_records.append(record)
 
@@ -845,6 +914,121 @@ class retrievalattention_cache(KV_Cache):
         out[:, take_k:] = pad_val
         return out
 
+    def _exact_causal_topk_torch(
+        self,
+        queries: np.ndarray,
+        keys: np.ndarray,
+        query_indices: np.ndarray,
+        k: int,
+        device: str,
+    ) -> np.ndarray:
+        """
+        Exact causal top-k via blocked torch matmul on GPU.
+        Used only for offline graph A/B diagnostics.
+        """
+        if queries.size == 0 or keys.size == 0 or query_indices.size == 0:
+            return np.empty((0, max(1, int(k))), dtype=np.int32)
+
+        k = max(1, int(k))
+        queries = np.ascontiguousarray(queries, dtype=np.float32)
+        keys = np.ascontiguousarray(keys, dtype=np.float32)
+        query_indices = np.ascontiguousarray(query_indices, dtype=np.int64)
+
+        q_block = int(self.kv_graph_ab_q_block)
+        k_block = int(self.kv_graph_ab_k_block)
+        num_q = int(queries.shape[0])
+        num_k = int(keys.shape[0])
+
+        q_t = torch.from_numpy(queries).to(device=device, dtype=torch.float32, non_blocking=True)
+        k_t = torch.from_numpy(keys).to(device=device, dtype=torch.float32, non_blocking=True)
+        qi_t = torch.from_numpy(query_indices).to(device=device, dtype=torch.int64, non_blocking=True)
+
+        out_idx = torch.empty((num_q, k), dtype=torch.int64, device=device)
+        neg_inf = torch.tensor(float("-inf"), dtype=torch.float32, device=device)
+
+        with torch.no_grad():
+            for q_start in range(0, num_q, q_block):
+                q_end = min(num_q, q_start + q_block)
+                q_chunk = q_t[q_start:q_end]
+                qi_chunk = qi_t[q_start:q_end]
+                top_scores = torch.full((q_chunk.shape[0], k), float("-inf"), dtype=torch.float32, device=device)
+                top_indices = torch.full((q_chunk.shape[0], k), -1, dtype=torch.int64, device=device)
+
+                for k_start in range(0, num_k, k_block):
+                    k_end = min(num_k, k_start + k_block)
+                    k_chunk = k_t[k_start:k_end]
+                    scores = torch.matmul(q_chunk, k_chunk.transpose(0, 1))
+
+                    key_idx = torch.arange(k_start, k_end, device=device, dtype=torch.int64)
+                    causal_mask = key_idx.unsqueeze(0) <= qi_chunk.unsqueeze(1)
+                    scores = torch.where(causal_mask, scores, neg_inf)
+
+                    take_k = min(k, int(k_end - k_start))
+                    vals, idx = torch.topk(scores, k=take_k, dim=1, sorted=False)
+                    idx = idx + k_start
+
+                    merged_scores = torch.cat([top_scores, vals], dim=1)
+                    merged_idx = torch.cat([top_indices, idx], dim=1)
+                    new_vals, new_pos = torch.topk(merged_scores, k=k, dim=1, sorted=False)
+                    top_scores = new_vals
+                    top_indices = torch.gather(merged_idx, 1, new_pos)
+
+                out_idx[q_start:q_end] = top_indices
+
+        return np.ascontiguousarray(out_idx.cpu().numpy().astype(np.int32, copy=False))
+
+    def _get_kv_graph_ab_graph(self, ldx: int, kv_hdx: int, keys_cpu: np.ndarray):
+        if not self.kv_graph_ab:
+            return None
+        cached = self._kv_graph_ab_cache[ldx][kv_hdx]
+        if cached is not None:
+            return cached
+
+        qfull_buf = None
+        if ldx < len(self.cpu_queries_qhead_full):
+            qfull_buf = self.cpu_queries_qhead_full[ldx]
+        if qfull_buf is None:
+            return None
+
+        qh_start = int(kv_hdx * self.group_size)
+        qh_end = min(int(qh_start + self.group_size), int(self.num_heads))
+        if qh_start >= qh_end:
+            return None
+
+        q_group = (
+            qfull_buf[qh_start:qh_end, :self.input_length, :]
+            .detach()
+            .float()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
+        if q_group.ndim != 3 or q_group.shape[0] <= 0:
+            return None
+
+        kv_queries = self._score_transform_np(np.mean(q_group, axis=0))
+        query_indices = np.arange(self.input_length, dtype=np.int64)
+        knn_full = self._exact_causal_topk_torch(
+            queries=kv_queries,
+            keys=keys_cpu,
+            query_indices=query_indices,
+            k=self.q_knn,
+            device=self.layer_mapping[str(ldx)],
+        )
+        knn_graph = self._select_graph_knn_rows(knn_full)
+        graph, meta = self._build_graph_csr_from_knn(knn_graph, keys_cpu=keys_cpu)
+        cached = (graph, meta)
+        self._kv_graph_ab_cache[ldx][kv_hdx] = cached
+        if self._profile_enabled():
+            print(
+                f"[RetrievalAttention] kv_graph_ab built layer={ldx} kv_head={kv_hdx} "
+                f"queries={kv_queries.shape[0]} train_queries={knn_graph.shape[0]} "
+                f"builder={meta.get('builder', 'n/a')} "
+                f"edges={int(graph[0][-1]) if isinstance(graph, tuple) and len(graph) >= 2 and graph[0].shape[0] > 0 else 0}",
+                flush=True,
+            )
+        return cached
+
     def get_parity_summary(self, reset: bool = False) -> dict:
         with self._parity_lock:
             records = list(self._parity_records)
@@ -868,6 +1052,9 @@ class retrievalattention_cache(KV_Cache):
                 "recall_weighted": None,
                 "recall_min": None,
                 "recall_max": None,
+                "kv_proxy": None,
+                "kv_proxy_traversal": None,
+                "kv_graph_traversal": None,
                 "traversal": None,
                 "details": [],
             }
@@ -882,6 +1069,78 @@ class retrievalattention_cache(KV_Cache):
             )
         else:
             weighted = float(np.mean(recalls))
+        kv_proxy_records = [r for r in records if r.get("kv_proxy_recall") is not None]
+        kv_proxy_summary = None
+        if kv_proxy_records:
+            kv_proxy_samples = [max(0, int(r.get("sample", 0))) for r in kv_proxy_records]
+            kv_proxy_total = int(sum(kv_proxy_samples))
+            kv_proxy_values = [float(r.get("kv_proxy_recall", 0.0)) for r in kv_proxy_records]
+            if kv_proxy_total > 0:
+                kv_proxy_weighted = float(
+                    sum(
+                        float(kv_proxy_values[i]) * float(kv_proxy_samples[i])
+                        for i in range(len(kv_proxy_records))
+                    )
+                    / float(kv_proxy_total)
+                )
+            else:
+                kv_proxy_weighted = float(np.mean(kv_proxy_values))
+            kv_proxy_summary = {
+                "records": int(len(kv_proxy_records)),
+                "total_sample": kv_proxy_total,
+                "recall_mean": float(np.mean(kv_proxy_values)),
+                "recall_weighted": float(kv_proxy_weighted),
+                "recall_min": float(np.min(kv_proxy_values)),
+                "recall_max": float(np.max(kv_proxy_values)),
+            }
+        kv_proxy_trav_records = [r for r in records if int(r.get("kv_proxy_trav_samples", 0)) > 0]
+        kv_proxy_trav_summary = None
+        if kv_proxy_trav_records:
+            kv_proxy_trav_samples = [max(0, int(r.get("kv_proxy_trav_samples", 0))) for r in kv_proxy_trav_records]
+            kv_proxy_trav_total = int(sum(kv_proxy_trav_samples))
+            if kv_proxy_trav_total > 0:
+                def _kv_proxy_trav_wavg(key):
+                    return float(
+                        sum(
+                            float(kv_proxy_trav_records[i].get(key, 0.0)) * float(kv_proxy_trav_samples[i])
+                            for i in range(len(kv_proxy_trav_records))
+                        )
+                        / float(kv_proxy_trav_total)
+                    )
+                kv_proxy_trav_summary = {
+                    "records": int(len(kv_proxy_trav_records)),
+                    "total_sample": kv_proxy_trav_total,
+                    "recall_mean": _kv_proxy_trav_wavg("kv_proxy_trav_recall"),
+                    "recall_cov_mean": _kv_proxy_trav_wavg("kv_proxy_trav_recall_cov"),
+                    "visited_mean": _kv_proxy_trav_wavg("kv_proxy_trav_visited_mean"),
+                    "visit_rate_mean": _kv_proxy_trav_wavg("kv_proxy_trav_visit_rate"),
+                    "prune_rate_mean": _kv_proxy_trav_wavg("kv_proxy_trav_prune_rate"),
+                    "cand_per_visit_mean": _kv_proxy_trav_wavg("kv_proxy_trav_cand_per_visit"),
+                }
+        kv_graph_trav_records = [r for r in records if int(r.get("kv_graph_trav_samples", 0)) > 0]
+        kv_graph_trav_summary = None
+        if kv_graph_trav_records:
+            kv_graph_trav_samples = [max(0, int(r.get("kv_graph_trav_samples", 0))) for r in kv_graph_trav_records]
+            kv_graph_trav_total = int(sum(kv_graph_trav_samples))
+            if kv_graph_trav_total > 0:
+                def _kv_graph_trav_wavg(key):
+                    return float(
+                        sum(
+                            float(kv_graph_trav_records[i].get(key, 0.0)) * float(kv_graph_trav_samples[i])
+                            for i in range(len(kv_graph_trav_records))
+                        )
+                        / float(kv_graph_trav_total)
+                    )
+                kv_graph_trav_summary = {
+                    "records": int(len(kv_graph_trav_records)),
+                    "total_sample": kv_graph_trav_total,
+                    "recall_mean": _kv_graph_trav_wavg("kv_graph_trav_recall"),
+                    "recall_cov_mean": _kv_graph_trav_wavg("kv_graph_trav_recall_cov"),
+                    "visited_mean": _kv_graph_trav_wavg("kv_graph_trav_visited_mean"),
+                    "visit_rate_mean": _kv_graph_trav_wavg("kv_graph_trav_visit_rate"),
+                    "prune_rate_mean": _kv_graph_trav_wavg("kv_graph_trav_prune_rate"),
+                    "cand_per_visit_mean": _kv_graph_trav_wavg("kv_graph_trav_cand_per_visit"),
+                }
         trav_records = [r for r in records if int(r.get("trav_samples", 0)) > 0]
         traversal_summary = None
         if trav_records:
@@ -920,6 +1179,9 @@ class retrievalattention_cache(KV_Cache):
             "recall_weighted": float(weighted),
             "recall_min": float(np.min(recalls)),
             "recall_max": float(np.max(recalls)),
+            "kv_proxy": kv_proxy_summary,
+            "kv_proxy_traversal": kv_proxy_trav_summary,
+            "kv_graph_traversal": kv_graph_trav_summary,
             "traversal": traversal_summary,
             "details": records,
         }
@@ -1136,7 +1398,120 @@ class retrievalattention_cache(KV_Cache):
                 break
         return out
 
-    def _acquire_neighbors_roar(self, x: int, candidates, keys_cpu: np.ndarray, degree_cap: int):
+    def _prepare_roar_python_gpu_keys(self, keys_cpu: np.ndarray):
+        if not self.roar_python_gpu_enabled:
+            return None, 0.0
+        if not torch.cuda.is_available():
+            return None, 0.0
+        start = time.time()
+        try:
+            keys_gpu = torch.as_tensor(
+                np.ascontiguousarray(keys_cpu, dtype=np.float32),
+                dtype=torch.float32,
+                device=self.roar_python_gpu_device,
+            )
+            return keys_gpu, float(time.time() - start)
+        except Exception as exc:
+            if self.roar_log:
+                print(
+                    "[RetrievalAttention] WARNING: python_gpu Roar key upload failed; "
+                    f"{type(exc).__name__}: {exc}. Falling back to python CPU path."
+                )
+            return None, 0.0
+
+    def _acquire_neighbors_roar_batch(
+        self,
+        xs,
+        candidates_batch,
+        keys_cpu: np.ndarray,
+        degree_cap: int,
+        keys_gpu: torch.Tensor = None,
+    ):
+        if len(xs) == 0:
+            return []
+        if keys_gpu is None:
+            return [
+                self._acquire_neighbors_roar(int(x), candidates_batch[i], keys_cpu, degree_cap, keys_gpu=None)
+                for i, x in enumerate(xs)
+            ]
+
+        cleaned = []
+        max_cand = 0
+        for i, x in enumerate(xs):
+            cand = self._dedup_dynamic_tokens(candidates_batch[i], exclude=int(x), max_take=0)
+            cleaned.append(cand)
+            if len(cand) > max_cand:
+                max_cand = len(cand)
+        if max_cand <= 0:
+            return [[] for _ in xs]
+
+        batch_n = len(xs)
+        idx = torch.zeros((batch_n, max_cand), dtype=torch.long, device=keys_gpu.device)
+        mask = torch.zeros((batch_n, max_cand), dtype=torch.bool, device=keys_gpu.device)
+        for i, cand in enumerate(cleaned):
+            if not cand:
+                continue
+            cand_t = torch.as_tensor(cand, dtype=torch.long, device=keys_gpu.device)
+            take = int(cand_t.numel())
+            idx[i, :take] = cand_t
+            mask[i, :take] = True
+
+        cand_vecs = keys_gpu.index_select(0, idx.reshape(-1)).reshape(batch_n, max_cand, -1)
+        x_idx = torch.as_tensor([int(x) for x in xs], dtype=torch.long, device=keys_gpu.device)
+        x_vecs = keys_gpu.index_select(0, x_idx)
+        sim_xc = torch.einsum("bcd,bd->bc", cand_vecs, x_vecs)
+        sim_xc = sim_xc.masked_fill(~mask, float("-inf"))
+
+        sim_np = sim_xc.detach().cpu().numpy()
+
+        out = []
+        for i, cand in enumerate(cleaned):
+            if not cand:
+                out.append([])
+                continue
+            cand_arr = np.asarray(cand, dtype=np.int32)
+            csz = cand_arr.shape[0]
+            scores = sim_np[i, :csz]
+            order = np.argsort(-scores)
+            sorted_cand = cand_arr[order]
+            sorted_sim = scores[order]
+
+            selected = [int(sorted_cand[0])]
+            selected_set = {int(sorted_cand[0])}
+
+            for j in range(1, sorted_cand.shape[0]):
+                if len(selected) >= degree_cap:
+                    break
+                c_tok = int(sorted_cand[j])
+                if c_tok in selected_set:
+                    continue
+                sx = float(sorted_sim[j])
+                sel_arr = np.asarray(selected, dtype=np.int32)
+                cp_sim = np.matmul(keys_cpu[sel_arr], keys_cpu[c_tok])
+                if np.all(sx > cp_sim):
+                    selected.append(c_tok)
+                    selected_set.add(c_tok)
+
+            if len(selected) < degree_cap:
+                for tok in sorted_cand.tolist():
+                    tok = int(tok)
+                    if tok in selected_set:
+                        continue
+                    selected.append(tok)
+                    selected_set.add(tok)
+                    if len(selected) >= degree_cap:
+                        break
+            out.append(selected[:degree_cap])
+        return out
+
+    def _acquire_neighbors_roar(
+        self,
+        x: int,
+        candidates,
+        keys_cpu: np.ndarray,
+        degree_cap: int,
+        keys_gpu: torch.Tensor = None,
+    ):
         """
         RoarGraph-style AcquireNeighbors:
         - sort candidates by closeness to x
@@ -1149,20 +1524,31 @@ class retrievalattention_cache(KV_Cache):
         if not cand:
             return []
 
-        x_idx = int(x)
-        x_vec = keys_cpu[x_idx]
         cand_arr = np.asarray(cand, dtype=np.int32)
-        cand_vecs = keys_cpu[cand_arr]
-        sim_xc = np.matmul(cand_vecs, x_vec)
+        if keys_gpu is not None:
+            cand_t = torch.as_tensor(cand_arr, dtype=torch.long, device=keys_gpu.device)
+            cand_vecs_t = keys_gpu.index_select(0, cand_t)
+            x_vec_t = keys_gpu[int(x)]
+            sim_xc = torch.matmul(cand_vecs_t, x_vec_t).detach().cpu().numpy()
+            gram = torch.matmul(cand_vecs_t, cand_vecs_t.transpose(0, 1)).detach().cpu().numpy()
+        else:
+            x_idx = int(x)
+            x_vec = keys_cpu[x_idx]
+            cand_vecs = keys_cpu[cand_arr]
+            sim_xc = np.matmul(cand_vecs, x_vec)
+            gram = np.matmul(cand_vecs, cand_vecs.T)
+
         order = np.argsort(-sim_xc)
         sorted_cand = cand_arr[order]
         sorted_sim = sim_xc[order]
 
         selected = []
+        selected_pos = []
         selected_set = set()
 
         first = int(sorted_cand[0])
         selected.append(first)
+        selected_pos.append(int(order[0]))
         selected_set.add(first)
 
         for idx in range(1, sorted_cand.shape[0]):
@@ -1172,11 +1558,12 @@ class retrievalattention_cache(KV_Cache):
             sx = float(sorted_sim[idx])
             if c in selected_set:
                 continue
-            sel_arr = np.asarray(selected, dtype=np.int32)
-            cp_sim = np.matmul(keys_cpu[sel_arr], keys_cpu[c])
+            c_pos = int(order[idx])
+            cp_sim = gram[c_pos, np.asarray(selected_pos, dtype=np.int32)]
             if np.all(sx > cp_sim):
                 selected.append(c)
                 selected_set.add(c)
+                selected_pos.append(c_pos)
 
         if len(selected) < degree_cap:
             for tok in sorted_cand.tolist():
@@ -1190,7 +1577,15 @@ class retrievalattention_cache(KV_Cache):
 
         return selected[:degree_cap]
 
-    def _beam_search_roar(self, source_node: int, adjacency: dict, keys_cpu: np.ndarray, entry_node: int, beam_l: int):
+    def _beam_search_roar(
+        self,
+        source_node: int,
+        adjacency: dict,
+        keys_cpu: np.ndarray,
+        entry_node: int,
+        beam_l: int,
+        keys_gpu: torch.Tensor = None,
+    ):
         """
         Small best-first beam over projected graph to gather enhancement candidates.
         """
@@ -1205,20 +1600,45 @@ class retrievalattention_cache(KV_Cache):
             entry = src
 
         src_vec = keys_cpu[src]
+        src_vec_gpu = keys_gpu[src] if keys_gpu is not None else None
         frontier = []
         best_score = {}
         visited = set()
         candidates = []
 
-        def push(node: int):
-            node = int(node)
-            if node < self.dynamic_start or node >= self.dynamic_end:
+        def push_many(nodes):
+            uniq = []
+            seen_local = set()
+            for node in nodes:
+                node = int(node)
+                if node in seen_local:
+                    continue
+                seen_local.add(node)
+                if node < self.dynamic_start or node >= self.dynamic_end:
+                    continue
+                uniq.append(node)
+            if not uniq:
                 return
-            score = float(np.dot(src_vec, keys_cpu[node]))
-            prev = best_score.get(node)
-            if prev is None or score > prev:
-                best_score[node] = score
-                heapq.heappush(frontier, (-score, node))
+            if keys_gpu is None:
+                for node in uniq:
+                    score = float(np.dot(src_vec, keys_cpu[node]))
+                    prev = best_score.get(node)
+                    if prev is None or score > prev:
+                        best_score[node] = score
+                        heapq.heappush(frontier, (-score, node))
+                return
+
+            node_t = torch.as_tensor(uniq, dtype=torch.long, device=keys_gpu.device)
+            scores = torch.matmul(keys_gpu.index_select(0, node_t), src_vec_gpu).detach().cpu().numpy()
+            for i, node in enumerate(uniq):
+                score = float(scores[i])
+                prev = best_score.get(node)
+                if prev is None or score > prev:
+                    best_score[node] = score
+                    heapq.heappush(frontier, (-score, node))
+
+        def push(node: int):
+            push_many([int(node)])
 
         push(entry)
         if entry != src and src in adjacency:
@@ -1236,11 +1656,13 @@ class retrievalattention_cache(KV_Cache):
             if node != src:
                 candidates.append(int(node))
 
+            nbrs = []
             for nb in adjacency.get(node, []):
                 nb = int(nb)
                 if nb in visited:
                     continue
-                push(nb)
+                nbrs.append(nb)
+            push_many(nbrs)
 
         return candidates[:beam_l]
 
@@ -1286,6 +1708,102 @@ class retrievalattention_cache(KV_Cache):
             weights = np.ones((total_edges,), dtype=self.graph_weight_dtype)
             return offsets, neighbors, weights
         return offsets, neighbors
+
+    def _graph_from_dense_neighbors(self, dense_neighbors: np.ndarray):
+        """
+        Convert fixed-degree dense neighbor table [seq, m] int32 into CSR graph.
+        """
+        num_tokens = self.input_length
+        empty_graph = self._empty_graph_csr()
+        if dense_neighbors is None:
+            return empty_graph, {"builder": "flashattn_fused_graph", "stop_reason": "none"}
+
+        arr = np.asarray(dense_neighbors)
+        if arr.ndim != 2:
+            raise RuntimeError(
+                f"fused graph neighbors must be rank-2 [seq,m], got shape={tuple(arr.shape)}"
+            )
+        if int(arr.shape[0]) != int(num_tokens):
+            raise RuntimeError(
+                "fused graph neighbors seq mismatch: "
+                f"got {int(arr.shape[0])}, expected {int(num_tokens)}"
+            )
+        degree_cap = max(1, int(self.roar_m))
+        ds = int(self.dynamic_start)
+        de = int(self.dynamic_end)
+        if de <= ds:
+            return empty_graph, {"builder": "flashattn_fused_graph", "stop_reason": "empty"}
+
+        # Dynamic region only: [dynamic_tokens, m]
+        rows = np.asarray(arr[ds:de], dtype=np.int32)
+        if rows.size == 0:
+            return empty_graph, {"builder": "flashattn_fused_graph", "stop_reason": "empty"}
+
+        nrows, m = rows.shape
+        row_ids = np.arange(ds, de, dtype=np.int32).reshape(-1, 1)
+
+        # Keep only dynamic, non-self neighbors.
+        valid = (rows >= ds) & (rows < de) & (rows != row_ids)
+        if not np.any(valid):
+            return empty_graph, {"builder": "flashattn_fused_graph", "stop_reason": "empty"}
+
+        # Dedup per row while preserving first-seen order across columns.
+        keep = valid.copy()
+        for c in range(1, m):
+            tok_c = rows[:, c]
+            dup_prev = np.zeros((nrows,), dtype=bool)
+            for p in range(c):
+                dup_prev |= valid[:, p] & (tok_c == rows[:, p])
+            keep[:, c] &= ~dup_prev
+
+        # Enforce per-row degree cap (first degree_cap kept entries).
+        if degree_cap < m:
+            rank = np.cumsum(keep, axis=1)
+            keep &= rank <= degree_cap
+
+        dyn_counts = keep.sum(axis=1, dtype=np.uint64)
+        if np.sum(dyn_counts, dtype=np.uint64) == 0:
+            return empty_graph, {"builder": "flashattn_fused_graph", "stop_reason": "empty"}
+
+        row_counts = np.zeros(num_tokens, dtype=np.uint64)
+        row_counts[ds:de] = dyn_counts
+
+        offsets64 = np.empty((num_tokens + 1,), dtype=np.uint64)
+        offsets64[0] = 0
+        np.cumsum(row_counts, out=offsets64[1:])
+        total_edges = int(offsets64[-1])
+        if total_edges > np.iinfo(np.uint32).max:
+            raise RuntimeError(
+                f"[RetrievalAttention] CSR offsets exceed uint32 range: edges={total_edges}"
+            )
+        offsets = offsets64.astype(np.uint32, copy=False)
+        neighbors = rows[keep].astype(np.int32, copy=False)
+        if int(neighbors.shape[0]) != total_edges:
+            raise RuntimeError(
+                "fused graph CSR mismatch: "
+                f"neighbors={int(neighbors.shape[0])}, offsets[-1]={total_edges}"
+            )
+
+        active_rows = int(np.count_nonzero(dyn_counts))
+
+        meta = {
+            "builder": "flashattn_fused_graph",
+            "backend": "gpu_dense",
+            "stop_reason": "ok",
+            "projected_nodes": active_rows,
+            "active_pivots": active_rows,
+            "active_queries": int(self.input_length),
+            "enhanced_nodes": 0,
+            "bipartite_sec": 0.0,
+            "projection_sec": 0.0,
+            "enhance_sec": 0.0,
+            "csr_sec": 0.0,
+            "total_sec": 0.0,
+        }
+        if self.graph_return_weights:
+            weights = np.ones((total_edges,), dtype=self.graph_weight_dtype)
+            return (offsets, neighbors, weights), meta
+        return (offsets, neighbors), meta
 
     def _should_use_roar_cpp_backend(self) -> bool:
         available = roargraph_cpp_available()
@@ -1427,8 +1945,10 @@ class retrievalattention_cache(KV_Cache):
         return (offsets, neighbors), meta
 
     def _build_graph_csr_from_knn_roar(self, knn: np.ndarray, keys_cpu: np.ndarray):
-        self._should_use_roar_cpp_backend()
-        return self._build_graph_csr_from_knn_roar_cpp(knn, keys_cpu)
+        if self.roar_backend == "cpp":
+            self._should_use_roar_cpp_backend()
+            return self._build_graph_csr_from_knn_roar_cpp(knn, keys_cpu)
+        return self._build_graph_csr_from_knn_roar_python(knn, keys_cpu)
 
     def _build_graph_csr_from_knn_roar_python(self, knn: np.ndarray, keys_cpu: np.ndarray):
         """
@@ -1439,6 +1959,7 @@ class retrievalattention_cache(KV_Cache):
         """
         meta = {
             "builder": "roar",
+            "backend": "python_gpu" if self.roar_python_gpu_enabled else "python",
             "bipartite_sec": 0.0,
             "projection_sec": 0.0,
             "enhance_sec": 0.0,
@@ -1448,6 +1969,7 @@ class retrievalattention_cache(KV_Cache):
             "active_pivots": 0,
             "projected_nodes": 0,
             "enhanced_nodes": 0,
+            "gpu_key_upload_sec": 0.0,
             "stop_reason": "ok",
         }
         total_start = time.time()
@@ -1467,6 +1989,10 @@ class retrievalattention_cache(KV_Cache):
             raise RuntimeError(
                 f"Roar graph builder keys_cpu too short: got {keys.shape[0]}, need {num_tokens}"
             )
+        keys_gpu, key_upload_sec = self._prepare_roar_python_gpu_keys(keys)
+        meta["gpu_key_upload_sec"] = float(key_upload_sec)
+        if keys_gpu is None:
+            meta["backend"] = "python"
 
         nq = min(max(1, int(self.roar_nq)), int(knn.shape[1]))
         degree_cap = max(1, int(self.roar_m))
@@ -1518,6 +2044,7 @@ class retrievalattention_cache(KV_Cache):
         proj_start = time.time()
         projected = {}
         max_q_per_pivot = int(self.roar_max_query_per_pivot)
+        projection_rows = []
         for x in active_pivots.tolist():
             begin = int(pivot_offsets[x])
             end = int(pivot_offsets[x + 1])
@@ -1548,22 +2075,65 @@ class retrievalattention_cache(KV_Cache):
 
             if not candidates:
                 continue
-            x_neighbors = self._acquire_neighbors_roar(int(x), candidates, keys, degree_cap)
-            if not x_neighbors:
-                continue
-            projected[int(x)] = x_neighbors
+            projection_rows.append((int(x), candidates))
 
-            # Reverse-edge maintenance during projection.
-            for p in x_neighbors:
-                p = int(p)
-                p_cands = list(projected.get(p, []))
-                if int(x) not in p_cands:
-                    p_cands.append(int(x))
-                p_neighbors = self._acquire_neighbors_roar(p, p_cands, keys, degree_cap)
-                if p_neighbors:
-                    projected[p] = p_neighbors
-                elif p in projected:
-                    del projected[p]
+        if keys_gpu is not None:
+            batch = max(1, int(self.roar_python_gpu_batch))
+            for start in range(0, len(projection_rows), batch):
+                chunk = projection_rows[start : start + batch]
+                xs = [int(row[0]) for row in chunk]
+                cand_batch = [row[1] for row in chunk]
+                neighbors_batch = self._acquire_neighbors_roar_batch(
+                    xs,
+                    cand_batch,
+                    keys,
+                    degree_cap,
+                    keys_gpu=keys_gpu,
+                )
+                for i, x in enumerate(xs):
+                    x_neighbors = neighbors_batch[i]
+                    if not x_neighbors:
+                        continue
+                    projected[int(x)] = x_neighbors
+
+                    # Reverse-edge maintenance during projection.
+                    for p in x_neighbors:
+                        p = int(p)
+                        p_cands = list(projected.get(p, []))
+                        if int(x) not in p_cands:
+                            p_cands.append(int(x))
+                        # Reverse-edge maintenance is highly irregular and
+                        # candidate sets are tiny. CPU path is faster than
+                        # launching/syncing many tiny GPU kernels here.
+                        p_neighbors = self._acquire_neighbors_roar(
+                            p,
+                            p_cands,
+                            keys,
+                            degree_cap,
+                            keys_gpu=None,
+                        )
+                        if p_neighbors:
+                            projected[p] = p_neighbors
+                        elif p in projected:
+                            del projected[p]
+        else:
+            for x, candidates in projection_rows:
+                x_neighbors = self._acquire_neighbors_roar(int(x), candidates, keys, degree_cap)
+                if not x_neighbors:
+                    continue
+                projected[int(x)] = x_neighbors
+
+                # Reverse-edge maintenance during projection.
+                for p in x_neighbors:
+                    p = int(p)
+                    p_cands = list(projected.get(p, []))
+                    if int(x) not in p_cands:
+                        p_cands.append(int(x))
+                    p_neighbors = self._acquire_neighbors_roar(p, p_cands, keys, degree_cap)
+                    if p_neighbors:
+                        projected[p] = p_neighbors
+                    elif p in projected:
+                        del projected[p]
 
         meta["projection_sec"] = time.time() - proj_start
         meta["projected_nodes"] = int(len(projected))
@@ -1592,11 +2162,18 @@ class retrievalattention_cache(KV_Cache):
                     keys_cpu=keys,
                     entry_node=src_entry,
                     beam_l=enhance_limit,
+                    keys_gpu=None,
                 )
                 if not beam_candidates:
                     continue
 
-                x_prime = self._acquire_neighbors_roar(x, beam_candidates, keys, degree_cap)
+                x_prime = self._acquire_neighbors_roar(
+                    x,
+                    beam_candidates,
+                    keys,
+                    degree_cap,
+                    keys_gpu=None,
+                )
                 if not x_prime:
                     continue
                 nprime[x] = x_prime
@@ -1607,7 +2184,13 @@ class retrievalattention_cache(KV_Cache):
                     p_cands = list(nprime.get(p, []))
                     if x not in p_cands:
                         p_cands.append(x)
-                    p_prime = self._acquire_neighbors_roar(p, p_cands, keys, degree_cap)
+                    p_prime = self._acquire_neighbors_roar(
+                        p,
+                        p_cands,
+                        keys,
+                        degree_cap,
+                        keys_gpu=None,
+                    )
                     if p_prime:
                         nprime[p] = p_prime
                     elif p in nprime:
@@ -1618,7 +2201,13 @@ class retrievalattention_cache(KV_Cache):
                 node = int(node)
                 merged = list(projected.get(node, []))
                 merged.extend(nprime_neighbors)
-                merged_neighbors = self._acquire_neighbors_roar(node, merged, keys, degree_cap)
+                merged_neighbors = self._acquire_neighbors_roar(
+                    node,
+                    merged,
+                    keys,
+                    degree_cap,
+                    keys_gpu=None,
+                )
                 if merged_neighbors:
                     projected[node] = merged_neighbors
                 elif node in projected:
@@ -1665,7 +2254,17 @@ class retrievalattention_cache(KV_Cache):
     def uses_flashattn_fused_prefill(self) -> bool:
         return bool(self.fa_fused_prefill)
 
-    def register_fused_prefill_knn(self, layer_idx: int, knn_idx, profile: dict = None):
+    def uses_flashattn_fused_graph_prefill(self) -> bool:
+        return bool(self.fa_fused_prefill and self.fa_graph_fused)
+
+    def register_fused_prefill_knn(
+        self,
+        layer_idx: int,
+        knn_idx,
+        profile: dict = None,
+        graph_neighbors=None,
+        graph_profile: dict = None,
+    ):
         """
         Register fused-prefill top-k indices produced during prefill attention.
         Accepted shapes:
@@ -1674,6 +2273,10 @@ class retrievalattention_cache(KV_Cache):
           [retrieval_heads, seq, q_knn]
         Stored format:
           [seq, retrieval_heads, q_knn] int32 contiguous (on CPU).
+
+        Optional graph_neighbors accepted shapes:
+          [1, kv_head, seq, graph_degree]
+          [kv_head, seq, graph_degree]
         """
         ldx = int(layer_idx)
         if ldx < 0 or ldx >= self.layer_num:
@@ -1724,6 +2327,31 @@ class retrievalattention_cache(KV_Cache):
 
         norm = np.ascontiguousarray(norm.astype(np.int32, copy=False))
         profile_dict = profile if isinstance(profile, dict) else {}
+        graph_profile_dict = graph_profile if isinstance(graph_profile, dict) else {}
+
+        graph_norm = None
+        if graph_neighbors is not None:
+            if isinstance(graph_neighbors, torch.Tensor):
+                g_arr = graph_neighbors.detach().to("cpu", non_blocking=False).numpy()
+            else:
+                g_arr = np.asarray(graph_neighbors)
+            if g_arr.ndim == 4:
+                if g_arr.shape[0] != 1:
+                    raise RuntimeError(
+                        f"fused prefill graph neighbors expects batch dim 1, got shape={tuple(g_arr.shape)}"
+                    )
+                g_arr = g_arr[0]
+            if g_arr.ndim != 3:
+                raise RuntimeError(
+                    "fused prefill graph neighbors must be rank-3 or rank-4, "
+                    f"got shape={tuple(g_arr.shape)}"
+                )
+            if int(g_arr.shape[0]) != int(self.kv_head) or int(g_arr.shape[1]) != int(self.input_length):
+                raise RuntimeError(
+                    "fused prefill graph neighbors shape mismatch: "
+                    f"got {tuple(g_arr.shape)}, expected [kv_head={self.kv_head}, seq={self.input_length}, m]"
+                )
+            graph_norm = np.ascontiguousarray(g_arr.astype(np.int32, copy=False))
 
         if self._fused_async_enabled:
             self._check_fused_score_mode_compat(profile_dict)
@@ -1738,6 +2366,7 @@ class retrievalattention_cache(KV_Cache):
                 self._fused_prefill_submitted[ldx] = True
                 self._fused_prefill_submit_count += 1
                 self.fused_prefill_profiles[ldx] = profile_dict
+                self.fused_prefill_graph_profiles[ldx] = graph_profile_dict
             if self._profile_enabled():
                 print(
                     f"[RetrievalAttention] fused_overlap submit layer={ldx} "
@@ -1745,7 +2374,14 @@ class retrievalattention_cache(KV_Cache):
                     flush=True,
                 )
             try:
-                future = executor.submit(self._finalize_fused_layer, ldx, norm, profile_dict)
+                future = executor.submit(
+                    self._finalize_fused_layer,
+                    ldx,
+                    norm,
+                    profile_dict,
+                    graph_norm,
+                    graph_profile_dict,
+                )
             except Exception:
                 with self._fused_prefill_lock:
                     self._fused_prefill_submitted[ldx] = False
@@ -1757,6 +2393,8 @@ class retrievalattention_cache(KV_Cache):
 
         self.fused_prefill_knn[ldx] = norm
         self.fused_prefill_profiles[ldx] = profile_dict
+        self.fused_prefill_graph_neighbors[ldx] = graph_norm
+        self.fused_prefill_graph_profiles[ldx] = graph_profile_dict
 
     def _get_allocated_cpu_count(self) -> int:
         """
@@ -1867,13 +2505,21 @@ class retrievalattention_cache(KV_Cache):
                     "retrieval_normalize support, or use RETRIEVALATTN_SCORE_MODE=ip."
                 )
 
-    def _finalize_fused_layer(self, ldx: int, layer_knn: np.ndarray, profile: dict = None):
+    def _finalize_fused_layer(
+        self,
+        ldx: int,
+        layer_knn: np.ndarray,
+        profile: dict = None,
+        layer_graph_neighbors: np.ndarray = None,
+        graph_profile: dict = None,
+    ):
         """
         Finalize one fused-prefill layer on CPU: decode index + graph + hub seeds.
         Runs in overlap worker thread when enabled.
         """
         layer_start = time.time()
         prof = profile if isinstance(profile, dict) else {}
+        graph_prof = graph_profile if isinstance(graph_profile, dict) else {}
         self._check_fused_score_mode_compat(prof)
         per_kv_topk = None
         layer_topk = prof.get("topk_sec", prof.get("fused_sec"))
@@ -1903,6 +2549,37 @@ class retrievalattention_cache(KV_Cache):
                 head_prof = dict(prof) if isinstance(prof, dict) else {}
                 if per_kv_topk is not None:
                     head_prof["topk_sec"] = per_kv_topk
+                graph_override = None
+                graph_override_meta = None
+                if layer_graph_neighbors is not None:
+                    graph_dense = np.ascontiguousarray(layer_graph_neighbors[kv_hdx], dtype=np.int32)
+                    if self.fa_graph_debug:
+                        dyn_s = int(self.dynamic_start)
+                        dyn_e = int(self.dynamic_end)
+                        piv = knn[:, 0] if knn.shape[1] > 0 else np.empty((0,), dtype=np.int32)
+                        cand = knn[:, 1:] if knn.shape[1] > 1 else np.empty((knn.shape[0], 0), dtype=np.int32)
+                        piv_dyn = float(np.mean((piv >= dyn_s) & (piv < dyn_e))) if piv.size > 0 else 0.0
+                        cand_dyn = float(np.mean((cand >= dyn_s) & (cand < dyn_e))) if cand.size > 0 else 0.0
+                        g_valid = (graph_dense >= dyn_s) & (graph_dense < dyn_e)
+                        g_nonempty_rows = int(np.count_nonzero(np.any(g_valid, axis=1)))
+                        g_valid_ratio = float(np.mean(g_valid)) if g_valid.size > 0 else 0.0
+                        print(
+                            "[RetrievalAttention] graph_debug "
+                            f"layer={ldx} kv_head={kv_hdx} "
+                            f"knn_pivot_dyn={piv_dyn:.4f} knn_cand_dyn={cand_dyn:.4f} "
+                            f"graph_rows_nonempty={g_nonempty_rows} graph_valid_ratio={g_valid_ratio:.4f}",
+                            flush=True,
+                        )
+                    graph_override, graph_override_meta = self._graph_from_dense_neighbors(graph_dense)
+                    if isinstance(graph_override_meta, dict):
+                        graph_override_meta = dict(graph_override_meta)
+                        graph_override_meta.update(
+                            {
+                                "graph_sec": float(graph_prof.get("graph_sec", 0.0)),
+                                "graph_nq": int(graph_prof.get("graph_nq", self.roar_nq)),
+                                "graph_degree": int(graph_prof.get("graph_degree", self.roar_m)),
+                            }
+                        )
                 result = self._finalize_gpu_head_build(
                     ldx,
                     kv_hdx,
@@ -1912,6 +2589,8 @@ class retrievalattention_cache(KV_Cache):
                     kv_hdx_override=kv_hdx,
                     graph_hdx_override=kv_hdx,
                     parity_hdx_override=qh_start,
+                    graph_override=graph_override,
+                    graph_override_meta=graph_override_meta,
                 )
                 self._commit_head_build_result(result)
 
@@ -1920,6 +2599,8 @@ class retrievalattention_cache(KV_Cache):
                 self._fused_prefill_done_count += 1
                 self.fused_prefill_knn[ldx] = None
                 self.fused_prefill_profiles[ldx] = None
+                self.fused_prefill_graph_neighbors[ldx] = None
+                self.fused_prefill_graph_profiles[ldx] = None
             if self._profile_enabled():
                 print(
                     f"[RetrievalAttention] fused_overlap done layer={ldx} "
@@ -1932,6 +2613,7 @@ class retrievalattention_cache(KV_Cache):
             raise
         finally:
             layer_knn = None
+            layer_graph_neighbors = None
 
     def _finalize_gpu_head_build(
         self,
@@ -1943,6 +2625,8 @@ class retrievalattention_cache(KV_Cache):
         kv_hdx_override: int = None,
         graph_hdx_override: int = None,
         parity_hdx_override: int = None,
+        graph_override=None,
+        graph_override_meta: dict = None,
     ):
         """
         CPU-side postprocess for one GPU-topk head:
@@ -1951,6 +2635,7 @@ class retrievalattention_cache(KV_Cache):
         kv_hdx = int(kv_hdx_override) if kv_hdx_override is not None else self._retrieval_head_to_kv_head(hdx)
         graph_hdx = int(graph_hdx_override) if graph_hdx_override is not None else kv_hdx
         parity_hdx = int(parity_hdx_override) if parity_hdx_override is not None else hdx
+        graph_override_meta = graph_override_meta if isinstance(graph_override_meta, dict) else {}
         knn_for_parity = knn
         if int(knn.shape[0]) != int(self.input_length):
             # Fused q_head graph build may merge multiple q-head rows per KV head.
@@ -1969,7 +2654,7 @@ class retrievalattention_cache(KV_Cache):
                     )
         decode_index = None
         keys_cpu = None
-        need_graph_keys = (self.graph_builder == "roar")
+        need_graph_keys = (self.graph_builder == "roar") and (graph_override is None)
         run_parity = (
             int(knn_for_parity.shape[0]) == int(self.input_length)
             and self._should_run_parity_for(ldx, parity_hdx)
@@ -2025,11 +2710,15 @@ class retrievalattention_cache(KV_Cache):
             sample_idx = np.ascontiguousarray(sample_idx_all[valid_mask], dtype=np.int32)
             sample_pos = np.ascontiguousarray(np.nonzero(valid_mask)[0], dtype=np.int32)
             profile_path = str(prof.get("path", "")).strip().lower()
-            use_causal_ref = (profile_path == "native_kernel_fused")
+            use_causal_ref = bool(prof.get("retrieval_causal", False))
+            if not use_causal_ref:
+                use_causal_ref = profile_path.startswith("native_kernel_fused")
             if sample_idx.size > 0:
                 sample_n = int(sample_idx.shape[0])
                 knn_sample = np.ascontiguousarray(knn_for_parity[sample_idx, :self.q_knn], dtype=np.int32)
                 per_q_head_recalls = []
+                q_head_refs = []
+                kv_proxy_recalls = []
                 qhead_buf = None
                 if ldx < len(self.cpu_queries_qhead_samples):
                     qhead_buf = self.cpu_queries_qhead_samples[ldx]
@@ -2070,9 +2759,51 @@ class retrievalattention_cache(KV_Cache):
                                 _, ref_knn = ref_index.search(q_queries, self.q_knn)
                             rec_qh = self._knn_recall_at_k(knn_sample, ref_knn, self.q_knn)
                             per_q_head_recalls.append(float(rec_qh))
+                            q_head_refs.append(np.ascontiguousarray(ref_knn, dtype=np.int32))
                             if traversal_queries is None and trav_ref_knn.shape[0] == q_queries.shape[0]:
                                 traversal_queries = q_queries
                                 traversal_ref_knn = trav_ref_knn
+
+                        if self.retrieval_head_mode == "q_head":
+                            kv_qh_start = int(kv_hdx * self.group_size)
+                            kv_qh_end = min(int(kv_qh_start + self.group_size), int(self.num_heads))
+                            kv_group = (
+                                qhead_buf[kv_qh_start:kv_qh_end, sample_pos, :]
+                                .detach()
+                                .float()
+                                .cpu()
+                                .numpy()
+                                .astype(np.float32)
+                            )
+                            if kv_group.ndim == 3 and kv_group.shape[0] > 0:
+                                kv_queries = self._score_transform_np(np.mean(kv_group, axis=0))
+                                if use_causal_ref:
+                                    kv_ref_knn = self._causal_topk_ref_np(
+                                        queries=kv_queries,
+                                        keys=keys_cpu,
+                                        query_indices=sample_idx,
+                                        k=self.q_knn,
+                                    )
+                                else:
+                                    if 'ref_index' not in locals():
+                                        ref_index = faiss.IndexFlatIP(self.head_dim)
+                                        ref_index.add(keys_cpu)
+                                    _, kv_ref_knn = ref_index.search(kv_queries, self.q_knn)
+                                kv_ref_knn = np.ascontiguousarray(kv_ref_knn, dtype=np.int32)
+                                for qhi in range(kv_group.shape[0]):
+                                    q_queries_full = self._score_transform_np(kv_group[qhi])
+                                    if use_causal_ref:
+                                        q_ref_knn = self._causal_topk_ref_np(
+                                            queries=q_queries_full,
+                                            keys=keys_cpu,
+                                            query_indices=sample_idx,
+                                            k=self.q_knn,
+                                        )
+                                    else:
+                                        _, q_ref_knn = ref_index.search(q_queries_full, self.q_knn)
+                                    kv_proxy_recalls.append(
+                                        float(self._knn_recall_at_k(kv_ref_knn, q_ref_knn, self.q_knn))
+                                    )
 
                 if len(per_q_head_recalls) == 0:
                     # Fallback: legacy grouped-query parity.
@@ -2119,6 +2850,21 @@ class retrievalattention_cache(KV_Cache):
                     "sample_n": int(sample_n),
                     "recall": float(rec),
                 }
+                if len(kv_proxy_recalls) > 0:
+                    kv_proxy_mean = float(np.mean(kv_proxy_recalls))
+                    kv_proxy_min = float(np.min(kv_proxy_recalls))
+                    kv_proxy_max = float(np.max(kv_proxy_recalls))
+                    parity_record.update(
+                        {
+                            "kv_proxy_recall": kv_proxy_mean,
+                            "kv_proxy_min": kv_proxy_min,
+                            "kv_proxy_max": kv_proxy_max,
+                            "kv_proxy_qh": int(len(kv_proxy_recalls)),
+                        }
+                    )
+                else:
+                    kv_proxy_mean = None
+                kv_proxy_traversal_metrics = None
                 split_tag = "holdout" if self.parity_holdout_only else "all_queries"
                 parity_msg = (
                     f"[RetrievalAttention] parity layer={ldx} head={parity_hdx} sample={sample_n} "
@@ -2126,12 +2872,24 @@ class retrievalattention_cache(KV_Cache):
                     f"range=[{rec_min:.4f},{rec_max:.4f}] qh={qh_count} mode={mode_tag} "
                     f"causal_ref={int(use_causal_ref)} split={split_tag}"
                 )
+                if kv_proxy_mean is not None:
+                    parity_msg = (
+                        f"{parity_msg} kv_proxy@{self.q_knn}={kv_proxy_mean:.4f}"
+                    )
 
         proj_start = time.time()
         knn_graph = self._select_graph_knn_rows(knn)
-        graph, graph_meta = self._build_graph_csr_from_knn(knn_graph, keys_cpu=keys_cpu)
+        if graph_override is not None:
+            graph = graph_override
+            graph_meta = dict(graph_override_meta)
+            graph_meta.setdefault("builder", "flashattn_fused_graph")
+            graph_meta.setdefault("backend", "gpu_dense")
+            graph_meta.setdefault("stop_reason", "ok")
+        else:
+            graph, graph_meta = self._build_graph_csr_from_knn(knn_graph, keys_cpu=keys_cpu)
         hub_seeds = self._build_hub_seeds_from_graph(graph)
         traversal_metrics = None
+        kv_proxy_traversal_metrics = None
         if (
             parity_record is not None
             and self.traversal_eval
@@ -2158,6 +2916,120 @@ class retrievalattention_cache(KV_Cache):
                     f"visit_rate={100.0 * float(traversal_metrics.get('visit_rate', 0.0)):.2f}% "
                     f"prune_rate={100.0 * float(traversal_metrics.get('prune_rate', 0.0)):.2f}%"
                 )
+            if (
+                graph_override is not None
+                and self.fa_graph_fused_check
+                and traversal_metrics is not None
+                and float(traversal_metrics.get("recall", 0.0)) < self.fa_graph_fused_quality_floor
+            ):
+                # Safety gate: sampled strict traversal recall fell below configured floor.
+                # Fall back to legacy graph construction for this head.
+                graph, graph_meta = self._build_graph_csr_from_knn(knn_graph, keys_cpu=keys_cpu)
+                hub_seeds = self._build_hub_seeds_from_graph(graph)
+                traversal_metrics = self._evaluate_traversal_efficiency(
+                    ldx=ldx,
+                    hdx=parity_hdx,
+                    kv_hdx=kv_hdx,
+                    queries_np=traversal_queries,
+                    ref_knn_np=traversal_ref_knn,
+                    graph=graph,
+                    decode_index=decode_index,
+                )
+                if parity_msg is not None:
+                    parity_msg = (
+                        f"{parity_msg} "
+                        f"graph_fused_fallback=1 "
+                        f"floor={self.fa_graph_fused_quality_floor:.3f}"
+                    )
+        if (
+            parity_record is not None
+            and self.traversal_eval
+            and parity_record.get("kv_proxy_recall") is not None
+            and qhead_buf is not None
+            and sample_pos is not None
+            and keys_cpu is not None
+        ):
+            kv_qh_start = int(kv_hdx * self.group_size)
+            kv_qh_end = min(int(kv_qh_start + self.group_size), int(self.num_heads))
+            kv_group = (
+                qhead_buf[kv_qh_start:kv_qh_end, sample_pos, :]
+                .detach()
+                .float()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
+            if kv_group.ndim == 3 and kv_group.shape[0] > 0:
+                kv_queries = self._score_transform_np(np.mean(kv_group, axis=0))
+                kv_trav_ref_knn = self._decode_dynamic_topk_ref_np(
+                    queries=kv_queries,
+                    keys=keys_cpu,
+                    k=self.q_knn,
+                )
+                kv_proxy_traversal_metrics = self._evaluate_traversal_efficiency(
+                    ldx=ldx,
+                    hdx=parity_hdx,
+                    kv_hdx=kv_hdx,
+                    queries_np=kv_queries,
+                    ref_knn_np=kv_trav_ref_knn,
+                    graph=graph,
+                    decode_index=decode_index,
+                )
+                if isinstance(kv_proxy_traversal_metrics, dict):
+                    parity_record.update(
+                        {
+                            "kv_proxy_trav_samples": int(kv_proxy_traversal_metrics.get("samples", 0)),
+                            "kv_proxy_trav_recall": float(kv_proxy_traversal_metrics.get("recall", 0.0)),
+                            "kv_proxy_trav_recall_cov": float(kv_proxy_traversal_metrics.get("recall_cov", 0.0)),
+                            "kv_proxy_trav_visited_mean": float(kv_proxy_traversal_metrics.get("visited_mean", 0.0)),
+                            "kv_proxy_trav_visit_rate": float(kv_proxy_traversal_metrics.get("visit_rate", 0.0)),
+                            "kv_proxy_trav_prune_rate": float(kv_proxy_traversal_metrics.get("prune_rate", 0.0)),
+                            "kv_proxy_trav_cand_per_visit": float(kv_proxy_traversal_metrics.get("cand_per_visit", 0.0)),
+                        }
+                    )
+                    if parity_msg is not None:
+                        parity_msg = (
+                            f"{parity_msg} "
+                            f"kv_proxy_trav@{self.q_knn}={float(kv_proxy_traversal_metrics.get('recall', 0.0)):.4f}"
+                        )
+        kv_graph_traversal_metrics = None
+        if (
+            parity_record is not None
+            and self.kv_graph_ab
+            and self.traversal_eval
+            and traversal_queries is not None
+            and traversal_ref_knn is not None
+            and keys_cpu is not None
+        ):
+            kv_graph_payload = self._get_kv_graph_ab_graph(ldx=ldx, kv_hdx=kv_hdx, keys_cpu=keys_cpu)
+            if kv_graph_payload is not None:
+                kv_graph, kv_graph_meta = kv_graph_payload
+                kv_graph_traversal_metrics = self._evaluate_traversal_efficiency(
+                    ldx=ldx,
+                    hdx=parity_hdx,
+                    kv_hdx=kv_hdx,
+                    queries_np=traversal_queries,
+                    ref_knn_np=traversal_ref_knn,
+                    graph=kv_graph,
+                    decode_index=decode_index,
+                )
+                if isinstance(kv_graph_traversal_metrics, dict):
+                    parity_record.update(
+                        {
+                            "kv_graph_trav_samples": int(kv_graph_traversal_metrics.get("samples", 0)),
+                            "kv_graph_trav_recall": float(kv_graph_traversal_metrics.get("recall", 0.0)),
+                            "kv_graph_trav_recall_cov": float(kv_graph_traversal_metrics.get("recall_cov", 0.0)),
+                            "kv_graph_trav_visited_mean": float(kv_graph_traversal_metrics.get("visited_mean", 0.0)),
+                            "kv_graph_trav_visit_rate": float(kv_graph_traversal_metrics.get("visit_rate", 0.0)),
+                            "kv_graph_trav_prune_rate": float(kv_graph_traversal_metrics.get("prune_rate", 0.0)),
+                            "kv_graph_trav_cand_per_visit": float(kv_graph_traversal_metrics.get("cand_per_visit", 0.0)),
+                        }
+                    )
+                    if parity_msg is not None:
+                        parity_msg = (
+                            f"{parity_msg} "
+                            f"kv_graph_trav@{self.q_knn}={float(kv_graph_traversal_metrics.get('recall', 0.0)):.4f}"
+                        )
         if parity_record is not None:
             self._record_parity(
                 ldx,
@@ -2166,6 +3038,7 @@ class retrievalattention_cache(KV_Cache):
                 float(parity_record["recall"]),
                 self.q_knn,
                 traversal=traversal_metrics,
+                extras={k: v for k, v in parity_record.items() if k not in {"sample_n", "recall"}},
             )
         graph_edges = 0
         graph_has_weights = False
@@ -2223,7 +3096,7 @@ class retrievalattention_cache(KV_Cache):
         graph_meta = result.get("graph_meta")
         extra = ""
         if isinstance(graph_meta, dict) and (
-            (graph_builder in {"roar", "roar_cpp"} and self.roar_log)
+            (graph_builder in {"roar", "roar_cpp", "flashattn_fused_graph"} and self.roar_log)
             or (str(graph_meta.get("stop_reason", "ok")) != "ok")
         ):
             extra = (
@@ -2231,6 +3104,7 @@ class retrievalattention_cache(KV_Cache):
                 f"bip={float(graph_meta.get('bipartite_sec', 0.0)):.2f}s "
                 f"enh={float(graph_meta.get('enhance_sec', 0.0)):.2f}s "
                 f"csr={float(graph_meta.get('csr_sec', 0.0)):.2f}s "
+                f"gsec={float(graph_meta.get('graph_sec', 0.0)):.2f}s "
                 f"active_q={int(graph_meta.get('active_queries', 0))} "
                 f"active_p={int(graph_meta.get('active_pivots', 0))} "
                 f"nodes={int(graph_meta.get('projected_nodes', 0))} "
@@ -2284,6 +3158,13 @@ class retrievalattention_cache(KV_Cache):
                 q_samples = torch.index_select(full_q, 0, parity_idx)  # [S, num_heads, dim]
                 q_samples = q_samples.transpose(0, 1).contiguous()      # [num_heads, S, dim]
                 qhead_sample_buf[:, :q_samples.shape[1], :].copy_(q_samples, non_blocking=True)
+        qhead_full_buf = None
+        if layer_idx < len(self.cpu_queries_qhead_full):
+            qhead_full_buf = self.cpu_queries_qhead_full[layer_idx]
+        if qhead_full_buf is not None:
+            full_q = query_states[0, valid_start:valid_start + self.input_length, :, :]  # [seq, num_heads, dim]
+            q_full = full_q.transpose(0, 1).contiguous()  # [num_heads, seq, dim]
+            qhead_full_buf[:, :q_full.shape[1], :].copy_(q_full, non_blocking=True)
 
         # Build static GPU KV (prefix + suffix)
         prefix = key_states[0, valid_start:valid_start + self.static_pattern_start, :, :].transpose(0, 1).contiguous()
@@ -2362,6 +3243,9 @@ class retrievalattention_cache(KV_Cache):
             f"graph_builder={self.graph_builder}, "
             f"roar_backend={self.roar_backend}, roar_cpp_available={int(self._roar_cpp_available)}, "
             f"roar_cpp_threads={self.roar_cpp_threads}, "
+            f"roar_py_gpu={int(self.roar_python_gpu_enabled)}, "
+            f"roar_py_gpu_device={self.roar_python_gpu_device}, "
+            f"roar_py_gpu_batch={self.roar_python_gpu_batch}, "
             f"graph_weighted={int(self.graph_weighted)}, clique_m={self.graph_clique_m}, "
             f"graph_return_weights={int(self.graph_return_weights)}, graph_weight_dtype={self.graph_weight_dtype_name}, "
             f"roar_nq={self.roar_nq}, roar_l={self.roar_l}, roar_m={self.roar_m}, "
@@ -2383,6 +3267,10 @@ class retrievalattention_cache(KV_Cache):
             f"traversal_eval={int(self.traversal_eval)}, "
             f"traversal_eval_sample={self.traversal_eval_sample}, "
             f"fused_prefill=1, "
+            f"graph_fused_prefill={int(self.fa_graph_fused)}, "
+            f"graph_fused_require={int(self.fa_graph_fused_require)}, "
+            f"graph_fused_check={int(self.fa_graph_fused_check)}, "
+            f"graph_fused_floor={self.fa_graph_fused_quality_floor:.3f}, "
             f"fused_shadow={int(self.fa_shadow_compare)}){thread_msg}{fused_overlap_msg}"
         )
 
@@ -2453,7 +3341,19 @@ class retrievalattention_cache(KV_Cache):
                     if isinstance(self.fused_prefill_profiles[ldx], dict)
                     else {}
                 )
-                self._finalize_fused_layer(ldx, layer_knn, profile)
+                layer_graph = self.fused_prefill_graph_neighbors[ldx]
+                layer_graph_profile = (
+                    self.fused_prefill_graph_profiles[ldx]
+                    if isinstance(self.fused_prefill_graph_profiles[ldx], dict)
+                    else {}
+                )
+                self._finalize_fused_layer(
+                    ldx,
+                    layer_knn,
+                    profile,
+                    layer_graph,
+                    layer_graph_profile,
+                )
                 layer_elapsed = time.time() - layer_start
                 total_elapsed = time.time() - start_ts
                 print(
@@ -2463,6 +3363,7 @@ class retrievalattention_cache(KV_Cache):
 
         # Free queries to save CPU memory after graph/index finalize.
         self.cpu_queries = None
+        self.cpu_queries_qhead_full = [None for _ in range(self.layer_num)]
         self._shutdown_fused_prefill_executor()
         with self._fused_prefill_lock:
             self._fused_prefill_futures.clear()
