@@ -234,7 +234,26 @@ class retrievalattention_cache(KV_Cache):
         except Exception:
             self.roar_cpp_threads = 0
         self.roar_cpp_threads = max(0, self.roar_cpp_threads)
-        self.decode_backend = "roar_cpp"
+        raw_decode_backend = os.environ.get("RETRIEVALATTN_DECODE_BACKEND", "auto").strip().lower()
+        if raw_decode_backend in {"", "auto"}:
+            self.decode_backend = "auto"
+        elif raw_decode_backend in {"python", "py"}:
+            self.decode_backend = "python"
+        elif raw_decode_backend in {"roar_cpp", "cpp"}:
+            self.decode_backend = "roar_cpp"
+        elif raw_decode_backend in {"python_gpu", "py_gpu", "gpu_python", "gpu"}:
+            self.decode_backend = "python_gpu"
+        else:
+            print(
+                f"[RetrievalAttention] WARNING: unknown RETRIEVALATTN_DECODE_BACKEND={raw_decode_backend}. "
+                "Falling back to auto."
+            )
+            self.decode_backend = "auto"
+        self.decode_python_gpu_enabled = (self.decode_backend == "python_gpu")
+        self.decode_gpu_keys_enabled = os.environ.get(
+            "RETRIEVALATTN_DECODE_GPU_KEYS",
+            "1" if self.decode_python_gpu_enabled else "0",
+        ) == "1"
         try:
             self.roar_decode_lpq = int(os.environ.get("RETRIEVALATTN_ROAR_DECODE_LPQ", "0"))
         except Exception:
@@ -285,6 +304,14 @@ class retrievalattention_cache(KV_Cache):
                 )
                 self.roar_backend = "python"
                 self.roar_python_gpu_enabled = False
+        if self.decode_python_gpu_enabled and not torch.cuda.is_available():
+            print(
+                "[RetrievalAttention] WARNING: RETRIEVALATTN_DECODE_BACKEND=python_gpu requested but CUDA is unavailable. "
+                "Falling back to python decode backend."
+            )
+            self.decode_backend = "python"
+            self.decode_python_gpu_enabled = False
+            self.decode_gpu_keys_enabled = False
         try:
             self.expand_width = int(os.environ.get("RETRIEVALATTN_EXPAND_WIDTH", "64"))
         except Exception:
@@ -517,7 +544,10 @@ class retrievalattention_cache(KV_Cache):
         # Warm-start seeds remain retrieval-head keyed (per q-head in q_head mode).
         self.prev_decode_seeds = [[[] for _ in range(self.retrieval_heads)] for _ in range(self.layer_num)]
         self._decode_key_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._decode_keys_gpu = [None for _ in range(self.layer_num)]
         self._decode_cpp_warned = False
+        self._decode_gpu_warned = False
+        self._decode_gpu_key_upload_warned = False
         self.fused_prefill_knn = [None for _ in range(self.layer_num)]
         self.fused_prefill_profiles = [None for _ in range(self.layer_num)]
         self.fused_prefill_graph_neighbors = [None for _ in range(self.layer_num)]
@@ -1822,9 +1852,13 @@ class retrievalattention_cache(KV_Cache):
     def _should_use_roar_cpp_decode_backend(self, graph_is_csr: bool) -> bool:
         if not graph_is_csr:
             return False
+        if self.decode_backend in {"python", "python_gpu"}:
+            return False
         available = roargraph_cpp_available()
         self._roar_cpp_available = bool(available)
         if not available:
+            if self.decode_backend == "auto":
+                return False
             cpp_err = roargraph_cpp_import_error()
             raise RuntimeError(
                 "RoarGraph C++ extension is required but unavailable. "
@@ -1869,6 +1903,72 @@ class retrievalattention_cache(KV_Cache):
             "dtype": key_dtype,
         }
         return key_array, key_dtype
+
+    def _capture_prefill_decode_keys_gpu(self, layer_idx: int, key_states: torch.Tensor, valid_start: int):
+        if not self.decode_gpu_keys_enabled:
+            return
+        if key_states is None or key_states.ndim != 4:
+            return
+        try:
+            start = int(valid_start)
+            full_keys = key_states[0, start:start + self.input_length, :, :]
+            if full_keys.shape[0] != self.input_length:
+                return
+            # Preserve the prefill-resident GPU keys for decode-side traversal scoring.
+            self._decode_keys_gpu[layer_idx] = full_keys.transpose(0, 1).contiguous().detach()
+        except Exception as exc:
+            if not self._decode_gpu_warned:
+                print(
+                    "[RetrievalAttention] WARNING: failed to capture prefill GPU keys for decode traversal; "
+                    f"falling back to CPU scoring. error={type(exc).__name__}: {exc}"
+                )
+                self._decode_gpu_warned = True
+            self._decode_keys_gpu[layer_idx] = None
+
+    def _get_decode_key_tensor_gpu(self, ldx: int, kv_hdx: int):
+        if not self.decode_gpu_keys_enabled:
+            return None
+        layer_keys = self._decode_keys_gpu[ldx]
+        if layer_keys is None:
+            try:
+                device = self.layer_mapping[str(ldx)]
+                layer_keys = self.cpu_keys[ldx][:, :self.input_length, :].to(device, non_blocking=True)
+                self._decode_keys_gpu[ldx] = layer_keys
+                if not self._decode_gpu_key_upload_warned:
+                    print(
+                        "[RetrievalAttention] WARNING: decode GPU key cache was not captured during prefill; "
+                        "falling back to a CPU->GPU key upload."
+                    )
+                    self._decode_gpu_key_upload_warned = True
+            except Exception as exc:
+                if not self._decode_gpu_warned:
+                    print(
+                        "[RetrievalAttention] WARNING: decode GPU key cache unavailable; "
+                        f"falling back to CPU scoring. error={type(exc).__name__}: {exc}"
+                    )
+                    self._decode_gpu_warned = True
+                return None
+        return layer_keys[int(kv_hdx)]
+
+    def _score_decode_tokens_gpu(
+        self,
+        ldx: int,
+        kv_hdx: int,
+        token_ids,
+        q_score_gpu: torch.Tensor,
+    ):
+        if not token_ids:
+            return None
+        keys_gpu = self._get_decode_key_tensor_gpu(ldx, kv_hdx)
+        if keys_gpu is None:
+            return None
+        idx = torch.as_tensor(token_ids, dtype=torch.long, device=keys_gpu.device)
+        cand_k = torch.index_select(keys_gpu, 0, idx).float()
+        cand_k = self._score_transform_torch(cand_k)
+        scores = torch.matmul(q_score_gpu, cand_k.transpose(0, 1))
+        if self.rerank_agg == "mean":
+            return scores.mean(dim=0)
+        return scores.max(dim=0).values
 
     def _build_graph_csr_from_knn_roar_cpp(self, knn: np.ndarray, keys_cpu: np.ndarray):
         meta = {
@@ -3176,6 +3276,7 @@ class retrievalattention_cache(KV_Cache):
         self.static_gpu_keys[layer_idx][:, self.static_pattern_start:, :] = suffix.to(self.layer_mapping[str(layer_idx)])
         self.static_gpu_values[layer_idx][:, :self.static_pattern_start, :] = prefix_v.to(self.layer_mapping[str(layer_idx)])
         self.static_gpu_values[layer_idx][:, self.static_pattern_start:, :] = suffix_v.to(self.layer_mapping[str(layer_idx)])
+        self._capture_prefill_decode_keys_gpu(layer_idx, key_states, valid_start)
 
         if (layer_idx == self.layer_num - 1) and (batch_idx + bsz == self.batch_size):
             self.context += seq_len
@@ -3246,6 +3347,7 @@ class retrievalattention_cache(KV_Cache):
             f"roar_py_gpu={int(self.roar_python_gpu_enabled)}, "
             f"roar_py_gpu_device={self.roar_python_gpu_device}, "
             f"roar_py_gpu_batch={self.roar_python_gpu_batch}, "
+            f"decode_backend={self.decode_backend}, decode_gpu_keys={int(self.decode_gpu_keys_enabled)}, "
             f"graph_weighted={int(self.graph_weighted)}, clique_m={self.graph_clique_m}, "
             f"graph_return_weights={int(self.graph_return_weights)}, graph_weight_dtype={self.graph_weight_dtype_name}, "
             f"roar_nq={self.roar_nq}, roar_l={self.roar_l}, roar_m={self.roar_m}, "
@@ -3559,6 +3661,20 @@ class retrievalattention_cache(KV_Cache):
 
         seed_start = time.perf_counter() if profile is not None else None
         q_seed_cpu = self._score_transform_torch(q_seed.cpu())
+        q_seed_gpu = None
+        if self.decode_python_gpu_enabled:
+            try:
+                q_seed_gpu = self._score_transform_torch(
+                    q_seed.to(self.layer_mapping[str(ldx)], non_blocking=True).float()
+                )
+            except Exception as exc:
+                if not self._decode_gpu_warned:
+                    print(
+                        "[RetrievalAttention] WARNING: failed to move decode query to GPU; "
+                        f"falling back to CPU traversal scoring. error={type(exc).__name__}: {exc}"
+                    )
+                    self._decode_gpu_warned = True
+                q_seed_gpu = None
         seed_scores = {}
         seed_k = max(self.q_knn, self.q_knn * self.seed_k_mult)
         seed_k = min(self.input_length, seed_k)
@@ -3645,14 +3761,18 @@ class retrievalattention_cache(KV_Cache):
                     tok += step
 
             if filtered:
-                idx = torch.tensor(filtered, dtype=torch.long, device="cpu")
-                seed_kv = torch.index_select(self.cpu_keys[ldx][kv_hdx], 0, idx).detach().float().cpu()
-                seed_kv = self._score_transform_torch(seed_kv)
-                seed_sim = torch.matmul(q_seed_cpu, seed_kv.transpose(0, 1))
-                if self.rerank_agg == "mean":
-                    seed_agg = seed_sim.mean(dim=0)
-                else:
-                    seed_agg = seed_sim.max(dim=0).values
+                seed_agg = None
+                if q_seed_gpu is not None:
+                    seed_agg = self._score_decode_tokens_gpu(ldx, kv_hdx, filtered, q_seed_gpu)
+                if seed_agg is None:
+                    idx = torch.tensor(filtered, dtype=torch.long, device="cpu")
+                    seed_kv = torch.index_select(self.cpu_keys[ldx][kv_hdx], 0, idx).detach().float().cpu()
+                    seed_kv = self._score_transform_torch(seed_kv)
+                    seed_sim = torch.matmul(q_seed_cpu, seed_kv.transpose(0, 1))
+                    if self.rerank_agg == "mean":
+                        seed_agg = seed_sim.mean(dim=0)
+                    else:
+                        seed_agg = seed_sim.max(dim=0).values
                 take = min(seed_k, int(seed_agg.shape[0]))
                 if take > 0:
                     vals, pos = torch.topk(seed_agg, k=take, dim=0)
@@ -3841,14 +3961,18 @@ class retrievalattention_cache(KV_Cache):
                             if len(candidates) + len(new_tokens) >= candidate_target:
                                 break
                     if new_tokens:
-                        idx = torch.tensor(new_tokens, dtype=torch.long, device="cpu")
-                        new_k = torch.index_select(self.cpu_keys[ldx][kv_hdx], 0, idx).detach().float().cpu()
-                        new_k = self._score_transform_torch(new_k)
-                        new_scores = torch.matmul(q_seed_cpu, new_k.transpose(0, 1))
-                        if self.rerank_agg == "mean":
-                            agg_new = new_scores.mean(dim=0)
-                        else:
-                            agg_new = new_scores.max(dim=0).values
+                        agg_new = None
+                        if q_seed_gpu is not None:
+                            agg_new = self._score_decode_tokens_gpu(ldx, kv_hdx, new_tokens, q_seed_gpu)
+                        if agg_new is None:
+                            idx = torch.tensor(new_tokens, dtype=torch.long, device="cpu")
+                            new_k = torch.index_select(self.cpu_keys[ldx][kv_hdx], 0, idx).detach().float().cpu()
+                            new_k = self._score_transform_torch(new_k)
+                            new_scores = torch.matmul(q_seed_cpu, new_k.transpose(0, 1))
+                            if self.rerank_agg == "mean":
+                                agg_new = new_scores.mean(dim=0)
+                            else:
+                                agg_new = new_scores.max(dim=0).values
 
                         for i, tok in enumerate(new_tokens):
                             if len(candidates) >= candidate_target:
@@ -3914,15 +4038,19 @@ class retrievalattention_cache(KV_Cache):
 
         rerank_start = time.perf_counter() if profile is not None else None
         if self.rerank:
-            idx = torch.tensor(candidates, dtype=torch.long, device="cpu")
-            cand_k = torch.index_select(self.cpu_keys[ldx][kv_hdx], 0, idx).detach().float().cpu()
-            cand_k = self._score_transform_torch(cand_k)
-            q_rank = self._score_transform_torch(q_group.detach().float().cpu())
-            scores = torch.matmul(q_rank, cand_k.transpose(0, 1))
-            if self.rerank_agg == "mean":
-                agg_scores = scores.mean(dim=0)
-            else:
-                agg_scores = scores.max(dim=0).values
+            agg_scores = None
+            if q_seed_gpu is not None:
+                agg_scores = self._score_decode_tokens_gpu(ldx, kv_hdx, candidates, q_seed_gpu)
+            if agg_scores is None:
+                idx = torch.tensor(candidates, dtype=torch.long, device="cpu")
+                cand_k = torch.index_select(self.cpu_keys[ldx][kv_hdx], 0, idx).detach().float().cpu()
+                cand_k = self._score_transform_torch(cand_k)
+                q_rank = self._score_transform_torch(q_group.detach().float().cpu())
+                scores = torch.matmul(q_rank, cand_k.transpose(0, 1))
+                if self.rerank_agg == "mean":
+                    agg_scores = scores.mean(dim=0)
+                else:
+                    agg_scores = scores.max(dim=0).values
             order = torch.argsort(agg_scores, descending=True).cpu().tolist()
             ranked = [candidates[i] for i in order]
         else:

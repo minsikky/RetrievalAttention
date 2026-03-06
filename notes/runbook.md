@@ -21,6 +21,39 @@
   - `RETRIEVALATTN_TRAVERSAL_EVAL_SAMPLE`: max sampled queries for traversal-efficiency eval.
 
 ## Branch/runtime baseline commands (2026-03-06)
+- Decode traversal backend A/B on controlled ~40k prompt:
+```bash
+# Production CPU decode baseline
+sbatch --job-name=dec32_cpp \
+  --output=slurm-dec32-cpp.out --error=slurm-dec32-cpp.out \
+  --export=ALL,DATA_PATH=benchmark/decode_ab_prompt_32k.json,GEN_LEN=32, \
+RETRIEVALATTN_FA_GRAPH_FUSED=1,RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1, \
+RETRIEVALATTN_DECODE_BACKEND=roar_cpp,RETRIEVALATTN_DECODE_GPU_KEYS=0, \
+RETRIEVALATTN_ROAR_BACKEND=cpp,RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRAVERSAL_EVAL=0 \
+  test.sh
+
+# Python CPU traversal control
+sbatch --job-name=dec32_py \
+  --output=slurm-dec32-py.out --error=slurm-dec32-py.out \
+  --export=ALL,DATA_PATH=benchmark/decode_ab_prompt_32k.json,GEN_LEN=32, \
+RETRIEVALATTN_FA_GRAPH_FUSED=1,RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1, \
+RETRIEVALATTN_DECODE_BACKEND=python,RETRIEVALATTN_DECODE_GPU_KEYS=0, \
+RETRIEVALATTN_ROAR_BACKEND=cpp,RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRAVERSAL_EVAL=0 \
+  test.sh
+
+# Experimental GPU decode path
+sbatch --job-name=dec32_gpu \
+  --output=slurm-dec32-gpu.out --error=slurm-dec32-gpu.out \
+  --export=ALL,DATA_PATH=benchmark/decode_ab_prompt_32k.json,GEN_LEN=32, \
+RETRIEVALATTN_FA_GRAPH_FUSED=1,RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1, \
+RETRIEVALATTN_DECODE_BACKEND=python_gpu,RETRIEVALATTN_DECODE_GPU_KEYS=1, \
+RETRIEVALATTN_ROAR_BACKEND=cpp,RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRAVERSAL_EVAL=0 \
+  test.sh
+```
+- Current conclusion:
+  - `roar_cpp` remains the only practical decode traversal backend here.
+  - `python_gpu` is slower than both `roar_cpp` and the same Python traversal on CPU.
+  - treat `python_gpu` as a failed experiment unless the traversal loop itself is moved out of Python.
 - Current tree, 32k, native fused GPU graph baseline:
 ```bash
 sbatch --job-name=cmp32_native \

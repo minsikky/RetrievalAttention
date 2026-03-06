@@ -7,6 +7,70 @@
 - Primary benchmark flow now: `test.sh` first, then RULER subset/full.
 
 ## 2026-03-06 update (baseline map + current status)
+- Decode traversal GPU experiment (controlled ~40k prompt, `GEN_LEN=32`):
+  - workload:
+    - `DATA_PATH=benchmark/decode_ab_prompt_32k.json`
+    - actual prompt length reported by `simple_test.py`: `Input length: 40001`
+    - same prefill path for all runs:
+      - `RETRIEVALATTN_FA_GRAPH_FUSED=1`
+      - `RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1`
+  - production CPU decode baseline:
+    - `44436176` (`dec32_cpp`)
+    - `RETRIEVALATTN_DECODE_BACKEND=roar_cpp`
+    - `Prefilling latency: 132.6654 s`
+    - `Decoding latency: 55.3619 s`
+    - `decode_profile`:
+      - `retrieve=42.786 s`
+      - `seed=10.611 s`
+      - `graph=21.183 s`
+      - `rerank=8.338 s`
+      - `visited_total=13414695`
+      - `candidates_total=12425410`
+  - Python CPU control:
+    - `44436598` (`dec32_py`)
+    - `RETRIEVALATTN_DECODE_BACKEND=python`
+    - `Prefilling latency: 132.7876 s`
+    - `Decoding latency: 200.4628 s`
+    - `decode_profile`:
+      - `retrieve=183.327 s`
+      - `seed=11.558 s`
+      - `graph=159.083 s`
+      - `rerank=9.588 s`
+      - `visited_total=7613077`
+      - `candidates_total=9763681`
+  - experimental GPU decode path:
+    - `44436175` (`dec32_gpu`)
+    - `RETRIEVALATTN_DECODE_BACKEND=python_gpu`
+    - `RETRIEVALATTN_DECODE_GPU_KEYS=1`
+    - implementation detail:
+      - this is not a native GPU traversal kernel,
+      - it keeps the current Python traversal loop,
+      - it captures prefill keys on GPU and moves seed/new-candidate/rerank scoring matmuls to GPU.
+    - `Prefilling latency: 133.0144 s`
+    - `Decoding latency: 275.1208 s`
+    - `decode_profile`:
+      - `retrieve=262.789 s`
+      - `seed=16.252 s`
+      - `graph=235.936 s`
+      - `rerank=8.164 s`
+      - `visited_total=7613077`
+      - `candidates_total=9763681`
+  - interpretation:
+    - against the production CPU C++ decode backend, the experimental GPU path is much worse (`275.1 s` vs `55.4 s` decode).
+    - the production comparison is not apples-to-apples because `roar_cpp` and Python traversal use different algorithms.
+    - the apples-to-apples comparison is `python` vs `python_gpu`, and there the GPU path is still worse:
+      - total decode: `275.1 / 200.5 ~= 1.37x` slower
+      - retrieve stage: `262.8 / 183.3 ~= 1.43x` slower
+      - graph stage: `235.9 / 159.1 ~= 1.48x` slower
+    - `python` and `python_gpu` have identical `visited_total` / `candidates_total`, so the traversal logic stayed aligned.
+    - rerank got slightly better on GPU (`8.164 s` vs `9.588 s`), but seed/graph stages got much worse.
+  - decision:
+    - do not pursue the current Python-controlled GPU decode path as a performance direction.
+    - if GPU decode traversal is revisited, it needs a more native design:
+      - persistent GPU frontier/visited structures
+      - batched neighbor expansion
+      - batched or fused scoring across many nodes / heads / steps
+      - ideally C++/CUDA or Triton rather than Python control flow
 - Important branch/runtime caveat:
   - branch names do not currently map cleanly to distinct runtime families.
   - `cpu_graph_builder_opt` commit `bf4ab79` only adds CPU graph-builder parity harness scripts; it does not define a separate GPU+CPU runtime.

@@ -1,5 +1,50 @@
 # Findings Log
 
+## 2026-03-06 update (decode traversal GPU experiment)
+- Added experimental decode backend parsing on current tree:
+  - `RETRIEVALATTN_DECODE_BACKEND=auto|python|roar_cpp|python_gpu`
+  - `RETRIEVALATTN_DECODE_GPU_KEYS=0|1`
+- Fixed stale bug where decode backend had effectively been hardcoded to `roar_cpp`.
+- Implemented experimental `python_gpu` decode path:
+  - captures full prefill keys on GPU during `prefill_update_kv_cache`,
+  - falls back to lazy CPU->GPU upload only if capture is missing,
+  - keeps the current Python traversal policy,
+  - moves seed scoring, traversal candidate scoring, and final rerank scoring to GPU.
+- Controlled decode A/B workload:
+  - `DATA_PATH=benchmark/decode_ab_prompt_32k.json`
+  - actual prompt length = `40001`
+  - `GEN_LEN=32`
+  - fused native graph prefill enabled in all cases.
+- Results:
+  - `44436176` / `slurm-dec32-cpp.out` (`roar_cpp`):
+    - `Decoding latency: 55.3619 s`
+    - `retrieve=42.786 s` with `[seed=10.611 s, graph=21.183 s, rerank=8.338 s]`
+  - `44436598` / `slurm-dec32-py.out` (`python`):
+    - `Decoding latency: 200.4628 s`
+    - `retrieve=183.327 s` with `[seed=11.558 s, graph=159.083 s, rerank=9.588 s]`
+    - `visited_total=7613077`, `candidates_total=9763681`
+  - `44436175` / `slurm-dec32-gpu.out` (`python_gpu`):
+    - `Decoding latency: 275.1208 s`
+    - `retrieve=262.789 s` with `[seed=16.252 s, graph=235.936 s, rerank=8.164 s]`
+    - `visited_total=7613077`, `candidates_total=9763681`
+- Interpretation:
+  - `python_gpu` is much slower than production `roar_cpp`.
+  - apples-to-apples, `python_gpu` is also slower than `python`:
+    - decode `1.37x` slower
+    - retrieve `1.43x` slower
+    - graph stage `1.48x` slower
+  - same visited/candidate counts between `python` and `python_gpu` indicate no traversal-policy drift;
+    the slowdown is backend overhead, not a different walk.
+  - likely cause:
+    - many small GPU scoring launches and synchronizations inside the Python frontier loop
+    - not enough arithmetic intensity per launch to beat CPU traversal
+  - minor positive signal:
+    - final rerank is slightly faster on GPU (`8.164 s` vs `9.588 s`)
+    - but this is dominated by much slower graph/seed stages
+- Decision:
+  - do not pursue the current Python + GPU-scoring decode path
+  - future GPU decode work should target a native / batched traversal design, not Python + micro-kernel scoring
+
 ## 2026-03-06 update (baseline comparison + branch/runtime map)
 - Branch map correction:
   - `cpu_graph_builder_opt` tip commit `bf4ab79` is not a separate GPU+CPU runtime branch; it only adds CPU graph-builder parity harness scripts.
