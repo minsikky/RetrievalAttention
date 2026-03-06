@@ -482,6 +482,14 @@ Decision rule:
   - `q_head`: fused top-k is expected as `[seq, num_heads, q_knn]`.
   - `kv_head`: legacy behavior keyed by KV heads.
   - current graph design is shared per KV head in both modes; `q_head` mainly controls per-head retrieval/seed/rerank behavior.
+- `RETRIEVALATTN_KV_GRAPH_AB`: offline recall-harness A/B for true kv-head graph quality on the current tree.
+  - `0` default.
+  - `1`: build an alternate kv-head graph from exact grouped queries using the same builder, and report:
+    - `kv_proxy`: grouped-query exact top-k overlap vs q-head target
+    - `kv_proxy_traversal`: grouped-query traversal on the current q-head graph
+    - `kv_graph_traversal`: true traversal recall on the alternate kv-head graph
+- `RETRIEVALATTN_KV_GRAPH_AB_Q_BLOCK`: GPU q-block size for the offline exact grouped-query top-k helper (`512` default).
+- `RETRIEVALATTN_KV_GRAPH_AB_K_BLOCK`: GPU k-block size for the offline exact grouped-query top-k helper (`4096` default).
 - `RETRIEVALATTN_FA_SHADOW_COMPARE`: in fused-prefill mode, run sampled parity check vs baseline GPU-topk (layer0/head0).
 - `RETRIEVALATTN_FA_SHADOW_SAMPLE`: number of sampled queries used in fused shadow compare.
 - Note: native graph-fused symbol (`fwd_kvcache_retrieval_graph`) is now patched in flash-attn source; until rebuilt on compute, runtime may still use Python graph-fused fallback.
@@ -578,6 +586,56 @@ Decision rule:
   - extension has symbol `fwd_kvcache_retrieval_graph`,
   - profile path is `native_kernel_fused_graph`,
   - output includes `[OK] flash_attn_with_kvcache_retrieval_graph smoke test passed.`
+
+## True kv-head graph A/B
+- Purpose:
+  - compare q-head graph traversal vs a true grouped-query-built kv-head graph on the same current-tree harness.
+- Recommended small decisive run:
+```bash
+RECALL_ONLY=1 \
+RECALL_INPUT_TOKENS=8192 \
+RETRIEVALATTN_FA_GRAPH_FUSED=0 \
+RETRIEVALATTN_ROAR_BACKEND=cpp \
+RETRIEVALATTN_VALIDATE_PARITY=1 \
+RETRIEVALATTN_KV_GRAPH_AB=1 \
+RETRIEVALATTN_PARITY_LAYERS=2 \
+RETRIEVALATTN_PARITY_HEADS=32 \
+RETRIEVALATTN_PARITY_SAMPLE=256 \
+RETRIEVALATTN_GRAPH_TRAIN_FRAC=0.9 \
+RETRIEVALATTN_GRAPH_SPLIT=stratified \
+RETRIEVALATTN_GRAPH_SPLIT_SEED=1234 \
+RETRIEVALATTN_PARITY_HOLDOUT_ONLY=1 \
+RETRIEVALATTN_TRAVERSAL_EVAL=1 \
+RETRIEVALATTN_TRAVERSAL_EVAL_SAMPLE=64 \
+sbatch test.sh
+```
+- Higher-budget follow-up:
+```bash
+RECALL_ONLY=1 \
+RECALL_INPUT_TOKENS=8192 \
+RETRIEVALATTN_FA_GRAPH_FUSED=0 \
+RETRIEVALATTN_ROAR_BACKEND=cpp \
+RETRIEVALATTN_VALIDATE_PARITY=1 \
+RETRIEVALATTN_KV_GRAPH_AB=1 \
+RETRIEVALATTN_PARITY_LAYERS=2 \
+RETRIEVALATTN_PARITY_HEADS=32 \
+RETRIEVALATTN_PARITY_SAMPLE=256 \
+RETRIEVALATTN_GRAPH_TRAIN_FRAC=0.9 \
+RETRIEVALATTN_GRAPH_SPLIT=stratified \
+RETRIEVALATTN_GRAPH_SPLIT_SEED=1234 \
+RETRIEVALATTN_PARITY_HOLDOUT_ONLY=1 \
+RETRIEVALATTN_TRAVERSAL_EVAL=1 \
+RETRIEVALATTN_TRAVERSAL_EVAL_SAMPLE=64 \
+RETRIEVALATTN_EXPAND_WIDTH=96 \
+RETRIEVALATTN_MIN_VISITS=1024 \
+RETRIEVALATTN_MAX_VISITS=8192 \
+RETRIEVALATTN_CAND_MULT=8 \
+sbatch test.sh
+```
+- Interpretation:
+  - compare `traversal.recall_mean` vs `kv_graph_traversal.recall_mean`
+  - if `kv_graph_traversal` collapses while `kv_proxy_traversal` stays close, the grouped-query-built graph is the failure mode
+  - current result already showed that; keep q-head graph construction
 
 ## Next workstream
 - Prioritize decode traversal refactor to beam-search style (paper-aligned):
