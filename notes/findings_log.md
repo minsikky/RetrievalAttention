@@ -1,6 +1,10 @@
 # Findings Log
 
 ## 2026-03-06 update (decode traversal GPU experiment)
+- preservation:
+  - experiment preserved at branch `exp/decode-python-gpu`
+  - snapshot commit: `efc234f`
+  - active runtime has been cleaned back to `auto|python|roar_cpp`
 - Added experimental decode backend parsing on current tree:
   - `RETRIEVALATTN_DECODE_BACKEND=auto|python|roar_cpp|python_gpu`
   - `RETRIEVALATTN_DECODE_GPU_KEYS=0|1`
@@ -44,6 +48,7 @@
 - Decision:
   - do not pursue the current Python + GPU-scoring decode path
   - future GPU decode work should target a native / batched traversal design, not Python + micro-kernel scoring
+  - the experimental implementation should be treated as historical only; replay it from `exp/decode-python-gpu`
 
 ## 2026-03-06 update (baseline comparison + branch/runtime map)
 - Branch map correction:

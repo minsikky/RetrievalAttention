@@ -8,6 +8,10 @@
 
 ## 2026-03-06 update (baseline map + current status)
 - Decode traversal GPU experiment (controlled ~40k prompt, `GEN_LEN=32`):
+  - preservation:
+    - experiment preserved at branch `exp/decode-python-gpu`
+    - snapshot commit: `efc234f`
+    - active runtime no longer carries the `python_gpu` decode backend
   - workload:
     - `DATA_PATH=benchmark/decode_ab_prompt_32k.json`
     - actual prompt length reported by `simple_test.py`: `Input length: 40001`

@@ -22,6 +22,9 @@
 
 ## Branch/runtime baseline commands (2026-03-06)
 - Decode traversal backend A/B on controlled ~40k prompt:
+- Historical experiment note:
+  - these `python_gpu` commands are for the preserved experiment branch only.
+  - replay from branch `exp/decode-python-gpu` at commit `efc234f`.
 ```bash
 # Production CPU decode baseline
 sbatch --job-name=dec32_cpp \
