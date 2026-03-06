@@ -1,5 +1,211 @@
 # Findings Log
 
+## 2026-03-06 update (baseline comparison + branch/runtime map)
+- Branch map correction:
+  - `cpu_graph_builder_opt` tip commit `bf4ab79` is not a separate GPU+CPU runtime branch; it only adds CPU graph-builder parity harness scripts.
+  - the old GPU-topk + CPU-graph runtime exists in older commits such as `c90fa94` / `8e9cdfc`.
+  - `gpu_top_k` tip (`ad4d23e`) is already on the fused-prefill runtime line.
+  - current working tree on `cpu_graph_builder_opt` contains uncommitted native-kernel experiments and should be treated as a separate experimental state.
+- Clean 32k comparison on the current tree:
+  - `44431973` (`cmp32_cpugpu`): path=`native_kernel_fused` + CPU `roar_cpp` graph build => `Prefilling latency: 143.6257 s`.
+  - `44431974` (`cmp32_native`): path=`native_kernel_fused_graph` => `Prefilling latency: 97.0912 s`.
+  - `44431975` (`cmp32_torch`): path=`python_retrieval_graph_wrapper` => `Prefilling latency: 115.461 s`.
+  - conclusion: on the current codebase, fused-native GPU graph build is the best 32k baseline.
+- Clean 64k comparison on the current tree:
+  - `44432451` (`cmp64_native`): path=`native_kernel_fused_graph` => `Prefilling latency: 369.7804 s`.
+    - steady-state per-layer fused retrieval: `native_retrieval_kernel_sec ~= 10.4-10.7 s`
+    - steady-state per-layer fused graph build: `native_graph_sec ~= 0.06 s`
+  - `44432452` (`cmp64_torch`): path=`python_retrieval_graph_wrapper` => `Prefilling latency: 459.9199 s`.
+    - steady-state per-layer wrapper top-k: `topk_sec ~= 13.27-13.28 s`
+    - steady-state per-layer graph build: `graph_sec ~= 0.27 s`
+  - `44432453` (`cmp64_cpugpu`): path=`native_kernel_fused` + CPU `roar_cpp` graph build => `Prefilling latency: 422.4145 s`.
+  - conclusion: 64k preserves the same ordering as 32k:
+    - native fused GPU graph < current GPU+CPU < forced Torch/Python GPU top-k
+    - native fused is ~`1.24x` faster than Torch/Python end-to-end at 64k.
+- Native q-head vs kv-head quality proxy (same current native path, 8k holdout recall run):
+  - job: `44432612`
+  - log: `slurm-kvqh-proxy-8k-v2.out`
+  - setup:
+    - current native fused graph path,
+    - `RECALL_ONLY=1`,
+    - `RECALL_INPUT_TOKENS=8192`,
+    - holdout queries only (`GRAPH_TRAIN_FRAC=0.9`, `PARITY_HOLDOUT_ONLY=1`),
+    - parity over first 2 layers / 8 heads.
+  - result:
+    - q-head native parity remained exact: `recall_weighted = 1.0`
+    - grouped kv-head proxy recall dropped to `kv_proxy.recall_weighted = 0.764678955078125`
+  - interpretation:
+    - replacing per-q-head retrieval with grouped KV-head-average retrieval loses about `23.5%` of the true q-head top-8 mass on this test.
+    - this supports keeping q-head as the retrieval objective.
+- Native q-head vs kv-head traversal proxy (same current native path, same 8k holdout setup):
+  - job: `44432670`
+  - log: `slurm-kvqh-trav-8k.out`
+  - result:
+    - q-head traversal recall: `traversal.recall_mean = 0.77978515625`
+    - grouped kv-head query traversal proxy: `kv_proxy_traversal.recall_mean = 0.7744140625`
+  - interpretation:
+    - grouped KV-head queries only reduced traversal recall slightly on the current q-head-built graph (`~0.54` percentage points absolute),
+    - much smaller than the exact top-k mismatch (`kv_proxy.recall_weighted ~= 0.7647`).
+    - likely reason: current traversal recall is already dominated by graph/search limitations, so grouped-query degradation is mostly masked in traversal.
+  - caveat:
+    - this is not yet a full kv-head graph-build experiment; it uses grouped KV-head queries on the current q-head-built graph.
+- True graph A/B on current tree (same builder, same q-head holdout queries, same traversal policy):
+  - implementation:
+    - `RETRIEVALATTN_KV_GRAPH_AB=1`
+    - current q-head graph comes from the normal current-tree path (`native top-k + current CPU graph build`)
+    - alternate kv-head graph is built offline from exact grouped KV-head queries using the same `roar_cpp` builder
+  - `8k` base-budget run:
+    - job: `44432809`
+    - log: `slurm-kvab_8k_base.out`
+    - summary:
+      - q-head graph traversal recall: `0.8123779296875`
+      - grouped-query-on-q-graph traversal proxy: `0.8392333984375`
+      - true kv-head graph traversal recall: `0.209228515625`
+  - `8k` high-budget run:
+    - job: `44432812`
+    - log: `slurm-kvab_8k_high.out`
+    - summary:
+      - q-head graph traversal recall: `0.8900146484375`
+      - grouped-query-on-q-graph traversal proxy: `0.9190673828125`
+      - true kv-head graph traversal recall: `0.2587890625`
+  - interpretation:
+    - the grouped query itself is not the main problem.
+    - the grouped-query-built kv-head graph is the problem.
+    - increasing traversal budget does **not** rescue the kv-head graph.
+    - therefore kv-head graph construction should be rejected for quality-sensitive use; keep q-head graph construction.
+- Old path from `c90fa94` (exported tree on GPFS, job `44432065`):
+  - config: `RETRIEVALATTN_FA_FUSED_PREFILL=0`, `RETRIEVALATTN_GPU_TOPK=1`, `RETRIEVALATTN_ROAR_BACKEND=cpp`.
+  - log reports `mode=gpu_topk`.
+  - result: `Prefilling latency: 100.0403 s`.
+  - this is much better than the current branch's CPU-graph path (`143.6 s`) and close to the fused-native baseline (`97.1 s`).
+  - caveat: `c90fa94` uses `retrieval_heads=8`, `retrieval_head_mode=kv_head`; this is not apples-to-apples with the current q-head fused baseline.
+ - Matched old-path speed-only reruns from separate exported trees:
+   - `44432245`: old `gpu_topk` with `retrieval_head_mode=kv_head` => `Prefilling latency: 97.6988 s`.
+   - `44432246`: patched old `gpu_topk` with `retrieval_head_mode=q_head` => `Prefilling latency: 218.2938 s`.
+   - interpretation:
+     - the old runtime family only looks competitive in `kv_head` mode.
+     - once made apples-to-apples with `q_head`, it becomes much slower than both the current-tree q-head CPU+GPU path (`143.6257 s`) and the current-tree fused-native q-head path (`97.0912 s`).
+     - therefore `c90fa94` should be treated only as a kv-head lower-bound reference, not a q-head optimization baseline.
+- Best known 119k fused-native baseline remains:
+  - `slurm-44245076.out`: steady-state `native_core_sec ~= 19.9 s/layer`, total prefill `670.8404 s`.
+- Current regressed 119k fused-native state:
+  - `slurm-44370482.out`: steady-state `native_core_sec ~= 35.3 s/layer`.
+- `v3_warpk8` experiment result:
+  - compiles and runs.
+  - 8k parity ok.
+  - 32k A/B: no useful speedup.
+  - `ncu` comparison vs v2:
+    - `registers/thread`: `190 -> 213`
+    - `theoretical occupancy`: unchanged at `16.67%`
+    - `eligible warps / scheduler`: slightly worse
+    - `kernel duration`: slightly worse
+  - conclusion: failed experiment; do not use as default baseline.
+- Forced Python/Torch GPU top-k path:
+  - added `RETRIEVALATTN_FA_FORCE_PYTHON_TOPK=1`.
+  - fixed correctness issues:
+    - causal masking in `_retrieval_group_topk_blockwise(...)`,
+    - Python GPU graph builder now uses first dynamic token as pivot (matching native path),
+    - parity logic now keys off `retrieval_causal` in profile.
+  - after fixes:
+    - 8k parity restored to `1.0` (`44429181`),
+    - 32k still slower than native fused (`44429201`: `117.5961 s`).
+  - conclusion: functionally usable, not performance baseline.
+- Practical baseline recommendation:
+  - q-head target baseline: `44431974` (`native_kernel_fused_graph`).
+  - kv-head lower-bound reference: `44432065` (`c90fa94`, `mode=gpu_topk`).
+  - for future comparisons, ignore the old runtime family and compare only the current-tree paths:
+    - native fused GPU graph,
+    - current GPU+CPU finalize path,
+    - forced Torch/Python GPU top-k path.
+
+## 2026-03-04 update (implemented kernel optimization checkpoint)
+- Implemented first pass of retrieval-kernel optimization hooks and v2 local path:
+  - native env controls:
+    - `RETRIEVALATTN_FA_KERNEL_MODE=legacy|v2_local|v2_splitk`
+    - `RETRIEVALATTN_FA_SPLITK=auto|0|N`
+  - legacy keeps split=1, v2 uses split heuristic when enabled.
+- Replaced earlier quadratic batched row scan logic in `retrieval_update_fragment_topk`:
+  - now single-pass fragment traversal with fixed row slots and one lock-merge per slot,
+  - per-score legacy fallback for rare slot overflow.
+- Added profile visibility for new mode/split in graph-fused native timing payload:
+  - `retrieval_kernel_mode`,
+  - `retrieval_effective_splits`.
+- Pending verification:
+  - build + A/B jobs submitted (`44297529`, `44297531`, `44297532`) to measure whether v2 path reduces `native_core_sec`.
+
+## 2026-03-04 update (single-compile true-v2 batch)
+- Added split-k retrieval updates to split-KV flash kernel loops:
+  - retrieval top-k now updates during split kernel execution (not only non-split path).
+- Added split-local top-k output mode (`RETRIEVALATTN_FA_KERNEL_MODE=v2_splitk`):
+  - kernel writes per-split retrieval buffers,
+  - final GPU reduction merges per-split candidates using `topk + gather`.
+- Added split-stride metadata in `Flash_fwd_params` for retrieval tensors.
+- Updated mode semantics:
+  - `legacy` -> mode `0`,
+  - `v2_local` -> mode `1`,
+  - `v2_splitk` -> mode `2`.
+- Updated split heuristic for mode `2` to be more aggressive on long contexts.
+- `test.sh` default switched to `RETRIEVALATTN_FA_KERNEL_MODE=v2_splitk`.
+- Rebuild submitted after batching all edits:
+  - `44298163` (later canceled as stale after instrumentation edits).
+
+## 2026-03-04 update (kernel instrumentation for debug/profiling)
+- Added kernel-phase profiling knobs:
+  - `RETRIEVALATTN_FA_KERNEL_PROFILE=1` enables retrieval-phase timing lines.
+  - `RETRIEVALATTN_FA_KERNEL_DEBUG=1` enables retrieval debug counters.
+- Native retrieval now emits:
+  - `native_retrieval_profile` with `kernel/merge/total` timing breakdown.
+  - `native_retrieval_debug` with counter summary:
+    - `cand_total`, `in_bounds`, `causal_filtered`, `norm_filtered`,
+      `locked_calls`, `local_calls`, `overflow_fallback`, `merged_rows`.
+- Added optional timing payload from `fwd_kvcache_retrieval` and wired it through Python profile parsing.
+- Extended graph-fused timing payload/profile parsing with:
+  - `retrieval_split_outputs`,
+  - `native_retrieval_kernel_sec`,
+  - `native_retrieval_merge_sec`,
+  - `native_retrieval_total_sec`.
+- `test.sh` now logs/forwards both kernel instrumentation env flags.
+- Build sequence after instrumentation:
+  - canceled stale build: `44298163`
+  - resubmitted build: `44298703` (failed compile).
+- Compile failure detail (`slurm-44298703.out`):
+  - duplicate `cS` / `tScS` declaration in non-split kernel scope,
+  - missing `tScS` in split-kernel scope where retrieval update is called.
+- Fix applied:
+  - removed duplicate non-split declaration,
+  - added split-scope `cS/tScS` near split-kernel MMA fragment setup.
+- Rebuild resubmitted: `44298749`.
+
+## 2026-03-04 update (top-k batched merge A/B regression)
+- A/B results on identical long-context config (`~119k` prefill tokens):
+  - `slurm-44245119.out` (`RETRIEVALATTN_FA_TOPK_BATCHED=0`): `native_core_sec` mean `~34.10s/layer`.
+  - `slurm-44245120.out` (`RETRIEVALATTN_FA_TOPK_BATCHED=1`): `native_core_sec` mean `~71.45s/layer`.
+  - previous baseline (`slurm-44245076.out`): `native_core_sec` mean `~19.87s/layer`.
+- Conclusion:
+  - current batched-merge implementation is a regression and should not be default.
+- Root-cause hypothesis from kernel structure:
+  - batched path adds quadratic per-fragment work (`seen_row` scan + per-row full `j` rescan in `flash_fwd_kernel.h`),
+  - lock reduction did not compensate for the added compute/divergence overhead.
+- Immediate safety change:
+  - default switched back to legacy path:
+    - `flash_api.cpp`: `RETRIEVALATTN_FA_TOPK_BATCHED` now defaults OFF.
+    - `test.sh`: `RETRIEVALATTN_FA_TOPK_BATCHED` default set to `0`.
+- Next action:
+  - replace this batched path with a true lock-free online top-k design (single-pass fragment accumulation, no O(n^2) row scans).
+
+## 2026-03-03 update (graph-fused prefill prototype)
+- Added graph-fused prefill runtime integration (flagged) in RetrievalAttention path:
+  - prefill wrapper can now call `flash_attn_with_kvcache_retrieval_graph(...)`,
+  - cache can consume fused graph payload and bypass CPU Roar graph build.
+- Added quality guard for rollout:
+  - `RETRIEVALATTN_FA_GRAPH_FUSED_CHECK` + `RETRIEVALATTN_FA_GRAPH_FUSED_QUALITY_FLOOR` fallback to legacy graph build when strict traversal recall is below floor.
+- Current limitation:
+  - this is **not** yet a native flash-attn fused CUDA graph kernel.
+  - graph build currently runs in Python interface via GPU torch ops over top-k output.
+- Native kernel status:
+  - interface support for `fwd_kvcache_retrieval_graph` probing is added,
+  - extension symbol itself is not implemented yet in `flash_api.cpp`/CUDA.
+
 ## 2026-03-03 update (decode complexity sweep automation)
 - Added sweep submission automation:
   - `benchmark/submit_decode_complexity_sweep.py`
@@ -466,6 +672,35 @@
 - Live-run behavior note:
   - logs may show many `fused_overlap submit layer=...` lines before any `index built layer=... head=...`.
   - with `RETRIEVALATTN_FUSED_PREFILL_OVERLAP_WORKERS=1`, this indicates queue backlog and CPU finalize bottleneck rather than GPU stall.
+
+### 2026-03-03 update (native flash-attn graph-fused symbol added in source)
+- Added `fwd_kvcache_retrieval_graph` to `third_party/flash-attn-ra/csrc/flash_attn/flash_api.cpp`.
+- Implementation path:
+  - call native `mha_fwd_kvcache_retrieval` first (attention + fused top-k),
+  - build graph neighbors directly in C++ using CUDA tensor ops (`unique` + stable lexicographic ranking + per-node degree cap),
+  - return native outputs with graph neighbors appended.
+- Motivation:
+  - remove Python-level graph build overhead and make graph-fused prefill available through a native extension symbol.
+- Current status:
+  - code patch is complete and validated by smoke on CUDA compute.
+
+### 2026-03-03 update (native graph-fused build/smoke fixes)
+- First rebuild attempt failed (`slurm-44244667.out`) due C++ tensor API mismatches in new graph helper:
+  - unsupported tensor bitshift operators (`<<`, `>>`),
+  - template parse issue on `item<bool>()`,
+  - bool-mask indexing form rejected by compiler.
+- Applied fixes in `flash_api.cpp`:
+  - replaced bitshift packing with arithmetic packing (`src * (1<<32) + dst`) and arithmetic unpacking,
+  - replaced mask filtering with `at::masked_select`,
+  - replaced `item<bool>()` checks with `item().toBool()`.
+- Second run built but smoke failed due return-arity mismatch (`too many values to unpack`):
+  - `fwd_kvcache_retrieval_graph` returned 5 tensors (included retrieval scores).
+  - fixed contract to return 4 tensors expected by Python wrapper:
+    - `(out, softmax_lse, retrieval_indices, graph_neighbors)`.
+- Final validation:
+  - build success: `slurm-44244822.out`,
+  - smoke success: `slurm-44244823.out`,
+  - smoke profile confirms native path: `path=native_kernel_fused_graph`.
 
 ### Reference logs
 - Baseline quality reference: `simple_test.out`
