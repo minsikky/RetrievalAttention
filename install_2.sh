@@ -35,10 +35,31 @@ export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
 #   A100: FLASH_ATTN_CUDA_ARCHS=80 TORCH_CUDA_ARCH_LIST=8.0
 export FLASH_ATTN_CUDA_ARCHS="${FLASH_ATTN_CUDA_ARCHS:-80;86}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0;8.6}"
-export MAX_JOBS="${MAX_JOBS:-${SLURM_CPUS_PER_TASK:-16}}"
 export NVCC_THREADS="${NVCC_THREADS:-4}"
 export FLASH_ATTENTION_FORCE_BUILD=TRUE
 export FLASH_ATTN_INCREMENTAL="${FLASH_ATTN_INCREMENTAL:-1}"
+export FLASH_ATTN_DISABLE_BWD="${FLASH_ATTN_DISABLE_BWD:-1}"
+export FLASH_ATTN_LINEINFO="${FLASH_ATTN_LINEINFO:-0}"
+export FLASH_ATTN_MINIMAL_LLAMA="${FLASH_ATTN_MINIMAL_LLAMA:-1}"
+export NINJA_STATUS="${NINJA_STATUS:-[%f/%t %o/sec] }"
+export FLASH_ATTN_CLEAN="${FLASH_ATTN_CLEAN:-0}"
+# Keep build temporaries in a per-job tmp dir for easier diagnostics.
+export FLASH_ATTN_TMPDIR="${FLASH_ATTN_TMPDIR:-/tmp/${USER:-user}/flashattn_${SLURM_JOB_ID:-manual}}"
+mkdir -p "${FLASH_ATTN_TMPDIR}"
+export TMPDIR="${FLASH_ATTN_TMPDIR}"
+
+# Avoid compiler oversubscription: nvcc --threads=N already adds internal parallelism.
+# If MAX_JOBS isn't provided, derive a conservative default from allocated CPUs.
+if [ -z "${MAX_JOBS:-}" ]; then
+  _cpu_budget="${SLURM_CPUS_PER_TASK:-16}"
+  _jobs=$(( _cpu_budget / NVCC_THREADS ))
+  if [ "${_jobs}" -lt 1 ]; then
+    _jobs=1
+  fi
+  export MAX_JOBS="${_jobs}"
+else
+  export MAX_JOBS
+fi
 
 echo "[INFO] host=$(hostname)"
 echo "[INFO] python=$(which python)"
@@ -50,6 +71,12 @@ echo "[INFO] TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}"
 echo "[INFO] MAX_JOBS=${MAX_JOBS}"
 echo "[INFO] NVCC_THREADS=${NVCC_THREADS}"
 echo "[INFO] FLASH_ATTN_INCREMENTAL=${FLASH_ATTN_INCREMENTAL}"
+echo "[INFO] FLASH_ATTN_DISABLE_BWD=${FLASH_ATTN_DISABLE_BWD}"
+echo "[INFO] FLASH_ATTN_LINEINFO=${FLASH_ATTN_LINEINFO}"
+echo "[INFO] FLASH_ATTN_MINIMAL_LLAMA=${FLASH_ATTN_MINIMAL_LLAMA}"
+echo "[INFO] NINJA_STATUS=${NINJA_STATUS}"
+echo "[INFO] FLASH_ATTN_CLEAN=${FLASH_ATTN_CLEAN}"
+echo "[INFO] TMPDIR=${TMPDIR}"
 python - <<'PY'
 import os, torch
 print("[INFO] torch:", torch.__version__)
@@ -57,8 +84,15 @@ print("[INFO] torch.cuda:", torch.version.cuda)
 print("[INFO] CUDA_HOME:", os.environ.get("CUDA_HOME"))
 PY
 
-NEED_EDITABLE_INSTALL=0
-python - <<'PY' || NEED_EDITABLE_INSTALL=1
+if [ "${FLASH_ATTN_CLEAN}" = "1" ]; then
+  echo "[INFO] Cleaning flash-attn build artifacts..."
+  rm -rf build dist *.egg-info
+  rm -f flash_attn_2_cuda*.so
+fi
+
+if [ "${FLASH_ATTN_INCREMENTAL}" = "1" ]; then
+  NEED_EDITABLE_INSTALL=0
+  python - <<'PY' || NEED_EDITABLE_INSTALL=1
 import importlib, os, sys
 repo = os.path.realpath(os.getcwd())
 try:
@@ -70,17 +104,14 @@ if mod_path.startswith(repo):
     sys.exit(0)
 sys.exit(1)
 PY
-if [ "${NEED_EDITABLE_INSTALL}" -ne 0 ]; then
-  echo "[INFO] Installing editable flash_attn package once..."
-  pip install --no-build-isolation --no-deps -v -e .
+  if [ "${NEED_EDITABLE_INSTALL}" -ne 0 ]; then
+    echo "[INFO] Editable flash_attn not installed from this repo; running one-time editable install..."
+    pip install --no-build-isolation --no-deps -v -e .
+  else
+    echo "[INFO] Editable flash_attn already installed. Running incremental in-place rebuild..."
+    python setup.py build_ext --inplace
+  fi
 else
-  echo "[INFO] Editable flash_attn already installed."
-fi
-
-if [ "${FLASH_ATTN_INCREMENTAL}" = "1" ]; then
-  echo "[INFO] Running incremental in-place rebuild (setup.py build_ext --inplace)..."
-  python setup.py build_ext --inplace
-else
-  echo "[INFO] Running full pip editable rebuild..."
+  echo "[INFO] Running full pip editable rebuild (single pass)..."
   pip install --no-build-isolation --no-deps -v -e .
 fi
