@@ -9,7 +9,6 @@
   - `RETRIEVALATTN_GPU_TOPK`,
   - `RETRIEVALATTN_CUSTOM_QK_TOPK*`,
   - `RETRIEVALATTN_GRAPH_BUILDER`,
-  - `RETRIEVALATTN_ROAR_BACKEND`,
   - `RETRIEVALATTN_Q_BLOCK`, `RETRIEVALATTN_K_BLOCK`,
   - `RETRIEVALATTN_OVERLAP`, `RETRIEVALATTN_LAYER_GPU_CACHE`.
 - `RETRIEVALATTN_FA_SHADOW_COMPARE` is deprecated and ignored in fused-only runtime.
@@ -20,6 +19,109 @@
   - `RETRIEVALATTN_PARITY_HOLDOUT_ONLY` (`0|1`): when enabled, parity/recall samples only from holdout rows.
   - `RETRIEVALATTN_TRAVERSAL_EVAL` (`0|1`): run traversal-efficiency eval during parity (forced to `1` in `RECALL_ONLY=1` mode).
   - `RETRIEVALATTN_TRAVERSAL_EVAL_SAMPLE`: max sampled queries for traversal-efficiency eval.
+
+## Branch/runtime baseline commands (2026-03-06)
+- Current tree, 32k, native fused GPU graph baseline:
+```bash
+sbatch --job-name=cmp32_native \
+  --export=ALL,RECALL_ONLY=1,RECALL_INPUT_TOKENS=32768,GEN_LEN=1, \
+RETRIEVALATTN_FA_GRAPH_FUSED=1,RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1, \
+RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRAVERSAL_EVAL=0, \
+RETRIEVALATTN_FA_KERNEL_PROFILE=1,RETRIEVALATTN_FA_GRAPH_PROFILE=1, \
+RETRIEVALATTN_FA_KERNEL_MODE=v2_splitk \
+  test.sh
+```
+- Current tree, 32k, native fused top-k + CPU graph:
+```bash
+sbatch --job-name=cmp32_cpugpu \
+  --export=ALL,RECALL_ONLY=1,RECALL_INPUT_TOKENS=32768,GEN_LEN=1, \
+RETRIEVALATTN_FA_GRAPH_FUSED=0,RETRIEVALATTN_ROAR_BACKEND=cpp, \
+RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRAVERSAL_EVAL=0, \
+RETRIEVALATTN_FA_KERNEL_PROFILE=1 \
+  test.sh
+```
+- Current tree, 32k, forced Torch/Python GPU top-k + GPU graph:
+```bash
+sbatch --job-name=cmp32_torch \
+  --export=ALL,RECALL_ONLY=1,RECALL_INPUT_TOKENS=32768,GEN_LEN=1, \
+RETRIEVALATTN_FA_GRAPH_FUSED=1,RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1, \
+RETRIEVALATTN_FA_FORCE_PYTHON_TOPK=1, \
+RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRAVERSAL_EVAL=0 \
+  test.sh
+```
+- Old GPU-topk + CPU-graph path from `c90fa94`:
+  - use an exported tree on GPFS, not `/tmp`, because compute nodes cannot see login-node `/tmp`.
+```bash
+mkdir -p /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention_c90fa94_tree
+git archive c90fa94 | tar -x -C /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention_c90fa94_tree
+ln -sf /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/.venv \
+  /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention_c90fa94_tree/.venv
+
+sbatch -D /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention_c90fa94_tree \
+  --job-name=c90_32_cpugpu \
+  --partition=spgpu --account=zhengya98 \
+  --output=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/slurm-c90-32k.out \
+  --error=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/slurm-c90-32k.out \
+  --export=ALL,RECALL_ONLY=1,RECALL_INPUT_TOKENS=32768,GEN_LEN=1, \
+RETRIEVALATTN_FA_FUSED_PREFILL=0,RETRIEVALATTN_GPU_TOPK=1, \
+RETRIEVALATTN_ROAR_BACKEND=cpp, \
+RETRIEVALATTN_ROAR_CPP_PATH=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/third_party/RoarGraph/python_ext, \
+RETRIEVALATTN_PARITY_SAMPLE=64 \
+  /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention_c90fa94_tree/test.sh
+```
+- Baseline results already observed:
+  - `cmp32_native` (`44431974`): `97.0912 s`
+  - `cmp32_cpugpu` (`44431973`): `143.6257 s`
+  - `cmp32_torch` (`44431975`): `115.461 s`
+  - `c90_32_cpugpu` (`44432065`): `100.0403 s`
+- Caveat:
+  - `c90fa94` old path uses `retrieval_head_mode=kv_head`; it is a lower-bound speed reference, not a fair q-head baseline.
+
+## Next-session fused-kernel v2 checklist (2026-03-03)
+1. Read pending job outputs first:
+```bash
+grep -E "native_core_sec|native_graph_sec|native_total_sec|ERROR|Traceback" slurm-44245118.out slurm-44245119.out slurm-44245120.out
+```
+2. Use fixed harness config for all A/B (do not change prompt/model/hardware between runs):
+```bash
+GEN_LEN=1 \
+RETRIEVALATTN_FA_GRAPH_FUSED=1 \
+RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1 \
+RETRIEVALATTN_FA_GRAPH_PROFILE=1 \
+RETRIEVALATTN_FA_KERNEL_PROFILE=1 \
+sbatch test.sh
+```
+Kernel-instrumentation knobs (default `0`):
+- `RETRIEVALATTN_FA_KERNEL_PROFILE=1`: logs `native_retrieval_profile` and exposes native retrieval phase timings in profile payload.
+- `RETRIEVALATTN_FA_KERNEL_DEBUG=1`: logs `native_retrieval_debug` counter summary (higher overhead; use only for debug).
+3. A/B top-k merge mode only (everything else fixed):
+```bash
+RETRIEVALATTN_FA_TOPK_BATCHED=1 sbatch test.sh
+RETRIEVALATTN_FA_TOPK_BATCHED=0 sbatch test.sh
+```
+4. Kernel-mode A/B helper (submit once, three runs):
+```bash
+# After build job succeeds (example: 44298749)
+./benchmark/submit_kernel_mode_ab.sh 44298749
+```
+5. Fast profile extraction after runs:
+```bash
+./benchmark/extract_kernel_profiles.sh slurm-ra-kab-*.out
+grep -nE "native_retrieval_profile|native_retrieval_debug|native_graph_profile|fused_overlap profile|index built layer" slurm-ra-kab-*.out
+```
+6. v2 implementation order:
+   - lock-free online top-k inside attention CTA,
+   - deterministic split-K 2-pass partial-topk reduction,
+   - chunked overlap (attention/top-k stream + graph stream) with double buffers.
+7. Required correctness gates for each performance claim:
+   - top-k parity (causal reference),
+   - no unexpected `edges=0`,
+   - traversal recall non-regression,
+   - deterministic output on fixed seed/hardware.
+8. Milestones:
+   - M-A: non-split lock-free core >2x faster,
+   - M-B: split-K adds >1.5x over non-split,
+   - M-C: fused v2 prefill within ~1.3-1.6x of Full FlashAttention.
 
 ## Standard simple run
 ```bash
@@ -234,6 +336,23 @@ python third_party/RoarGraph/python_ext/setup.py build_ext --inplace
 ```bash
 RETRIEVALATTN_ROAR_BACKEND=python sbatch test.sh
 ```
+- Experimental GPU-assisted Python graph build path:
+```bash
+RETRIEVALATTN_ROAR_BACKEND=python_gpu \
+RETRIEVALATTN_ROAR_PY_GPU_DEVICE=cuda \
+RETRIEVALATTN_ROAR_PY_GPU_BATCH=256 \
+sbatch test.sh
+```
+
+## spgpu A/B script (cpp vs python_gpu)
+- Script: `benchmark/run_roar_backend_ab_spgpu.sh`
+- Runs two back-to-back recall-only jobs in one Slurm allocation with identical settings:
+  - `RETRIEVALATTN_ROAR_BACKEND=cpp`
+  - `RETRIEVALATTN_ROAR_BACKEND=python_gpu`
+- Submit:
+```bash
+sbatch benchmark/run_roar_backend_ab_spgpu.sh
+```
 
 ## Recommended RetrievalAttention debug run
 ```bash
@@ -355,12 +474,17 @@ Decision rule:
 - `RETRIEVALATTN_GPU_TOPK`: enable GPU topk build.
 - `RETRIEVALATTN_CUSTOM_QK_TOPK`: opt-in Triton custom fused qk+topk kernel path (currently frozen/experimental; not recommended for active runs).
 - `RETRIEVALATTN_FA_FUSED_PREFILL`: use FlashAttention fused-prefill retrieval path (expects flash-attn API `flash_attn_with_kvcache_retrieval` from a custom build/fork).
+- `RETRIEVALATTN_FA_GRAPH_FUSED`: enable graph-fused prefill path (prototype).
+- `RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE`: fail-fast if graph-fused call fails (no fallback).
+- `RETRIEVALATTN_FA_GRAPH_FUSED_CHECK`: run quality-floor check and fallback per-head when below floor.
+- `RETRIEVALATTN_FA_GRAPH_FUSED_QUALITY_FLOOR`: strict traversal recall floor used by graph-fused fallback gate (default `0.90`).
 - `RETRIEVALATTN_RETRIEVAL_HEAD_MODE`: retrieval indexing mode (`q_head` or `kv_head`; fused path default is `q_head`).
   - `q_head`: fused top-k is expected as `[seq, num_heads, q_knn]`.
   - `kv_head`: legacy behavior keyed by KV heads.
   - current graph design is shared per KV head in both modes; `q_head` mainly controls per-head retrieval/seed/rerank behavior.
 - `RETRIEVALATTN_FA_SHADOW_COMPARE`: in fused-prefill mode, run sampled parity check vs baseline GPU-topk (layer0/head0).
 - `RETRIEVALATTN_FA_SHADOW_SAMPLE`: number of sampled queries used in fused shadow compare.
+- Note: native graph-fused symbol (`fwd_kvcache_retrieval_graph`) is now patched in flash-attn source; until rebuilt on compute, runtime may still use Python graph-fused fallback.
 - `RETRIEVALATTN_FUSED_PREFILL_OVERLAP`: overlap CPU finalize (index/graph build) with ongoing fused prefill (`1` default).
 - `RETRIEVALATTN_FUSED_PREFILL_OVERLAP_WORKERS`: overlap worker count (`1` recommended to avoid faiss/OpenMP oversubscription).
 - `RETRIEVALATTN_CUSTOM_QK_TOPK_BLOCK_Q`: custom kernel Q tile size (default `64`; auto-capped to `<=64` to avoid pathological kernels).
@@ -383,7 +507,9 @@ Decision rule:
 - `RETRIEVALATTN_ROAR_ENTRY`: enhancement entry policy (`hub|max_degree|self`).
 - `RETRIEVALATTN_ROAR_MAX_QUERY_PER_PIVOT`: optional cap of bridge queries per pivot (`0` disables cap).
 - `RETRIEVALATTN_ROAR_LOG`: emit per-stage Roar build metrics in head logs.
-- `RETRIEVALATTN_ROAR_BACKEND`: Roar builder backend selector (`cpp` recommended, `python`, `auto`).
+- `RETRIEVALATTN_ROAR_BACKEND`: Roar builder backend selector (`cpp` recommended, `python`, `python_gpu` experimental).
+- `RETRIEVALATTN_ROAR_PY_GPU_DEVICE`: CUDA device string for `python_gpu` backend (`cuda` default).
+- `RETRIEVALATTN_ROAR_PY_GPU_BATCH`: batch size for projection-stage GPU scoring in `python_gpu`.
 - `RETRIEVALATTN_ROAR_CPP_THREADS`: thread override for C++ Roar builder (`0` lets OpenMP decide).
 - `RETRIEVALATTN_DECODE_BACKEND`: decode traversal backend (`auto` default, `python`, `roar_cpp`).
 - `RETRIEVALATTN_ROAR_DECODE_INIT`: number of seed tokens sent to C++ decode queue.
@@ -443,6 +569,15 @@ Decision rule:
 2. Verify build banner includes intended env values.
 3. Check for empty retrieval assertion.
 4. If quality issue persists, follow `notes/debug_playbook.md`.
+
+## Native graph-fused smoke
+- Build flash-attn fork (compute node): `sbatch install_2.sh`
+- Run native graph-fused smoke after build:
+  - `sbatch --dependency=afterok:<build_jobid> smoke_flashattn_fused_graph.sh`
+- Expected smoke signals:
+  - extension has symbol `fwd_kvcache_retrieval_graph`,
+  - profile path is `native_kernel_fused_graph`,
+  - output includes `[OK] flash_attn_with_kvcache_retrieval_graph smoke test passed.`
 
 ## Next workstream
 - Prioritize decode traversal refactor to beam-search style (paper-aligned):
