@@ -10,6 +10,10 @@ _ROAR_EXT_MODULE = "roargraph_builder_ext"
 _ROAR_EXT_HANDLE = None
 _ROAR_EXT_IMPORT_ERROR = None
 
+_ROAR_TORCH_EXT_MODULE = "roargraph_torch_ext"
+_ROAR_TORCH_EXT_HANDLE = None
+_ROAR_TORCH_EXT_IMPORT_ERROR = None
+
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -48,6 +52,28 @@ def _try_import() -> bool:
         return False
 
 
+def _try_import_torch() -> bool:
+    global _ROAR_TORCH_EXT_HANDLE
+    global _ROAR_TORCH_EXT_IMPORT_ERROR
+
+    if _ROAR_TORCH_EXT_HANDLE is not None:
+        return True
+    if _ROAR_TORCH_EXT_IMPORT_ERROR is not None:
+        return False
+
+    ext_dir = _resolve_ext_dir()
+    if ext_dir.exists():
+        ext_dir_str = str(ext_dir)
+        if ext_dir_str not in sys.path:
+            sys.path.insert(0, ext_dir_str)
+    try:
+        _ROAR_TORCH_EXT_HANDLE = importlib.import_module(_ROAR_TORCH_EXT_MODULE)
+        return True
+    except Exception as exc:  # pragma: no cover - import failure path
+        _ROAR_TORCH_EXT_IMPORT_ERROR = exc
+        return False
+
+
 def roargraph_cpp_available() -> bool:
     return _try_import()
 
@@ -55,6 +81,15 @@ def roargraph_cpp_available() -> bool:
 def roargraph_cpp_import_error():
     _try_import()
     return _ROAR_EXT_IMPORT_ERROR
+
+
+def roargraph_cuda_available() -> bool:
+    return _try_import_torch()
+
+
+def roargraph_cuda_import_error():
+    _try_import_torch()
+    return _ROAR_TORCH_EXT_IMPORT_ERROR
 
 
 def build_roar_graph_csr_cpp(
@@ -164,4 +199,106 @@ def search_roar_graph_csr_cpp(
         int(num_threads),
         str(score_agg),
         key_dtype,
+    )
+
+
+def search_roar_graph_csr_cuda(
+    query_seed,
+    query_rank,
+    keys,
+    offsets,
+    neighbors,
+    init_ids,
+    init_scores,
+    *,
+    token_budget: int,
+    candidate_target: int,
+    expand_width: int,
+    min_visits: int,
+    max_visits: int,
+    frontier_topn: int,
+    stop_patience: int,
+    stop_margin: float,
+    dynamic_start: int,
+    dynamic_end: int,
+    score_agg: str = "max",
+):
+    if not _try_import_torch():
+        raise RuntimeError(
+            "RoarGraph torch/CUDA extension is unavailable. "
+            "Build it with: "
+            "`module load python/3.10.4 && source .venv/bin/activate && "
+            "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+        ) from _ROAR_TORCH_EXT_IMPORT_ERROR
+
+    return _ROAR_TORCH_EXT_HANDLE.search_graph_csr_cuda(
+        query_seed,
+        query_rank,
+        keys,
+        offsets,
+        neighbors,
+        init_ids,
+        init_scores,
+        int(token_budget),
+        int(candidate_target),
+        int(expand_width),
+        int(min_visits),
+        int(max_visits),
+        int(frontier_topn),
+        int(stop_patience),
+        float(stop_margin),
+        int(dynamic_start),
+        int(dynamic_end),
+        str(score_agg),
+    )
+
+
+def search_roar_graph_csr_cuda_group(
+    queries_seed,
+    queries_rank,
+    keys,
+    offsets,
+    neighbors,
+    init_ids,
+    init_scores,
+    *,
+    token_budget: int,
+    candidate_target: int,
+    expand_width: int,
+    min_visits: int,
+    max_visits: int,
+    frontier_topn: int,
+    stop_patience: int,
+    stop_margin: float,
+    dynamic_start: int,
+    dynamic_end: int,
+    score_agg: str = "max",
+):
+    if not _try_import_torch():
+        raise RuntimeError(
+            "RoarGraph torch/CUDA extension is unavailable. "
+            "Build it with: "
+            "`module load python/3.10.4 && source .venv/bin/activate && "
+            "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+        ) from _ROAR_TORCH_EXT_IMPORT_ERROR
+
+    return _ROAR_TORCH_EXT_HANDLE.search_graph_csr_cuda_group(
+        queries_seed,
+        queries_rank,
+        keys,
+        offsets,
+        neighbors,
+        init_ids,
+        init_scores,
+        int(token_budget),
+        int(candidate_target),
+        int(expand_width),
+        int(min_visits),
+        int(max_visits),
+        int(frontier_topn),
+        int(stop_patience),
+        float(stop_margin),
+        int(dynamic_start),
+        int(dynamic_end),
+        str(score_agg),
     )

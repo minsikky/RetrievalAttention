@@ -17,8 +17,12 @@ except Exception:
 from .roargraph_cpp_backend import (
     build_roar_graph_csr_cpp,
     search_roar_graph_csr_cpp,
+    search_roar_graph_csr_cuda,
+    search_roar_graph_csr_cuda_group,
     roargraph_cpp_available,
     roargraph_cpp_import_error,
+    roargraph_cuda_available,
+    roargraph_cuda_import_error,
 )
 
 
@@ -241,6 +245,10 @@ class retrievalattention_cache(KV_Cache):
             self.decode_backend = "python"
         elif raw_decode_backend in {"roar_cpp", "cpp"}:
             self.decode_backend = "roar_cpp"
+        elif raw_decode_backend in {"roar_cuda", "cuda"}:
+            self.decode_backend = "roar_cuda"
+        elif raw_decode_backend in {"roar_cuda_v2", "cuda_v2"}:
+            self.decode_backend = "roar_cuda_v2"
         else:
             print(
                 f"[RetrievalAttention] WARNING: unknown RETRIEVALATTN_DECODE_BACKEND={raw_decode_backend}. "
@@ -273,6 +281,7 @@ class retrievalattention_cache(KV_Cache):
             self.roar_decode_threads = 0
         self.roar_decode_threads = max(0, self.roar_decode_threads)
         self._roar_cpp_available = roargraph_cpp_available()
+        self._roar_cuda_available = roargraph_cuda_available()
         if self.roar_backend == "cpp" and not self._roar_cpp_available:
             cpp_err = roargraph_cpp_import_error()
             raise RuntimeError(
@@ -281,6 +290,15 @@ class retrievalattention_cache(KV_Cache):
                 "`module load python/3.10.4 && source .venv/bin/activate && "
                 "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
                 + (f". Import error: {cpp_err}" if cpp_err is not None else "")
+            )
+        if self.decode_backend in {"roar_cuda", "roar_cuda_v2"} and not self._roar_cuda_available:
+            cuda_err = roargraph_cuda_import_error()
+            raise RuntimeError(
+                "RoarGraph torch/CUDA extension is required but unavailable. "
+                "Build it with: "
+                "`module load python/3.10.4 && source .venv/bin/activate && "
+                "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+                + (f". Import error: {cuda_err}" if cuda_err is not None else "")
             )
         if self.roar_python_gpu_enabled:
             if not torch.cuda.is_available():
@@ -529,7 +547,10 @@ class retrievalattention_cache(KV_Cache):
         # Warm-start seeds remain retrieval-head keyed (per q-head in q_head mode).
         self.prev_decode_seeds = [[[] for _ in range(self.retrieval_heads)] for _ in range(self.layer_num)]
         self._decode_key_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._decode_cuda_key_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._decode_cuda_graph_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cpp_warned = False
+        self._decode_cuda_warned = False
         self.fused_prefill_knn = [None for _ in range(self.layer_num)]
         self.fused_prefill_profiles = [None for _ in range(self.layer_num)]
         self.fused_prefill_graph_neighbors = [None for _ in range(self.layer_num)]
@@ -1834,7 +1855,7 @@ class retrievalattention_cache(KV_Cache):
     def _should_use_roar_cpp_decode_backend(self, graph_is_csr: bool) -> bool:
         if not graph_is_csr:
             return False
-        if self.decode_backend == "python":
+        if self.decode_backend in {"python", "roar_cuda", "roar_cuda_v2"}:
             return False
         available = roargraph_cpp_available()
         self._roar_cpp_available = bool(available)
@@ -1885,6 +1906,38 @@ class retrievalattention_cache(KV_Cache):
             "dtype": key_dtype,
         }
         return key_array, key_dtype
+
+    def _get_decode_key_tensor_cuda(self, ldx: int, hdx: int):
+        cached = self._decode_cuda_key_cache[ldx][hdx]
+        if cached is not None:
+            return cached
+        device = self.layer_mapping[str(ldx)]
+        key_tensor = self.cpu_keys[ldx][hdx, :self.input_length, :].detach().to(device, non_blocking=True).float()
+        key_tensor = self._score_transform_torch(key_tensor)
+        self._decode_cuda_key_cache[ldx][hdx] = key_tensor.contiguous()
+        return self._decode_cuda_key_cache[ldx][hdx]
+
+    def _get_decode_graph_tensors_cuda(self, ldx: int, hdx: int):
+        cached = self._decode_cuda_graph_cache[ldx][hdx]
+        if cached is not None:
+            return cached
+        graph = self.graphs[ldx][hdx]
+        if not (isinstance(graph, tuple) and len(graph) >= 2):
+            return None
+        offsets = graph[0]
+        neighbors = graph[1]
+        offsets_t = torch.as_tensor(np.ascontiguousarray(offsets, dtype=np.uint32), dtype=torch.int64, device="cpu")
+        neighbors_t = torch.as_tensor(np.ascontiguousarray(neighbors, dtype=np.int32), dtype=torch.int32, device="cpu")
+        self._decode_cuda_graph_cache[ldx][hdx] = (offsets_t, neighbors_t)
+        return self._decode_cuda_graph_cache[ldx][hdx]
+
+    def _prepare_decode_cuda_caches(self):
+        if self.decode_backend not in {"roar_cuda", "roar_cuda_v2"}:
+            return
+        for ldx in range(self.layer_num):
+            for kv_hdx in range(self.kv_head):
+                self._get_decode_key_tensor_cuda(ldx, kv_hdx)
+                self._get_decode_graph_tensors_cuda(ldx, kv_hdx)
 
     def _build_graph_csr_from_knn_roar_cpp(self, knn: np.ndarray, keys_cpu: np.ndarray):
         meta = {
@@ -3380,6 +3433,7 @@ class retrievalattention_cache(KV_Cache):
         # Free queries to save CPU memory after graph/index finalize.
         self.cpu_queries = None
         self.cpu_queries_qhead_full = [None for _ in range(self.layer_num)]
+        self._prepare_decode_cuda_caches()
         self._shutdown_fused_prefill_executor()
         with self._fused_prefill_lock:
             self._fused_prefill_futures.clear()
@@ -3506,6 +3560,545 @@ class retrievalattention_cache(KV_Cache):
 
         return None, None
 
+    def _make_decode_retrieve_profile(self):
+        if not self.decode_profile:
+            return None, None
+        total_start = time.perf_counter()
+        profile = {
+            "total_sec": 0.0,
+            "seed_sec": 0.0,
+            "graph_sec": 0.0,
+            "rerank_sec": 0.0,
+            "finalize_sec": 0.0,
+            "visited": 0,
+            "candidates": 0,
+            "search_space": 0,
+            "visited_ratio": 0.0,
+            "stop_reason": "n/a",
+        }
+        return total_start, profile
+
+    def _finish_decode_retrieve_profile(self, total_start, profile, stop_reason: str, visited: int, candidates: int):
+        if profile is None:
+            return None
+        profile["stop_reason"] = stop_reason
+        visited_i = max(0, int(visited))
+        candidates_i = max(0, int(candidates))
+        search_space = max(0, int(self.dynamic_end - self.dynamic_start))
+        profile["visited"] = visited_i
+        profile["candidates"] = candidates_i
+        profile["search_space"] = search_space
+        profile["visited_ratio"] = (
+            float(visited_i) / float(search_space)
+            if search_space > 0 else 0.0
+        )
+        profile["total_sec"] = time.perf_counter() - total_start
+        return profile
+
+    def _decode_stop_reason_from_code(self, code: int) -> str:
+        mapping = {
+            0: "frontier_empty",
+            1: "max_visits",
+            2: "candidate_cap",
+            3: "stability_gap",
+            4: "empty_init",
+        }
+        return mapping.get(int(code), f"code_{int(code)}")
+
+    def _prepare_decode_seed_state(self, ldx, hdx, query_group, defer_seed_scoring: bool = False):
+        total_start, profile = self._make_decode_retrieve_profile()
+        kv_hdx = self._retrieval_head_to_kv_head(hdx)
+        index = self.indexes[ldx][kv_hdx]
+        graph = self.graphs[ldx][kv_hdx]
+        graph_is_csr = isinstance(graph, tuple) and len(graph) >= 2
+        graph_offsets = None
+        graph_neighbors = None
+        if graph_is_csr:
+            graph_offsets = graph[0]
+            graph_neighbors = graph[1]
+            if int(graph_offsets[-1]) != int(graph_neighbors.shape[0]):
+                raise RuntimeError(
+                    f"[RetrievalAttention] Invalid CSR graph at layer={ldx}, head={hdx}: "
+                    f"offsets[-1]={int(graph_offsets[-1])}, neighbors={int(graph_neighbors.shape[0])}"
+                )
+
+        q_group = query_group.detach().float()
+        if q_group.dim() == 1:
+            q_group = q_group.unsqueeze(0)
+        if self.query_mode == "group_avg":
+            q_seed = q_group.mean(dim=0, keepdim=True)
+        else:
+            q_seed = q_group
+
+        seed_start = time.perf_counter() if profile is not None else None
+        q_seed_cpu = self._score_transform_torch(q_seed.cpu())
+        device = self.layer_mapping[str(ldx)]
+        q_seed_cuda = self._score_transform_torch(q_seed.to(device, non_blocking=True).float())
+        q_rank_cuda = self._score_transform_torch(q_group.to(device, non_blocking=True).float())
+        seed_scores = {}
+        seed_k = max(self.q_knn, self.q_knn * self.seed_k_mult)
+        seed_k = min(self.input_length, seed_k)
+        if seed_k <= 0:
+            if profile is not None:
+                profile["seed_sec"] += time.perf_counter() - seed_start
+                self._finish_decode_retrieve_profile(total_start, profile, "seed_k_zero", 0, 0)
+            return {
+                "empty": True,
+                "tokens": [],
+                "profile": profile,
+                "ldx": int(ldx),
+                "hdx": int(hdx),
+                "kv_hdx": int(kv_hdx),
+                "q_group": q_group,
+            }
+
+        static_indices = self.static_index_set
+        if self.seed_mode == "faiss":
+            if index is not None:
+                q_np = q_seed_cpu.numpy().astype(np.float32)
+                sim, idx = index.search(q_np, seed_k)
+                for ridx in range(idx.shape[0]):
+                    for cidx in range(idx.shape[1]):
+                        tok = int(idx[ridx, cidx])
+                        score = float(sim[ridx, cidx])
+                        prev = seed_scores.get(tok)
+                        if prev is None or score > prev:
+                            seed_scores[tok] = score
+            else:
+                if not self._fallback_seed_warned:
+                    print(
+                        "[RetrievalAttention] WARNING: decode index missing; falling back to brute-force seed search. "
+                        "Set RETRIEVALATTN_DECODE_INDEX=faiss for stable quality."
+                    )
+                    self._fallback_seed_warned = True
+                k = self.cpu_keys[ldx][kv_hdx, :self.input_length, :].detach().float().cpu()
+                k = self._score_transform_torch(k)
+                scores = torch.matmul(q_seed_cpu, k.transpose(0, 1))
+                k_take = min(seed_k, scores.shape[1])
+                if k_take <= 0:
+                    if profile is not None:
+                        profile["seed_sec"] += time.perf_counter() - seed_start
+                        self._finish_decode_retrieve_profile(total_start, profile, "seed_k_zero", 0, 0)
+                    return {
+                        "empty": True,
+                        "tokens": [],
+                        "profile": profile,
+                        "ldx": int(ldx),
+                        "hdx": int(hdx),
+                        "kv_hdx": int(kv_hdx),
+                        "q_group": q_group,
+                    }
+                vals, idx = torch.topk(scores, k=k_take, dim=1)
+                for ridx in range(idx.shape[0]):
+                    row_idx = idx[ridx]
+                    row_vals = vals[ridx]
+                    for cidx in range(row_idx.shape[0]):
+                        tok = int(row_idx[cidx].item())
+                        score = float(row_vals[cidx].item())
+                        prev = seed_scores.get(tok)
+                        if prev is None or score > prev:
+                            seed_scores[tok] = score
+        else:
+            seed_candidates = []
+            prev_tokens = self.prev_decode_seeds[ldx][hdx]
+            if prev_tokens:
+                seed_candidates.extend(prev_tokens[:self.seed_prev_k])
+            hub_tokens = self.hub_seeds[ldx][kv_hdx]
+            if hub_tokens and self.seed_hub_k > 0:
+                seed_candidates.extend(hub_tokens[:self.seed_hub_k])
+            if self.seed_tail_k > 0 and self.dynamic_end > self.dynamic_start:
+                span = self.dynamic_end - self.dynamic_start
+                step = max(1, span // self.seed_tail_k)
+                tok = self.dynamic_end - 1
+                added = 0
+                while tok >= self.dynamic_start and added < self.seed_tail_k:
+                    seed_candidates.append(int(tok))
+                    tok -= step
+                    added += 1
+            filtered = []
+            filtered_seen = set()
+            for tok in seed_candidates:
+                tok = int(tok)
+                if tok < 0 or tok >= self.input_length:
+                    continue
+                if tok in static_indices or tok in filtered_seen:
+                    continue
+                filtered_seen.add(tok)
+                filtered.append(tok)
+            if not filtered and self.dynamic_end > self.dynamic_start:
+                fallback_take = max(8, min(seed_k, 32))
+                span = self.dynamic_end - self.dynamic_start
+                step = max(1, span // fallback_take)
+                tok = self.dynamic_start
+                while tok < self.dynamic_end and len(filtered) < fallback_take:
+                    filtered.append(int(tok))
+                    tok += step
+            if filtered and defer_seed_scoring:
+                seed_candidate_ids = [int(tok) for tok in filtered]
+            elif filtered:
+                idx = torch.tensor(filtered, dtype=torch.long, device="cpu")
+                seed_kv = torch.index_select(self.cpu_keys[ldx][kv_hdx], 0, idx).detach().float().cpu()
+                seed_kv = self._score_transform_torch(seed_kv)
+                seed_sim = torch.matmul(q_seed_cpu, seed_kv.transpose(0, 1))
+                if self.rerank_agg == "mean":
+                    seed_agg = seed_sim.mean(dim=0)
+                else:
+                    seed_agg = seed_sim.max(dim=0).values
+                take = min(seed_k, int(seed_agg.shape[0]))
+                if take > 0:
+                    vals, pos = torch.topk(seed_agg, k=take, dim=0)
+                    for i in range(take):
+                        tok = int(filtered[int(pos[i].item())])
+                        seed_scores[tok] = float(vals[i].item())
+            else:
+                seed_candidate_ids = []
+        if self.seed_mode != "faiss" and defer_seed_scoring:
+            if profile is not None:
+                profile["seed_sec"] += time.perf_counter() - seed_start
+            candidate_target = self.token_budget * self.candidate_multiplier
+            candidate_target = max(self.token_budget, candidate_target)
+            candidate_target = min(candidate_target, self.input_length)
+            if not seed_candidate_ids:
+                if profile is not None:
+                    self._finish_decode_retrieve_profile(total_start, profile, "empty_seed_ranked", 0, 0)
+                return {
+                    "empty": True,
+                    "tokens": [],
+                    "profile": profile,
+                    "ldx": int(ldx),
+                    "hdx": int(hdx),
+                    "kv_hdx": int(kv_hdx),
+                    "q_group": q_group,
+                }
+            return {
+                "empty": False,
+                "total_start": total_start,
+                "profile": profile,
+                "ldx": int(ldx),
+                "hdx": int(hdx),
+                "kv_hdx": int(kv_hdx),
+                "graph": graph,
+                "graph_is_csr": graph_is_csr,
+                "graph_offsets": graph_offsets,
+                "graph_neighbors": graph_neighbors,
+                "q_group": q_group,
+                "q_seed_cuda": q_seed_cuda,
+                "q_rank_cuda": q_rank_cuda,
+                "candidate_target": int(candidate_target),
+                "seed_k": int(seed_k),
+                "seed_candidate_ids": seed_candidate_ids,
+            }
+
+        if profile is not None:
+            profile["seed_sec"] += time.perf_counter() - seed_start
+
+        seed_ranked = []
+        for tok, score in seed_scores.items():
+            if tok in static_indices:
+                continue
+            seed_ranked.append((tok, score))
+        seed_ranked.sort(key=lambda x: x[1], reverse=True)
+        if not seed_ranked:
+            if profile is not None:
+                self._finish_decode_retrieve_profile(total_start, profile, "empty_seed_ranked", 0, 0)
+            return {
+                "empty": True,
+                "tokens": [],
+                "profile": profile,
+                "ldx": int(ldx),
+                "hdx": int(hdx),
+                "kv_hdx": int(kv_hdx),
+                "q_group": q_group,
+            }
+
+        seed_floor = int(math.ceil(self.token_budget * self.seed_ratio))
+        seed_floor = min(self.token_budget, max(0, seed_floor))
+        if seed_floor > len(seed_ranked):
+            seed_floor = len(seed_ranked)
+        selected_seeds = [tok for tok, _ in seed_ranked[:seed_floor]]
+        selected_seed_set = set(selected_seeds)
+
+        candidate_target = self.token_budget * self.candidate_multiplier
+        candidate_target = max(self.token_budget, candidate_target)
+        candidate_target = min(candidate_target, self.input_length)
+
+        init_candidates = []
+        init_scores = []
+        for tok, score in seed_ranked:
+            if len(init_candidates) >= candidate_target:
+                break
+            tok = int(tok)
+            init_candidates.append(tok)
+            init_scores.append(float(score))
+
+        return {
+            "empty": False,
+            "total_start": total_start,
+            "profile": profile,
+            "ldx": int(ldx),
+            "hdx": int(hdx),
+            "kv_hdx": int(kv_hdx),
+            "graph": graph,
+            "graph_is_csr": graph_is_csr,
+            "graph_offsets": graph_offsets,
+            "graph_neighbors": graph_neighbors,
+            "q_group": q_group,
+            "q_seed_cuda": q_seed_cuda,
+            "q_rank_cuda": q_rank_cuda,
+            "seed_floor": int(seed_floor),
+            "selected_seed_set": selected_seed_set,
+            "candidate_target": int(candidate_target),
+            "init_candidates": init_candidates,
+            "init_scores": init_scores,
+        }
+
+    def _finalize_decode_seed_state(
+        self,
+        state,
+        ranked_tokens,
+        stop_reason: str,
+        visited_count: int,
+        candidate_count: int,
+        update_decode_state: bool = True,
+        enforce_seed_floor: bool = True,
+    ):
+        profile = state["profile"]
+        finalize_start = time.perf_counter() if profile is not None else None
+        final = []
+        final_set = set()
+        seed_floor = int(state["seed_floor"])
+        selected_seed_set = state["selected_seed_set"]
+        if enforce_seed_floor and seed_floor > 0:
+            for tok in ranked_tokens:
+                if tok in selected_seed_set and tok not in final_set:
+                    final.append(tok)
+                    final_set.add(tok)
+                    if len(final) >= seed_floor or len(final) >= self.token_budget:
+                        break
+        for tok in ranked_tokens:
+            tok = int(tok)
+            if tok in final_set:
+                continue
+            final.append(tok)
+            final_set.add(tok)
+            if len(final) >= self.token_budget:
+                break
+        if update_decode_state:
+            hdx = int(state["hdx"])
+            ldx = int(state["ldx"]) if "ldx" in state else None
+            if ldx is not None:
+                if final:
+                    self.prev_decode_seeds[ldx][hdx] = list(final[: self.seed_prev_k])
+                else:
+                    self.prev_decode_seeds[ldx][hdx] = []
+        if profile is not None:
+            profile["finalize_sec"] += time.perf_counter() - finalize_start
+            self._finish_decode_retrieve_profile(
+                state["total_start"],
+                profile,
+                stop_reason,
+                visited_count,
+                candidate_count,
+            )
+        return final, profile
+
+    def _retrieve_tokens_roar_cuda_v2_group(
+        self,
+        ldx: int,
+        kv_hdx: int,
+        states,
+        update_decode_state: bool = True,
+        enforce_seed_floor: bool = True,
+    ):
+        results = {}
+        active_states = []
+        for state in states:
+            if state.get("empty", False):
+                results[int(state["hdx"])] = (list(state.get("tokens", [])), state.get("profile"))
+            else:
+                active_states.append(state)
+
+        if not active_states:
+            return results
+
+        seed_states = [state for state in active_states if "seed_candidate_ids" in state]
+        if seed_states:
+            seed_q_count = len(seed_states)
+            union_tokens = []
+            union_pos = {}
+            row_members = []
+            for state in seed_states:
+                row = []
+                for tok in state["seed_candidate_ids"]:
+                    tok = int(tok)
+                    pos = union_pos.get(tok)
+                    if pos is None:
+                        pos = len(union_tokens)
+                        union_pos[tok] = pos
+                        union_tokens.append(tok)
+                    row.append(int(pos))
+                row_members.append(row)
+
+            key_t_seed = self._get_decode_key_tensor_cuda(ldx, kv_hdx)
+            if key_t_seed is None:
+                raise RuntimeError("roar_cuda_v2 seed key cache unavailable")
+            queries_seed = torch.cat([state["q_seed_cuda"] for state in seed_states], dim=0)
+            union_ids_t = torch.as_tensor(union_tokens, dtype=torch.long, device=key_t_seed.device)
+            seed_keys_t = torch.index_select(key_t_seed, 0, union_ids_t)
+            seed_score_start = time.perf_counter()
+            seed_scores_t = torch.matmul(queries_seed, seed_keys_t.transpose(0, 1))
+            mask = torch.zeros((seed_q_count, len(union_tokens)), dtype=torch.bool, device=key_t_seed.device)
+            for i, positions in enumerate(row_members):
+                if positions:
+                    mask[i, torch.as_tensor(positions, dtype=torch.long, device=key_t_seed.device)] = True
+            seed_scores_t = seed_scores_t.masked_fill(~mask, float("-inf"))
+            max_seed_k = max(max(1, int(state["seed_k"])) for state in seed_states)
+            top_vals_t, top_pos_t = torch.topk(seed_scores_t, k=min(max_seed_k, seed_scores_t.shape[1]), dim=1)
+            top_vals = top_vals_t.cpu()
+            top_pos = top_pos_t.cpu()
+            per_seed_sec = (time.perf_counter() - seed_score_start) / float(max(1, seed_q_count))
+
+            for i, state in enumerate(seed_states):
+                seed_ranked = []
+                take = min(int(state["seed_k"]), len(state["seed_candidate_ids"]))
+                row_vals = top_vals[i]
+                row_pos = top_pos[i]
+                for j in range(row_pos.shape[0]):
+                    score = float(row_vals[j].item())
+                    if not math.isfinite(score):
+                        continue
+                    tok = int(union_tokens[int(row_pos[j].item())])
+                    seed_ranked.append((tok, score))
+                    if len(seed_ranked) >= take:
+                        break
+                if not seed_ranked:
+                    if state["profile"] is not None:
+                        self._finish_decode_retrieve_profile(
+                            state["total_start"],
+                            state["profile"],
+                            "empty_seed_ranked",
+                            0,
+                            0,
+                        )
+                    results[int(state["hdx"])] = ([], state["profile"])
+                    state["empty"] = True
+                    continue
+                seed_floor = int(math.ceil(self.token_budget * self.seed_ratio))
+                seed_floor = min(self.token_budget, max(0, seed_floor))
+                seed_floor = min(seed_floor, len(seed_ranked))
+                state["seed_floor"] = int(seed_floor)
+                state["selected_seed_set"] = set(tok for tok, _ in seed_ranked[:seed_floor])
+                state["init_candidates"] = [int(tok) for tok, _ in seed_ranked]
+                state["init_scores"] = [float(score) for _, score in seed_ranked]
+                if state["profile"] is not None:
+                    state["profile"]["seed_sec"] += per_seed_sec
+
+            active_states = [state for state in active_states if not state.get("empty", False)]
+            if not active_states:
+                return results
+
+        graph = active_states[0]["graph"]
+        if not (isinstance(graph, tuple) and len(graph) >= 2):
+            for state in active_states:
+                token_ids, retrieve_profile = self._retrieve_tokens(
+                    ldx,
+                    int(state["hdx"]),
+                    state["q_group"],
+                    update_decode_state=update_decode_state,
+                    enforce_seed_floor=enforce_seed_floor,
+                )
+                results[int(state["hdx"])] = (token_ids, retrieve_profile)
+            return results
+
+        key_t = self._get_decode_key_tensor_cuda(ldx, kv_hdx)
+        graph_tensors = self._get_decode_graph_tensors_cuda(ldx, kv_hdx)
+        if key_t is None or graph_tensors is None:
+            for state in active_states:
+                token_ids, retrieve_profile = self._retrieve_tokens(
+                    ldx,
+                    int(state["hdx"]),
+                    state["q_group"],
+                    update_decode_state=update_decode_state,
+                    enforce_seed_floor=enforce_seed_floor,
+                )
+                results[int(state["hdx"])] = (token_ids, retrieve_profile)
+            return results
+
+        q_count = len(active_states)
+        max_init = max(len(state["init_candidates"]) for state in active_states)
+        queries_seed = torch.cat([state["q_seed_cuda"] for state in active_states], dim=0)
+        queries_rank = torch.cat([state["q_rank_cuda"] for state in active_states], dim=0)
+        init_ids_t = torch.full((q_count, max_init), -1, dtype=torch.int32, device="cpu")
+        init_scores_t = torch.full((q_count, max_init), -1e30, dtype=torch.float32, device="cpu")
+        for i, state in enumerate(active_states):
+            n = len(state["init_candidates"])
+            if n <= 0:
+                continue
+            init_ids_t[i, :n] = torch.as_tensor(state["init_candidates"], dtype=torch.int32, device="cpu")
+            init_scores_t[i, :n] = torch.as_tensor(state["init_scores"], dtype=torch.float32, device="cpu")
+
+        graph_offsets_t, graph_neighbors_t = graph_tensors
+        graph_start = time.perf_counter()
+        out_ids_t, _out_scores_t, out_counts_t, out_visited_t, out_stop_t = search_roar_graph_csr_cuda_group(
+            queries_seed=queries_seed,
+            queries_rank=queries_rank,
+            keys=key_t,
+            offsets=graph_offsets_t,
+            neighbors=graph_neighbors_t,
+            init_ids=init_ids_t,
+            init_scores=init_scores_t,
+            token_budget=int(self.token_budget),
+            candidate_target=int(active_states[0]["candidate_target"]),
+            expand_width=int(self.expand_width),
+            min_visits=int(self.min_visits),
+            max_visits=int(self.max_visits),
+            frontier_topn=int(self.frontier_topn),
+            stop_patience=int(self.stop_patience),
+            stop_margin=float(self.stop_margin),
+            dynamic_start=int(self.dynamic_start),
+            dynamic_end=int(self.dynamic_end),
+            score_agg=self.rerank_agg,
+        )
+        graph_elapsed = time.perf_counter() - graph_start
+        out_ids = out_ids_t.cpu()
+        out_counts = out_counts_t.cpu()
+        out_visited = out_visited_t.cpu()
+        out_stop = out_stop_t.cpu()
+        per_graph_sec = graph_elapsed / float(max(1, q_count))
+
+        for i, state in enumerate(active_states):
+            keep = int(out_counts[i].item())
+            ranked_tokens = []
+            if keep > 0:
+                row = out_ids[i, :keep]
+                ranked_tokens = [int(tok) for tok in row.tolist() if int(tok) >= 0]
+            stop_reason = self._decode_stop_reason_from_code(int(out_stop[i].item()))
+            visited_count = int(out_visited[i].item())
+            candidate_count = len(ranked_tokens)
+            profile = state["profile"]
+            if profile is not None:
+                profile["graph_sec"] += per_graph_sec
+                profile["rerank_sec"] += 0.0
+            final, retrieve_profile = self._finalize_decode_seed_state(
+                state,
+                ranked_tokens,
+                stop_reason=stop_reason,
+                visited_count=visited_count,
+                candidate_count=candidate_count,
+                update_decode_state=update_decode_state,
+                enforce_seed_floor=enforce_seed_floor,
+            )
+            if retrieve_profile is not None:
+                retrieve_profile["total_sec"] = (
+                    float(retrieve_profile.get("seed_sec", 0.0))
+                    + float(retrieve_profile.get("graph_sec", 0.0))
+                    + float(retrieve_profile.get("rerank_sec", 0.0))
+                    + float(retrieve_profile.get("finalize_sec", 0.0))
+                )
+            results[int(state["hdx"])] = (final, retrieve_profile)
+
+        return results
+
     def _retrieve_tokens(
         self,
         ldx,
@@ -3575,6 +4168,12 @@ class retrievalattention_cache(KV_Cache):
 
         seed_start = time.perf_counter() if profile is not None else None
         q_seed_cpu = self._score_transform_torch(q_seed.cpu())
+        q_seed_cuda = None
+        q_rank_cuda = None
+        if self.decode_backend in {"roar_cuda", "roar_cuda_v2"}:
+            device = self.layer_mapping[str(ldx)]
+            q_seed_cuda = self._score_transform_torch(q_seed.to(device, non_blocking=True).float())
+            q_rank_cuda = self._score_transform_torch(q_group.to(device, non_blocking=True).float())
         seed_scores = {}
         seed_k = max(self.q_knn, self.q_knn * self.seed_k_mult)
         seed_k = min(self.input_length, seed_k)
@@ -3704,6 +4303,7 @@ class retrievalattention_cache(KV_Cache):
         seen = set()
         candidate_scores = {}
         visited_count = 0
+        ranked_override = None
 
         # Prime candidates with seeds ranked by ANN score.
         for tok, score in seed_ranked:
@@ -3783,7 +4383,79 @@ class retrievalattention_cache(KV_Cache):
                         self._decode_cpp_warned = True
                     use_cpp_decode = False
 
-            if not use_cpp_decode:
+            use_cuda_decode = (self.decode_backend == "roar_cuda" and graph_is_csr)
+            if use_cuda_decode and not use_cpp_decode:
+                try:
+                    init_ids_t = torch.as_tensor(
+                        [int(tok) for tok in candidates],
+                        dtype=torch.int32,
+                        device="cpu",
+                    )
+                    init_scores_t = torch.as_tensor(
+                        [float(candidate_scores[int(tok)]) for tok in candidates],
+                        dtype=torch.float32,
+                        device="cpu",
+                    )
+                    key_t = self._get_decode_key_tensor_cuda(ldx, kv_hdx)
+                    graph_tensors = self._get_decode_graph_tensors_cuda(ldx, kv_hdx)
+                    if key_t is None or graph_tensors is None or q_seed_cuda is None or q_rank_cuda is None:
+                        raise RuntimeError("roar_cuda decode state is unavailable")
+                    graph_offsets_t, graph_neighbors_t = graph_tensors
+                    ids_cuda, scores_cuda, meta_cuda = search_roar_graph_csr_cuda(
+                        query_seed=q_seed_cuda,
+                        query_rank=q_rank_cuda,
+                        keys=key_t,
+                        offsets=graph_offsets_t,
+                        neighbors=graph_neighbors_t,
+                        init_ids=init_ids_t,
+                        init_scores=init_scores_t,
+                        token_budget=int(self.token_budget),
+                        candidate_target=int(candidate_target),
+                        expand_width=int(self.expand_width),
+                        min_visits=int(self.min_visits),
+                        max_visits=int(self.max_visits),
+                        frontier_topn=int(self.frontier_topn),
+                        stop_patience=int(self.stop_patience),
+                        stop_margin=float(self.stop_margin),
+                        dynamic_start=int(self.dynamic_start),
+                        dynamic_end=int(self.dynamic_end),
+                        score_agg=self.rerank_agg,
+                    )
+                    if isinstance(meta_cuda, dict):
+                        stop_reason = str(meta_cuda.get("stop_reason", "roar_cuda"))
+                        visited_count = int(meta_cuda.get("visited", 0))
+                    else:
+                        stop_reason = "roar_cuda"
+                        visited_count = 0
+                    ids_list = [int(x) for x in ids_cuda.detach().cpu().tolist()]
+                    scores_list = [float(x) for x in scores_cuda.detach().cpu().tolist()]
+                    candidates = []
+                    seen = set()
+                    candidate_scores = {}
+                    ranked_override = []
+                    for tok, score in zip(ids_list, scores_list):
+                        if tok in static_indices or tok in seen:
+                            continue
+                        seen.add(tok)
+                        candidates.append(tok)
+                        candidate_scores[tok] = score
+                        ranked_override.append(tok)
+                        if len(candidates) >= candidate_target:
+                            break
+                    if len(candidates) >= candidate_target and stop_reason == "frontier_empty":
+                        stop_reason = "candidate_cap"
+                except Exception as exc:
+                    if self.decode_backend == "roar_cuda":
+                        raise
+                    if not self._decode_cuda_warned:
+                        print(
+                            "[RetrievalAttention] WARNING: decode roar cuda search failed; "
+                            f"falling back to python traversal. error={exc}"
+                        )
+                        self._decode_cuda_warned = True
+                    use_cuda_decode = False
+
+            if not use_cpp_decode and not use_cuda_decode:
                 frontier = []
                 frontier_best_by_node = {}
                 expanded = set()
@@ -3929,7 +4601,9 @@ class retrievalattention_cache(KV_Cache):
             return finish([], stop_reason, visited=visited_count, candidates=len(candidates))
 
         rerank_start = time.perf_counter() if profile is not None else None
-        if self.rerank:
+        if ranked_override is not None:
+            ranked = ranked_override
+        elif self.rerank:
             idx = torch.tensor(candidates, dtype=torch.long, device="cpu")
             cand_k = torch.index_select(self.cpu_keys[ldx][kv_hdx], 0, idx).detach().float().cpu()
             cand_k = self._score_transform_torch(cand_k)
@@ -4005,17 +4679,62 @@ class retrievalattention_cache(KV_Cache):
         empty_heads = 0
         dynamic_counts = []
         head_count = self.retrieval_heads
+        token_results = {}
+        profile_results = {}
+        q_attn_by_head = {}
+
+        use_roar_cuda_v2 = (
+            self.decode_backend == "roar_cuda_v2"
+            and self.retrieval_head_mode == "q_head"
+            and self.query_mode == "per_head"
+        )
+
+        if use_roar_cuda_v2:
+            for kv_hdx in range(self.kv_head):
+                states = []
+                for local_h in range(self.group_size):
+                    hdx = kv_hdx * self.group_size + local_h
+                    if hdx >= head_count:
+                        break
+                    q_group = q[hdx]
+                    q_attn_by_head[hdx] = q_group.unsqueeze(0)
+                    state = self._prepare_decode_seed_state(
+                        layer_idx,
+                        hdx,
+                        q_group,
+                        defer_seed_scoring=True,
+                    )
+                    states.append(state)
+                group_results = self._retrieve_tokens_roar_cuda_v2_group(
+                    layer_idx,
+                    kv_hdx,
+                    states,
+                    update_decode_state=True,
+                    enforce_seed_floor=True,
+                )
+                token_results.update(group_results)
+        else:
+            for hdx in range(head_count):
+                kv_hdx = self._retrieval_head_to_kv_head(hdx)
+                if self.retrieval_head_mode == "q_head":
+                    q_group = q[hdx]
+                    q_attn = q_group.unsqueeze(0)
+                else:
+                    q_group = q_grouped[hdx]
+                    q_attn = q_group
+                q_attn_by_head[hdx] = q_attn
+                token_ids, retrieve_profile = self._retrieve_tokens(layer_idx, hdx, q_group)
+                token_results[hdx] = (token_ids, retrieve_profile)
 
         for hdx in range(head_count):
             kv_hdx = self._retrieval_head_to_kv_head(hdx)
-            if self.retrieval_head_mode == "q_head":
-                q_group = q[hdx]  # [head_dim]
-                q_attn = q_group.unsqueeze(0)  # [1, head_dim]
-            else:
-                q_group = q_grouped[hdx]  # [group_size, head_dim]
-                q_attn = q_group
-
-            token_ids, retrieve_profile = self._retrieve_tokens(layer_idx, hdx, q_group)
+            if hdx not in q_attn_by_head:
+                if self.retrieval_head_mode == "q_head":
+                    q_attn_by_head[hdx] = q[hdx].unsqueeze(0)
+                else:
+                    q_attn_by_head[hdx] = q_grouped[hdx]
+            q_attn = q_attn_by_head[hdx]
+            token_ids, retrieve_profile = token_results.get(hdx, ([], None))
             if self.decode_profile and retrieve_profile is not None:
                 self._decode_profile_stats["retrieve_total_sec"] += float(retrieve_profile["total_sec"])
                 self._decode_profile_stats["retrieve_seed_sec"] += float(retrieve_profile["seed_sec"])
@@ -4036,7 +4755,6 @@ class retrievalattention_cache(KV_Cache):
                 empty_heads += 1
             dynamic_counts.append(len(token_ids))
 
-            # Gather dynamic tokens from CPU
             gather_start = time.perf_counter() if self.decode_profile else None
             if token_ids:
                 idx = torch.tensor(token_ids, dtype=torch.long, device="cpu")
@@ -4048,7 +4766,6 @@ class retrievalattention_cache(KV_Cache):
             if self.decode_profile:
                 self._decode_profile_stats["gather_total_sec"] += (time.perf_counter() - gather_start)
 
-            # Static KV on GPU
             static_k = self.static_gpu_keys[layer_idx][kv_hdx]
             static_v = self.static_gpu_values[layer_idx][kv_hdx]
 
@@ -4059,12 +4776,11 @@ class retrievalattention_cache(KV_Cache):
                 k = static_k
                 v = static_v
 
-            # Attention: q_attn [G, D] (or [1, D] in q_head mode), k [T, D] -> [G, T]
             attn_start = time.perf_counter() if self.decode_profile else None
             scores = torch.matmul(q_attn, k.transpose(0, 1)) * scale
             scores = scores.float()
             attn = torch.softmax(scores, dim=-1).to(v.dtype)
-            out = torch.matmul(attn, v)  # [G, D] or [1, D]
+            out = torch.matmul(attn, v)
             if self.decode_profile:
                 self._decode_profile_stats["attn_total_sec"] += (time.perf_counter() - attn_start)
             outputs.append(out)
