@@ -57,6 +57,82 @@ RETRIEVALATTN_ROAR_BACKEND=cpp,RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRA
   - `roar_cpp` remains the only practical decode traversal backend here.
   - `python_gpu` is slower than both `roar_cpp` and the same Python traversal on CPU.
   - treat `python_gpu` as a failed experiment unless the traversal loop itself is moved out of Python.
+- Active native decode backend A/B:
+```bash
+# Production baseline
+sbatch --job-name=dec40_cpp2 \
+  --output=slurm-dec40-cpp2.out --error=slurm-dec40-cpp2.out \
+  --export=ALL,DATA_PATH=benchmark/decode_ab_prompt_32k.json,GEN_LEN=32, \
+RETRIEVALATTN_FA_GRAPH_FUSED=1,RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1, \
+RETRIEVALATTN_DECODE_BACKEND=roar_cpp,RETRIEVALATTN_ROAR_BACKEND=cpp, \
+RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRAVERSAL_EVAL=0 \
+  test.sh
+
+# Python control
+sbatch --job-name=dec40_py2 \
+  --output=slurm-dec40-py2.out --error=slurm-dec40-py2.out \
+  --export=ALL,DATA_PATH=benchmark/decode_ab_prompt_32k.json,GEN_LEN=32, \
+RETRIEVALATTN_FA_GRAPH_FUSED=1,RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1, \
+RETRIEVALATTN_DECODE_BACKEND=python,RETRIEVALATTN_ROAR_BACKEND=cpp, \
+RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRAVERSAL_EVAL=0 \
+  test.sh
+
+# Native CUDA-scoring backend
+sbatch --job-name=dec40_cuda \
+  --output=slurm-dec40-cuda.out --error=slurm-dec40-cuda.out \
+  --export=ALL,DATA_PATH=benchmark/decode_ab_prompt_32k.json,GEN_LEN=32, \
+RETRIEVALATTN_FA_GRAPH_FUSED=1,RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1, \
+RETRIEVALATTN_DECODE_BACKEND=roar_cuda,RETRIEVALATTN_ROAR_BACKEND=cpp, \
+RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRAVERSAL_EVAL=0 \
+  test.sh
+```
+- Current `roar_cuda` conclusion:
+  - clearly beats `python`
+  - does not yet beat `roar_cpp`
+  - keep it as experimental native backend, not default
+- `roar_cuda_v2` validation commands:
+```bash
+# 40k prompt, longer decode
+sbatch --job-name=dec40_cpp_g100 \
+  --output=slurm-dec40-cpp-g100.out --error=slurm-dec40-cpp-g100.out \
+  --export=ALL,DATA_PATH=benchmark/decode_ab_prompt_32k.json,GEN_LEN=100, \
+RETRIEVALATTN_FA_GRAPH_FUSED=1,RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1, \
+RETRIEVALATTN_DECODE_BACKEND=roar_cpp,RETRIEVALATTN_ROAR_BACKEND=cpp, \
+RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRAVERSAL_EVAL=0 \
+  test.sh
+
+sbatch --job-name=dec40_cuda_v2_g100 \
+  --output=slurm-dec40-cuda-v2-g100.out --error=slurm-dec40-cuda-v2-g100.out \
+  --export=ALL,DATA_PATH=benchmark/decode_ab_prompt_32k.json,GEN_LEN=100, \
+RETRIEVALATTN_FA_GRAPH_FUSED=1,RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1, \
+RETRIEVALATTN_DECODE_BACKEND=roar_cuda_v2,RETRIEVALATTN_ROAR_BACKEND=cpp, \
+RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRAVERSAL_EVAL=0 \
+  test.sh
+
+# ~65k prompt, 32-step decode
+sbatch --job-name=dec64_cpp_g32 \
+  --output=slurm-dec64-cpp-g32.out --error=slurm-dec64-cpp-g32.out \
+  --export=ALL,DATA_PATH=benchmark/decode_ab_prompt_64k.json,GEN_LEN=32, \
+RETRIEVALATTN_FA_GRAPH_FUSED=1,RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1, \
+RETRIEVALATTN_DECODE_BACKEND=roar_cpp,RETRIEVALATTN_ROAR_BACKEND=cpp, \
+RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRAVERSAL_EVAL=0 \
+  test.sh
+
+sbatch --job-name=dec64_cuda_v2_g32 \
+  --output=slurm-dec64-cuda-v2-g32.out --error=slurm-dec64-cuda-v2-g32.out \
+  --export=ALL,DATA_PATH=benchmark/decode_ab_prompt_64k.json,GEN_LEN=32, \
+RETRIEVALATTN_FA_GRAPH_FUSED=1,RETRIEVALATTN_FA_GRAPH_FUSED_REQUIRE=1, \
+RETRIEVALATTN_DECODE_BACKEND=roar_cuda_v2,RETRIEVALATTN_ROAR_BACKEND=cpp, \
+RETRIEVALATTN_VALIDATE_PARITY=0,RETRIEVALATTN_TRAVERSAL_EVAL=0 \
+  test.sh
+```
+- Current `roar_cuda_v2` conclusion:
+  - beats `roar_cpp` on the A40 controlled benchmark family
+  - validated on:
+    - ~40k prompt, `GEN_LEN=32`
+    - ~40k prompt, `GEN_LEN=100`
+    - ~65k prompt, `GEN_LEN=32`
+  - next step is not “make it faster than `roar_cpp`” anymore; it is “decide whether to promote it and clean up profiling/overhead”
 - Current tree, 32k, native fused GPU graph baseline:
 ```bash
 sbatch --job-name=cmp32_native \

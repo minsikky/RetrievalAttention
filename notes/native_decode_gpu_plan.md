@@ -68,6 +68,10 @@
 - Do not try to fuse traversal into attention first.
 - First milestone is a standalone GPU decode traversal backend that beats Python CPU on the same traversal policy.
 - Second milestone is to challenge `roar_cpp`.
+- Status:
+  - achieved
+  - current `roar_cuda` backend beats Python CPU on both ~9k and ~40k decode benchmarks
+  - remaining milestone is to beat `roar_cpp`
 
 ## Suggested A/B Ladder
 1. `python` vs native GPU backend on the same traversal policy
@@ -83,3 +87,48 @@
 - Must beat Python CPU traversal clearly on the same policy.
 - Must not degrade retrieval quality relative to current decode-space reference.
 - Must show lower `graph` time than `roar_cpp` on the controlled ~40k decode benchmark before scaling up.
+
+## Current Result
+- `roar_cuda` already beats Python CPU on the same traversal policy.
+- It does not yet beat `roar_cpp`.
+- The remaining gap is concentrated in the `graph` slice, not rerank.
+
+## `roar_cuda_v2` Result
+- `roar_cuda_v2` changes that conclusion:
+  - the graph slice is now effectively solved for the current 40k benchmark
+  - `roar_cuda_v2` slightly beats `roar_cpp` on graph stage
+  - overall decode still trails `roar_cpp` because seed handling is now the dominant remaining gap
+
+## Grouped GPU Seed Scoring Result
+- After moving grouped seed scoring to GPU, `roar_cuda_v2` now beats `roar_cpp` on the controlled 40k A40 benchmark.
+- Current best numbers:
+  - `roar_cpp`: decode `54.0159 s`, seed `10.088 s`, graph `21.164 s`
+  - `roar_cuda_v2`: decode `46.0405 s`, seed `7.062 s`, graph `18.868 s`
+- Therefore the current optimization focus changes from “beat `roar_cpp`” to:
+  - validate on larger / harder decode settings
+  - clean up grouped profile accounting
+  - decide whether `roar_cuda_v2` is robust enough to become preferred over `roar_cpp`
+- Therefore `v2` should focus next on:
+  - grouped seed generation / scoring
+  - only after that revisit more frontier-side work
+
+## Validation Status
+- Longer decode validation passed:
+  - ~40k prompt, `GEN_LEN=100`
+  - `roar_cuda_v2` still faster than `roar_cpp`
+- Larger-context validation passed:
+  - ~65k prompt, `GEN_LEN=32`
+  - `roar_cuda_v2` still faster than `roar_cpp`
+
+## Updated Next Steps
+1. Clean up grouped profile accounting and reduce the remaining `other` slice.
+2. Decide backend policy:
+   - keep `roar_cpp` as conservative default, or
+   - promote `roar_cuda_v2` as preferred backend on supported A40-class systems.
+3. Only after that, revisit deeper frontier/device-state optimization.
+
+## Next Concrete Optimization Targets
+1. Move more of the frontier/visited state out of host-side structures and into device-side buffers.
+2. Batch multiple frontier expansions more aggressively inside the extension.
+3. Reduce CPU participation in neighbor enumeration and duplicate filtering.
+4. Consider per-kv-head batched search across grouped q-head calls to increase GPU arithmetic intensity.

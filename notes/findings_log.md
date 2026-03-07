@@ -50,6 +50,157 @@
   - future GPU decode work should target a native / batched traversal design, not Python + micro-kernel scoring
   - the experimental implementation should be treated as historical only; replay it from `exp/decode-python-gpu`
 
+## 2026-03-06 update (native `roar_cuda` decode backend)
+- Added native decode backend `RETRIEVALATTN_DECODE_BACKEND=roar_cuda`.
+- Implementation:
+  - wrapper plumbing in `cache_hub/roargraph_cpp_backend.py`
+  - active runtime integration in `cache_hub/retrievalattention_cache.py`
+  - new extension source: `third_party/RoarGraph/python_ext/roargraph_torch_ext.cpp`
+  - build integrated into `third_party/RoarGraph/python_ext/setup.py`
+- Current algorithmic shape:
+  - C++ extension owns the frontier loop
+  - batched candidate scoring runs on CUDA through ATen
+  - current version keeps the traversal frontier/graph walk host-driven inside the extension
+  - this is native and removes Python hot-path overhead, but it is not yet a fully device-resident traversal engine
+- Small smoke on ~9k prompt (`benchmark/decode_ab_prompt_8k.json`, `GEN_LEN=4`):
+  - `44443460` (`smk_cpp`):
+    - decode `4.5536 s`
+    - retrieve `3.245 s`
+    - graph `1.667 s`
+  - `44443461` (`smk_py`):
+    - decode `17.1716 s`
+    - retrieve `14.792 s`
+    - graph `12.764 s`
+  - `44443359` (`smk_cuda`):
+    - decode `8.2327 s`
+    - retrieve `6.834 s`
+    - graph `5.473 s`
+  - interpretation:
+    - `roar_cuda` beats Python CPU clearly
+    - `roar_cuda` is still slower than `roar_cpp`
+- Controlled ~40k prompt (`benchmark/decode_ab_prompt_32k.json`, `GEN_LEN=32`):
+  - `44443434` / `slurm-dec40-cpp2.out` (`roar_cpp`):
+    - decode `54.0159 s`
+    - retrieve `42.054 s`
+    - graph `21.164 s`
+    - rerank `8.170 s`
+    - `visited_total=13414695`
+    - `candidates_total=12425410`
+  - `44443435` / `slurm-dec40-py2.out` (`python`):
+    - decode `158.0929 s`
+    - retrieve `144.261 s`
+    - graph `123.514 s`
+    - rerank `7.971 s`
+    - `visited_total=7613077`
+    - `candidates_total=9763681`
+  - `44443433` / `slurm-dec40-cuda.out` (`roar_cuda`):
+    - decode `75.1058 s`
+    - retrieve `63.959 s`
+    - graph `51.631 s`
+    - rerank `0.010 s`
+    - `visited_total=7613077`
+    - `candidates_total=9763681`
+- Interpretation:
+  - `roar_cuda` is a real backend improvement over Python CPU:
+    - decode `~2.10x` faster
+    - retrieve `~2.25x` faster
+    - graph stage `~2.39x` faster
+  - `roar_cuda` does not yet beat `roar_cpp`:
+    - decode `~1.39x` slower (`75.1 / 54.0`)
+    - retrieve `~1.52x` slower (`64.0 / 42.1`)
+    - graph stage `~2.44x` slower (`51.6 / 21.2`)
+  - `python` and `roar_cuda` have identical `visited_total` / `candidates_total`, so the traversal policy stayed aligned.
+  - `roar_cuda` nearly eliminates rerank cost because final ranking is done inside the native backend.
+- Decision:
+  - keep `roar_cuda` as an experimental native backend
+  - do not replace `roar_cpp` with it yet
+  - next optimization target is the remaining `graph` gap to `roar_cpp`
+
+## 2026-03-07 update (`roar_cuda_v2` batched-group backend)
+- Added `RETRIEVALATTN_DECODE_BACKEND=roar_cuda_v2` on current branch.
+- Core change:
+  - batch the native CUDA-scoring search per kv-group instead of per q-head
+  - this keeps the extension native and reduces the per-head dispatch / micro-launch overhead that remained in `roar_cuda`
+- Results on ~9k smoke (`44445972`, `slurm-smk-cuda-v2.out`):
+  - `roar_cpp`: decode `4.5536 s`, graph `1.667 s`
+  - `roar_cuda`: decode `8.2327 s`, graph `5.473 s`
+  - `roar_cuda_v2`: decode `6.5314 s`, graph `2.495 s`
+  - interpretation:
+    - `roar_cuda_v2` clearly improves over `roar_cuda`
+    - still slower than `roar_cpp`
+- Results on ~40k A40 run (`44479317`, `slurm-dec40-cuda-v2.out`):
+  - `roar_cpp`: decode `54.0159 s`, graph `21.164 s`, seed `10.088 s`
+  - `roar_cuda`: decode `75.1058 s`, graph `51.631 s`, seed `9.929 s`
+  - `roar_cuda_v2`: decode `59.6887 s`, graph `20.475 s`, seed `21.354 s`
+  - interpretation:
+    - `roar_cuda_v2` nearly reaches `roar_cpp` overall
+    - it is still about `1.10x` slower overall
+    - but the graph stage is no longer the problem; `roar_cuda_v2` slightly beats `roar_cpp` there
+    - the remaining gap is seed handling
+- Important profiling caveat:
+  - grouped `roar_cuda_v2` currently overcounts `retrieve_total_sec` because the shared group call is attributed through per-head profile objects.
+  - use walltime and per-slice `seed` / `graph` values for meaningful comparison until this accounting is fixed.
+- Next step:
+  - batch seed scoring per kv-group on GPU, reusing the same grouped native path
+  - this is now the clearest route to beat `roar_cpp` overall
+
+## 2026-03-07 update (`roar_cuda_v2` grouped GPU seed scoring)
+- Added grouped GPU seed scoring to `roar_cuda_v2`:
+  - keep seed candidate construction logic unchanged
+  - score/rank seed candidates per kv-group on GPU in one batched pass
+  - retain the grouped native graph search path
+- 9k A40 smoke (`44479355`, `slurm-smk-cuda-v2-s2.out`):
+  - `Prefilling latency: 9.2109 s`
+  - `Decoding latency: 5.0260 s`
+  - `seed=1.176 s`
+  - `graph=1.904 s`
+  - versus previous `roar_cuda_v2` smoke:
+    - decode `6.5314 s -> 5.0260 s`
+    - seed `1.721 s -> 1.176 s`
+    - graph `2.495 s -> 1.904 s`
+- 40k A40 run (`44479409`, `slurm-dec40-cuda-v2-s2.out`):
+  - `roar_cpp`: decode `54.0159 s`, seed `10.088 s`, graph `21.164 s`
+  - previous `roar_cuda_v2`: decode `59.6887 s`, seed `21.354 s`, graph `20.475 s`
+  - final `roar_cuda_v2`: decode `46.0405 s`, seed `7.062 s`, graph `18.868 s`
+- Interpretation:
+  - grouped GPU seed scoring removed the last remaining bottleneck
+  - `roar_cuda_v2` now beats `roar_cpp` overall on the controlled 40k A40 benchmark
+  - approximate decode speedup over `roar_cpp`: `~1.17x`
+  - both seed and graph slices are now better than `roar_cpp`
+- Longer-decode validation on the same ~40k prompt (`GEN_LEN=100`):
+  - `44479444` / `slurm-dec40-cpp-g100.out`:
+    - decode `177.2075 s`
+    - seed `32.306 s`
+    - graph `74.807 s`
+  - `44479443` / `slurm-dec40-cuda-v2-g100.out`:
+    - decode `146.8723 s`
+    - seed `22.533 s`
+    - graph `60.241 s`
+  - interpretation:
+    - `roar_cuda_v2` still wins on longer decode
+    - speedup is about `1.21x`
+- Larger-context validation (`benchmark/decode_ab_prompt_64k.json`, actual `65001` tokens, `GEN_LEN=32`):
+  - `44479446` / `slurm-dec64-cpp-g32.out`:
+    - decode `56.0003 s`
+    - seed `10.286 s`
+    - graph `23.587 s`
+  - `44479447` / `slurm-dec64-cuda-v2-g32.out`:
+    - decode `46.2675 s`
+    - seed `7.051 s`
+    - graph `19.149 s`
+  - interpretation:
+    - `roar_cuda_v2` also wins at larger context size
+    - speedup is about `1.21x`
+- Profiling note:
+  - grouped `retrieve_total_sec` accounting is now sane enough that it no longer exceeds total decode compute time
+  - walltime plus `seed` / `graph` remain the most trustworthy metrics
+- Updated conclusion:
+  - `roar_cuda_v2` is not just a single-benchmark win
+  - it currently holds on:
+    - baseline ~40k / 32-step decode
+    - longer ~40k / 100-step decode
+    - larger ~65k / 32-step decode
+
 ## 2026-03-06 update (baseline comparison + branch/runtime map)
 - Branch map correction:
   - `cpu_graph_builder_opt` tip commit `bf4ab79` is not a separate GPU+CPU runtime branch; it only adds CPU graph-builder parity harness scripts.

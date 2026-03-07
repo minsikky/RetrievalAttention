@@ -12,6 +12,14 @@
     - experiment preserved at branch `exp/decode-python-gpu`
     - snapshot commit: `efc234f`
     - active runtime no longer carries the `python_gpu` decode backend
+  - native follow-up:
+    - active branch now includes a new native backend name: `RETRIEVALATTN_DECODE_BACKEND=roar_cuda`
+    - implementation:
+      - `third_party/RoarGraph/python_ext/roargraph_torch_ext.cpp`
+      - built via `third_party/RoarGraph/python_ext/setup.py`
+      - keeps Python out of the hot traversal loop
+      - uses batched CUDA scoring from a C++ extension
+      - current version is not a fully device-resident frontier/visited design yet
   - workload:
     - `DATA_PATH=benchmark/decode_ab_prompt_32k.json`
     - actual prompt length reported by `simple_test.py`: `Input length: 40001`
@@ -31,50 +39,128 @@
       - `visited_total=13414695`
       - `candidates_total=12425410`
   - Python CPU control:
-    - `44436598` (`dec32_py`)
+    - historical run: `44436598` (`dec32_py`)
+    - current matched run: `44443435` (`dec40_py2`)
     - `RETRIEVALATTN_DECODE_BACKEND=python`
-    - `Prefilling latency: 132.7876 s`
-    - `Decoding latency: 200.4628 s`
+    - current matched result:
+      - `Prefilling latency: 132.8356 s`
+      - `Decoding latency: 158.0929 s`
     - `decode_profile`:
-      - `retrieve=183.327 s`
-      - `seed=11.558 s`
-      - `graph=159.083 s`
-      - `rerank=9.588 s`
+      - `retrieve=144.261 s`
+      - `seed=9.834 s`
+      - `graph=123.514 s`
+      - `rerank=7.971 s`
       - `visited_total=7613077`
       - `candidates_total=9763681`
-  - experimental GPU decode path:
-    - `44436175` (`dec32_gpu`)
-    - `RETRIEVALATTN_DECODE_BACKEND=python_gpu`
-    - `RETRIEVALATTN_DECODE_GPU_KEYS=1`
-    - implementation detail:
-      - this is not a native GPU traversal kernel,
-      - it keeps the current Python traversal loop,
-      - it captures prefill keys on GPU and moves seed/new-candidate/rerank scoring matmuls to GPU.
-    - `Prefilling latency: 133.0144 s`
-    - `Decoding latency: 275.1208 s`
+  - native CUDA-scoring decode path:
+    - `44443433` (`dec40_cuda`)
+    - `RETRIEVALATTN_DECODE_BACKEND=roar_cuda`
+    - `Prefilling latency: 133.6492 s`
+    - `Decoding latency: 75.1058 s`
     - `decode_profile`:
-      - `retrieve=262.789 s`
-      - `seed=16.252 s`
-      - `graph=235.936 s`
-      - `rerank=8.164 s`
+      - `retrieve=63.959 s`
+      - `seed=9.929 s`
+      - `graph=51.631 s`
+      - `rerank=0.010 s`
       - `visited_total=7613077`
       - `candidates_total=9763681`
   - interpretation:
-    - against the production CPU C++ decode backend, the experimental GPU path is much worse (`275.1 s` vs `55.4 s` decode).
-    - the production comparison is not apples-to-apples because `roar_cpp` and Python traversal use different algorithms.
-    - the apples-to-apples comparison is `python` vs `python_gpu`, and there the GPU path is still worse:
-      - total decode: `275.1 / 200.5 ~= 1.37x` slower
-      - retrieve stage: `262.8 / 183.3 ~= 1.43x` slower
-      - graph stage: `235.9 / 159.1 ~= 1.48x` slower
-    - `python` and `python_gpu` have identical `visited_total` / `candidates_total`, so the traversal logic stayed aligned.
-    - rerank got slightly better on GPU (`8.164 s` vs `9.588 s`), but seed/graph stages got much worse.
+    - against the production CPU C++ decode backend, `roar_cuda` is still slower:
+      - total decode: `75.1 s` vs `54.0 s`
+      - retrieve: `64.0 s` vs `42.1 s`
+      - graph stage: `51.6 s` vs `21.2 s`
+    - against the same Python traversal policy, `roar_cuda` is a real speedup:
+      - total decode: `158.1 / 75.1 ~= 2.10x` faster
+      - retrieve: `144.3 / 64.0 ~= 2.25x` faster
+      - graph stage: `123.5 / 51.6 ~= 2.39x` faster
+    - `python` and `roar_cuda` have identical `visited_total` / `candidates_total`, so the traversal policy stayed aligned.
+    - `roar_cuda` nearly eliminates explicit rerank cost because the native backend returns final ranked candidates directly.
   - decision:
-    - do not pursue the current Python-controlled GPU decode path as a performance direction.
-    - if GPU decode traversal is revisited, it needs a more native design:
-      - persistent GPU frontier/visited structures
-      - batched neighbor expansion
-      - batched or fused scoring across many nodes / heads / steps
-      - ideally C++/CUDA or Triton rather than Python control flow
+    - `roar_cuda` is good enough to keep as an experimental native backend because it clearly beats Python CPU.
+    - it is not yet good enough to replace `roar_cpp`.
+    - next work should focus on the remaining gap to `roar_cpp`, especially the `graph` slice.
+- `roar_cuda_v2` follow-up on current branch:
+  - backend:
+    - `RETRIEVALATTN_DECODE_BACKEND=roar_cuda_v2`
+    - batched per-kv-group native search call
+    - current implementation still uses host-managed frontier state inside the extension, but batches all q-heads in a kv-group together
+  - 9k smoke on `spgpu` (`44445972`, `slurm-smk-cuda-v2.out`):
+    - `Prefilling latency: 13.9278 s`
+    - `Decoding latency: 6.5314 s`
+    - `graph=2.495 s`
+    - comparison on same 9k workload:
+      - `roar_cpp`: `4.5536 s` decode, `graph=1.667 s`
+      - `roar_cuda`: `8.2327 s` decode, `graph=5.473 s`
+    - interpretation:
+      - `roar_cuda_v2` beats `roar_cuda`
+      - `roar_cuda_v2` still trails `roar_cpp`
+  - first 40k run on `spgpu` (`44479317`, `slurm-dec40-cuda-v2.out`):
+    - `Prefilling latency: 138.7633 s`
+    - `Decoding latency: 59.6887 s`
+    - `graph=20.475 s`
+    - `seed=21.354 s`
+    - `visited_total=7263443`
+    - `candidates_total=9763681`
+    - comparison on same 40k workload:
+      - `roar_cpp`: `54.0159 s` decode, `graph=21.164 s`, `seed=10.088 s`
+      - `roar_cuda`: `75.1058 s` decode, `graph=51.631 s`, `seed=9.929 s`
+      - `python`: `158.0929 s` decode, `graph=123.514 s`, `seed=9.834 s`
+    - interpretation:
+      - `roar_cuda_v2` closed most of the gap:
+        - decode: `59.69 s` vs `54.02 s` (`~1.10x` slower than `roar_cpp`)
+        - graph stage: `20.48 s` vs `21.16 s` (slightly better than `roar_cpp`)
+      - the remaining gap was seed stage, not graph stage
+      - `roar_cuda_v2` was materially better than `roar_cuda`
+  - grouped GPU seed-scoring update on `spgpu` (`44479409`, `slurm-dec40-cuda-v2-s2.out`):
+    - `Prefilling latency: 132.8210 s`
+    - `Decoding latency: 46.0405 s`
+    - `decode_profile`:
+      - `seed=7.062 s`
+      - `graph=18.868 s`
+      - `rerank=0.000 s`
+      - `visited_total=7263443`
+      - `candidates_total=9763681`
+    - comparison on the same 40k workload:
+      - `roar_cpp`: decode `54.0159 s`, seed `10.088 s`, graph `21.164 s`
+      - `roar_cuda_v2` final: decode `46.0405 s`, seed `7.062 s`, graph `18.868 s`
+    - interpretation:
+      - `roar_cuda_v2` now beats `roar_cpp` overall on the A40 run
+      - decode speedup: `54.0159 / 46.0405 ~= 1.17x`
+      - both seed and graph slices are now better than `roar_cpp`
+  - longer-decode validation on the same ~40k prompt (`GEN_LEN=100`):
+    - `roar_cpp` (`44479444`, `slurm-dec40-cpp-g100.out`):
+      - `Decoding latency: 177.2075 s`
+      - `seed=32.306 s`
+      - `graph=74.807 s`
+    - `roar_cuda_v2` (`44479443`, `slurm-dec40-cuda-v2-g100.out`):
+      - `Decoding latency: 146.8723 s`
+      - `seed=22.533 s`
+      - `graph=60.241 s`
+    - interpretation:
+      - the `roar_cuda_v2` win holds for longer decode
+      - decode speedup: `177.2075 / 146.8723 ~= 1.21x`
+  - larger-context validation on ~65k prompt (`GEN_LEN=32`):
+    - prompt file: `benchmark/decode_ab_prompt_64k.json`
+    - actual prompt length reported by `simple_test.py`: `Input length: 65001`
+    - `roar_cpp` (`44479446`, `slurm-dec64-cpp-g32.out`):
+      - `Prefilling latency: 337.1427 s`
+      - `Decoding latency: 56.0003 s`
+      - `seed=10.286 s`
+      - `graph=23.587 s`
+    - `roar_cuda_v2` (`44479447`, `slurm-dec64-cuda-v2-g32.out`):
+      - `Prefilling latency: 336.6468 s`
+      - `Decoding latency: 46.2675 s`
+      - `seed=7.051 s`
+      - `graph=19.149 s`
+    - interpretation:
+      - the `roar_cuda_v2` win holds at larger context size as well
+      - decode speedup: `56.0003 / 46.2675 ~= 1.21x`
+  - note:
+    - grouped profile accounting is now sane enough that `retrieve_total_sec` no longer explodes above total.
+    - walltime plus per-slice `seed` / `graph` remain the preferred comparison metrics.
+  - next optimization target:
+    - reduce the remaining `other` slice in grouped `roar_cuda_v2`
+    - then decide whether to make `roar_cuda_v2` the preferred decode backend over `roar_cpp`
 - Important branch/runtime caveat:
   - branch names do not currently map cleanly to distinct runtime families.
   - `cpu_graph_builder_opt` commit `bf4ab79` only adds CPU graph-builder parity harness scripts; it does not define a separate GPU+CPU runtime.
