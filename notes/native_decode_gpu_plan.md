@@ -1,5 +1,35 @@
 # Native GPU Decode Traversal Plan
 
+## 2026-03-09 status update
+- This note is now partially historical.
+- A custom CUDA full-GPU decode backend exists and is materially faster than the earlier hybrid/full-ATen traversal attempts on the 40k / 32-step benchmark.
+- Latest important measured points:
+  - pre-graph-kernel baseline (`44568543`):
+    - decode `42.5315 s`
+    - retrieve `31.803 s`
+  - instrumented stable baseline (`44579772`):
+    - decode `43.8746 s`
+    - retrieve `31.891 s`
+    - kernel hotspot: `merge`, not `score`
+  - targeted merge + frontier-slot rewrite (`44580727`):
+    - decode `24.9511 s`
+    - retrieve `13.318 s`
+- The crucial lesson from instrumentation:
+  - current full-GPU graph cost is dominated by serial candidate maintenance
+  - scoring is not the main bottleneck
+  - naive frontier parallelization with atomics was explicitly tested and failed badly on this workload
+
+## Updated rule-of-thumb for this backend
+- Do:
+  - measure with kernel debug on before changing traversal structure
+  - optimize `merge/select` first
+  - remove serial bookkeeping such as frontier-token -> candidate-slot scans
+  - keep the stop rule fixed while doing performance work
+- Do not:
+  - assume more GPU parallelism is automatically better
+  - spend time on scoring kernels when kernel counters say score is only a few percent
+  - reintroduce atomics/sync-heavy frontier expansion unless the per-round work size changes materially
+
 ## Goal
 - Replace the failed Python-controlled `python_gpu` decode experiment with a native GPU decode traversal design that can actually beat CPU `roar_cpp`.
 
@@ -120,15 +150,139 @@
   - ~65k prompt, `GEN_LEN=32`
   - `roar_cuda_v2` still faster than `roar_cpp`
 
-## Updated Next Steps
-1. Clean up grouped profile accounting and reduce the remaining `other` slice.
-2. Decide backend policy:
-   - keep `roar_cpp` as conservative default, or
-   - promote `roar_cuda_v2` as preferred backend on supported A40-class systems.
-3. Only after that, revisit deeper frontier/device-state optimization.
+## Current Decode Backend Map (2026-03-07)
+- Best current backend:
+  - `roar_cuda_v2`
+  - controlled ~40k prompt, `GEN_LEN=32`:
+    - `decode=46.0405 s`
+    - `seed=7.062 s`
+    - `graph=18.868 s`
+  - controlled ~40k prompt, `GEN_LEN=100`:
+    - `decode=146.8723 s`
+  - ~65k prompt, `GEN_LEN=32`:
+    - `decode=46.2675 s`
+- Competitive experimental backend:
+  - hybrid explicit-beam `roar_cuda_beam`
+  - ~40k / `GEN_LEN=32`:
+    - `decode=46.2885 s`
+    - `seed=7.076 s`
+    - `graph=19.666 s`
+  - ~40k / `GEN_LEN=100`:
+    - `decode=148.3664 s`
+- Failed decode traversal paths:
+  - Python-controlled GPU traversal (`python_gpu`): too many tiny launches / syncs
+  - dense score-table beam:
+    - ~40k / `GEN_LEN=32`: `decode=178.5231 s`
+  - “full GPU” beam with more device-resident state:
+    - ~40k / `GEN_LEN=32`: `decode=207.6486 s`
+  - `roar_cuda_frontier` small-buffer GPU frontier:
+    - ~40k / `GEN_LEN=32`: `decode=232.8459 s`
 
-## Next Concrete Optimization Targets
-1. Move more of the frontier/visited state out of host-side structures and into device-side buffers.
-2. Batch multiple frontier expansions more aggressively inside the extension.
-3. Reduce CPU participation in neighbor enumeration and duplicate filtering.
-4. Consider per-kv-head batched search across grouped q-head calls to increase GPU arithmetic intensity.
+## What The Recent Failures Actually Mean
+- They do **not** prove that GPU traversal is a dead end.
+- They do show that expressing irregular graph traversal as a sequence of generic ATen ops is the wrong path.
+- The full-GPU attempts were slow because they still spent most of their time in:
+  - GPU CSR gather / compaction over ragged rows,
+  - repeated `sort` / `masked_select` / `index_select` / `topk`,
+  - small-buffer bookkeeping split across many kernels,
+  - repeated synchronization back to host for stop logic / counters.
+- In other words:
+  - the problem is not “frontier on GPU” conceptually,
+  - the problem is “frontier on GPU implemented as many generic tensor ops”.
+
+## Updated Next Step
+Move to **custom CUDA kernels** for traversal, not more ATen composition.
+
+### Required properties
+- Keep q-head retrieval objective unchanged.
+- Keep current grouped GPU seed scoring path.
+- Keep small-buffer traversal only:
+  - no dense `[q_count, num_tokens]` score tables.
+- No CPU synchronization inside a decode step except final result extraction.
+
+### Kernel breakdown to implement
+1. `expand_frontier_kernel`
+- Input:
+  - CSR `offsets`, `neighbors`
+  - current frontier ids/counts
+  - visited bitset
+  - dynamic range
+- Output:
+  - compact neighbor list per query/group
+  - updated visited marks
+- Must do dedup / visited marking on device.
+
+2. `score_neighbors_kernel` or grouped GEMM + custom packing
+- Score compact neighbor buffers against grouped queries.
+- Avoid per-round high-level gather/scatter churn.
+
+3. `merge_frontier_candidates_kernel`
+- Merge scored neighbors into:
+  - next frontier buffer (`frontier_width`)
+  - candidate buffer (`candidate_target`)
+- This is the key missing piece in current experiments.
+- Must not sort full candidate lists on host every round.
+
+4. `stop_metrics_kernel`
+- Compute:
+  - current top-`token_budget` threshold
+  - frontier best
+  - stability step updates
+- Only return tiny summary tensors to host if absolutely necessary.
+
+5. Final rerank
+- Can stay as grouped GPU matmul over final candidate union initially.
+- This part is not the bottleneck.
+
+## Backend Recommendation
+- Keep `roar_cuda_v2` as the preferred decode backend until a custom-kernel traversal wins.
+- Treat `roar_cuda_beam` and `roar_cuda_frontier` as experimental evidence, not promotion candidates.
+- If resuming implementation, start from the current grouped seed path and replace only the traversal core.
+
+## 2026-03-07 custom-kernel follow-up
+- We tried that next step.
+- Two custom-kernel decode iterations were run through a separate split CUDA extension:
+  - iteration 1:
+    - custom frontier expansion + custom per-neighbor scoring + custom merge
+    - ~40k A40 result: `decode=79.7116 s`, `graph=56.450 s`
+  - iteration 2:
+    - custom frontier expansion + grouped GPU matmul scoring + custom merge
+    - ~40k A40 result: `decode=130.0818 s`, `graph=101.482 s`
+- matched `roar_cuda_v2` reference on the same setup:
+  - `decode=49.3138 s`, `graph=21.514 s`
+- What this means:
+  - “some custom kernels” are not enough
+  - iteration 1 failed because direct scalar per-neighbor scoring was too expensive
+  - iteration 2 failed because the ATen-built compact union / row-mask path around scoring was too expensive
+- Updated recommendation:
+  - stop the current `roar_cuda_kernel` branch
+  - keep `roar_cuda_v2` as the preferred decode backend
+  - if custom traversal is revisited later, it must natively implement the full round core:
+    - frontier expansion
+    - dedup / compact union build
+    - score staging
+    - frontier/candidate merge
+
+## 2026-03-07 custom-kernel result
+- Implemented an experimental backend:
+  - `RETRIEVALATTN_DECODE_BACKEND=roar_cuda_kernel`
+  - separate CUDA extension:
+    - `roargraph_cuda_kernel_ext`
+- Result:
+  - first custom-kernel version:
+    - 40k decode `85.6461 s`
+    - `graph=58.753 s`
+  - second version with frontier-token / warp-level expansion:
+    - 40k decode `127.4251 s`
+    - `graph=99.428 s`
+  - `roar_cuda_v2` reference on same workload:
+    - 40k decode `48.5557 s`
+    - `graph=21.075 s`
+- Conclusion:
+  - “custom CUDA traversal” alone is not enough
+  - the losing design choice was direct per-neighbor score computation inside the traversal kernel
+  - the grouped matmul-based scoring path still dominates for this workload
+- If revisiting custom kernels later:
+  - keep custom kernels for expansion / seen marking / merge only
+  - do **not** keep direct neighbor-by-neighbor scoring in the hot traversal kernel
+  - any future kernel path should preserve grouped score evaluation (or something equivalently GEMM-friendly)

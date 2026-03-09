@@ -6,6 +6,83 @@
 - Target model for iteration: `meta-llama/Llama-3.1-8B-Instruct`.
 - Primary benchmark flow now: `test.sh` first, then RULER subset/full.
 
+## 2026-03-09 update (full-GPU decode kernel progress)
+- Active decode experiment:
+  - backend: `RETRIEVALATTN_DECODE_BACKEND=roar_cuda_fullgpu`
+  - controlled workload:
+    - `DATA_PATH=benchmark/decode_ab_prompt_32k.json`
+    - actual prompt length: `40001`
+    - `GEN_LEN=32`
+    - fused graph prefill required
+- Important baseline before graph-kernel work:
+  - `44568543` / `slurm-44568543.out`
+  - `Decoding latency: 42.5315 s`
+  - `decode_profile`:
+    - `retrieve=31.803 s`
+    - `gather=1.002 s`
+    - `attn=2.679 s`
+    - `other=5.509 s`
+  - interpretation:
+    - grouped device gather/attention was already fixed
+    - `retrieve` / `graph` was the dominant remaining bottleneck
+- Failed attempt:
+  - subwarp-parallel frontier expansion + atomic append
+  - job `44577839`
+  - decode never finished in the expected window and had to be canceled after running far past the known ~40s regime
+  - conclusion:
+    - for this workload (`beam_width=48`, graph degree ~8, ~11 rounds/head), the frontier is too small to amortize warp-synchronization and atomic overhead
+    - “parallelize expansion first” was the wrong optimization cut
+- Instrumented stable full-GPU baseline:
+  - job `44579772` / `slurm-44579772.out`
+  - `Decoding latency: 43.8746 s`
+  - `decode_profile`:
+    - `retrieve=31.891 s`
+    - `gather=1.014 s`
+    - `attn=2.591 s`
+    - `other=6.930 s`
+  - kernel phase breakdown on `step=0`, `layer=0`:
+    - `merge`: dominant, about `57%` to `83%` of per-head kernel cycles
+    - `expand`: secondary, about `6%` to `36%`
+    - `score`: only about `1%` to `2%`
+    - `finalize`: about `5%` to `9%`
+    - `find_probes` was large on some heads, confirming that linear frontier-token -> candidate-slot lookup was a real cost inside `expand`
+  - conclusion:
+    - do not optimize scoring next
+    - do not reintroduce aggressive frontier parallelization
+    - optimize serial candidate maintenance first
+- Successful graph-kernel pass:
+  - change:
+    - round-end merge/select replaced repeated per-token sorted insertion
+    - `frontier_slots` removed the linear `find_token_index` path from expansion
+  - job `44580727` / `slurm-44580727.out`
+  - `Decoding latency: 24.9511 s`
+  - `decode_profile`:
+    - `retrieve=13.318 s`
+    - `gather=1.003 s`
+    - `attn=2.483 s`
+    - `other=6.849 s`
+  - kernel phase breakdown on `step=0`, `layer=0`:
+    - `merge`: reduced to about `47%` to `69%`
+    - `expand`: about `7%` to `28%`
+    - `score`: about `4%` to `5%`
+    - `finalize`: now visible at about `15%` to `24%`
+    - `find_probes=0`
+  - interpretation:
+    - the biggest win came from attacking the measured hotspot (`merge`)
+    - removing `find_token_index` materially cleaned up `expand`
+    - current next bottlenecks are `merge` first, then `finalize`
+- Current in-flight follow-up:
+  - job `44581886`
+  - purpose:
+    - keep kernel debug on
+    - reduce repeated frontier rebuild work inside `merge`
+    - reduce duplicate-check cost in `finalize`
+  - comparison target:
+    - `44580727`
+  - desired confirmation:
+    - lower `merge` and/or `finalize` share with the same debug settings
+    - maintain decode below the new ~25s level
+
 ## 2026-03-06 update (baseline map + current status)
 - Decode traversal GPU experiment (controlled ~40k prompt, `GEN_LEN=32`):
   - preservation:
@@ -161,6 +238,207 @@
   - next optimization target:
     - reduce the remaining `other` slice in grouped `roar_cuda_v2`
     - then decide whether to make `roar_cuda_v2` the preferred decode backend over `roar_cpp`
+- Experimental relaxed beam backend on current branch:
+  - new backend name:
+    - `RETRIEVALATTN_DECODE_BACKEND=roar_cuda_beam`
+  - design:
+    - grouped GPU seed scoring reused from `roar_cuda_v2`
+    - grouped beam-style traversal with top-`B` frontier expansion per round
+    - GPU-resident CSR tensors and GPU score-table updates
+  - smoke:
+    - `44479538` (`slurm-smk-cuda-beam.out`) completed successfully
+  - 40k controlled A40 comparison:
+    - `roar_cpp` (`44479539`, `slurm-dec40-cpp-beamcmp.out`):
+      - `Decoding latency: 56.8454 s`
+      - `seed=11.194 s`
+      - `graph=23.495 s`
+      - `visited_total=13414695`
+      - `candidates_total=12425410`
+    - `roar_cuda_v2` (`44479540`, `slurm-dec40-cuda-v2-beamcmp.out`):
+      - `Decoding latency: 47.7948 s`
+      - `seed=8.851 s`
+      - `graph=18.921 s`
+      - `visited_total=7263443`
+      - `candidates_total=9763681`
+    - `roar_cuda_beam` (`44479541`, `slurm-dec40-cuda-beam.out`):
+      - `Decoding latency: 178.5231 s`
+      - `seed=8.212 s`
+      - `graph=147.603 s`
+      - `visited_total=4088763`
+      - `candidates_total=12216683`
+  - conclusion:
+    - `roar_cuda_beam` is functionally valid but performance-regressed.
+    - The failure is in `graph`, not `seed`.
+    - Current implementation likely loses because it performs repeated full-row score-table `topk` over the entire dynamic token space each round.
+    - `roar_cuda_v2` remains the decode backend to optimize/promote.
+- `roar_cuda_beam` rework on current branch:
+  - backend implementation was rewritten to use a true explicit beam buffer instead of a dense score table.
+  - new grouped per-round flow:
+    - expand current beam only
+    - dedup new neighbors per query on host/native side
+    - score the union once on GPU
+    - pick next beam from those scored candidates
+  - 40k / 32-step result (`44479578`, `slurm-dec40-cuda-beam-v2.out`):
+    - `Decoding latency: 46.2885 s`
+    - `seed=7.076 s`
+    - `graph=19.666 s`
+  - 40k / 100-step result (`44479584`, `slurm-dec40-cuda-beam-g100.out`):
+    - `Decoding latency: 148.3664 s`
+    - `seed=22.465 s`
+    - `graph=62.675 s`
+  - interpretation:
+    - the rework fixed the beam backend and made it competitive
+    - it now clearly beats `roar_cpp`
+    - but it still does not beat the best `roar_cuda_v2` runs:
+      - 40k / 32-step: `46.2885 s` vs `46.0405 s`
+      - 40k / 100-step: `148.3664 s` vs `146.8723 s`
+  - current decision:
+    - keep `roar_cuda_beam` as a viable experimental backend
+    - keep `roar_cuda_v2` as the preferred decode backend
+- Custom CUDA traversal experiments on current branch:
+  - new backend name:
+    - `RETRIEVALATTN_DECODE_BACKEND=roar_cuda_kernel`
+  - build note:
+    - a separate small CUDA extension module was required:
+      - `third_party/RoarGraph/python_ext/roargraph_cuda_kernel.cpp`
+      - `third_party/RoarGraph/python_ext/roargraph_torch_ext_cuda.cu`
+    - compiling it through the existing large `roargraph_torch_ext.cpp` translation unit OOM-killed `cc1plus` on `standard`
+    - split build plus `--mem=16G` fixed the build path
+  - iteration 1: custom expand+score kernel + custom merge kernel
+    - smoke (`44484145` / `slurm-44484145.out`)
+      - `Prefilling latency: 44.0405 s`
+      - `Decoding latency: 9.3122 s`
+      - `seed=0.758 s`
+      - `graph=6.541 s`
+    - controlled ~40k run (`44484147` / `slurm-44484147.out`)
+      - `Prefilling latency: 201.0708 s`
+      - `Decoding latency: 79.7116 s`
+      - `seed=6.740 s`
+      - `graph=56.450 s`
+    - comparison vs matched `roar_cuda_v2` run (`44484146` / `slurm-44484146.out`)
+      - `roar_cuda_v2`: `decode=49.3138 s`, `seed=7.343 s`, `graph=21.514 s`
+      - custom kernel v1 is much slower overall and loses overwhelmingly in `graph`
+    - interpretation:
+      - putting direct scalar dot products inside the traversal kernel was a bad trade
+      - this removed the efficient grouped GPU score path and replaced it with low-intensity per-neighbor scoring
+  - iteration 2: custom expand kernel + grouped GPU matmul scoring + custom merge kernel
+    - smoke (`44484296` / `slurm-44484296.out`)
+      - `Prefilling latency: 43.6819 s`
+      - `Decoding latency: 12.5173 s`
+      - `seed=0.768 s`
+      - `graph=9.707 s`
+    - controlled ~40k run (`44484297` / `slurm-44484297.out`)
+      - `Prefilling latency: 216.3928 s`
+      - `Decoding latency: 130.0818 s`
+      - `seed=7.675 s`
+      - `graph=101.482 s`
+    - interpretation:
+      - this is even worse than iteration 1
+      - moving scoring back to grouped matmul did not help because the surrounding per-round union construction (`sort`, unique, row-mask build) is still too expensive
+  - current conclusion:
+    - `roar_cuda_v2` remains the preferred decode backend by a large margin
+    - current custom-kernel traversal path should not be promoted
+    - if revisiting custom traversal again, the next version must make the **entire round core** native:
+      - frontier expansion
+      - dedup / compact union build
+      - scoring handoff without ATen `sort` / `eq(...).any(1)` per round
+      - frontier/candidate merge
+
+## 2026-03-07 update (custom CUDA traversal attempt)
+- Added a new experimental decode backend:
+  - `RETRIEVALATTN_DECODE_BACKEND=roar_cuda_kernel`
+  - implementation split into a separate small CUDA extension:
+    - `third_party/RoarGraph/python_ext/roargraph_cuda_kernel.cpp`
+    - `third_party/RoarGraph/python_ext/roargraph_torch_ext_cuda.cu`
+  - rationale for separate module:
+    - recompiling the legacy `roargraph_torch_ext.cpp` as part of the CUDA module caused repeated `cc1plus` OOM kills
+    - moving the new backend into its own extension allowed the build to complete with `--mem=48G`
+- Build notes:
+  - required `module load cuda/12.8.1`
+  - required `TORCH_CUDA_ARCH_LIST=8.0;8.6`
+  - practical build request for Slurm:
+    - `--mem=48G`
+- Kernel design, iteration 1:
+  - grouped GPU seed scoring reused from `roar_cuda_v2`
+  - custom CUDA traversal core:
+    - `init_seed_state_kernel`
+    - `expand_score_kernel`
+    - `merge_round_kernel`
+  - semantics:
+    - explicit beam/frontier
+    - device-side seen bitset
+    - direct per-neighbor score computation inside the expansion kernel
+    - final rerank still uses grouped GPU matmul
+- 9k smoke (`44484122`, `slurm-44484122.out`):
+  - passed
+  - decode `9.9073 s`
+  - `seed=0.824 s`
+  - `graph=7.032 s`
+  - slower than the established `roar_cuda_v2` smoke path
+- 40k benchmark, iteration 1 (`44484124`, `slurm-44484124.out`):
+  - `Prefilling latency: 216.1633 s`
+  - `Decoding latency: 85.6461 s`
+  - `seed=7.210 s`
+  - `graph=58.753 s`
+  - `visited_total=7,123,130`
+  - `candidates_total=8,357,230`
+  - same-run `roar_cuda_v2` reference (`44484123`, `slurm-44484123.out`):
+    - `Decoding latency: 48.5557 s`
+    - `seed=7.276 s`
+    - `graph=21.075 s`
+  - interpretation:
+    - seed is effectively matched
+    - graph is the failure
+    - custom kernel traversal is much slower despite similar visited/candidate totals
+- Kernel design, iteration 2:
+  - changed `expand_score_kernel` from one-block-per-query to one-block-per-frontier-token
+  - added warp-level dot-product reduction for each neighbor
+  - intent:
+    - improve occupancy and parallelize the score computation
+- 40k benchmark, iteration 2 (`44484265`, `slurm-44484265.out`):
+  - `Prefilling latency: 217.0569 s`
+  - `Decoding latency: 127.4251 s`
+  - `seed=7.469 s`
+  - `graph=99.428 s`
+  - `visited_total=7,123,130`
+  - `candidates_total=8,357,230`
+  - interpretation:
+    - the occupancy-oriented rewrite made the kernel path worse
+    - the search work is effectively unchanged, so the loss is backend execution efficiency, not retrieval policy
+- Current conclusion:
+  - `roar_cuda_kernel` is a failed experiment for now
+  - even with custom kernels, direct per-neighbor score computation in the traversal kernel is much worse than the current grouped `roar_cuda_v2` path
+  - preferred decode backend remains `roar_cuda_v2`
+  - full-GPU traversal follow-up:
+    - tried a more device-resident `roar_cuda_beam` variant with GPU CSR walk plus GPU `seen` / `expanded` / beam buffers
+    - 40k / 32-step result (`44479626`, `slurm-dec40-cuda-beam-gpu.out`):
+      - `Decoding latency: 207.6486 s`
+      - `seed=7.029 s`
+      - `graph=180.996 s`
+    - conclusion:
+      - the full-GPU attempt is a bad regression
+      - it was reverted from the active tree
+      - the active beam implementation remains the hybrid explicit-beam version from `slurm-dec40-cuda-beam-v2.out`
+- `roar_cuda_frontier` experiment on current branch:
+  - new backend name:
+    - `RETRIEVALATTN_DECODE_BACKEND=roar_cuda_frontier`
+  - design:
+    - GPU-resident CSR
+    - GPU frontier buffer
+    - GPU candidate buffer
+    - no dense full-token-space score table
+  - smoke:
+    - `44479680` (`slurm-smk-cuda-frontier2.out`) passed
+  - 40k / 32-step result:
+    - `44479681` (`slurm-dec40-cuda-frontier2.out`)
+    - `Decoding latency: 232.8459 s`
+    - `seed=7.053 s`
+    - `graph=206.192 s`
+  - conclusion:
+    - the more GPU-resident frontier design is also a bad regression
+    - current active recommendation does not change:
+      - keep `roar_cuda_v2` as the preferred decode backend
+      - keep hybrid explicit-beam `roar_cuda_beam` only as an experimental branch point
 - Important branch/runtime caveat:
   - branch names do not currently map cleanly to distinct runtime families.
   - `cpu_graph_builder_opt` commit `bf4ab79` only adds CPU graph-builder parity harness scripts; it does not define a separate GPU+CPU runtime.
