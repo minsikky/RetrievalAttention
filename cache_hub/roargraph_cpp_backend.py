@@ -14,6 +14,10 @@ _ROAR_TORCH_EXT_MODULE = "roargraph_torch_ext"
 _ROAR_TORCH_EXT_HANDLE = None
 _ROAR_TORCH_EXT_IMPORT_ERROR = None
 
+_ROAR_TORCH_KERNEL_EXT_MODULE = "roargraph_cuda_kernel_ext"
+_ROAR_TORCH_KERNEL_EXT_HANDLE = None
+_ROAR_TORCH_KERNEL_EXT_IMPORT_ERROR = None
+
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -74,6 +78,28 @@ def _try_import_torch() -> bool:
         return False
 
 
+def _try_import_torch_kernel() -> bool:
+    global _ROAR_TORCH_KERNEL_EXT_HANDLE
+    global _ROAR_TORCH_KERNEL_EXT_IMPORT_ERROR
+
+    if _ROAR_TORCH_KERNEL_EXT_HANDLE is not None:
+        return True
+    if _ROAR_TORCH_KERNEL_EXT_IMPORT_ERROR is not None:
+        return False
+
+    ext_dir = _resolve_ext_dir()
+    if ext_dir.exists():
+        ext_dir_str = str(ext_dir)
+        if ext_dir_str not in sys.path:
+            sys.path.insert(0, ext_dir_str)
+    try:
+        _ROAR_TORCH_KERNEL_EXT_HANDLE = importlib.import_module(_ROAR_TORCH_KERNEL_EXT_MODULE)
+        return True
+    except Exception as exc:  # pragma: no cover - import failure path
+        _ROAR_TORCH_KERNEL_EXT_IMPORT_ERROR = exc
+        return False
+
+
 def roargraph_cpp_available() -> bool:
     return _try_import()
 
@@ -90,6 +116,15 @@ def roargraph_cuda_available() -> bool:
 def roargraph_cuda_import_error():
     _try_import_torch()
     return _ROAR_TORCH_EXT_IMPORT_ERROR
+
+
+def roargraph_cuda_kernel_available() -> bool:
+    return _try_import_torch_kernel()
+
+
+def roargraph_cuda_kernel_import_error():
+    _try_import_torch_kernel()
+    return _ROAR_TORCH_KERNEL_EXT_IMPORT_ERROR
 
 
 def build_roar_graph_csr_cpp(
@@ -300,5 +335,217 @@ def search_roar_graph_csr_cuda_group(
         float(stop_margin),
         int(dynamic_start),
         int(dynamic_end),
+        str(score_agg),
+    )
+
+
+def search_roar_graph_csr_cuda_group_beam(
+    queries_seed,
+    queries_rank,
+    keys,
+    offsets,
+    neighbors,
+    init_ids,
+    init_scores,
+    *,
+    token_budget: int,
+    candidate_target: int,
+    beam_width: int,
+    max_degree: int,
+    min_visits: int,
+    max_visits: int,
+    stop_patience: int,
+    stop_margin: float,
+    dynamic_start: int,
+    dynamic_end: int,
+    score_agg: str = "max",
+):
+    if not _try_import_torch():
+        raise RuntimeError(
+            "RoarGraph torch/CUDA extension is unavailable. "
+            "Build it with: "
+            "`module load python/3.10.4 && source .venv/bin/activate && "
+            "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+        ) from _ROAR_TORCH_EXT_IMPORT_ERROR
+
+    return _ROAR_TORCH_EXT_HANDLE.search_graph_csr_cuda_group_beam(
+        queries_seed,
+        queries_rank,
+        keys,
+        offsets,
+        neighbors,
+        init_ids,
+        init_scores,
+        int(token_budget),
+        int(candidate_target),
+        int(beam_width),
+        int(max_degree),
+        int(min_visits),
+        int(max_visits),
+        int(stop_patience),
+        float(stop_margin),
+        int(dynamic_start),
+        int(dynamic_end),
+        str(score_agg),
+    )
+
+
+def search_roar_graph_csr_cuda_frontier(
+    queries_seed,
+    queries_rank,
+    keys,
+    offsets,
+    neighbors,
+    init_ids,
+    init_scores,
+    *,
+    token_budget: int,
+    candidate_target: int,
+    frontier_width: int,
+    min_visits: int,
+    max_visits: int,
+    stop_patience: int,
+    stop_margin: float,
+    dynamic_start: int,
+    dynamic_end: int,
+    score_agg: str = "max",
+):
+    if not _try_import_torch():
+        raise RuntimeError(
+            "RoarGraph torch/CUDA extension is unavailable. "
+            "Build it with: "
+            "`module load python/3.10.4 && source .venv/bin/activate && "
+            "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+        ) from _ROAR_TORCH_EXT_IMPORT_ERROR
+
+    return _ROAR_TORCH_EXT_HANDLE.search_graph_csr_cuda_frontier(
+        queries_seed,
+        queries_rank,
+        keys,
+        offsets,
+        neighbors,
+        init_ids,
+        init_scores,
+        int(token_budget),
+        int(candidate_target),
+        int(frontier_width),
+        int(min_visits),
+        int(max_visits),
+        int(stop_patience),
+        float(stop_margin),
+        int(dynamic_start),
+        int(dynamic_end),
+        str(score_agg),
+    )
+
+
+def search_roar_graph_csr_cuda_group_kernel(
+    queries_seed,
+    queries_rank,
+    keys,
+    offsets,
+    neighbors,
+    init_ids,
+    init_scores,
+    *,
+    token_budget: int,
+    candidate_target: int,
+    beam_width: int,
+    max_degree: int,
+    min_visits: int,
+    max_visits: int,
+    stop_patience: int,
+    stop_margin: float,
+    dynamic_start: int,
+    dynamic_end: int,
+    score_agg: str = "max",
+):
+    if not _try_import_torch_kernel():
+        raise RuntimeError(
+            "RoarGraph torch/CUDA kernel extension is unavailable. "
+            "Build it with: "
+            "`module load python/3.10.4 && source .venv/bin/activate && "
+            "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+        ) from _ROAR_TORCH_KERNEL_EXT_IMPORT_ERROR
+
+    return _ROAR_TORCH_KERNEL_EXT_HANDLE.search_graph_csr_cuda_group_kernel(
+        queries_seed,
+        queries_rank,
+        keys,
+        offsets,
+        neighbors,
+        init_ids,
+        init_scores,
+        int(token_budget),
+        int(candidate_target),
+        int(beam_width),
+        int(max_degree),
+        int(min_visits),
+        int(max_visits),
+        int(stop_patience),
+        float(stop_margin),
+        int(dynamic_start),
+        int(dynamic_end),
+        str(score_agg),
+    )
+
+
+def search_roar_graph_csr_cuda_group_fullgpu(
+    queries_seed,
+    queries_rank,
+    keys,
+    offsets,
+    neighbors,
+    prev_seed_ids,
+    prev_seed_counts,
+    hub_seed_ids,
+    *,
+    token_budget: int,
+    candidate_target: int,
+    beam_width: int,
+    max_degree: int,
+    min_visits: int,
+    max_visits: int,
+    stop_patience: int,
+    stop_margin: float,
+    dynamic_start: int,
+    dynamic_end: int,
+    seed_k: int,
+    seed_floor: int,
+    seed_tail_k: int,
+    seed_prev_k: int,
+    score_agg: str = "max",
+):
+    if not _try_import_torch_kernel():
+        raise RuntimeError(
+            "RoarGraph torch/CUDA kernel extension is unavailable. "
+            "Build it with: "
+            "`module load python/3.10.4 && source .venv/bin/activate && "
+            "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+        ) from _ROAR_TORCH_KERNEL_EXT_IMPORT_ERROR
+
+    return _ROAR_TORCH_KERNEL_EXT_HANDLE.search_graph_csr_cuda_group_fullgpu(
+        queries_seed,
+        queries_rank,
+        keys,
+        offsets,
+        neighbors,
+        prev_seed_ids,
+        prev_seed_counts,
+        hub_seed_ids,
+        int(token_budget),
+        int(candidate_target),
+        int(beam_width),
+        int(max_degree),
+        int(min_visits),
+        int(max_visits),
+        int(stop_patience),
+        float(stop_margin),
+        int(dynamic_start),
+        int(dynamic_end),
+        int(seed_k),
+        int(seed_floor),
+        int(seed_tail_k),
+        int(seed_prev_k),
         str(score_agg),
     )
