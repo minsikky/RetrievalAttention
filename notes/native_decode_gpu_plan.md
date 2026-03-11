@@ -18,6 +18,17 @@
   - current full-GPU graph cost is dominated by serial candidate maintenance
   - scoring is not the main bottleneck
   - naive frontier parallelization with atomics was explicitly tested and failed badly on this workload
+- Additional 2026-03-11 update:
+  - one more kernel-side merge experiment was tried after the successful finalize cleanup:
+    - pre-merge threshold filtering against the current kth candidate
+    - scratch-buffer candidate merge plus pointer swapping
+  - result on `44866961`:
+    - decode regressed to `29.7985 s`
+    - retrieve stayed flat at `10.573 s`
+    - kernel `merge` improved only marginally, while `expand` and `score` got slower
+  - conclusion:
+    - small pre-merge filtering tricks are not enough
+    - the next likely win is to reduce the full-GPU group integration overhead around the stable kernel, not to keep nibbling at the current merge helper
 
 ## Updated rule-of-thumb for this backend
 - Do:
@@ -191,7 +202,7 @@
   - the problem is “frontier on GPU implemented as many generic tensor ops”.
 
 ## Updated Next Step
-Move to **custom CUDA kernels** for traversal, not more ATen composition.
+Move to **measured optimizations around the stable custom kernel**, not more speculative merge-side micro-optimizations.
 
 ### Required properties
 - Keep q-head retrieval objective unchanged.
@@ -199,6 +210,7 @@ Move to **custom CUDA kernels** for traversal, not more ATen composition.
 - Keep small-buffer traversal only:
   - no dense `[q_count, num_tokens]` score tables.
 - No CPU synchronization inside a decode step except final result extraction.
+- Preserve the current stable full-GPU kernel unless a new kernel change is justified by measurements.
 
 ### Kernel breakdown to implement
 1. `expand_frontier_kernel`
@@ -238,6 +250,12 @@ Move to **custom CUDA kernels** for traversal, not more ATen composition.
 - Keep `roar_cuda_v2` as the preferred decode backend until a custom-kernel traversal wins.
 - Treat `roar_cuda_beam` and `roar_cuda_frontier` as experimental evidence, not promotion candidates.
 - If resuming implementation, start from the current grouped seed path and replace only the traversal core.
+- For the current full-GPU branch specifically:
+  - stable kernel baseline is `44581886`
+  - next optimization target is the KV-group integration path:
+    - avoid per-head payload dict creation
+    - avoid restacking already-batched device IDs and masks
+    - keep attention inputs batched per KV-group after search
 
 ## 2026-03-07 custom-kernel follow-up
 - We tried that next step.

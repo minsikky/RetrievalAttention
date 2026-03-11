@@ -66,6 +66,137 @@
     - reduce repeated frontier rebuild work inside `merge`
     - reduce duplicate-check work in `finalize`
 
+## 2026-03-11 update (full-GPU finalize trim win, threshold-filter loss)
+- Controlled workload remained unchanged:
+  - `DATA_PATH=benchmark/decode_ab_prompt_32k.json`
+  - actual input length `40001`
+  - `GEN_LEN=32`
+  - `RETRIEVALATTN_DECODE_BACKEND=roar_cuda_fullgpu`
+  - fused graph prefill required
+  - kernel debug kept on for all comparisons below
+- Successful follow-up to the first merge rewrite:
+  - `44581886` / `slurm-44581886.out`
+  - results:
+    - decode `21.8701 s`
+    - retrieve `10.602 s`
+    - gather `0.982 s`
+    - attn `2.237 s`
+    - other `6.743 s`
+  - compared to `44580727`:
+    - decode `24.9511 s -> 21.8701 s`
+    - retrieve `13.318 s -> 10.602 s`
+  - kernel instrumentation:
+    - `finalize` dropped from roughly `15-24%` to about `2.5-6%`
+    - `merge` improved in absolute cycles but remained the largest slice
+  - conclusion:
+    - finalize cleanup was worth it
+    - stable baseline to beat is now `44581886`
+- Failed threshold-filter / double-buffer attempt:
+  - kernel changes:
+    - compact `new_ids/new_scores` against the current kth candidate before merge
+    - merge into a scratch candidate buffer and swap pointers instead of copying results back
+  - `44866961` / `slurm-44866961.out`
+  - results:
+    - decode `29.7985 s`
+    - retrieve `10.573 s`
+    - gather `0.849 s`
+    - attn `4.939 s`
+    - other `9.206 s`
+  - comparison to `44581886`:
+    - retrieval behavior was unchanged:
+      - `visited_total=6001907`
+      - `candidates_total=8274574`
+      - `rounds/head=11.3`
+      - `cand/visit=1.38x`
+    - kernel phase deltas averaged across kv-heads:
+      - `merge`: about `-1.1%`
+      - `finalize`: about `-6.0%`
+      - `score`: about `+3.5%`
+      - `expand`: about `+8.4%`
+  - interpretation:
+    - the threshold filter did not buy enough to matter
+    - many heads already stop around candidate capacity, so pre-merge compaction does not discard much
+    - extra pointer/state logic likely increased register pressure or instruction overhead enough to slow `expand` and `score`
+    - this line of optimization should be treated as a dead end for the current workload
+- Updated recommendation:
+  - revert the threshold-filter patch
+  - keep the stable `44581886` kernel
+  - next optimization should target the full-GPU group integration path, not another small merge tweak:
+    - reduce per-head Python dict packing/unpacking
+    - keep group outputs batched through attention instead of restacking them
+- Follow-up on that integration target:
+  - first grouped integration attempt (`44872645` / `slurm-44872645.out`):
+    - decode `32.2138 s`
+    - retrieve `10.532 s`
+    - gather `1.222 s`
+    - attn `5.902 s`
+    - other `9.082 s`
+    - interpretation:
+      - kernel/retrieval stayed unchanged
+      - the regression came from extra device-side packing/restacking in the new grouped path
+  - zero-copy fast path for the common all-active case (`44873830` / `slurm-44873830.out`):
+    - decode `24.4656 s`
+    - retrieve `10.507 s`
+    - gather `1.684 s`
+    - attn `4.261 s`
+    - other `5.644 s`
+    - interpretation:
+      - this recovered most of the regression
+      - but it still did not beat the stable `44581886` baseline
+      - the remaining loss was still in gather/attention integration, not the kernel
+  - attempted gather-side simplification by padding invalid output IDs with `0` and removing the `torch.where(...)` remap (`44876250` / `slurm-44876250.out`):
+    - decode `34.0106 s`
+    - retrieve `11.348 s`
+    - gather `0.410 s`
+    - attn `7.947 s`
+    - traversal changed:
+      - `visited_total=6240570`
+      - `candidates_total=8594816`
+      - `rounds/head=12.0`
+    - root cause:
+      - current `out_mask = out_ids.ge(0)` logic treated every padded slot as valid after the `-1 -> 0` change
+      - this was a semantic bug, not a valid performance result
+    - action:
+      - reverted immediately
+      - rebuilt the extension back to the last valid source state
+- Updated recommendation after all three runs:
+  - stop pushing on the current grouped post-search integration path for now
+  - it has not beaten the original `44581886` fast path
+  - the next performance work should either:
+    - measure and reduce the original full-GPU path’s `other` bucket directly, or
+    - move to a cleaner kernel/interface change that emits exactly the gather layout attention wants
+
+## 2026-03-11 update (`other` bucket split on the stable full-GPU path)
+- Instrumented the stable full-GPU path with explicit `other` sub-buckets and reran the same 40k / 32-step debug job:
+  - `44885078` / `slurm-44885078.out`
+  - results:
+    - decode `23.765 s`
+    - retrieve `10.617 s`
+    - gather `0.995 s`
+    - attn `3.324 s`
+    - other `6.926 s`
+  - `other` decomposition:
+    - `setup=0.015 s`
+    - `state=0.956 s`
+    - `profile=0.109 s`
+    - `group=0.148 s`
+    - `output=0.036 s`
+    - `misc=5.662 s`
+- Interpretation:
+  - the obvious cache-side Python/bookkeeping pieces are small
+  - the only non-trivial cache-local bucket is state prep, and even that is under `1 s`
+  - the dominant residual `misc` is too large to be explained by the retrieval cache’s explicit bookkeeping
+  - most likely explanation:
+    - `compute_total_sec` starts before the cache’s first `torch.cuda.synchronize(...)`
+    - therefore the first sync in the full-GPU retrieval path is probably absorbing upstream asynchronous GPU work that was launched before the cache began its own timed sections
+    - likely sources are the query/QKV/decode-attention preparation path outside the retrieval cache
+- Practical conclusion:
+  - do not prioritize more cache-side `other` cleanup as the next optimization target
+  - if we want to reduce the large residual `other/misc`, the next instrumentation should move up one level:
+    - around the model-side decode path before entering the retrieval cache
+    - or by adding an explicit synchronized boundary at cache entry purely for profiling attribution
+  - if we still want a small cache-side win, batching or simplifying full-GPU state prep is the only obvious local candidate, but the expected gain is modest
+
 ## 2026-03-06 update (decode traversal GPU experiment)
 - preservation:
   - experiment preserved at branch `exp/decode-python-gpu`

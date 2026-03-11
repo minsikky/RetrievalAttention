@@ -83,6 +83,49 @@
     - lower `merge` and/or `finalize` share with the same debug settings
     - maintain decode below the new ~25s level
 
+## 2026-03-11 update (full-GPU merge/finalize pass + failed threshold-filter follow-up)
+- Successful follow-up after `44580727`:
+  - job `44581886` / `slurm-44581886.out`
+  - decode `21.8701 s`
+  - `decode_profile`:
+    - `retrieve=10.602 s`
+    - `gather=0.982 s`
+    - `attn=2.237 s`
+    - `other=6.743 s`
+  - kernel phase breakdown on `step=0`, `layer=0`:
+    - `merge`: still dominant, about `56%` to `68%`
+    - `expand`: about `15%` to `34%`
+    - `score`: about `4%` to `9%`
+    - `finalize`: reduced to about `2.5%` to `6%`
+  - interpretation:
+    - trimming finalize duplicate checks was worth it
+    - the stable full-GPU kernel baseline to beat is now `21.87 s`
+- Failed follow-up after that:
+  - change:
+    - threshold-filter `new_ids/new_scores` against the current kth candidate before merge
+    - double-buffer candidate storage and swap pointers instead of copying merged buffers back
+  - job `44866961` / `slurm-44866961.out`
+  - result:
+    - decode regressed to `29.7985 s`
+    - `retrieve=10.573 s` was essentially unchanged
+    - `gather=0.849 s` improved slightly
+    - `attn=4.939 s` and `other=9.206 s` were worse
+  - kernel phase delta versus `44581886`:
+    - `merge`: only about `1%` better on average
+    - `finalize`: about `6%` better
+    - `score`: about `3.5%` worse
+    - `expand`: about `8.4%` worse
+  - conclusion:
+    - this is not a useful direction
+    - the threshold filter does not trigger often enough to matter on the current search dynamics
+    - the extra pointer/state logic likely increased kernel overhead without moving the main hotspot enough
+    - do not keep this patch in the working tree; revert to the `44581886` kernel state before the next pass
+- Updated next optimization target:
+  - keep the stable kernel from `44581886`
+  - reduce full-GPU Python/group overhead:
+    - stop unpacking per-head payload dicts and restacking them for attention
+    - keep the full-GPU path batched at the KV-group level through post-search attention
+
 ## 2026-03-06 update (baseline map + current status)
 - Decode traversal GPU experiment (controlled ~40k prompt, `GEN_LEN=32`):
   - preservation:

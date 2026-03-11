@@ -509,6 +509,11 @@ class retrievalattention_cache(KV_Cache):
             "retrieve_finalize_sec": 0.0,
             "gather_total_sec": 0.0,
             "attn_total_sec": 0.0,
+            "other_setup_sec": 0.0,
+            "other_state_prep_sec": 0.0,
+            "other_profile_accum_sec": 0.0,
+            "other_group_bookkeeping_sec": 0.0,
+            "other_output_sec": 0.0,
             "visited_total": 0,
             "candidates_total": 0,
             "final_outputs_total": 0,
@@ -3651,6 +3656,19 @@ class retrievalattention_cache(KV_Cache):
         gather = float(stats["gather_total_sec"])
         attn = float(stats["attn_total_sec"])
         other = max(0.0, total - retrieve - gather - attn)
+        other_setup = float(stats["other_setup_sec"])
+        other_state_prep = float(stats["other_state_prep_sec"])
+        other_profile_accum = float(stats["other_profile_accum_sec"])
+        other_group_bookkeeping = float(stats["other_group_bookkeeping_sec"])
+        other_output = float(stats["other_output_sec"])
+        other_accounted = (
+            other_setup
+            + other_state_prep
+            + other_profile_accum
+            + other_group_bookkeeping
+            + other_output
+        )
+        other_misc = max(0.0, other - other_accounted)
         heads = int(stats["heads"])
         visited_total = int(stats["visited_total"])
         candidates_total = int(stats["candidates_total"])
@@ -3717,7 +3735,10 @@ class retrievalattention_cache(KV_Cache):
             f"finalize={stats['retrieve_finalize_sec']:.3f}s] | "
             f"gather={gather:.3f}s ({pct(gather):.1f}%) | "
             f"attn={attn:.3f}s ({pct(attn):.1f}%) | "
-            f"other={other:.3f}s ({pct(other):.1f}%) | "
+            f"other={other:.3f}s ({pct(other):.1f}%) "
+            f"[setup={other_setup:.3f}s, state={other_state_prep:.3f}s, "
+            f"profile={other_profile_accum:.3f}s, group={other_group_bookkeeping:.3f}s, "
+            f"output={other_output:.3f}s, misc={other_misc:.3f}s] | "
             f"visited_total={visited_total} "
             f"candidates_total={candidates_total} | "
             f"traversal=[space/head={search_space_per_head:.1f}, "
@@ -3734,6 +3755,41 @@ class retrievalattention_cache(KV_Cache):
         if reset:
             self.reset_decode_profile()
         return msg
+
+    def _accumulate_decode_retrieve_profile(self, retrieve_profile):
+        if not self.decode_profile or retrieve_profile is None:
+            return
+        accum_start = time.perf_counter()
+        self._decode_profile_stats["retrieve_total_sec"] += float(retrieve_profile["total_sec"])
+        self._decode_profile_stats["retrieve_seed_sec"] += float(retrieve_profile["seed_sec"])
+        self._decode_profile_stats["retrieve_graph_sec"] += float(retrieve_profile["graph_sec"])
+        self._decode_profile_stats["retrieve_rerank_sec"] += float(retrieve_profile["rerank_sec"])
+        self._decode_profile_stats["retrieve_finalize_sec"] += float(retrieve_profile["finalize_sec"])
+        self._decode_profile_stats["visited_total"] += int(retrieve_profile["visited"])
+        self._decode_profile_stats["candidates_total"] += int(retrieve_profile["candidates"])
+        self._decode_profile_stats["final_outputs_total"] += int(retrieve_profile.get("final_outputs", 0))
+        self._decode_profile_stats["kernel_round_total"] += int(retrieve_profile.get("kernel_rounds", 0))
+        self._decode_profile_stats["forced_seed_total"] += int(retrieve_profile.get("forced_seeds", 0))
+        stop_reason = str(retrieve_profile.get("stop_reason", ""))
+        if stop_reason == "frontier_empty":
+            self._decode_profile_stats["stop_frontier_empty"] += 1
+        elif stop_reason == "max_visits":
+            self._decode_profile_stats["stop_max_visits"] += 1
+        elif stop_reason == "candidate_cap":
+            self._decode_profile_stats["stop_candidate_cap"] += 1
+        elif stop_reason == "stability_gap":
+            self._decode_profile_stats["stop_stability_gap"] += 1
+        elif stop_reason == "empty_init":
+            self._decode_profile_stats["stop_empty_init"] += 1
+        search_space = max(0, int(retrieve_profile.get("search_space", 0)))
+        self._decode_profile_stats["search_space_total"] += search_space
+        if search_space > 0:
+            self._decode_profile_stats["search_space_heads"] += 1
+        self._decode_profile_stats["visited_ratio_sum"] += float(
+            retrieve_profile.get("visited_ratio", 0.0)
+        )
+        self._decode_profile_stats["visited_ratio_count"] += 1
+        self._decode_profile_stats["other_profile_accum_sec"] += (time.perf_counter() - accum_start)
 
     def decode_update_kv_cache(self, key_states, value_states, layer_idx):
         """
@@ -3848,8 +3904,8 @@ class retrievalattention_cache(KV_Cache):
         )
 
         for hdx in head_ids:
-            fg_payload, fg_profile = fg_results.get(hdx, ({}, None))
             ref_ids, ref_profile = ref_results.get(hdx, ([], None))
+            fg_payload, fg_profile = fg_results.get(hdx, ({}, None))
             if isinstance(fg_payload, dict) and "device_ids" in fg_payload:
                 fg_mask = fg_payload["device_mask"]
                 fg_ids = fg_payload["device_ids"][fg_mask].detach().cpu().tolist()
@@ -5961,6 +6017,8 @@ class retrievalattention_cache(KV_Cache):
             and self.retrieval_head_mode == "q_head"
             and self.query_mode == "per_head"
         )
+        if self.decode_profile:
+            self._decode_profile_stats["other_setup_sec"] += (time.perf_counter() - compute_start)
 
         if use_roar_cuda_v2 or use_roar_cuda_kernel or use_roar_cuda_fullgpu or use_roar_cuda_frontier or use_roar_cuda_beam:
             for kv_hdx in range(self.kv_head):
@@ -5971,6 +6029,7 @@ class retrievalattention_cache(KV_Cache):
                         break
                     q_group = q[hdx]
                     q_attn_by_head[hdx] = q_group.unsqueeze(0)
+                    state_prep_start = time.perf_counter() if self.decode_profile else None
                     if use_roar_cuda_fullgpu:
                         state = self._prepare_decode_seed_state_fullgpu(
                             layer_idx,
@@ -5983,6 +6042,10 @@ class retrievalattention_cache(KV_Cache):
                             hdx,
                             q_group,
                             defer_seed_scoring=True,
+                        )
+                    if self.decode_profile:
+                        self._decode_profile_stats["other_state_prep_sec"] += (
+                            time.perf_counter() - state_prep_start
                         )
                     states.append(state)
                 if use_roar_cuda_kernel:
@@ -6032,7 +6095,12 @@ class retrievalattention_cache(KV_Cache):
                         update_decode_state=True,
                         enforce_seed_floor=True,
                     )
+                bookkeeping_start = time.perf_counter() if self.decode_profile else None
                 token_results.update(group_results)
+                if self.decode_profile:
+                    self._decode_profile_stats["other_group_bookkeeping_sec"] += (
+                        time.perf_counter() - bookkeeping_start
+                    )
         else:
             for hdx in range(head_count):
                 kv_hdx = self._retrieval_head_to_kv_head(hdx)
@@ -6056,38 +6124,14 @@ class retrievalattention_cache(KV_Cache):
                     head_ids.append(hdx)
                 if not head_ids:
                     continue
+                bookkeeping_start = time.perf_counter() if self.decode_profile else None
                 for hdx in head_ids:
                     token_ids, retrieve_profile = token_results.get(hdx, ({}, None))
-                    if self.decode_profile and retrieve_profile is not None:
-                        self._decode_profile_stats["retrieve_total_sec"] += float(retrieve_profile["total_sec"])
-                        self._decode_profile_stats["retrieve_seed_sec"] += float(retrieve_profile["seed_sec"])
-                        self._decode_profile_stats["retrieve_graph_sec"] += float(retrieve_profile["graph_sec"])
-                        self._decode_profile_stats["retrieve_rerank_sec"] += float(retrieve_profile["rerank_sec"])
-                        self._decode_profile_stats["retrieve_finalize_sec"] += float(retrieve_profile["finalize_sec"])
-                        self._decode_profile_stats["visited_total"] += int(retrieve_profile["visited"])
-                        self._decode_profile_stats["candidates_total"] += int(retrieve_profile["candidates"])
-                        self._decode_profile_stats["final_outputs_total"] += int(retrieve_profile.get("final_outputs", 0))
-                        self._decode_profile_stats["kernel_round_total"] += int(retrieve_profile.get("kernel_rounds", 0))
-                        self._decode_profile_stats["forced_seed_total"] += int(retrieve_profile.get("forced_seeds", 0))
-                        stop_reason = str(retrieve_profile.get("stop_reason", ""))
-                        if stop_reason == "frontier_empty":
-                            self._decode_profile_stats["stop_frontier_empty"] += 1
-                        elif stop_reason == "max_visits":
-                            self._decode_profile_stats["stop_max_visits"] += 1
-                        elif stop_reason == "candidate_cap":
-                            self._decode_profile_stats["stop_candidate_cap"] += 1
-                        elif stop_reason == "stability_gap":
-                            self._decode_profile_stats["stop_stability_gap"] += 1
-                        elif stop_reason == "empty_init":
-                            self._decode_profile_stats["stop_empty_init"] += 1
-                        search_space = max(0, int(retrieve_profile.get("search_space", 0)))
-                        self._decode_profile_stats["search_space_total"] += search_space
-                        if search_space > 0:
-                            self._decode_profile_stats["search_space_heads"] += 1
-                        self._decode_profile_stats["visited_ratio_sum"] += float(
-                            retrieve_profile.get("visited_ratio", 0.0)
-                        )
-                        self._decode_profile_stats["visited_ratio_count"] += 1
+                    self._accumulate_decode_retrieve_profile(retrieve_profile)
+                if self.decode_profile:
+                    self._decode_profile_stats["other_group_bookkeeping_sec"] += (
+                        time.perf_counter() - bookkeeping_start
+                    )
                 group_outputs, group_empty, group_dyn_counts = self._apply_fullgpu_group_attention(
                     layer_idx=layer_idx,
                     kv_hdx=kv_hdx,
@@ -6111,10 +6155,13 @@ class retrievalattention_cache(KV_Cache):
                     f"[RetrievalAttention][debug] step={self.decode_pos} layer={layer_idx} "
                     f"empty_heads={empty_heads}/{head_count} avg_dynamic={avg_dyn:.1f}"
                 )
+            output_start = time.perf_counter() if self.decode_profile else None
             if self.decode_profile:
                 self._decode_profile_stats["calls"] += 1
                 self._decode_profile_stats["compute_total_sec"] += (time.perf_counter() - compute_start)
             out = torch.cat(outputs, dim=0).view(1, 1, self.num_heads, self.head_dim)
+            if self.decode_profile:
+                self._decode_profile_stats["other_output_sec"] += (time.perf_counter() - output_start)
             return out
 
         for hdx in range(head_count):
@@ -6126,36 +6173,12 @@ class retrievalattention_cache(KV_Cache):
                     q_attn_by_head[hdx] = q_grouped[hdx]
             q_attn = q_attn_by_head[hdx]
             token_ids, retrieve_profile = token_results.get(hdx, ([], None))
-            if self.decode_profile and retrieve_profile is not None:
-                self._decode_profile_stats["retrieve_total_sec"] += float(retrieve_profile["total_sec"])
-                self._decode_profile_stats["retrieve_seed_sec"] += float(retrieve_profile["seed_sec"])
-                self._decode_profile_stats["retrieve_graph_sec"] += float(retrieve_profile["graph_sec"])
-                self._decode_profile_stats["retrieve_rerank_sec"] += float(retrieve_profile["rerank_sec"])
-                self._decode_profile_stats["retrieve_finalize_sec"] += float(retrieve_profile["finalize_sec"])
-                self._decode_profile_stats["visited_total"] += int(retrieve_profile["visited"])
-                self._decode_profile_stats["candidates_total"] += int(retrieve_profile["candidates"])
-                self._decode_profile_stats["final_outputs_total"] += int(retrieve_profile.get("final_outputs", 0))
-                self._decode_profile_stats["kernel_round_total"] += int(retrieve_profile.get("kernel_rounds", 0))
-                self._decode_profile_stats["forced_seed_total"] += int(retrieve_profile.get("forced_seeds", 0))
-                stop_reason = str(retrieve_profile.get("stop_reason", ""))
-                if stop_reason == "frontier_empty":
-                    self._decode_profile_stats["stop_frontier_empty"] += 1
-                elif stop_reason == "max_visits":
-                    self._decode_profile_stats["stop_max_visits"] += 1
-                elif stop_reason == "candidate_cap":
-                    self._decode_profile_stats["stop_candidate_cap"] += 1
-                elif stop_reason == "stability_gap":
-                    self._decode_profile_stats["stop_stability_gap"] += 1
-                elif stop_reason == "empty_init":
-                    self._decode_profile_stats["stop_empty_init"] += 1
-                search_space = max(0, int(retrieve_profile.get("search_space", 0)))
-                self._decode_profile_stats["search_space_total"] += search_space
-                if search_space > 0:
-                    self._decode_profile_stats["search_space_heads"] += 1
-                self._decode_profile_stats["visited_ratio_sum"] += float(
-                    retrieve_profile.get("visited_ratio", 0.0)
+            bookkeeping_start = time.perf_counter() if self.decode_profile else None
+            self._accumulate_decode_retrieve_profile(retrieve_profile)
+            if self.decode_profile:
+                self._decode_profile_stats["other_group_bookkeeping_sec"] += (
+                    time.perf_counter() - bookkeeping_start
                 )
-                self._decode_profile_stats["visited_ratio_count"] += 1
             gather_start = time.perf_counter() if self.decode_profile else None
             dyn_mask = None
             if isinstance(token_ids, dict) and "device_ids" in token_ids:
@@ -6246,9 +6269,12 @@ class retrievalattention_cache(KV_Cache):
                 f"empty_heads={empty_heads}/{head_count} avg_dynamic={avg_dyn:.1f}"
             )
 
+        output_start = time.perf_counter() if self.decode_profile else None
         if self.decode_profile:
             self._decode_profile_stats["calls"] += 1
             self._decode_profile_stats["compute_total_sec"] += (time.perf_counter() - compute_start)
 
         out = torch.cat(outputs, dim=0).view(1, 1, self.num_heads, self.head_dim)
+        if self.decode_profile:
+            self._decode_profile_stats["other_output_sec"] += (time.perf_counter() - output_start)
         return out
