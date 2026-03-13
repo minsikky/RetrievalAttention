@@ -1245,3 +1245,51 @@
 - Current implication:
   - at these decode lengths, full dense attention is far faster than the sparse RetrievalAttention variants.
   - online decode graph is mechanistically working, but it is not yet latency-competitive in this regime.
+
+## 2026-03-13 online length-sweep completion
+- The remaining online sweep runs finished:
+  - `e24` (`45069306`):
+    - `query_acc=1.0`
+    - `strict_acc=1.0`
+    - `avg_decode_sec=264.90s`
+    - `update=100.682s`
+    - `aged_gen/head=47.48`
+  - `e48` (`45069307`):
+    - `query_acc=1.0`
+    - `strict_acc=1.0`
+    - `avg_decode_sec=502.11s`
+    - `update=234.919s`
+    - `aged_gen/head=61.02`
+- Interpretation:
+  - online provenance quality is strong on this synthetic task across the tested lengths;
+  - the dominant scalability problem is update cost, not graph traversal cost.
+
+## 2026-03-13 fullgpu online update breakdown and fix
+- Added online update timing split in decode profile:
+  - `d2h`
+  - `build`
+  - `h2d`
+- Baseline split before the overlay fix (`45079412`):
+  - `update=56.989s`
+  - `d2h=7.545s`
+  - `build=54.533s`
+  - `h2d=1.265s`
+- Conclusion from that run:
+  - full overlay CSR rebuild on CPU was the dominant implementation inefficiency;
+  - GPU upload was relatively small.
+- Implemented a persistent row-wise fullgpu overlay representation:
+  - overlay stored as `row_count + fixed-cap row_neighbors`;
+  - flush updates only dirty rows on device;
+  - behavior unchanged.
+- Verification run after the fix (`45081113`):
+  - `update=16.255s` (down from `56.989s`)
+  - `build=14.716s` (down from `54.533s`)
+  - `group=9.844s` (slightly down from `10.237s`)
+  - `avg_decode_sec=125.53s` (down from `171.32s`)
+  - retrieval/quality counters unchanged:
+    - `overlay_edges=102490740`
+    - `aged_gen/head=35.02`
+    - `query_acc=1.0`
+- Current implication:
+  - the persistent-overlay change is a real win and preserves behavior;
+  - the next remaining online-specific cost is provenance/bookkeeping (`d2h` + `group`), not overlay rebuild.

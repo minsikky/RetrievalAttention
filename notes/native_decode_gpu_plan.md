@@ -391,3 +391,33 @@ Move to **measured optimizations around the stable custom kernel**, not more spe
 - Updated interpretation:
   - at short/medium decode lengths, sparse RetrievalAttention is nowhere near dense attention on latency.
   - if online sparse decode is going to win, it likely has to be at much longer decode lengths than `12/24/48` entries.
+
+## 2026-03-13 online update priority shift
+- The completed online sweep makes the bottleneck clear:
+  - `online e24`: `update=100.682s`, `graph=31.694s`
+  - `online e48`: `update=234.919s`, `graph=55.133s`
+- So the next priority is online update implementation efficiency, not more graph-kernel tuning.
+
+## 2026-03-13 persistent overlay result
+- Added update sub-buckets:
+  - `d2h`
+  - `build`
+  - `h2d`
+- Pre-fix measurement (`45079412`) showed:
+  - `update=56.989s`
+  - `d2h=7.545s`
+  - `build=54.533s`
+  - `h2d=1.265s`
+- Implemented a persistent row-wise fullgpu overlay:
+  - overlay represented as per-row count + fixed-cap row neighbors
+  - flush updates only dirty rows on device
+  - no full overlay CSR rebuild on every step
+- Verification (`45081113`) showed:
+  - `update=16.255s`
+  - `build=14.716s`
+  - `avg_decode_sec=125.531s`
+  - retrieval behavior unchanged
+- Updated recommendation:
+  1. keep the persistent row-wise overlay path
+  2. next optimize provenance extraction / Python-side bookkeeping
+  3. only then revisit deeper graph-kernel changes

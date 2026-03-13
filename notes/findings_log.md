@@ -1516,3 +1516,51 @@
   - online decode graph is functioning but very expensive
   - dense attention is still the performance target to beat at these lengths
   - sparse decode must be tested at much longer decode lengths before claiming any latency win
+
+## 2026-03-13 completed online sweep
+- `online e24` (`45069306`):
+  - `avg_decode_sec=264.899`
+  - `query_acc=1.0`
+  - `update=100.682s`
+  - `overlay_edges=192244755`
+  - `aged_gen/head=47.48`
+- `online e48` (`45069307`):
+  - `avg_decode_sec=502.114`
+  - `query_acc=1.0`
+  - `update=234.919s`
+  - `overlay_edges=326816270`
+  - `aged_gen/head=61.02`
+- Read:
+  - online retrieval quality is strong on the synthetic task;
+  - update cost grows much faster than traversal and is the main scalability blocker.
+
+## 2026-03-13 online update breakdown
+- Added timing split for fullgpu online update:
+  - `d2h`, `build`, `h2d`
+- Measurement run (`45079412`):
+  - `update=56.989s`
+  - `d2h=7.545s`
+  - `build=54.533s`
+  - `h2d=1.265s`
+- Interpretation:
+  - the dominant implementation waste was full overlay CSR rebuild on CPU;
+  - upload was relatively small;
+  - grouped provenance D2H alone was not enough to fix the problem.
+
+## 2026-03-13 persistent row-wise fullgpu overlay
+- Replaced fullgpu overlay CSR rebuild/update with persistent row-wise overlay storage:
+  - per-row count
+  - fixed-cap row neighbor table
+  - dirty-row device updates only
+- Verification run (`45081113`) vs pre-fix control (`45079412`):
+  - `update: 56.989s -> 16.255s`
+  - `build: 54.533s -> 14.716s`
+  - `group: 10.237s -> 9.844s`
+  - `avg_decode_sec: 171.325s -> 125.531s`
+- Retrieval behavior stayed unchanged:
+  - same `overlay_edges`
+  - same `aged_gen/head`
+  - same `query_acc=1.0`
+- Conclusion:
+  - the persistent-overlay implementation is a real no-behavior-change win;
+  - next likely easy target is provenance/bookkeeping overhead (`d2h` + Python-side group work).
