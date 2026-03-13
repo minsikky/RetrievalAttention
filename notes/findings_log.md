@@ -1,5 +1,77 @@
 # Findings Log
 
+## 2026-03-12 update (online decode graph smoke results + automation)
+- Generated-memory benchmark is now correct and two-phase:
+  - ledger generation first
+  - then question prompt appended into the same KV cache
+  - this removed the earlier one-shot formatting failure
+- Exact mode split for online decode experiments:
+  - `baseline`:
+    - aged-out generated tokens are outside retrieval space
+  - `dynamic`:
+    - aged-out generated tokens are inside retrieval space
+    - but no new graph edges are added
+    - therefore generated tokens are mostly only reachable if seeds land on them
+  - `online`:
+    - same as `dynamic`
+    - plus deferred provenance edges are inserted into an overlay graph
+- Default-window fullgpu smoke (`static_pattern_end=512`) was non-discriminative:
+  - baseline:
+    - `44959939`
+    - `query_acc=1.0`, `strict_acc=1.0`, `format_acc=1.0`
+    - `decode_profile total=103.936 s`
+  - dynamic:
+    - `44959942`
+    - `query_acc=1.0`, `strict_acc=1.0`, `format_acc=1.0`
+    - `decode_profile total=90.733 s`
+    - online counters:
+      - `nodes=0`
+      - `edges=0`
+      - `overlay_edges=0`
+      - `aged_gen/head=0.00`
+  - online:
+    - `44959951`
+    - `query_acc=1.0`, `strict_acc=1.0`, `format_acc=1.0`
+    - `decode_profile total=152.641 s`
+    - online counters:
+      - `nodes=0`
+      - `edges=0`
+      - `overlay_edges=0`
+      - `aged_gen/head=0.00`
+  - interpretation:
+    - all three modes are functionally correct on the smoke task
+    - the smoke does **not** validate online retrieval because the `512`-token suffix window is too large; generated tokens never age out
+    - current online fullgpu mode already adds overhead before any online edge is exercised
+    - most of that extra cost shows up in `other/group`, which is consistent with provenance bookkeeping overhead
+- Small-window follow-up launched:
+  - `RETRIEVALATTN_STATIC_PATTERN_START=16`
+  - `RETRIEVALATTN_STATIC_PATTERN_END=16`
+  - `NUM_ENTRIES=12`
+  - jobs:
+    - baseline: `44964177`
+    - dynamic: `44964183`
+    - online: `44964196`
+  - this is the first run family that should meaningfully exercise online decode updates because generated tokens should age out after roughly `16` decode tokens
+- Automation finding:
+  - `codex exec resume` works against the same stored session id, but it is not safe same-process injection into the live stock TUI
+  - a real safe in-band steering primitive exists in the app-server protocol:
+    - `turn/start`
+    - `turn/steer`
+    - `turn/interrupt`
+  - tested directly with a local WebSocket app-server:
+    - `scripts/test_codex_app_server_steer.mjs`
+    - result:
+      - steer accepted
+      - final agent message changed to the steered token
+  - tested end-to-end with Slurm:
+    - app-managed thread:
+      - `.codex/app_sessions/slurm-steer-test.json`
+    - watcher delivered a steer prompt on completion of job `44963617`
+    - final message in `.codex/app_sessions/slurm-steer-test.turn.json` became `WATCHER_STEER_44963617`
+  - practical conclusion:
+    - for the current stock TUI, keep polling / sentinel-based workflow
+    - for true same-thread external steering, move to an app-server-managed interactive workflow
+
 ## 2026-03-09 update (full-GPU decode kernel instrumentation + targeted merge rewrite)
 - Controlled workload for all results below:
   - `DATA_PATH=benchmark/decode_ab_prompt_32k.json`
@@ -1362,3 +1434,85 @@
     - dedup / compact union construction
     - scoring handoff without ATen `sort` / `eq(...).any(1)` per round
     - frontier/candidate merge
+
+## 2026-03-13 fullgpu online reporting fix
+- Fixed a fullgpu decode-profile reporting bug:
+  - `online_overlay_edges` was not populated in the `roar_cuda_fullgpu` path.
+  - `online_generated_hits` / `online_generated_any` were also missing in the fullgpu per-head retrieve profile.
+- Result after rerun:
+  - `dynamic` (`44986399`):
+    - `aged_gen/head=2.98`
+    - `aged_gen_head_rate=76.3%`
+  - `online` (`44986398`):
+    - `overlay_edges=102490740`
+    - `aged_gen/head=35.02`
+    - `aged_gen_head_rate=90.4%`
+- Conclusion:
+  - the online fullgpu mechanism was active; earlier zero-valued counters were misleading.
+  - online provenance edges materially increase retrieval of aged generated tokens.
+
+## 2026-03-13 generated-memory comparison modes
+- Added two new comparison schemes:
+  - `growing_static`
+  - `full_dense`
+- `growing_static`:
+  - RetrievalAttention/fullgpu-only comparison mode
+  - dynamic retrieval region stays frozen to the prompt-only span
+  - generated tokens are kept in the static attention set through fullgpu device K/V caches
+- `full_dense`:
+  - true dense decode baseline using `attn_type=Full_Flash_Attn`
+- Benchmark support changes:
+  - `generated_memory_eval.py` no longer hardcodes `RetrievalAttention`
+  - summaries now report `avg_total_generated_tokens`
+  - runner supports `MIN_PROMPT_TOKENS` to keep prompt length aligned across modes
+
+## 2026-03-13 growing-static result
+- Smoke run:
+  - `45067162` / `slurm-45067162.out`
+- Result:
+  - ledger generation succeeded
+  - answer phase drifted and failed to emit valid `ANSWER ...` lines
+  - `query_acc=0.0`
+  - `format_acc=0.0`
+- Interpretation:
+  - this is not a good quality upper-bound reference for the task
+  - keeping generated tokens available only through static attention is weaker than expected
+
+## 2026-03-13 dense baseline result
+- Fair dense smoke (`MIN_PROMPT_TOKENS=96`):
+  - `45069142` / `slurm-45069142.out`
+  - `Full_Flash_Attn`
+  - `query_acc=1.0`
+  - `strict_acc=1.0`
+  - `avg_decode_sec=7.14s`
+- This gives the first direct dense baseline for the generated-memory task.
+
+## 2026-03-13 partial length sweep
+- Sweep root:
+  - `generated_memory_eval_result/length_sweep_s16_fullgpu_vs_dense`
+- Modes:
+  - `baseline`
+  - `dynamic`
+  - `online`
+  - `full_dense`
+- Lengths:
+  - `12`, `24`, `48` entries
+- Partial results before `online e24/e48` completed:
+  - `baseline`
+    - `e12`: `query_acc=0.0`, `avg_decode_sec~97.1s`
+    - `e24`: `query_acc=0.0`, `avg_decode_sec~128.4s`
+    - `e48`: `query_acc=0.0`, `avg_decode_sec~184.9s`
+  - `dynamic`
+    - `e12`: `query_acc=0.333`, `avg_decode_sec~86.5s`
+    - `e24`: `query_acc=0.0`, `avg_decode_sec~131.1s`
+    - `e48`: `query_acc=0.0`, `avg_decode_sec~174.6s`
+  - `online`
+    - `e12`: `query_acc=1.0`, `avg_decode_sec~169.3s`
+  - `full_dense`
+    - `e12`: `query_acc=1.0`, `avg_decode_sec~6.15s`
+    - `e24`: `query_acc=1.0`, `avg_decode_sec~8.28s`
+    - `e48`: `query_acc=0.667`, `avg_decode_sec~12.98s`
+- Working conclusion:
+  - online decode graph is functioning but very expensive
+  - dense attention is still the performance target to beat at these lengths
+  - sparse decode must be tested at much longer decode lengths before claiming any latency win

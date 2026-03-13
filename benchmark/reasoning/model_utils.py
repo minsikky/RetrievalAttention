@@ -44,6 +44,7 @@ def generate_completions(llm, tokenizer, prompts, max_new_tokens,
             args.attn_type,
             retrieval_budget=args.retrieval_budget,
             estimation_budget=args.estimation_budget,
+            token_budget_override=args.token_budget_override,
         )
         attn_config["RetroInfer"]["buffer_cluster_num"] = 200
 

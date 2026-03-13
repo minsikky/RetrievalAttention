@@ -289,6 +289,38 @@ class retrievalattention_cache(KV_Cache):
                 "Falling back to auto."
             )
             self.decode_backend = "auto"
+        self.online_dynamic_range = os.environ.get("RETRIEVALATTN_ONLINE_DYNAMIC_RANGE", "0") == "1"
+        self.online_graph_enable = os.environ.get("RETRIEVALATTN_ONLINE_GRAPH_ENABLE", "0") == "1"
+        self.growing_static_suffix = os.environ.get("RETRIEVALATTN_GROW_STATIC_SUFFIX", "0") == "1"
+        if self.growing_static_suffix and (self.online_dynamic_range or self.online_graph_enable):
+            raise RuntimeError(
+                "RETRIEVALATTN_GROW_STATIC_SUFFIX is a comparison mode and cannot be combined with "
+                "RETRIEVALATTN_ONLINE_DYNAMIC_RANGE or RETRIEVALATTN_ONLINE_GRAPH_ENABLE."
+            )
+        if self.growing_static_suffix and self.decode_backend != "roar_cuda_fullgpu":
+            raise RuntimeError(
+                "RETRIEVALATTN_GROW_STATIC_SUFFIX currently requires "
+                "RETRIEVALATTN_DECODE_BACKEND=roar_cuda_fullgpu."
+            )
+        self.online_graph_bidirectional = os.environ.get("RETRIEVALATTN_ONLINE_GRAPH_BIDIR", "1") == "1"
+        try:
+            self.online_graph_insert_k = int(os.environ.get("RETRIEVALATTN_ONLINE_GRAPH_INSERT_K", "8"))
+        except Exception:
+            self.online_graph_insert_k = 8
+        self.online_graph_insert_k = max(1, self.online_graph_insert_k)
+        try:
+            self.online_graph_neighbor_cap = int(os.environ.get("RETRIEVALATTN_ONLINE_GRAPH_NEIGHBOR_CAP", "16"))
+        except Exception:
+            self.online_graph_neighbor_cap = 16
+        self.online_graph_neighbor_cap = max(self.online_graph_insert_k, self.online_graph_neighbor_cap)
+        try:
+            self.online_graph_defer = int(os.environ.get("RETRIEVALATTN_ONLINE_GRAPH_DEFER", "-1"))
+        except Exception:
+            self.online_graph_defer = -1
+        if self.online_graph_defer < 0:
+            self.online_graph_defer = int(self.static_pattern_end)
+        self.online_graph_defer = max(0, self.online_graph_defer)
+        self.online_graph_log = os.environ.get("RETRIEVALATTN_ONLINE_GRAPH_LOG", "1") == "1"
         try:
             self.roar_decode_lpq = int(os.environ.get("RETRIEVALATTN_ROAR_DECODE_LPQ", "0"))
         except Exception:
@@ -528,6 +560,12 @@ class retrievalattention_cache(KV_Cache):
             "search_space_heads": 0,
             "visited_ratio_sum": 0.0,
             "visited_ratio_count": 0,
+            "online_update_sec": 0.0,
+            "online_insert_nodes": 0,
+            "online_insert_edges": 0,
+            "online_overlay_edges": 0,
+            "online_generated_hits": 0,
+            "online_generated_head_hits": 0,
         }
         self._parity_records = []
         self._parity_lock = threading.Lock()
@@ -616,6 +654,8 @@ class retrievalattention_cache(KV_Cache):
         self._decode_cuda_value_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_graph_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_graph_device_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._decode_cuda_overlay_graph_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._decode_cuda_overlay_graph_device_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_graph_degree_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_hub_seed_ids = [None for _ in range(self.layer_num)]
         self._decode_cuda_prev_seed_ids = [None for _ in range(self.layer_num)]
@@ -636,6 +676,10 @@ class retrievalattention_cache(KV_Cache):
         self._fused_prefill_lock = threading.Lock()
         self._faiss_threads_async_configured = False
         self._kv_graph_ab_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._online_graph_pending = [[{} for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._online_graph_pending_order = [[[] for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._online_graph_pending_cursor = [[0 for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._online_graph_overlay = [[{} for _ in range(self.kv_head)] for _ in range(self.layer_num)]
 
         # Track suffix window positions
         self.suffix_start = max(0, self.input_length - self.static_pattern_end)
@@ -645,8 +689,10 @@ class retrievalattention_cache(KV_Cache):
         suffix_static = min(max(0, self.static_pattern_end), self.input_length)
         self.dynamic_start = prefix_static
         self.dynamic_end = max(self.dynamic_start, self.input_length - suffix_static)
+        self.growing_static_dynamic_end = int(self.dynamic_end)
         self.static_index_set = set(range(prefix_static))
         self.static_index_set.update(range(self.dynamic_end, self.input_length))
+        self._online_graph_warned = False
 
         self._built = False
 
@@ -677,6 +723,160 @@ class retrievalattention_cache(KV_Cache):
                 f"Invalid retrieval kv-head index={head_idx} (kv_head={self.kv_head})"
             )
         return head_idx
+
+    def _decode_token_limit(self) -> int:
+        if self.online_dynamic_range or self.online_graph_enable or self.growing_static_suffix:
+            return max(int(self.input_length), int(self.context))
+        return int(self.input_length)
+
+    def _rebuild_static_index_set(self, total_tokens: int):
+        total_tokens = max(0, int(total_tokens))
+        prefix = set(range(int(self.dynamic_start)))
+        suffix_start = max(int(self.dynamic_start), int(self.dynamic_end))
+        prefix.update(range(suffix_start, total_tokens))
+        self.static_index_set = prefix
+
+    def _refresh_decode_dynamic_state(self):
+        if not (self.online_dynamic_range or self.online_graph_enable or self.growing_static_suffix):
+            return
+        total_tokens = self._decode_token_limit()
+        if self.growing_static_suffix:
+            self.dynamic_end = min(
+                total_tokens,
+                max(int(self.dynamic_start), int(self.growing_static_dynamic_end)),
+            )
+            self._rebuild_static_index_set(total_tokens)
+            return
+        suffix_keep = max(0, int(self.static_pattern_end))
+        if suffix_keep > 0:
+            self.dynamic_end = max(int(self.dynamic_start), total_tokens - suffix_keep)
+        else:
+            self.dynamic_end = max(int(self.dynamic_start), total_tokens)
+        self.dynamic_end = min(self.dynamic_end, total_tokens)
+        self._rebuild_static_index_set(total_tokens)
+
+    def _online_graph_add_directed_edge(self, layer_idx: int, kv_hdx: int, src: int, dst: int) -> int:
+        src = int(src)
+        dst = int(dst)
+        if src == dst:
+            return 0
+        if src < int(self.dynamic_start) or dst < int(self.dynamic_start):
+            return 0
+        per_head = self._online_graph_overlay[layer_idx][kv_hdx]
+        cur = per_head.get(src)
+        if cur is None:
+            per_head[src] = [dst]
+            return 1
+        if dst in cur:
+            return 0
+        if len(cur) >= int(self.online_graph_neighbor_cap):
+            return 0
+        cur.append(dst)
+        return 1
+
+    def _record_online_graph_provenance(self, layer_idx: int, head_idx: int, token_ids):
+        if not self.online_graph_enable:
+            return
+        if not isinstance(token_ids, (list, tuple)) or len(token_ids) == 0:
+            return
+        token_pos = int(self.input_length + self.decode_pos)
+        total_tokens = max(self._decode_token_limit(), token_pos + 1)
+        if token_pos < int(self.input_length) or token_pos >= int(self.cpu_keys[layer_idx].shape[1]):
+            return
+        kv_hdx = self._retrieval_head_to_kv_head(head_idx)
+        keep = []
+        seen = set()
+        for tok in token_ids:
+            tok = int(tok)
+            if tok < int(self.dynamic_start) or tok >= total_tokens:
+                continue
+            if tok >= token_pos:
+                continue
+            if tok in seen:
+                continue
+            seen.add(tok)
+            keep.append(tok)
+            if len(keep) >= int(self.online_graph_insert_k):
+                break
+        if not keep:
+            return
+        pending = self._online_graph_pending[layer_idx][kv_hdx]
+        cur = pending.get(token_pos)
+        if cur is None:
+            pending[token_pos] = list(keep)
+            self._online_graph_pending_order[layer_idx][kv_hdx].append(token_pos)
+            return
+        for tok in keep:
+            if tok in cur:
+                continue
+            cur.append(tok)
+            if len(cur) >= int(self.online_graph_insert_k):
+                break
+
+    def _fullgpu_payload_token_ids(self, payload):
+        if not isinstance(payload, dict) or "device_ids" not in payload:
+            return []
+        take = max(0, int(payload.get("final_count", 0)))
+        if take <= 0:
+            return []
+        ids_t = payload["device_ids"][:take]
+        if ids_t.numel() <= 0:
+            return []
+        return [int(tok) for tok in ids_t.detach().cpu().tolist() if int(tok) >= 0]
+
+    def _flush_online_graph_pending(self):
+        if not self.online_graph_enable:
+            return
+        total_tokens = self._decode_token_limit()
+        if total_tokens <= int(self.input_length):
+            return
+        eligible_before = max(
+            int(self.input_length),
+            total_tokens - max(0, int(self.online_graph_defer)),
+        )
+        if eligible_before <= int(self.input_length):
+            return
+        start = time.perf_counter() if self.decode_profile else None
+        inserted_nodes = 0
+        inserted_edges = 0
+        dirty_pairs = set()
+        for layer_idx in range(self.layer_num):
+            for kv_hdx in range(self.kv_head):
+                queue = self._online_graph_pending_order[layer_idx][kv_hdx]
+                cursor = int(self._online_graph_pending_cursor[layer_idx][kv_hdx])
+                pending = self._online_graph_pending[layer_idx][kv_hdx]
+                while cursor < len(queue):
+                    token_pos = int(queue[cursor])
+                    if token_pos >= eligible_before:
+                        break
+                    cursor += 1
+                    neighbors = pending.pop(token_pos, None)
+                    if not neighbors:
+                        continue
+                    inserted_nodes += 1
+                    pair_edges_before = inserted_edges
+                    for nb in neighbors:
+                        nb = int(nb)
+                        if nb < int(self.dynamic_start) or nb >= total_tokens:
+                            continue
+                        inserted_edges += self._online_graph_add_directed_edge(layer_idx, kv_hdx, token_pos, nb)
+                        if self.online_graph_bidirectional:
+                            inserted_edges += self._online_graph_add_directed_edge(layer_idx, kv_hdx, nb, token_pos)
+                    if inserted_edges > pair_edges_before:
+                        dirty_pairs.add((int(layer_idx), int(kv_hdx)))
+                self._online_graph_pending_cursor[layer_idx][kv_hdx] = cursor
+        if self.decode_backend == "roar_cuda_fullgpu":
+            for layer_idx, kv_hdx in dirty_pairs:
+                self._build_decode_overlay_graph_tensors(layer_idx, kv_hdx)
+                self._get_decode_overlay_graph_tensors_cuda_device(layer_idx, kv_hdx)
+        if self.decode_profile:
+            self._decode_profile_stats["online_update_sec"] += (time.perf_counter() - start)
+            self._decode_profile_stats["online_insert_nodes"] += int(inserted_nodes)
+            self._decode_profile_stats["online_insert_edges"] += int(inserted_edges)
+
+    def _is_dynamic_generated_token(self, tok: int) -> bool:
+        tok = int(tok)
+        return tok >= int(self.input_length) and tok < int(self.dynamic_end)
 
     def _knn_recall_at_k(self, a: np.ndarray, b: np.ndarray, k: int) -> float:
         """
@@ -1926,6 +2126,8 @@ class retrievalattention_cache(KV_Cache):
     def _should_use_roar_cpp_decode_backend(self, graph_is_csr: bool) -> bool:
         if not graph_is_csr:
             return False
+        if self.online_graph_enable or self.online_dynamic_range:
+            return False
         if self.decode_backend in {
             "python",
             "roar_cuda",
@@ -1991,8 +2193,11 @@ class retrievalattention_cache(KV_Cache):
         if cached is not None:
             return cached
         device = self.layer_mapping[str(ldx)]
-        key_tensor = self.cpu_keys[ldx][hdx, :self.input_length, :].detach().to(device, non_blocking=True).float()
-        key_tensor = self._score_transform_torch(key_tensor)
+        total_len = int(self.cpu_keys[ldx].shape[1])
+        key_tensor = torch.zeros((total_len, self.head_dim), dtype=torch.float32, device=device)
+        prefill_keys = self.cpu_keys[ldx][hdx, :self.input_length, :].detach().to(device, non_blocking=True).float()
+        prefill_keys = self._score_transform_torch(prefill_keys)
+        key_tensor[:self.input_length, :].copy_(prefill_keys, non_blocking=True)
         self._decode_cuda_key_cache[ldx][hdx] = key_tensor.contiguous()
         return self._decode_cuda_key_cache[ldx][hdx]
 
@@ -2001,7 +2206,10 @@ class retrievalattention_cache(KV_Cache):
         if cached is not None:
             return cached
         device = self.layer_mapping[str(ldx)]
-        key_tensor = self.cpu_keys[ldx][hdx, :self.input_length, :].detach().to(device, non_blocking=True)
+        total_len = int(self.cpu_keys[ldx].shape[1])
+        key_tensor = torch.zeros((total_len, self.head_dim), dtype=self.dtype, device=device)
+        prefill_keys = self.cpu_keys[ldx][hdx, :self.input_length, :].detach().to(device, non_blocking=True)
+        key_tensor[:self.input_length, :].copy_(prefill_keys, non_blocking=True)
         self._decode_cuda_attn_key_cache[ldx][hdx] = key_tensor.contiguous()
         return self._decode_cuda_attn_key_cache[ldx][hdx]
 
@@ -2010,7 +2218,10 @@ class retrievalattention_cache(KV_Cache):
         if cached is not None:
             return cached
         device = self.layer_mapping[str(ldx)]
-        value_tensor = self.cpu_values[ldx][hdx, :self.input_length, :].detach().to(device, non_blocking=True)
+        total_len = int(self.cpu_values[ldx].shape[1])
+        value_tensor = torch.zeros((total_len, self.head_dim), dtype=self.dtype, device=device)
+        prefill_values = self.cpu_values[ldx][hdx, :self.input_length, :].detach().to(device, non_blocking=True)
+        value_tensor[:self.input_length, :].copy_(prefill_values, non_blocking=True)
         self._decode_cuda_value_cache[ldx][hdx] = value_tensor.contiguous()
         return self._decode_cuda_value_cache[ldx][hdx]
 
@@ -2021,8 +2232,15 @@ class retrievalattention_cache(KV_Cache):
         graph = self.graphs[ldx][hdx]
         if not (isinstance(graph, tuple) and len(graph) >= 2):
             return None
-        offsets = graph[0]
+        offsets = np.asarray(graph[0], dtype=np.uint32)
         neighbors = graph[1]
+        total_len = int(self.cpu_keys[ldx].shape[1])
+        if offsets.shape[0] < (total_len + 1):
+            ext_offsets = np.empty((total_len + 1,), dtype=np.uint32)
+            ext_offsets[:offsets.shape[0]] = offsets
+            last = int(offsets[-1]) if offsets.shape[0] > 0 else 0
+            ext_offsets[offsets.shape[0]:] = np.uint32(last)
+            offsets = ext_offsets
         offsets_t = torch.as_tensor(np.ascontiguousarray(offsets, dtype=np.uint32), dtype=torch.int64, device="cpu")
         neighbors_t = torch.as_tensor(np.ascontiguousarray(neighbors, dtype=np.int32), dtype=torch.int32, device="cpu")
         self._decode_cuda_graph_cache[ldx][hdx] = (offsets_t, neighbors_t)
@@ -2044,6 +2262,64 @@ class retrievalattention_cache(KV_Cache):
             neighbors_dev.contiguous(),
         )
         return self._decode_cuda_graph_device_cache[ldx][hdx]
+
+    def _build_decode_overlay_graph_tensors(self, ldx: int, hdx: int):
+        total_len = int(self.cpu_keys[ldx].shape[1])
+        overlay = self._online_graph_overlay[ldx][hdx]
+        offsets = np.zeros((total_len + 1,), dtype=np.uint32)
+        total_edges = 0
+        for src, dsts in overlay.items():
+            src_i = int(src)
+            if src_i < 0 or src_i >= total_len:
+                continue
+            valid_count = 0
+            for dst in dsts:
+                dst_i = int(dst)
+                if 0 <= dst_i < total_len:
+                    valid_count += 1
+            offsets[src_i + 1] = np.uint32(valid_count)
+            total_edges += valid_count
+        if total_len > 0:
+            np.cumsum(offsets, out=offsets)
+        neighbors = np.full((total_edges,), -1, dtype=np.int32)
+        cursor = offsets[:-1].copy()
+        for src, dsts in overlay.items():
+            src_i = int(src)
+            if src_i < 0 or src_i >= total_len:
+                continue
+            pos = int(cursor[src_i])
+            for dst in dsts:
+                dst_i = int(dst)
+                if dst_i < 0 or dst_i >= total_len:
+                    continue
+                neighbors[pos] = np.int32(dst_i)
+                pos += 1
+            cursor[src_i] = np.uint32(pos)
+        offsets_t = torch.as_tensor(offsets, dtype=torch.int64, device="cpu")
+        neighbors_t = torch.as_tensor(neighbors, dtype=torch.int32, device="cpu")
+        self._decode_cuda_overlay_graph_cache[ldx][hdx] = (offsets_t, neighbors_t)
+        self._decode_cuda_overlay_graph_device_cache[ldx][hdx] = None
+        return self._decode_cuda_overlay_graph_cache[ldx][hdx]
+
+    def _get_decode_overlay_graph_tensors_cuda(self, ldx: int, hdx: int):
+        cached = self._decode_cuda_overlay_graph_cache[ldx][hdx]
+        if cached is not None:
+            return cached
+        return self._build_decode_overlay_graph_tensors(ldx, hdx)
+
+    def _get_decode_overlay_graph_tensors_cuda_device(self, ldx: int, hdx: int):
+        cached = self._decode_cuda_overlay_graph_device_cache[ldx][hdx]
+        if cached is not None:
+            return cached
+        offsets_t, neighbors_t = self._get_decode_overlay_graph_tensors_cuda(ldx, hdx)
+        device = self.layer_mapping[str(ldx)]
+        offsets_dev = offsets_t.to(device=device, non_blocking=True)
+        neighbors_dev = neighbors_t.to(device=device, non_blocking=True)
+        self._decode_cuda_overlay_graph_device_cache[ldx][hdx] = (
+            offsets_dev.contiguous(),
+            neighbors_dev.contiguous(),
+        )
+        return self._decode_cuda_overlay_graph_device_cache[ldx][hdx]
 
     def _get_decode_graph_max_degree(self, ldx: int, hdx: int) -> int:
         cached = self._decode_cuda_graph_degree_cache[ldx][hdx]
@@ -2081,6 +2357,7 @@ class retrievalattention_cache(KV_Cache):
                 if self.decode_backend == "roar_cuda_fullgpu":
                     self._get_decode_attn_key_tensor_cuda(ldx, kv_hdx)
                     self._get_decode_value_tensor_cuda(ldx, kv_hdx)
+                    self._get_decode_overlay_graph_tensors_cuda_device(ldx, kv_hdx)
 
     def _prepare_decode_cuda_seed_caches(self):
         if self.decode_backend != "roar_cuda_fullgpu":
@@ -3420,6 +3697,7 @@ class retrievalattention_cache(KV_Cache):
 
         if (layer_idx == self.layer_num - 1) and (batch_idx + bsz == self.batch_size):
             self.context += seq_len
+            self._refresh_decode_dynamic_state()
 
         return key_states[:, valid_start:, :, :], value_states[:, valid_start:, :, :]
 
@@ -3679,6 +3957,12 @@ class retrievalattention_cache(KV_Cache):
         search_space_heads = int(stats["search_space_heads"])
         visited_ratio_sum = float(stats["visited_ratio_sum"])
         visited_ratio_count = int(stats["visited_ratio_count"])
+        online_update_sec = float(stats["online_update_sec"])
+        online_insert_nodes = int(stats["online_insert_nodes"])
+        online_insert_edges = int(stats["online_insert_edges"])
+        online_overlay_edges = int(stats["online_overlay_edges"])
+        online_generated_hits = int(stats["online_generated_hits"])
+        online_generated_head_hits = int(stats["online_generated_head_hits"])
 
         def pct(v: float) -> float:
             return 100.0 * v / total if total > 0 else 0.0
@@ -3714,6 +3998,14 @@ class retrievalattention_cache(KV_Cache):
         )
         forced_per_head = (
             float(forced_seed_total) / float(heads)
+            if heads > 0 else 0.0
+        )
+        online_generated_per_head = (
+            float(online_generated_hits) / float(heads)
+            if heads > 0 else 0.0
+        )
+        online_generated_head_rate = (
+            100.0 * float(online_generated_head_hits) / float(heads)
             if heads > 0 else 0.0
         )
         stop_counts = {
@@ -3752,6 +4044,15 @@ class retrievalattention_cache(KV_Cache):
             f"forced/head={forced_per_head:.1f}, "
             f"stop={stop_counts}]"
         )
+        if self.online_dynamic_range or self.online_graph_enable:
+            msg += (
+                f" | online=[dynamic_end={int(self.dynamic_end)}, "
+                f"update={online_update_sec:.3f}s, "
+                f"nodes={online_insert_nodes}, edges={online_insert_edges}, "
+                f"overlay_edges={online_overlay_edges}, "
+                f"aged_gen/head={online_generated_per_head:.2f}, "
+                f"aged_gen_head_rate={online_generated_head_rate:.1f}%]"
+            )
         if reset:
             self.reset_decode_profile()
         return msg
@@ -3789,6 +4090,9 @@ class retrievalattention_cache(KV_Cache):
             retrieve_profile.get("visited_ratio", 0.0)
         )
         self._decode_profile_stats["visited_ratio_count"] += 1
+        self._decode_profile_stats["online_overlay_edges"] += int(retrieve_profile.get("online_overlay_edges", 0))
+        self._decode_profile_stats["online_generated_hits"] += int(retrieve_profile.get("online_generated_hits", 0))
+        self._decode_profile_stats["online_generated_head_hits"] += int(retrieve_profile.get("online_generated_any", 0))
         self._decode_profile_stats["other_profile_accum_sec"] += (time.perf_counter() - accum_start)
 
     def decode_update_kv_cache(self, key_states, value_states, layer_idx):
@@ -3800,9 +4104,24 @@ class retrievalattention_cache(KV_Cache):
         if pos < self.cpu_keys[layer_idx].shape[1]:
             self.cpu_keys[layer_idx][:, pos:pos + 1, :].copy_(key_states[0].transpose(0, 1), non_blocking=True)
             self.cpu_values[layer_idx][:, pos:pos + 1, :].copy_(value_states[0].transpose(0, 1), non_blocking=True)
+            if self.decode_backend == "roar_cuda_fullgpu":
+                device = self.layer_mapping[str(layer_idx)]
+                key_row = key_states[0, 0].to(device, non_blocking=True)
+                value_row = value_states[0, 0].to(device, non_blocking=True)
+                score_row = self._score_transform_torch(key_row.float())
+                for kv_hdx in range(self.kv_head):
+                    key_cache = self._decode_cuda_key_cache[layer_idx][kv_hdx]
+                    if key_cache is not None:
+                        key_cache[pos:pos + 1, :].copy_(score_row[kv_hdx:kv_hdx + 1], non_blocking=True)
+                    attn_key_cache = self._decode_cuda_attn_key_cache[layer_idx][kv_hdx]
+                    if attn_key_cache is not None:
+                        attn_key_cache[pos:pos + 1, :].copy_(key_row[kv_hdx:kv_hdx + 1], non_blocking=True)
+                    value_cache = self._decode_cuda_value_cache[layer_idx][kv_hdx]
+                    if value_cache is not None:
+                        value_cache[pos:pos + 1, :].copy_(value_row[kv_hdx:kv_hdx + 1], non_blocking=True)
 
         # Update static suffix window (shift left, append new token)
-        if self.static_pattern_end > 0:
+        if self.static_pattern_end > 0 and not self.growing_static_suffix:
             suffix = self.static_gpu_keys[layer_idx][:, self.static_pattern_start:, :]
             suffix_v = self.static_gpu_values[layer_idx][:, self.static_pattern_start:, :]
             suffix = torch.roll(suffix, shifts=-1, dims=1)
@@ -3815,6 +4134,8 @@ class retrievalattention_cache(KV_Cache):
         if layer_idx == self.layer_num - 1:
             self.decode_pos += 1
             self.context += 1
+            self._refresh_decode_dynamic_state()
+            self._flush_online_graph_pending()
 
         return None, None
 
@@ -3965,6 +4286,7 @@ class retrievalattention_cache(KV_Cache):
             "accepted": 11,
             "frontier_expanded": 12,
             "find_probes": 13,
+            "overlay_edges": 14,
         }
 
         phase_totals = {name: 0 for name in phase_cols}
@@ -4961,6 +5283,7 @@ class retrievalattention_cache(KV_Cache):
         key_attn_t = self._get_decode_attn_key_tensor_cuda(ldx, kv_hdx)
         value_t = self._get_decode_value_tensor_cuda(ldx, kv_hdx)
         graph_tensors = self._get_decode_graph_tensors_cuda_device(ldx, kv_hdx)
+        overlay_tensors = self._get_decode_overlay_graph_tensors_cuda_device(ldx, kv_hdx)
         hub_seed_ids = self._decode_cuda_hub_seed_ids[ldx]
         prev_seed_ids = self._decode_cuda_prev_seed_ids[ldx]
         prev_seed_counts = self._decode_cuda_prev_seed_counts[ldx]
@@ -4969,6 +5292,7 @@ class retrievalattention_cache(KV_Cache):
             or key_attn_t is None
             or value_t is None
             or graph_tensors is None
+            or overlay_tensors is None
             or hub_seed_ids is None
             or prev_seed_ids is None
             or prev_seed_counts is None
@@ -4976,6 +5300,7 @@ class retrievalattention_cache(KV_Cache):
             raise RuntimeError("roar_cuda_fullgpu decode state is unavailable")
 
         graph_offsets_t, graph_neighbors_t = graph_tensors
+        overlay_offsets_t, overlay_neighbors_t = overlay_tensors
         graph_max_degree = int(self._get_decode_graph_max_degree(ldx, kv_hdx))
         q_count = len(active_states)
         queries_seed = torch.cat([state["q_seed_cuda"] for state in active_states], dim=0)
@@ -5009,6 +5334,8 @@ class retrievalattention_cache(KV_Cache):
             keys=key_score_t,
             offsets=graph_offsets_t,
             neighbors=graph_neighbors_t,
+            overlay_offsets=overlay_offsets_t,
+            overlay_neighbors=overlay_neighbors_t,
             prev_seed_ids=prev_ids_t,
             prev_seed_counts=prev_counts_t,
             hub_seed_ids=hub_ids_t,
@@ -5041,6 +5368,9 @@ class retrievalattention_cache(KV_Cache):
         out_visited = out_visited_t.detach().cpu()
         out_stop = out_stop_t.detach().cpu()
         out_debug = out_debug_t.detach().cpu()
+        out_ids_cpu = None
+        if self.online_dynamic_range or self.online_graph_enable:
+            out_ids_cpu = out_ids_t.detach().cpu()
         out_mask_t = out_ids_t.ge(0)
         self._maybe_log_fullgpu_kernel_debug(
             layer_idx=ldx,
@@ -5067,6 +5397,7 @@ class retrievalattention_cache(KV_Cache):
             accepted_i = int(out_debug[i, 11].item()) if out_debug.shape[1] > 11 else 0
             frontier_expanded_i = int(out_debug[i, 12].item()) if out_debug.shape[1] > 12 else 0
             find_probe_i = int(out_debug[i, 13].item()) if out_debug.shape[1] > 13 else 0
+            overlay_edges_i = int(out_debug[i, 14].item()) if out_debug.shape[1] > 14 else 0
             profile = state["profile"]
             if profile is not None:
                 profile["graph_sec"] += per_graph_sec
@@ -5094,7 +5425,22 @@ class retrievalattention_cache(KV_Cache):
                     "accepted": accepted_i,
                     "frontier_expanded": frontier_expanded_i,
                     "find_probes": find_probe_i,
+                    "overlay_edges": overlay_edges_i,
                 }
+                profile["online_overlay_edges"] = overlay_edges_i
+                if out_ids_cpu is not None and count_i > 0:
+                    final_tokens_i = [
+                        int(tok) for tok in out_ids_cpu[i, :count_i].tolist()
+                        if int(tok) >= 0
+                    ]
+                    online_generated_hits_i = sum(
+                        1 for tok in final_tokens_i if self._is_dynamic_generated_token(tok)
+                    )
+                    profile["online_generated_hits"] = int(online_generated_hits_i)
+                    profile["online_generated_any"] = 1 if online_generated_hits_i > 0 else 0
+                else:
+                    profile["online_generated_hits"] = 0
+                    profile["online_generated_any"] = 0
                 profile["total_sec"] = (
                     float(profile.get("seed_sec", 0.0))
                     + float(profile.get("graph_sec", 0.0))
@@ -5133,6 +5479,28 @@ class retrievalattention_cache(KV_Cache):
 
         return results
 
+    def _get_fullgpu_static_kv(self, layer_idx: int, kv_hdx: int):
+        if not self.growing_static_suffix:
+            return self.static_gpu_keys[layer_idx][kv_hdx], self.static_gpu_values[layer_idx][kv_hdx]
+
+        total_tokens = self._decode_token_limit()
+        prefix_len = min(int(self.dynamic_start), int(total_tokens))
+        suffix_start = min(max(int(self.dynamic_start), int(self.dynamic_end)), int(total_tokens))
+
+        prefix_k = self.static_gpu_keys[layer_idx][kv_hdx, :prefix_len, :]
+        prefix_v = self.static_gpu_values[layer_idx][kv_hdx, :prefix_len, :]
+
+        attn_key_cache = self._get_decode_attn_key_tensor_cuda(layer_idx, kv_hdx)
+        value_cache = self._get_decode_value_tensor_cuda(layer_idx, kv_hdx)
+        suffix_k = attn_key_cache[suffix_start:total_tokens, :]
+        suffix_v = value_cache[suffix_start:total_tokens, :]
+
+        if prefix_len <= 0:
+            return suffix_k, suffix_v
+        if suffix_start >= total_tokens:
+            return prefix_k, prefix_v
+        return torch.cat([prefix_k, suffix_k], dim=0), torch.cat([prefix_v, suffix_v], dim=0)
+
     def _apply_fullgpu_group_attention(
         self,
         layer_idx: int,
@@ -5150,8 +5518,7 @@ class retrievalattention_cache(KV_Cache):
             payloads.append(payload)
             q_batch.append(q_attn_by_head[hdx].squeeze(0))
 
-        static_k = self.static_gpu_keys[layer_idx][kv_hdx]
-        static_v = self.static_gpu_values[layer_idx][kv_hdx]
+        static_k, static_v = self._get_fullgpu_static_kv(layer_idx, kv_hdx)
         q_batch_t = torch.stack(q_batch, dim=0)  # [q_count, dim]
         gather_start = time.perf_counter() if self.decode_profile else None
         if self.decode_profile and self.fullgpu_profile_sync:
@@ -5418,6 +5785,10 @@ class retrievalattention_cache(KV_Cache):
                 "search_space": 0,
                 "visited_ratio": 0.0,
                 "stop_reason": "n/a",
+                "final_outputs": 0,
+                "online_overlay_edges": 0,
+                "online_generated_hits": 0,
+                "online_generated_any": 0,
             }
 
         def finish(tokens, stop_reason: str, visited: int = 0, candidates: int = 0):
@@ -5461,6 +5832,7 @@ class retrievalattention_cache(KV_Cache):
         q_seed_cpu = self._score_transform_torch(q_seed.cpu())
         q_seed_cuda = None
         q_rank_cuda = None
+        token_limit = self._decode_token_limit()
         if self.decode_backend in {
             "roar_cuda",
             "roar_cuda_v2",
@@ -5474,7 +5846,7 @@ class retrievalattention_cache(KV_Cache):
             q_rank_cuda = self._score_transform_torch(q_group.to(device, non_blocking=True).float())
         seed_scores = {}
         seed_k = max(self.q_knn, self.q_knn * self.seed_k_mult)
-        seed_k = min(self.input_length, seed_k)
+        seed_k = min(token_limit, seed_k)
         if seed_k <= 0:
             if profile is not None:
                 profile["seed_sec"] += time.perf_counter() - seed_start
@@ -5500,7 +5872,7 @@ class retrievalattention_cache(KV_Cache):
                         "Set RETRIEVALATTN_DECODE_INDEX=faiss for stable quality."
                     )
                     self._fallback_seed_warned = True
-                k = self.cpu_keys[ldx][kv_hdx, :self.input_length, :].detach().float().cpu()
+                k = self.cpu_keys[ldx][kv_hdx, :token_limit, :].detach().float().cpu()
                 k = self._score_transform_torch(k)
                 scores = torch.matmul(q_seed_cpu, k.transpose(0, 1))  # [num_q, num_tokens]
                 k_take = min(seed_k, scores.shape[1])
@@ -5541,7 +5913,7 @@ class retrievalattention_cache(KV_Cache):
             filtered_seen = set()
             for tok in seed_candidates:
                 tok = int(tok)
-                if tok < 0 or tok >= self.input_length:
+                if tok < 0 or tok >= token_limit:
                     continue
                 if tok in static_indices or tok in filtered_seen:
                     continue
@@ -5595,7 +5967,7 @@ class retrievalattention_cache(KV_Cache):
 
         candidate_target = self.token_budget * self.candidate_multiplier
         candidate_target = max(self.token_budget, candidate_target)
-        candidate_target = min(candidate_target, self.input_length)
+        candidate_target = min(candidate_target, token_limit)
 
         candidates = []
         seen = set()
@@ -5626,7 +5998,7 @@ class retrievalattention_cache(KV_Cache):
                     init_scores = np.asarray([float(score) for _, score in seed_ranked[:init_take]], dtype=np.float32)
                     lpq = int(self.roar_decode_lpq) if self.roar_decode_lpq > 0 else int(candidate_target)
                     lpq = max(self.token_budget, lpq)
-                    lpq = min(self.input_length, lpq)
+                    lpq = min(token_limit, lpq)
                     topk_take = min(candidate_target, lpq)
                     max_hops = int(self.roar_decode_max_hops) if self.roar_decode_max_hops > 0 else int(self.max_visits)
                     max_cmps = int(self.roar_decode_max_cmps)
@@ -5813,12 +6185,31 @@ class retrievalattention_cache(KV_Cache):
                         if len(candidates) + len(new_tokens) >= candidate_target:
                             break
                         if graph_is_csr:
-                            row_start = int(graph_offsets[tok])
-                            row_end = int(graph_offsets[tok + 1])
-                            nb_iter = graph_neighbors[row_start:row_end]
+                            if 0 <= tok and (tok + 1) < int(graph_offsets.shape[0]):
+                                row_start = int(graph_offsets[tok])
+                                row_end = int(graph_offsets[tok + 1])
+                                base_iter = graph_neighbors[row_start:row_end]
+                            else:
+                                base_iter = ()
                         else:
-                            nb_iter = graph[tok]
-                        for nb in nb_iter:
+                            if 0 <= tok < len(graph):
+                                base_iter = graph[tok]
+                            else:
+                                base_iter = ()
+                        for nb in base_iter:
+                            nb = int(nb)
+                            if nb in static_indices or nb in seen or nb in new_token_set:
+                                continue
+                            new_tokens.append(nb)
+                            new_token_set.add(nb)
+                            if len(candidates) + len(new_tokens) >= candidate_target:
+                                break
+                        overlay_iter = ()
+                        if self.online_graph_enable:
+                            overlay_iter = self._online_graph_overlay[ldx][kv_hdx].get(int(tok), ())
+                            if profile is not None:
+                                profile["online_overlay_edges"] = int(profile.get("online_overlay_edges", 0)) + len(overlay_iter)
+                        for nb in overlay_iter:
                             nb = int(nb)
                             if nb in static_indices or nb in seen or nb in new_token_set:
                                 continue
@@ -5952,6 +6343,11 @@ class retrievalattention_cache(KV_Cache):
             else:
                 self.prev_decode_seeds[ldx][hdx] = []
         if profile is not None:
+            profile["final_outputs"] = int(len(final))
+            online_generated_hits = sum(1 for tok in final if self._is_dynamic_generated_token(tok))
+            profile["online_generated_hits"] = int(online_generated_hits)
+            profile["online_generated_any"] = 1 if online_generated_hits > 0 else 0
+        if profile is not None:
             profile["finalize_sec"] += time.perf_counter() - finalize_start
 
         return finish(final, stop_reason, visited=visited_count, candidates=len(candidates))
@@ -6017,6 +6413,16 @@ class retrievalattention_cache(KV_Cache):
             and self.retrieval_head_mode == "q_head"
             and self.query_mode == "per_head"
         )
+        if (
+            self.online_graph_enable
+            and self.decode_backend not in {"python", "auto", "roar_cuda_fullgpu"}
+            and not self._online_graph_warned
+        ):
+            print(
+                "[RetrievalAttention] WARNING: online decode graph overlay currently only affects the "
+                "python/auto decode traversal path."
+            )
+            self._online_graph_warned = True
         if self.decode_profile:
             self._decode_profile_stats["other_setup_sec"] += (time.perf_counter() - compute_start)
 
@@ -6127,6 +6533,12 @@ class retrievalattention_cache(KV_Cache):
                 bookkeeping_start = time.perf_counter() if self.decode_profile else None
                 for hdx in head_ids:
                     token_ids, retrieve_profile = token_results.get(hdx, ({}, None))
+                    if self.online_graph_enable:
+                        self._record_online_graph_provenance(
+                            layer_idx,
+                            hdx,
+                            self._fullgpu_payload_token_ids(token_ids),
+                        )
                     self._accumulate_decode_retrieve_profile(retrieve_profile)
                 if self.decode_profile:
                     self._decode_profile_stats["other_group_bookkeeping_sec"] += (
@@ -6173,6 +6585,7 @@ class retrievalattention_cache(KV_Cache):
                     q_attn_by_head[hdx] = q_grouped[hdx]
             q_attn = q_attn_by_head[hdx]
             token_ids, retrieve_profile = token_results.get(hdx, ([], None))
+            self._record_online_graph_provenance(layer_idx, hdx, token_ids)
             bookkeeping_start = time.perf_counter() if self.decode_profile else None
             self._accumulate_decode_retrieve_profile(retrieve_profile)
             if self.decode_profile:

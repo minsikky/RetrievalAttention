@@ -1,5 +1,50 @@
 # Native GPU Decode Traversal Plan
 
+## 2026-03-12 update (online decode graph plan extension)
+- The custom full-GPU decode backend is now being used for online decode update experiments, not just the original 40k decode AB kernel benchmark.
+- Full-GPU runtime changes already implemented:
+  - decode device K / attention-K / V caches are full-length and updated online
+  - base CSR row pointers are extended to future decode slots
+  - an overlay CSR exists for online inserted edges and is read by the full-GPU kernel
+- That enables the following experimental mode split on the same `roar_cuda_fullgpu` traversal:
+  - `baseline`:
+    - no online dynamic range
+    - no online graph overlay
+  - `dynamic`:
+    - dynamic range advances as decode grows
+    - generated tokens become retrieval-eligible after they leave the suffix window
+    - no new graph edges are inserted
+  - `online`:
+    - same dynamic range advancement
+    - deferred provenance edges inserted into an overlay CSR
+- Important conceptual note:
+  - `dynamic` is intentionally a seed-exposure baseline, not a fully connected generated-token graph
+  - without new edges, aged-out generated tokens are mainly reachable only if seeds land on them
+  - this is useful because it separates “mere eligibility” from “added graph connectivity”
+- Current short-window validation plan:
+  - shrink the suffix window so aged-out generated tokens appear quickly
+  - active in-flight jobs:
+    - `44964177`
+    - `44964183`
+    - `44964196`
+  - success criteria:
+    - `dynamic`: non-zero `aged_gen/head`
+    - `online`: non-zero `nodes`, `edges`, `overlay_edges`
+    - task quality should remain intact
+- Session-steering plan update:
+  - for the stock interactive TUI, external safe same-process message injection is not currently available
+  - `codex exec resume` is not the right primitive for a live active TUI session
+  - app-server protocol does expose the right primitives:
+    - `turn/start`
+    - `turn/steer`
+    - `turn/interrupt`
+  - tested successfully:
+    - local WebSocket app-server steering
+    - Slurm watcher steering an app-managed thread
+  - practical recommendation:
+    - keep polling for the current stock TUI
+    - only pursue same-thread automatic steering if moving to an app-server-managed interactive workflow
+
 ## 2026-03-09 status update
 - This note is now partially historical.
 - A custom CUDA full-GPU decode backend exists and is materially faster than the earlier hybrid/full-ATen traversal attempts on the 40k / 32-step benchmark.
@@ -304,3 +349,45 @@ Move to **measured optimizations around the stable custom kernel**, not more spe
   - keep custom kernels for expansion / seen marking / merge only
   - do **not** keep direct neighbor-by-neighbor scoring in the hot traversal kernel
   - any future kernel path should preserve grouped score evaluation (or something equivalently GEMM-friendly)
+
+## 2026-03-13 online decode graph checkpoint
+- Fullgpu online metrics are now trustworthy:
+  - `overlay_edges` is counted in the fullgpu kernel/profile path
+  - `aged_gen/head` is computed from the final returned token IDs
+- Verified on the small-window generated-memory smoke:
+  - `dynamic` already retrieves some aged generated tokens:
+    - `aged_gen/head=2.98`
+  - `online` retrieves many more and actively traverses overlay edges:
+    - `overlay_edges=102490740`
+    - `aged_gen/head=35.02`
+- So the online provenance mechanism is real; the remaining question is cost/amortization, not correctness of the basic path.
+
+## 2026-03-13 new comparison baselines
+- Added `growing_static`:
+  - RetrievalAttention/fullgpu-only comparison mode
+  - generated tokens remain in static attention
+  - retrieval dynamic region stays frozen to prompt-only span
+- Added `full_dense`:
+  - true dense baseline via `Full_Flash_Attn`
+- Immediate finding:
+  - `growing_static` is not a quality upper bound for this task; it failed the answer-format smoke.
+  - dense baseline is both valid and much faster at the tested lengths.
+
+## 2026-03-13 partial length-sweep result
+- Sweep root:
+  - `generated_memory_eval_result/length_sweep_s16_fullgpu_vs_dense`
+- Partial trend with `online e24/e48` still running:
+  - `baseline`
+    - quality collapses at all tested lengths
+  - `dynamic`
+    - mild help at the shortest case only
+  - `online`
+    - strong quality at `e12`
+    - large latency cost
+  - `full_dense`
+    - `e12`: `avg_decode_sec~6.15s`, `query_acc=1.0`
+    - `e24`: `avg_decode_sec~8.28s`, `query_acc=1.0`
+    - `e48`: `avg_decode_sec~12.98s`, `query_acc=0.667`
+- Updated interpretation:
+  - at short/medium decode lengths, sparse RetrievalAttention is nowhere near dense attention on latency.
+  - if online sparse decode is going to win, it likely has to be at much longer decode lengths than `12/24/48` entries.

@@ -2,9 +2,92 @@
 
 ## Scope
 - Repository: RetrievalAttention / RetroInfer experiments.
-- Active branch: `gpu_top_k`.
+- Active branch: `online_decode_graph_exp`.
 - Target model for iteration: `meta-llama/Llama-3.1-8B-Instruct`.
 - Primary benchmark flow now: `test.sh` first, then RULER subset/full.
+
+## 2026-03-12 update (online decode graph experiment + app-server steering)
+- Current focus is no longer only the 40k decode AB kernel benchmark.
+- Active experiment is online graph updates for long decode with RetrievalAttention on `Llama-3.1-8B-Instruct`.
+- The generated-memory benchmark is now two-phase and same-session:
+  - phase 1 generates ledger entries ending with `END LEDGER`
+  - phase 2 appends a question prompt into the same KV cache and decodes answers
+  - benchmark file:
+    - `benchmark/generated_memory_eval.py`
+  - wrapper:
+    - `benchmark/run_generated_memory_online.sh`
+- Exact online mode semantics:
+  - `baseline`
+    - `RETRIEVALATTN_ONLINE_DYNAMIC_RANGE=0`
+    - `RETRIEVALATTN_ONLINE_GRAPH_ENABLE=0`
+    - aged-out generated tokens never enter retrieval search space
+  - `dynamic`
+    - `RETRIEVALATTN_ONLINE_DYNAMIC_RANGE=1`
+    - `RETRIEVALATTN_ONLINE_GRAPH_ENABLE=0`
+    - aged-out generated tokens become eligible for retrieval, but no new graph edges are added
+    - in practice these tokens are mostly reachable only through seeds / tail anchors / prev-step carryover
+  - `online`
+    - `RETRIEVALATTN_ONLINE_DYNAMIC_RANGE=1`
+    - `RETRIEVALATTN_ONLINE_GRAPH_ENABLE=1`
+    - same as `dynamic`, plus deferred provenance edges are inserted into an online overlay graph
+- `roar_cuda_fullgpu` now supports the online experiment path:
+  - decode device key / attn-key / value caches are allocated to full decode length and updated online
+  - base CSR row pointers are extended to future decode slots
+  - an overlay CSR is rebuilt for online edges and read by the full-GPU kernel
+- Important smoke result with the default `static_pattern_end=512`:
+  - baseline:
+    - `44959939` / `slurm-44959939.out`
+    - `query_acc=1.0`, `strict_acc=1.0`, `format_acc=1.0`
+    - decode profile total `103.936 s`
+  - dynamic:
+    - `44959942` / `slurm-44959942.out`
+    - `query_acc=1.0`, `strict_acc=1.0`, `format_acc=1.0`
+    - decode profile total `90.733 s`
+    - online stats:
+      - `nodes=0`, `edges=0`, `overlay_edges=0`, `aged_gen/head=0.00`
+  - online:
+    - `44959951` / `slurm-44959951.out`
+    - `query_acc=1.0`, `strict_acc=1.0`, `format_acc=1.0`
+    - decode profile total `152.641 s`
+    - online stats:
+      - `nodes=0`, `edges=0`, `overlay_edges=0`, `aged_gen/head=0.00`
+  - interpretation:
+    - the benchmark flow is now correct
+    - but the smoke was non-discriminative because the `512`-token suffix window was too large, so generated tokens never aged out
+    - online mode already adds overhead even before edges are exercised
+- New small-window jobs were launched to make online behavior observable:
+  - `RETRIEVALATTN_STATIC_PATTERN_START=16`
+  - `RETRIEVALATTN_STATIC_PATTERN_END=16`
+  - `NUM_SAMPLES=1`
+  - `NUM_ENTRIES=12`
+  - jobs:
+    - baseline: `44964177` / `slurm-44964177.out`
+    - dynamic: `44964183` / `slurm-44964183.out`
+    - online: `44964196` / `slurm-44964196.out`
+  - expected useful signals:
+    - `dynamic`: non-zero `aged_gen/head`
+    - `online`: non-zero `nodes`, `edges`, `overlay_edges`
+- Slurm/Codex automation status:
+  - current stock interactive TUI session does **not** support safe true external message injection
+  - `codex exec resume` was tested and works against the same persisted session id, but it is a second Codex process reopening the stored thread, not safe in-band steering for the live TUI
+  - app-server route was tested successfully:
+    - protocol supports `turn/start`, `turn/steer`, `turn/interrupt`
+    - a local WebSocket app-server test accepted `turn/steer` and changed the final answer
+    - result file:
+      - `.codex/app_server_test/steer_test_result.json`
+  - end-to-end Slurm steering test on an app-managed thread also passed:
+    - session file:
+      - `.codex/app_sessions/slurm-steer-test.json`
+    - steering job:
+      - `44963617`
+    - watcher log:
+      - `.codex/slurm/resume-44963617.log`
+    - final turn result:
+      - `.codex/app_sessions/slurm-steer-test.turn.json`
+    - final agent message became `WATCHER_STEER_44963617`
+  - practical decision for day-to-day use:
+    - stick to polling / sentinel files for the current stock TUI
+    - use the app-server path only if moving to an app-server-managed interactive workflow
 
 ## 2026-03-09 update (full-GPU decode kernel progress)
 - Active decode experiment:
@@ -1098,3 +1181,67 @@
     - `idx` shape `(1, 64, 32, 32)` (`int32`),
     - `graph` shape `(1, 8, 64, 16)` (`int32`),
     - native symbol `fwd_kvcache_retrieval_graph` is available and callable.
+
+## 2026-03-13 online decode graph status
+- Branch focus remains online decode graph updates for `RetrievalAttention` with `RETRIEVALATTN_DECODE_BACKEND=roar_cuda_fullgpu`.
+- Fullgpu reporting bug is fixed:
+  - `online_overlay_edges` is now counted in the fullgpu kernel/profile path.
+  - `aged_gen/head` and `aged_gen_head_rate` are now computed correctly for fullgpu from final returned token IDs.
+- Verified mechanism on the `static_pattern_start=16`, `static_pattern_end=16` generated-memory smoke:
+  - `dynamic`:
+    - `aged_gen/head=2.98`
+    - `aged_gen_head_rate=76.3%`
+    - `query_acc=0.333`
+  - `online`:
+    - `overlay_edges=102490740`
+    - `aged_gen/head=35.02`
+    - `aged_gen_head_rate=90.4%`
+    - `query_acc=1.0`
+- Interpretation:
+  - the online overlay is definitely being traversed in fullgpu mode.
+  - online provenance edges materially increase retrieval of aged generated tokens.
+
+## 2026-03-13 generated-memory comparison modes
+- Added benchmark-side comparison modes in `benchmark/run_generated_memory_online.sh`:
+  - `baseline`
+  - `dynamic`
+  - `online`
+  - `growing_static`
+  - `full_dense`
+- `growing_static` mode:
+  - keeps the retrieval dynamic region frozen at the prefill boundary,
+  - keeps generated tokens in the static attention set via fullgpu device K/V caches,
+  - currently fullgpu-only (`RETRIEVALATTN_GROW_STATIC_SUFFIX=1`).
+- `full_dense` mode:
+  - uses `attn_type=Full_Flash_Attn` as a true dense decode baseline.
+- Benchmark updates:
+  - `generated_memory_eval.py` no longer hardcodes `RetrievalAttention`;
+  - summaries now include `avg_total_generated_tokens`.
+
+## 2026-03-13 dense vs sparse early result
+- Fair dense smoke (`MIN_PROMPT_TOKENS=96`) succeeded:
+  - `Full_Flash_Attn`, `num_entries=12`, `num_queries=3`
+  - `query_acc=1.0`, `strict_acc=1.0`
+  - `avg_decode_sec=7.14s`
+- Partial length sweep launched under:
+  - `generated_memory_eval_result/length_sweep_s16_fullgpu_vs_dense`
+  - modes: `baseline`, `dynamic`, `online`, `full_dense`
+  - lengths: `12`, `24`, `48`
+  - `NUM_SAMPLES=1`
+- Partial results (with `online e24/e48` still running at the time of note update):
+  - `baseline`:
+    - poor quality at all lengths (`query_acc=0.0`)
+    - decode roughly `97s -> 128s -> 185s`
+  - `dynamic`:
+    - some help at `e12` (`query_acc=0.333`)
+    - no quality win at `e24/e48`
+    - decode roughly `86s -> 131s -> 175s`
+  - `online`:
+    - `e12` gave `query_acc=1.0` but high latency (`~169s`)
+  - `full_dense`:
+    - `e12`: `query_acc=1.0`, `avg_decode_sec~6.15s`
+    - `e24`: `query_acc=1.0`, `avg_decode_sec~8.28s`
+    - `e48`: `query_acc=0.667`, `avg_decode_sec~12.98s`
+- Current implication:
+  - at these decode lengths, full dense attention is far faster than the sparse RetrievalAttention variants.
+  - online decode graph is mechanistically working, but it is not yet latency-competitive in this regime.

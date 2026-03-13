@@ -5,9 +5,10 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 def add_config_args(parser):
     parser.add_argument("--attn_type", type=str, default="RetroInfer",
-                        choices=["Full_Flash_Attn", "RetroInfer"], help="Attention method")
+                        choices=["Full_Flash_Attn", "RetroInfer", "RetrievalAttention"], help="Attention method")
     parser.add_argument("--retrieval_budget", type=float, default=0.018, help="Retrieval budget")
     parser.add_argument("--estimation_budget", type=float, default=0.232, help="Estimation budget for RetroInfer")
+    parser.add_argument("--token_budget_override", type=int, default=None, help="Fixed token budget for RetrievalAttention")
     parser.add_argument("--cache_ratio", type=float, default=0.0, help="Cache ratio for RetroInfer")
     parser.add_argument("--use_cuda_graph", action='store_true', help="Use CUDA graph for inference")
     parser.add_argument("--gpu_only", action='store_true', help="Whether to use GPU-only mode for RetroInfer")
@@ -35,13 +36,26 @@ def get_numa_node_core_count(node_id=0):
 def generate_config(
     model_name, context_len, attn_type, 
     retrieval_budget=0.018, estimation_budget=0.232, cache_ratio=0.0,
-    use_cuda_graph=False, gpu_only=False
+    use_cuda_graph=False, gpu_only=False, token_budget_override=None
 ):
     CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
     MODEL_NAME = model_name.split("/")[-1]+'.json'
     CONFIG_FILE = os.path.join(CONFIG_DIR, MODEL_NAME)
     with open(CONFIG_FILE, "r") as f:
         _config = json.load(f)
+
+    if attn_type == "RetrievalAttention" and attn_type not in _config:
+        default_static_start = int(os.environ.get("RETRIEVALATTN_STATIC_PATTERN_START", "128"))
+        default_static_end = int(os.environ.get("RETRIEVALATTN_STATIC_PATTERN_END", "512"))
+        default_q_knn = int(os.environ.get("RETRIEVALATTN_Q_KNN", "8"))
+        default_key_degree = int(os.environ.get("RETRIEVALATTN_KEY_DEGREE", "8"))
+        _config[attn_type] = {
+            "static_pattern_start": max(0, default_static_start),
+            "static_pattern_end": max(0, default_static_end),
+            "q_knn": max(1, default_q_knn),
+            "key_degree": max(1, default_key_degree),
+            "token_budget": 1,
+        }
     
     avg_cluster_size = 16
     n_segments = max(round(context_len/8192), 1)
@@ -65,7 +79,15 @@ def generate_config(
             _config[attn_type]['buffer_cluster_num'] = 150
         _config[attn_type]['use_cuda_graph'] = use_cuda_graph
         _config[attn_type]['gpu_only'] = gpu_only
-    
+    elif attn_type == "RetrievalAttention":
+        if token_budget_override is not None and int(token_budget_override) > 0:
+            token_budget = int(token_budget_override)
+        else:
+            static_total = int(_config[attn_type].get("static_pattern_start", 0)) + int(_config[attn_type].get("static_pattern_end", 0))
+            dynamic_tokens = max(1, int(context_len) - static_total)
+            token_budget = max(1, int(round(float(retrieval_budget) * float(dynamic_tokens))))
+        _config[attn_type]["token_budget"] = int(token_budget)
+
     if attn_type != "Full_Flash_Attn":
         print(_config[attn_type])
     
