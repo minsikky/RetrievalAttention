@@ -769,12 +769,25 @@ class retrievalattention_cache(KV_Cache):
         cur = per_head.get(src)
         if cur is None:
             per_head[src] = [dst]
+            cached = self._decode_cuda_overlay_graph_cache[layer_idx][kv_hdx]
+            if cached is not None:
+                counts_t, neighbors_t = cached
+                if 0 <= src < int(counts_t.shape[0]):
+                    counts_t[src] = 1
+                    neighbors_t[src, 0] = int(dst)
             return 1
         if dst in cur:
             return 0
         if len(cur) >= int(self.online_graph_neighbor_cap):
             return 0
         cur.append(dst)
+        cached = self._decode_cuda_overlay_graph_cache[layer_idx][kv_hdx]
+        if cached is not None:
+            counts_t, neighbors_t = cached
+            count = len(cur)
+            if 0 <= src < int(counts_t.shape[0]) and count <= int(neighbors_t.shape[1]):
+                counts_t[src] = int(count)
+                neighbors_t[src, count - 1] = int(dst)
         return 1
 
     def _record_online_graph_provenance(self, layer_idx: int, head_idx: int, token_ids):
@@ -828,10 +841,16 @@ class retrievalattention_cache(KV_Cache):
         return [int(tok) for tok in ids_t.detach().cpu().tolist() if int(tok) >= 0]
 
     def _fullgpu_payload_token_ids_group(self, payloads_by_head):
+        out = {}
         valid = []
         max_cols = 0
         for hdx, payload in payloads_by_head:
-            if not isinstance(payload, dict) or "device_ids" not in payload:
+            if not isinstance(payload, dict):
+                continue
+            if "cpu_tokens" in payload:
+                out[int(hdx)] = [int(tok) for tok in payload["cpu_tokens"] if int(tok) >= 0]
+                continue
+            if "device_ids" not in payload:
                 continue
             take = max(0, int(payload.get("final_count", 0)))
             if take <= 0:
@@ -843,7 +862,7 @@ class retrievalattention_cache(KV_Cache):
             max_cols = max(max_cols, int(row.numel()))
             valid.append((int(hdx), row, take))
         if not valid or max_cols <= 0:
-            return {}
+            return out
 
         rows = []
         for _, row, _ in valid:
@@ -2373,38 +2392,17 @@ class retrievalattention_cache(KV_Cache):
         counts_t, neighbors_t = self._get_decode_overlay_graph_tensors_cuda(ldx, hdx)
         counts_dev, neighbors_dev = self._get_decode_overlay_graph_tensors_cuda_device(ldx, hdx)
         total_len = int(counts_t.shape[0])
-        cap = int(self.online_graph_neighbor_cap)
         ordered_rows = sorted(row for row in row_set if row < total_len)
         if not ordered_rows:
             return
 
-        row_counts_cpu = torch.zeros((len(ordered_rows),), dtype=torch.int32, device="cpu")
-        row_neighbors_cpu = torch.full((len(ordered_rows), cap), -1, dtype=torch.int32, device="cpu")
-        overlay = self._online_graph_overlay[ldx][hdx]
-        for idx, row in enumerate(ordered_rows):
-            dsts = overlay.get(int(row), ())
-            valid = []
-            for dst in dsts:
-                dst_i = int(dst)
-                if dst_i < 0 or dst_i >= total_len:
-                    continue
-                valid.append(dst_i)
-                if len(valid) >= cap:
-                    break
-            count = min(len(valid), cap)
-            counts_t[row] = int(count)
-            neighbors_t[row].fill_(-1)
-            if count > 0:
-                vals = torch.tensor(valid[:count], dtype=torch.int32, device="cpu")
-                neighbors_t[row, :count] = vals
-                row_neighbors_cpu[idx, :count] = vals
-            row_counts_cpu[idx] = int(count)
-
         device = self.layer_mapping[str(ldx)]
-        row_idx_dev = torch.tensor(ordered_rows, dtype=torch.int64, device=device)
         upload_start = time.perf_counter() if self.decode_profile else None
-        counts_dev.index_copy_(0, row_idx_dev, row_counts_cpu.to(device=device, non_blocking=True))
-        neighbors_dev.index_copy_(0, row_idx_dev, row_neighbors_cpu.to(device=device, non_blocking=True))
+        row_idx_dev = torch.as_tensor(ordered_rows, dtype=torch.int64, device=device)
+        row_counts_dev = counts_t.index_select(0, torch.as_tensor(ordered_rows, dtype=torch.long, device="cpu")).to(device=device, non_blocking=True)
+        row_neighbors_dev = neighbors_t.index_select(0, torch.as_tensor(ordered_rows, dtype=torch.long, device="cpu")).to(device=device, non_blocking=True)
+        counts_dev.index_copy_(0, row_idx_dev, row_counts_dev)
+        neighbors_dev.index_copy_(0, row_idx_dev, row_neighbors_dev)
         if self.decode_profile:
             self._decode_profile_stats["online_overlay_h2d_sec"] += (
                 time.perf_counter() - upload_start
@@ -5493,6 +5491,12 @@ class retrievalattention_cache(KV_Cache):
             frontier_expanded_i = int(out_debug[i, 12].item()) if out_debug.shape[1] > 12 else 0
             find_probe_i = int(out_debug[i, 13].item()) if out_debug.shape[1] > 13 else 0
             overlay_edges_i = int(out_debug[i, 14].item()) if out_debug.shape[1] > 14 else 0
+            final_tokens_i = []
+            if out_ids_cpu is not None and count_i > 0:
+                final_tokens_i = [
+                    int(tok) for tok in out_ids_cpu[i, :count_i].tolist()
+                    if int(tok) >= 0
+                ]
             profile = state["profile"]
             if profile is not None:
                 profile["graph_sec"] += per_graph_sec
@@ -5523,11 +5527,7 @@ class retrievalattention_cache(KV_Cache):
                     "overlay_edges": overlay_edges_i,
                 }
                 profile["online_overlay_edges"] = overlay_edges_i
-                if out_ids_cpu is not None and count_i > 0:
-                    final_tokens_i = [
-                        int(tok) for tok in out_ids_cpu[i, :count_i].tolist()
-                        if int(tok) >= 0
-                    ]
+                if final_tokens_i:
                     online_generated_hits_i = sum(
                         1 for tok in final_tokens_i if self._is_dynamic_generated_token(tok)
                     )
@@ -5549,6 +5549,7 @@ class retrievalattention_cache(KV_Cache):
                     "device_mask": out_mask_t[i],
                     "device_attn_keys": key_attn_t,
                     "device_attn_values": value_t,
+                    "cpu_tokens": final_tokens_i if out_ids_cpu is not None else None,
                     "final_count": count_i,
                     "candidate_count": cand_raw_i,
                     "rounds": rounds_i,

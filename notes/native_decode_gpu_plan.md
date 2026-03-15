@@ -421,3 +421,25 @@ Move to **measured optimizations around the stable custom kernel**, not more spe
   1. keep the persistent row-wise overlay path
   2. next optimize provenance extraction / Python-side bookkeeping
   3. only then revisit deeper graph-kernel changes
+
+## 2026-03-13 update follow-up status
+- Two “safe” follow-up attempts after `45081113` did not survive validation:
+  - KV-group provenance merge changed retrieval behavior (`45085490`)
+  - staging-buffer reuse + narrower D2H alone preserved behavior but regressed latency (`45090954`)
+- So the active baseline should remain the `45081113` version.
+- Current safe next-direction ideas should avoid:
+  - changing provenance merge semantics
+  - extra host/device staging copies that duplicate `index_copy_` work
+
+## 2026-03-15 updated safe baseline
+- New safe improvements validated in `45248579`:
+  - removed duplicate D2H for provenance by reusing CPU `final_tokens`
+  - removed row repacking during flush by using the incrementally maintained CPU overlay row mirror
+- This improved the short online case while preserving behavior:
+  - `update 15.881s -> 13.201s`
+  - `group 9.793s -> 4.553s`
+  - `avg_decode_sec 127.324s -> 117.729s`
+- Updated recommendation:
+  1. treat `45248579` as the current best safe online baseline
+  2. rerun focused scaling from this version
+  3. only after that, consider deeper constant-factor work in dynamic/fullgpu retrieval

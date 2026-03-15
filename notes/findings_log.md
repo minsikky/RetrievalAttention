@@ -1564,3 +1564,52 @@
 - Conclusion:
   - the persistent-overlay implementation is a real no-behavior-change win;
   - next likely easy target is provenance/bookkeeping overhead (`d2h` + Python-side group work).
+
+## 2026-03-13 failed provenance/bookkeeping follow-up
+- Attempt 1:
+  - KV-group provenance merge + staging-buffer reuse + narrower grouped D2H
+  - run: `45085490`
+  - outcome:
+    - faster on wall/profile
+    - but behavior changed:
+      - `edges 721402 -> 562204`
+      - `overlay_edges 102490740 -> 76805774`
+      - `aged_gen/head 35.02 -> 33.73`
+  - verdict:
+    - invalid optimization; do not keep
+- Attempt 2:
+  - reverted the KV-group provenance merge
+  - kept only:
+    - narrower grouped D2H copy
+    - staging-buffer reuse for row updates
+  - run: `45090954`
+  - outcome:
+    - behavior matched `45081113`
+    - but latency regressed:
+      - `update 16.255s -> 29.535s`
+      - `group 9.844s -> 10.573s`
+      - `avg_decode_sec 125.531s -> 142.448s`
+  - verdict:
+    - also not worth keeping
+- Current baseline remains:
+  - `45081113` as the best validated online short-run result after the persistent-overlay fix.
+
+## 2026-03-15 safe provenance/build improvement
+- Implemented two safe cuts:
+  - reuse CPU `final_tokens` already materialized in `_retrieve_tokens_roar_cuda_fullgpu_group()` for provenance
+  - keep the CPU overlay row mirror updated incrementally in `_online_graph_add_directed_edge()`, then upload dirty rows directly
+- Verification run:
+  - `45248579`
+- Compared to restored baseline `45091431`:
+  - `update 15.881s -> 13.201s`
+  - `d2h 7.157s -> 1.922s`
+  - `build 14.364s -> 4.145s`
+  - `group 9.793s -> 4.553s`
+  - `avg_decode_sec 127.324s -> 117.729s`
+- Behavior check:
+  - same `edges`
+  - same `overlay_edges`
+  - same `aged_gen/head`
+  - same `query_acc=1.0`
+- Conclusion:
+  - this version is a valid new short-run online baseline and should replace `45081113` for future scaling tests.

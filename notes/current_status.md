@@ -1293,3 +1293,42 @@
 - Current implication:
   - the persistent-overlay change is a real win and preserves behavior;
   - the next remaining online-specific cost is provenance/bookkeeping (`d2h` + `group`), not overlay rebuild.
+
+## 2026-03-13 failed follow-up on provenance/bookkeeping
+- Tried two follow-up implementation-only optimizations after the persistent-overlay win:
+  1. KV-group provenance merge before pending insertion
+  2. staging-buffer reuse plus narrower grouped D2H copy
+- Result of the first attempt (`45085490`):
+  - faster wall/profile numbers, but **not valid**:
+    - `edges: 721402 -> 562204`
+    - `overlay_edges: 102490740 -> 76805774`
+    - `aged_gen/head: 35.02 -> 33.73`
+  - interpretation:
+    - the KV-group provenance merge changed behavior and should not be kept.
+- Result of the safe subset (staging-buffer reuse + narrower grouped D2H only) (`45090954`):
+  - behavior matched `45081113`
+  - but latency regressed:
+    - `update: 16.255s -> 29.535s`
+    - `group: 9.844s -> 10.573s`
+    - `avg_decode_sec: 125.53s -> 142.45s`
+- Decision:
+  - revert both follow-up changes and keep `45081113` behavior/performance as the active online baseline.
+
+## 2026-03-15 safe online-update improvements
+- Implemented two verified behavior-preserving improvements on top of the `45081113` baseline:
+  1. reuse the CPU `final_tokens` already produced in fullgpu retrieval for online provenance, removing the second D2H copy;
+  2. keep the CPU overlay row mirror incrementally updated on edge insertion, so flush uploads dirty rows directly instead of repacking them.
+- Verification run (`45248579`) vs the restored baseline rerun (`45091431`):
+  - `update: 15.881s -> 13.201s`
+  - `d2h: 7.157s -> 1.922s`
+  - `build: 14.364s -> 4.145s`
+  - `group: 9.793s -> 4.553s`
+  - `avg_decode_sec: 127.324s -> 117.729s`
+- Retrieval behavior stayed unchanged:
+  - same `edges=721402`
+  - same `overlay_edges=102490740`
+  - same `aged_gen/head=35.02`
+  - same `query_acc=1.0`
+- Current implication:
+  - this is another real no-behavior-change win;
+  - the next step is to rerun the scaling sweep from this newer baseline before making longer-horizon claims.
