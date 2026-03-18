@@ -211,6 +211,24 @@
     - `avg_omitted_dynamic_mass≈0.109`
     - `bound_violation_rate≈65.1%`
   - so this first prior needs a stronger safety correction before it can replace the current worst-case global bound
+- Follow-up residual-tail experiment:
+  - add one synthetic tail bucket after sparse retrieval:
+    - tail mass from the omitted-mass estimate
+    - tail value from `mean(V_dynamic)`
+  - outcome:
+    - slightly better omitted-mass accounting
+    - worse dense/sparse output-vector match
+    - no accuracy recovery
+  - conclusion:
+    - probability-mass correction alone is not enough
+    - any residual-tail path needs a much better tail-value estimator
+- Zero-tail control:
+  - use the omitted-mass estimate only as a down-scaling factor on the kept sparse output
+  - no synthetic tail value contribution
+  - outcome:
+    - significantly worse output-vector match than both no-tail and `mean(V_dynamic)` tail
+  - conclusion:
+    - renormalization error is real, but fixing normalization without modeling the omitted value mixture does not recover quality
 
 ## 2026-03-12 update (online decode graph plan extension)
 - The custom full-GPU decode backend is now being used for online decode update experiments, not just the original 40k decode AB kernel benchmark.

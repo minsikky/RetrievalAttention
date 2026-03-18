@@ -325,6 +325,34 @@
   - takeaway:
     - the moment prior makes traversal meaningfully more aggressive
     - but the first diagonal-moment Gaussian-style unseen-tail estimate is too optimistic and violates the intended omitted-mass guarantee badly
+- Residual-tail attention experiment on top of `moment_diag`:
+  - `45546773` / `e12` / compare-on
+  - change:
+    - keep the same adaptive retrieval
+    - do not let the kept dynamic tokens absorb all probability mass
+    - instead add one residual tail bucket with:
+      - mass = estimated omitted mass
+      - value = `mean(V_dynamic)`
+  - result versus `45544521`:
+    - `avg_omitted_dynamic_mass`: `≈0.1090 -> ≈0.0943`
+    - `avg_dense_sparse_out_l2`: `≈0.1308 -> ≈0.2291`
+    - `query_acc`: `0.0 -> 0.0`
+  - takeaway:
+    - missing-mass accounting is a real issue
+    - but the tail-value approximation now becomes the limiting factor
+    - `mean(V_dynamic)` is not a good enough surrogate for the omitted value mixture
+- Zero-tail control:
+  - `45549946` / `e12` / compare-on
+  - change:
+    - keep the same `moment_diag` adaptive retrieval
+    - use the omitted-mass estimate only to scale the kept sparse output by `(1 - rho_tail)`
+    - tail value contribution is forced to zero
+  - result:
+    - `avg_dense_sparse_out_l2≈0.552`, much worse than both no-tail (`≈0.131`) and `mean(V_dynamic)` tail (`≈0.229`)
+    - `query_acc=0.0`
+  - takeaway:
+    - simple normalization correction alone does not help
+    - omitted value contribution is a first-order issue
 
 ## 2026-03-12 update (online decode graph smoke results + automation)
 - Generated-memory benchmark is now correct and two-phase:

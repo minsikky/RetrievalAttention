@@ -380,6 +380,13 @@ class retrievalattention_cache(KV_Cache):
         except Exception:
             self.dynamic_budget_prior_var_scale = 1.0
         self.dynamic_budget_prior_var_scale = max(0.0, float(self.dynamic_budget_prior_var_scale))
+        self.dynamic_tail_enable = os.environ.get("RETRIEVALATTN_DYNAMIC_TAIL_ENABLE", "0") == "1"
+        self.dynamic_tail_mode = os.environ.get(
+            "RETRIEVALATTN_DYNAMIC_TAIL_MODE",
+            "dynamic_mean",
+        ).strip().lower()
+        if self.dynamic_tail_mode not in {"dynamic_mean", "zero"}:
+            self.dynamic_tail_mode = "dynamic_mean"
         try:
             self.roar_decode_lpq = int(os.environ.get("RETRIEVALATTN_ROAR_DECODE_LPQ", "0"))
         except Exception:
@@ -2756,6 +2763,20 @@ class retrievalattention_cache(KV_Cache):
             zero = torch.zeros((self.head_dim,), dtype=torch.float32, device=device)
             return zero, zero
         return sum_t, sumsq_t
+
+    def _get_dynamic_tail_value_fullgpu(self, layer_idx: int, kv_hdx: int):
+        value_t = self._get_decode_value_tensor_cuda(layer_idx, kv_hdx)
+        if value_t is None:
+            device = self.layer_mapping[str(layer_idx)]
+            return torch.zeros((self.head_dim,), dtype=torch.float32, device=device)
+        dyn_start = int(self.dynamic_start)
+        dyn_end = int(self.dynamic_end)
+        if dyn_end <= dyn_start:
+            return torch.zeros((self.head_dim,), dtype=torch.float32, device=value_t.device)
+        dyn_slice = value_t[dyn_start:dyn_end]
+        if int(dyn_slice.shape[0]) <= 0:
+            return torch.zeros((self.head_dim,), dtype=torch.float32, device=value_t.device)
+        return dyn_slice.float().mean(dim=0)
 
     def _update_dynamic_attn_moments_fullgpu(self, old_dynamic_end: int, new_dynamic_end: int):
         if self.decode_backend != "roar_cuda_fullgpu":
@@ -6182,6 +6203,7 @@ class retrievalattention_cache(KV_Cache):
         adaptive_upper_scores_t: torch.Tensor = None,
         adaptive_candidate_counts_t: torch.Tensor = None,
         adaptive_dynamic_span: int = None,
+        sparse_out_batch: torch.Tensor = None,
     ):
         if not self.oracle_compare_enable:
             return
@@ -6243,7 +6265,10 @@ class retrievalattention_cache(KV_Cache):
             dense_v_cat = torch.cat([static_v, self._get_decode_value_tensor_cuda(layer_idx, kv_hdx)[self.dynamic_start:self.dynamic_end]], dim=0)
             sparse_v_cat = torch.cat([static_v, dyn_v[idx]], dim=0)
             dense_out = torch.matmul(dense_attn.unsqueeze(0).to(dense_v_cat.dtype), dense_v_cat).squeeze(0)
-            sparse_out = torch.matmul(sparse_attn.unsqueeze(0).to(sparse_v_cat.dtype), sparse_v_cat).squeeze(0)
+            if sparse_out_batch is not None:
+                sparse_out = sparse_out_batch[idx].float()
+            else:
+                sparse_out = torch.matmul(sparse_attn.unsqueeze(0).to(sparse_v_cat.dtype), sparse_v_cat).squeeze(0)
             total_dynamic_mass = float(dense_attn[static_len:].sum().item()) if dense_attn.numel() > static_len else 0.0
             omitted_dynamic_mass = max(0.0, total_dynamic_mass - oracle_dyn_mass)
             adaptive_mass_bound = (
@@ -6695,6 +6720,27 @@ class retrievalattention_cache(KV_Cache):
         v_cat = torch.cat([static_v_expand, dyn_v], dim=1)
         attn = torch.softmax(scores, dim=-1).to(v_cat.dtype)
         out_batch = torch.bmm(attn.unsqueeze(1), v_cat).squeeze(1)
+        tail_mass_t = None
+        if self.dynamic_tail_enable and self.dynamic_budget_enable:
+            if budget_meta is not None:
+                tail_mass_t = budget_meta["mass_bounds_t"].to(device=device, dtype=out_batch.dtype)
+            elif self.dynamic_budget_mode == "traversal_cuda":
+                tail_mass_t = torch.as_tensor(
+                    [
+                        float(p.get("adaptive_mass_bound", 0.0)) if isinstance(p, dict) else 0.0
+                        for p in payloads
+                    ],
+                    dtype=out_batch.dtype,
+                    device=device,
+                )
+            if tail_mass_t is not None:
+                tail_mass_t = tail_mass_t.clamp(0.0, 0.99)
+                if self.dynamic_tail_mode == "zero":
+                    out_batch = (1.0 - tail_mass_t.unsqueeze(1)) * out_batch
+                else:
+                    tail_v = self._get_dynamic_tail_value_fullgpu(layer_idx, kv_hdx).to(device=device, dtype=out_batch.dtype)
+                    if int(tail_v.numel()) > 0:
+                        out_batch = (1.0 - tail_mass_t.unsqueeze(1)) * out_batch + tail_mass_t.unsqueeze(1) * tail_v.unsqueeze(0)
         keep_counts_t = (
             budget_meta["keep_counts_t"]
             if budget_meta is not None
@@ -6728,6 +6774,7 @@ class retrievalattention_cache(KV_Cache):
             adaptive_upper_scores_t=(budget_meta["upper_scores_t"] if budget_meta is not None else None),
             adaptive_candidate_counts_t=(budget_meta["candidate_counts_t"] if budget_meta is not None else None),
             adaptive_dynamic_span=(budget_meta["dynamic_span"] if budget_meta is not None else None),
+            sparse_out_batch=out_batch,
         )
 
         if self.decode_profile:
@@ -6766,6 +6813,10 @@ class retrievalattention_cache(KV_Cache):
                         retrieve_profile["adaptive_upper_score_bound"] = float(
                             budget_meta["upper_scores_t"][idx].item()
                         )
+                if tail_mass_t is not None:
+                    payload["dynamic_tail_mass"] = float(tail_mass_t[idx].item())
+                    if retrieve_profile is not None:
+                        retrieve_profile["dynamic_tail_mass"] = float(tail_mass_t[idx].item())
             if dyn_count == 0:
                 empty_heads += 1
             dynamic_counts.append(dyn_count)

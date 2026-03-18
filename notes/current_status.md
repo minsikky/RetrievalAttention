@@ -317,6 +317,26 @@
     - interpretation:
       - the moment-prior direction is promising as an aggressive estimate
       - but the first diagonal-moment / Gaussian-style unseen-tail model is too optimistic to use as-is
+  - residual-tail attention experiment (`45546773`, `e12`, compare-on):
+    - kept the same `traversal_cuda + moment_diag` adaptive retrieval
+    - instead of fully renormalizing the kept dynamic set, injected one residual tail bucket:
+      - tail mass from the estimated omitted mass
+      - tail value approximated as `mean(V_dynamic)`
+    - result:
+      - `avg_omitted_dynamic_mass≈0.0943` vs `≈0.1090` without the residual bucket
+      - but `avg_dense_sparse_out_l2` worsened to `≈0.229` from `≈0.131`
+      - `query_acc` stayed `0.0`
+    - interpretation:
+      - accounting for missing mass helps conceptually
+      - but a single residual bucket with `mean(V_dynamic)` is too crude a tail-value approximation
+  - zero-tail control (`45549946`, `e12`, compare-on):
+    - same omitted-mass estimate, but omitted mass was assigned to zero-valued tail contribution
+    - result was worse than both no-tail and `mean(V_dynamic)` tail:
+      - `avg_dense_sparse_out_l2≈0.552`
+      - `query_acc=0.0`
+    - interpretation:
+      - normalization-only correction does not help
+      - the missing value contribution is central, not secondary
 
 ## 2026-03-12 update (online decode graph experiment + app-server steering)
 - Current focus is no longer only the 40k decode AB kernel benchmark.
