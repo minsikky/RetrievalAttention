@@ -204,6 +204,13 @@
   - add a moment-prior unseen-tail estimator that uses constant-size attention-key summaries
   - keep the same omitted-mass stopping objective and traversal-time kernel plumbing
   - validate on small compare-on runs before any longer sweep
+- First result from that experiment:
+  - the moment-prior prototype did reduce candidate/keep counts substantially on `e12`
+  - but its omitted-mass estimate was far too optimistic:
+    - `avg_adaptive_mass_bound≈0.120`
+    - `avg_omitted_dynamic_mass≈0.109`
+    - `bound_violation_rate≈65.1%`
+  - so this first prior needs a stronger safety correction before it can replace the current worst-case global bound
 
 ## 2026-03-12 update (online decode graph plan extension)
 - The custom full-GPU decode backend is now being used for online decode update experiments, not just the original 40k decode AB kernel benchmark.

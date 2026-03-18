@@ -367,6 +367,19 @@ class retrievalattention_cache(KV_Cache):
         self.dynamic_budget_mode = os.environ.get("RETRIEVALATTN_DYNAMIC_BUDGET_MODE", "torch").strip().lower()
         if self.dynamic_budget_mode not in {"torch", "cuda", "traversal_cuda"}:
             self.dynamic_budget_mode = "torch"
+        self.dynamic_budget_prior = os.environ.get(
+            "RETRIEVALATTN_DYNAMIC_BUDGET_PRIOR",
+            "global_norm",
+        ).strip().lower()
+        if self.dynamic_budget_prior not in {"global_norm", "moment_diag"}:
+            self.dynamic_budget_prior = "global_norm"
+        try:
+            self.dynamic_budget_prior_var_scale = float(
+                os.environ.get("RETRIEVALATTN_DYNAMIC_BUDGET_PRIOR_VAR_SCALE", "1.0")
+            )
+        except Exception:
+            self.dynamic_budget_prior_var_scale = 1.0
+        self.dynamic_budget_prior_var_scale = max(0.0, float(self.dynamic_budget_prior_var_scale))
         try:
             self.roar_decode_lpq = int(os.environ.get("RETRIEVALATTN_ROAR_DECODE_LPQ", "0"))
         except Exception:
@@ -710,6 +723,8 @@ class retrievalattention_cache(KV_Cache):
         self._decode_cuda_attn_key_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_attn_key_norm_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_attn_key_prefixmax_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._decode_cuda_attn_key_sum_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._decode_cuda_attn_key_sumsq_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_value_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_graph_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_graph_device_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
@@ -2515,8 +2530,19 @@ class retrievalattention_cache(KV_Cache):
                         dyn_prefill,
                         dim=0,
                     ).values
+        dyn_start = int(self.dynamic_start)
+        dyn_end = min(int(self.dynamic_end), int(self.input_length))
+        sum_tensor = torch.zeros((self.head_dim,), dtype=torch.float32, device=device)
+        sumsq_tensor = torch.zeros((self.head_dim,), dtype=torch.float32, device=device)
+        if dyn_end > dyn_start:
+            dyn_prefill_keys = prefill_keys[dyn_start:dyn_end].float()
+            if int(dyn_prefill_keys.numel()) > 0:
+                sum_tensor.copy_(dyn_prefill_keys.sum(dim=0), non_blocking=True)
+                sumsq_tensor.copy_((dyn_prefill_keys * dyn_prefill_keys).sum(dim=0), non_blocking=True)
         self._decode_cuda_attn_key_norm_cache[ldx][hdx] = norm_tensor
         self._decode_cuda_attn_key_prefixmax_cache[ldx][hdx] = prefixmax_tensor
+        self._decode_cuda_attn_key_sum_cache[ldx][hdx] = sum_tensor
+        self._decode_cuda_attn_key_sumsq_cache[ldx][hdx] = sumsq_tensor
         return self._decode_cuda_attn_key_cache[ldx][hdx]
 
     def _get_decode_value_tensor_cuda(self, ldx: int, hdx: int):
@@ -2717,6 +2743,41 @@ class retrievalattention_cache(KV_Cache):
             return torch.tensor(0.0, dtype=torch.float32, device=device)
         idx = min(max(0, dyn_end - 1), int(prefixmax_t.shape[0]) - 1)
         return prefixmax_t[idx]
+
+    def _get_dynamic_attn_moment_tensors_fullgpu(self, ldx: int, hdx: int):
+        sum_t = self._decode_cuda_attn_key_sum_cache[ldx][hdx]
+        sumsq_t = self._decode_cuda_attn_key_sumsq_cache[ldx][hdx]
+        if sum_t is None or sumsq_t is None:
+            self._get_decode_attn_key_tensor_cuda(ldx, hdx)
+            sum_t = self._decode_cuda_attn_key_sum_cache[ldx][hdx]
+            sumsq_t = self._decode_cuda_attn_key_sumsq_cache[ldx][hdx]
+        if sum_t is None or sumsq_t is None:
+            device = self.layer_mapping[str(ldx)]
+            zero = torch.zeros((self.head_dim,), dtype=torch.float32, device=device)
+            return zero, zero
+        return sum_t, sumsq_t
+
+    def _update_dynamic_attn_moments_fullgpu(self, old_dynamic_end: int, new_dynamic_end: int):
+        if self.decode_backend != "roar_cuda_fullgpu":
+            return
+        if self.dynamic_budget_prior != "moment_diag":
+            return
+        start = max(int(self.dynamic_start), int(old_dynamic_end))
+        end = max(start, int(new_dynamic_end))
+        if end <= start:
+            return
+        for ldx in range(self.layer_num):
+            for kv_hdx in range(self.kv_head):
+                attn_key_cache = self._decode_cuda_attn_key_cache[ldx][kv_hdx]
+                sum_cache = self._decode_cuda_attn_key_sum_cache[ldx][kv_hdx]
+                sumsq_cache = self._decode_cuda_attn_key_sumsq_cache[ldx][kv_hdx]
+                if attn_key_cache is None or sum_cache is None or sumsq_cache is None:
+                    continue
+                rows = attn_key_cache[start:end].float()
+                if int(rows.numel()) <= 0:
+                    continue
+                sum_cache.add_(rows.sum(dim=0))
+                sumsq_cache.add_((rows * rows).sum(dim=0))
 
     def _build_graph_csr_from_knn_roar_cpp(self, knn: np.ndarray, keys_cpu: np.ndarray):
         meta = {
@@ -4508,9 +4569,11 @@ class retrievalattention_cache(KV_Cache):
             self.static_gpu_values[layer_idx][:, self.static_pattern_start:, :] = suffix_v
 
         if layer_idx == self.layer_num - 1:
+            old_dynamic_end = int(self.dynamic_end)
             self.decode_pos += 1
             self.context += 1
             self._refresh_decode_dynamic_state()
+            self._update_dynamic_attn_moments_fullgpu(old_dynamic_end, int(self.dynamic_end))
             self._flush_online_graph_pending()
 
         return None, None
@@ -5699,9 +5762,22 @@ class retrievalattention_cache(KV_Cache):
                 dtype=torch.float32,
                 device=queries_seed.device,
             )
-        max_k_norm_t = self._get_dynamic_attn_max_norm_fullgpu(ldx, kv_hdx).to(device=queries_seed.device)
-        q_norms_t = torch.linalg.vector_norm(queries_attn.float(), dim=-1)
-        upper_scores_t = q_norms_t * max_k_norm_t * float(scale)
+        upper_scores_t = torch.zeros((q_count,), dtype=torch.float32, device=queries_seed.device)
+        total_score_sum_t = torch.zeros((q_count,), dtype=torch.float32, device=queries_seed.device)
+        total_score_sumsq_t = torch.zeros((q_count,), dtype=torch.float32, device=queries_seed.device)
+        if self.dynamic_budget_prior == "moment_diag":
+            sum_k_t, sumsq_k_t = self._get_dynamic_attn_moment_tensors_fullgpu(ldx, kv_hdx)
+            sum_k_t = sum_k_t.to(device=queries_seed.device, dtype=torch.float32)
+            sumsq_k_t = sumsq_k_t.to(device=queries_seed.device, dtype=torch.float32)
+            total_score_sum_t = torch.matmul(queries_attn.float(), sum_k_t) * float(scale)
+            total_score_sumsq_t = torch.matmul(
+                queries_attn.float().square(),
+                sumsq_k_t,
+            ) * float(scale * scale)
+        else:
+            max_k_norm_t = self._get_dynamic_attn_max_norm_fullgpu(ldx, kv_hdx).to(device=queries_seed.device)
+            q_norms_t = torch.linalg.vector_norm(queries_attn.float(), dim=-1)
+            upper_scores_t = q_norms_t * max_k_norm_t * float(scale)
         head_indices = [int(state["hdx"]) for state in active_states]
         head_indices_t = torch.as_tensor(
             head_indices,
@@ -5738,6 +5814,8 @@ class retrievalattention_cache(KV_Cache):
             attn_keys=key_attn_t,
             static_logz=static_logz_t,
             upper_scores=upper_scores_t,
+            total_score_sum=total_score_sum_t,
+            total_score_sumsq=total_score_sumsq_t,
             offsets=graph_offsets_t,
             neighbors=graph_neighbors_t,
             overlay_counts=overlay_counts_t,
@@ -5762,6 +5840,8 @@ class retrievalattention_cache(KV_Cache):
             adaptive_enable=bool(self.dynamic_budget_enable and self.dynamic_budget_mode == "traversal_cuda"),
             adaptive_min_keep=int(self.dynamic_budget_min),
             adaptive_target_omass=float(self.dynamic_budget_target_omass),
+            adaptive_prior_mode=str(self.dynamic_budget_prior),
+            adaptive_prior_var_scale=float(self.dynamic_budget_prior_var_scale),
             score_agg=self.rerank_agg,
         )
         if self.decode_profile and self.fullgpu_profile_sync:
@@ -5851,7 +5931,11 @@ class retrievalattention_cache(KV_Cache):
                 if self.dynamic_budget_enable and self.dynamic_budget_mode == "traversal_cuda":
                     profile["adaptive_final_outputs"] = int(final_count_i)
                     profile["adaptive_mass_bound"] = float(adaptive_mass_i)
-                    profile["adaptive_upper_score_bound"] = float(upper_scores_t[i].item())
+                    profile["adaptive_upper_score_bound"] = (
+                        float(upper_scores_t[i].item())
+                        if self.dynamic_budget_prior == "global_norm"
+                        else float("nan")
+                    )
                 profile["online_overlay_edges"] = overlay_edges_i
                 if final_tokens_i:
                     online_generated_hits_i = sum(
@@ -5882,7 +5966,11 @@ class retrievalattention_cache(KV_Cache):
                     "frontier_at_stop": frontier_i,
                     "forced_seeds": forced_i,
                     "adaptive_mass_bound": float(adaptive_mass_i),
-                    "adaptive_upper_score_bound": float(upper_scores_t[i].item()),
+                    "adaptive_upper_score_bound": (
+                        float(upper_scores_t[i].item())
+                        if self.dynamic_budget_prior == "global_norm"
+                        else float("nan")
+                    ),
                     "adaptive_dynamic_span": int(max(0, int(self.dynamic_end - self.dynamic_start))),
                     "adaptive_candidate_count": int(cand_raw_i),
                     "adaptive_keep_count": int(final_count_i),

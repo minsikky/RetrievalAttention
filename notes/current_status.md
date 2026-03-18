@@ -305,6 +305,18 @@
     - use constant-size per-`(layer, kv_head)` attention-key moment summaries over the dynamic region
     - derive per-query unseen score mean / second moment online from those summaries plus the current query
     - goal: get a much tighter traversal-time unseen estimate without storing metadata that scales with context length
+  - first moment-prior prototype result (`45544521`, `e12`, compare-on):
+    - it was much more aggressive:
+      - `avg_adaptive_candidate_count≈45.8` vs `≈73.9` for global-norm
+      - `avg_adaptive_mass_bound≈0.120` vs `≈0.999`
+    - but it was not safe enough:
+      - `avg_omitted_dynamic_mass≈0.109`
+      - `bound_violation_rate≈65.1%`
+    - and quality regressed:
+      - `query_acc=0.0`, `format_acc=0.0`
+    - interpretation:
+      - the moment-prior direction is promising as an aggressive estimate
+      - but the first diagonal-moment / Gaussian-style unseen-tail model is too optimistic to use as-is
 
 ## 2026-03-12 update (online decode graph experiment + app-server steering)
 - Current focus is no longer only the 40k decode AB kernel benchmark.

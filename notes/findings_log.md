@@ -306,6 +306,25 @@
   - maintain per-`(layer, kv_head)` dynamic-region sums / squared sums of attention-key coordinates
   - combine those with the current attention query to estimate unseen score mean / second moment online during traversal
   - replace the current worst-case `upper_score + log(unseen_count)` term with that moment-based unseen `logZ` estimate
+- First moment-prior traversal experiment:
+  - implemented constant-size dynamic attention-key moment caches plus a `moment_diag` prior mode for traversal-time stopping
+  - compare-on A/B at `e12`:
+    - global-norm baseline `45544520`
+      - `avg_adaptive_candidate_count≈73.9`
+      - `avg_adaptive_keep_count≈73.9`
+      - `avg_adaptive_mass_bound≈0.999`
+      - `avg_omitted_dynamic_mass≈0.0945`
+      - `bound_violation_rate≈0.1%`
+    - moment prior `45544521`
+      - `avg_adaptive_candidate_count≈45.8`
+      - `avg_adaptive_keep_count≈43.5`
+      - `avg_adaptive_mass_bound≈0.120`
+      - `avg_omitted_dynamic_mass≈0.109`
+      - `bound_violation_rate≈65.1%`
+      - `query_acc=0.0`, `format_acc=0.0`
+  - takeaway:
+    - the moment prior makes traversal meaningfully more aggressive
+    - but the first diagonal-moment Gaussian-style unseen-tail estimate is too optimistic and violates the intended omitted-mass guarantee badly
 
 ## 2026-03-12 update (online decode graph smoke results + automation)
 - Generated-memory benchmark is now correct and two-phase:

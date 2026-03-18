@@ -498,6 +498,8 @@ def search_roar_graph_csr_cuda_group_fullgpu(
     attn_keys,
     static_logz,
     upper_scores,
+    total_score_sum,
+    total_score_sumsq,
     offsets,
     neighbors,
     overlay_counts,
@@ -523,6 +525,8 @@ def search_roar_graph_csr_cuda_group_fullgpu(
     adaptive_enable: bool = False,
     adaptive_min_keep: int = 1,
     adaptive_target_omass: float = 0.0,
+    adaptive_prior_mode: str = "global_norm",
+    adaptive_prior_var_scale: float = 1.0,
     score_agg: str = "max",
 ):
     if not _try_import_torch_kernel():
@@ -541,6 +545,8 @@ def search_roar_graph_csr_cuda_group_fullgpu(
         attn_keys,
         static_logz,
         upper_scores,
+        total_score_sum,
+        total_score_sumsq,
         offsets,
         neighbors,
         overlay_counts,
@@ -565,6 +571,8 @@ def search_roar_graph_csr_cuda_group_fullgpu(
         bool(adaptive_enable),
         int(adaptive_min_keep),
         float(adaptive_target_omass),
+        str(adaptive_prior_mode),
+        float(adaptive_prior_var_scale),
         str(score_agg),
     )
 
