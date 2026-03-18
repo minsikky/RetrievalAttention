@@ -48,6 +48,11 @@ def parse_args():
     parser.add_argument("--prefill_filler_repeats", type=int, default=0)
     parser.add_argument("--min_prompt_tokens", type=int, default=0)
     parser.add_argument("--generation_margin_tokens", type=int, default=64)
+    parser.add_argument(
+        "--teacher_ledger_attn_type",
+        type=str,
+        default=os.environ.get("GENERATED_MEMORY_TEACHER_LEDGER_ATTN_TYPE", ""),
+    )
     return parser.parse_args()
 
 
@@ -185,6 +190,58 @@ def build_answer_output_stub(num_queries: int):
     return "\n".join(f"ANSWER {i}: red" for i in range(1, int(num_queries) + 1))
 
 
+def aggregate_oracle_compare(records):
+    if not records:
+        return None
+    numeric_keys = [
+        "oracle_dyn_mass",
+        "total_dynamic_mass",
+        "omitted_dynamic_mass",
+        "oracle_token_count",
+        "sparse_dynamic_count",
+        "dense_sparse_out_l2",
+        "adaptive_mass_bound",
+        "adaptive_upper_score_bound",
+        "adaptive_dynamic_span",
+        "adaptive_candidate_count",
+        "adaptive_keep_count",
+    ]
+    out = {"num_records": int(len(records))}
+    for key in numeric_keys:
+        vals = []
+        for rec in records:
+            value = rec.get(key)
+            if value is None:
+                continue
+            if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                continue
+            vals.append(float(value))
+        if vals:
+            out[f"avg_{key}"] = float(np.mean(vals))
+    bound_vals = []
+    violation_count = 0
+    compare_count = 0
+    for rec in records:
+        bound = rec.get("adaptive_mass_bound")
+        actual = rec.get("omitted_dynamic_mass")
+        if bound is None or actual is None:
+            continue
+        if isinstance(bound, float) and (math.isnan(bound) or math.isinf(bound)):
+            continue
+        if float(bound) < 0.0:
+            continue
+        bound_vals.append(float(bound) - float(actual))
+        compare_count += 1
+        if float(actual) > float(bound) + 1e-6:
+            violation_count += 1
+    if compare_count > 0:
+        out["bound_compare_count"] = int(compare_count)
+        out["bound_violation_rate"] = float(violation_count) / float(compare_count)
+        out["avg_bound_slack"] = float(np.mean(bound_vals))
+        out["min_bound_slack"] = float(np.min(bound_vals))
+    return out
+
+
 def evaluate_output(text: str, query_positions, num_entries: int):
     region = extract_generated_region(text)
     entries = {}
@@ -225,6 +282,54 @@ def evaluate_output(text: str, query_positions, num_entries: int):
         "entries": entries,
         "answers": answers,
     }
+
+
+def compute_entry_token_spans(tokenizer, ledger_prompt: str, ledger_output: str, query_positions):
+    prompt_ids = tokenizer(ledger_prompt, return_tensors="pt").input_ids[0]
+    prompt_len = int(prompt_ids.shape[0])
+    spans = {}
+    cursor = 0
+    for line in ledger_output.splitlines(keepends=True):
+        token_len = len(tokenizer(line, return_tensors="pt", add_special_tokens=False).input_ids[0])
+        match = ENTRY_RE.match(line.strip("\n"))
+        if match is not None:
+            entry_idx = int(match.group(1))
+            if entry_idx in query_positions:
+                start = prompt_len + int(cursor)
+                spans[int(entry_idx)] = list(range(start, start + int(token_len)))
+        cursor += int(token_len)
+    return spans
+
+
+def summarize_oracle_debug(records, entry_spans):
+    summary = {}
+    if not records:
+        return summary
+    for entry_idx, span in entry_spans.items():
+        span_set = set(int(tok) for tok in span)
+        hit_records = []
+        hit_steps = set()
+        hit_layers = set()
+        hit_heads = set()
+        for rec in records:
+            toks = rec.get("tokens", [])
+            if any(int(tok) in span_set for tok in toks):
+                hit_records.append(rec)
+                hit_steps.add(int(rec.get("step", -1)))
+                hit_layers.add(int(rec.get("layer", -1)))
+                hit_heads.add(int(rec.get("head", -1)))
+        summary[str(int(entry_idx))] = {
+            "span_start": int(span[0]) if span else -1,
+            "span_end": int(span[-1]) if span else -1,
+            "span_len": int(len(span)),
+            "hit_record_count": int(len(hit_records)),
+            "hit_step_count": int(len(hit_steps)),
+            "hit_steps": sorted(int(x) for x in hit_steps),
+            "hit_layer_count": int(len(hit_layers)),
+            "hit_head_count": int(len(hit_heads)),
+            "any_hit": bool(hit_records),
+        }
+    return summary
 
 
 def init_generation_session(llm, tokenizer, prompt_text: str, attn_type: str, attn_config, total_future_tokens: int):
@@ -288,6 +393,21 @@ def greedy_decode_answers(llm, tokenizer, start_token, max_new_tokens: int, expe
     return text, generated_ids, next_logits, False
 
 
+def teacher_force_decode_ids(llm, tokenizer, forced_ids, stop_substrings=()):
+    device = llm.layers[0].device
+    generated_ids = []
+    next_logits = None
+    for tok in forced_ids:
+        current_token = torch.tensor([[int(tok)]], dtype=torch.long, device=device)
+        generated_ids.append(int(tok))
+        text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        next_logits = llm.decode_forward(inputs_ids=current_token)
+        if any(stop in text for stop in stop_substrings):
+            return text, generated_ids, next_logits, True
+    text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    return text, generated_ids, next_logits, False
+
+
 def append_prompt_continuation(llm, tokenizer, prompt_text: str, fallback_logits):
     if not prompt_text:
         return fallback_logits
@@ -298,6 +418,19 @@ def append_prompt_continuation(llm, tokenizer, prompt_text: str, fallback_logits
     for pos in range(prompt_ids.shape[1]):
         logits = llm.decode_forward(inputs_ids=prompt_ids[:, pos:pos + 1])
     return logits
+
+
+def release_model(llm):
+    if llm is None:
+        return
+    try:
+        del llm.kv_cache
+    except Exception:
+        pass
+    del llm
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def bucket_name(pos: int, num_entries: int):
@@ -388,6 +521,41 @@ def main():
     results = []
     bucket_hits = {"far": [], "mid": [], "near": []}
     for sample in samples:
+        teacher_ledger_attn_type = str(args.teacher_ledger_attn_type or "").strip()
+        teacher_prefill_sec = 0.0
+        teacher_decode_sec = 0.0
+        teacher_ledger_ids = None
+        teacher_saw_end = None
+        if teacher_ledger_attn_type:
+            teacher_llm = load_model(args.model_name, max_len, dtype, args.device)
+            teacher_config = generate_config(
+                args.model_name,
+                sample["ledger_prompt_tokens"],
+                teacher_ledger_attn_type,
+                retrieval_budget=args.retrieval_budget,
+                estimation_budget=args.estimation_budget,
+                token_budget_override=args.token_budget_override,
+            )
+            teacher_first_token, teacher_prefill_sec = init_generation_session(
+                llm=teacher_llm,
+                tokenizer=tokenizer,
+                prompt_text=sample["ledger_prompt"],
+                attn_type=teacher_ledger_attn_type,
+                attn_config=teacher_config,
+                total_future_tokens=int(max_ledger_new_tokens),
+            )
+            teacher_decode_start = time.time()
+            _teacher_ledger_text, teacher_ledger_ids, _teacher_after_logits, teacher_saw_end = greedy_decode_until(
+                llm=teacher_llm,
+                tokenizer=tokenizer,
+                start_token=teacher_first_token,
+                max_new_tokens=max_ledger_new_tokens,
+                stop_substrings=("END LEDGER",),
+            )
+            torch.cuda.synchronize()
+            teacher_decode_sec = float(time.time() - teacher_decode_start)
+            release_model(teacher_llm)
+
         attn_config = generate_config(
             args.model_name,
             sample["ledger_prompt_tokens"],
@@ -405,19 +573,38 @@ def main():
             total_future_tokens=total_future_tokens,
         )
         decode_start = time.time()
-        ledger_text, ledger_ids, after_ledger_logits, saw_end = greedy_decode_until(
-            llm=llm,
-            tokenizer=tokenizer,
-            start_token=first_token,
-            max_new_tokens=max_ledger_new_tokens,
-            stop_substrings=("END LEDGER",),
-        )
+        if teacher_ledger_ids is not None:
+            ledger_text, ledger_ids, after_ledger_logits, saw_end = teacher_force_decode_ids(
+                llm=llm,
+                tokenizer=tokenizer,
+                forced_ids=teacher_ledger_ids,
+                stop_substrings=("END LEDGER",),
+            )
+        else:
+            ledger_text, ledger_ids, after_ledger_logits, saw_end = greedy_decode_until(
+                llm=llm,
+                tokenizer=tokenizer,
+                start_token=first_token,
+                max_new_tokens=max_ledger_new_tokens,
+                stop_substrings=("END LEDGER",),
+            )
         answer_seed_logits = append_prompt_continuation(
             llm=llm,
             tokenizer=tokenizer,
             prompt_text=sample["question_prompt"],
             fallback_logits=after_ledger_logits,
         )
+        if (
+            args.attn_type == "RetrievalAttention"
+            and os.environ.get("RETRIEVALATTN_ORACLE_RETRIEVE", "0") == "1"
+            and hasattr(llm, "kv_cache")
+        ):
+            setattr(llm.kv_cache, "oracle_retrieval_enable", True)
+            setattr(llm.kv_cache, "oracle_debug_enable", True)
+            setattr(llm.kv_cache, "oracle_compare_enable", True)
+            setattr(llm.kv_cache, "oracle_answer_start_pos", int(llm.kv_cache.decode_pos))
+            setattr(llm.kv_cache, "oracle_debug_records", [])
+            setattr(llm.kv_cache, "oracle_compare_records", [])
         first_answer = llm.sampling(answer_seed_logits, do_sample=False).to(llm.layers[0].device)
         answer_text, answer_ids, _after_answer_logits, _ = greedy_decode_answers(
             llm=llm,
@@ -426,6 +613,38 @@ def main():
             max_new_tokens=max_answer_new_tokens,
             expected_answers=int(args.num_queries),
         )
+        if (
+            args.attn_type == "RetrievalAttention"
+            and hasattr(llm, "kv_cache")
+        ):
+            setattr(llm.kv_cache, "oracle_retrieval_enable", False)
+        oracle_debug_summary = None
+        if (
+            args.attn_type == "RetrievalAttention"
+            and os.environ.get("RETRIEVALATTN_ORACLE_RETRIEVE", "0") == "1"
+            and hasattr(llm, "kv_cache")
+        ):
+            records = list(getattr(llm.kv_cache, "oracle_debug_records", []))
+            entry_spans = compute_entry_token_spans(
+                tokenizer=tokenizer,
+                ledger_prompt=sample["ledger_prompt"],
+                ledger_output=ledger_text,
+                query_positions=sample["query_positions"],
+            )
+            oracle_debug_summary = {
+                "entry_spans": {str(k): v for k, v in entry_spans.items()},
+                "retrieval_hits": summarize_oracle_debug(records, entry_spans),
+                "record_count": int(len(records)),
+            }
+            oracle_compare_summary = list(getattr(llm.kv_cache, "oracle_compare_records", []))
+            setattr(llm.kv_cache, "oracle_debug_enable", False)
+            setattr(llm.kv_cache, "oracle_compare_enable", False)
+            setattr(llm.kv_cache, "oracle_answer_start_pos", None)
+            setattr(llm.kv_cache, "oracle_debug_records", [])
+            setattr(llm.kv_cache, "oracle_compare_records", [])
+        else:
+            oracle_compare_summary = None
+        oracle_compare_agg = aggregate_oracle_compare(oracle_compare_summary)
         torch.cuda.synchronize()
         decode_sec = float(time.time() - decode_start)
         output_text = sample["ledger_prompt"] + ledger_text + sample["question_prompt"] + answer_text
@@ -442,15 +661,24 @@ def main():
             "query_positions": sample["query_positions"],
             "ledger_prompt_tokens": sample["ledger_prompt_tokens"],
             "question_prompt_tokens": sample["question_prompt_tokens"],
-            "prefill_sec": float(prefill_sec),
-            "decode_sec": float(decode_sec),
+            "prefill_sec": float(prefill_sec + teacher_prefill_sec),
+            "decode_sec": float(decode_sec + teacher_decode_sec),
+            "student_prefill_sec": float(prefill_sec),
+            "student_decode_sec": float(decode_sec),
+            "teacher_prefill_sec": float(teacher_prefill_sec),
+            "teacher_decode_sec": float(teacher_decode_sec),
             "ledger_generated_tokens": int(len(ledger_ids)),
             "answer_generated_tokens": int(len(answer_ids)),
             "saw_end_ledger": bool(saw_end),
+            "teacher_saw_end_ledger": bool(teacher_saw_end) if teacher_saw_end is not None else None,
+            "teacher_ledger_attn_type": teacher_ledger_attn_type or None,
             "output": output_text,
             "ledger_output": ledger_text,
             "answer_output": answer_text,
             "decode_profile": decode_profile_msg,
+            "oracle_debug": oracle_debug_summary,
+            "oracle_compare": oracle_compare_summary,
+            "oracle_compare_agg": oracle_compare_agg,
             **eval_result,
         }
         results.append(sample_result)
@@ -487,6 +715,12 @@ def main():
         "attn_type": args.attn_type,
         "token_budget_override": int(args.token_budget_override) if args.token_budget_override is not None else None,
     }
+    oracle_compare_rows = []
+    for row in results:
+        oracle_compare_rows.extend(row.get("oracle_compare", []) or [])
+    oracle_compare_summary = aggregate_oracle_compare(oracle_compare_rows)
+    if oracle_compare_summary is not None:
+        summary["oracle_compare"] = oracle_compare_summary
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

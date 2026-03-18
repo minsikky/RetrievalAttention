@@ -1,5 +1,153 @@
 # Native GPU Decode Traversal Plan
 
+## 2026-03-17 update (online insertion-signal direction pruned)
+- Tested whether online edge quality could be improved by adding future-query evidence on top of the current birth-step provenance signal.
+- Variants tried:
+  - future-window replacement
+  - future-window additive hybrid
+  - future-window rerank-only
+- All three failed as net improvements:
+  - replacement reduced retrieval strength too much
+  - additive hybrid made the graph denser/slower and failed at `e192`
+  - rerank-only preserved quality but increased latency
+- Therefore the current source has been reverted to the stable `online_next` insertion path.
+- Practical implication for next design work:
+  - do not spend more time on simple future-window voting over the same birth-step candidates
+  - the next promising change should alter the insertion signal more fundamentally rather than refining this particular support-count scheme
+
+## 2026-03-17 update (query-centroid online signal also pruned)
+- Tried a more `Q-K`-aligned online signal:
+  - accumulate future query vectors that attend to a token while it remains in the static suffix
+  - build a bounded local candidate pool from those future queries
+  - choose retirement-time neighbors using a query centroid
+- Controlled `e192` result:
+  - baseline `online_next`:
+    - `45413816`
+    - `query_acc=0.667`
+    - `avg_decode_sec=872.1 s`
+  - `query_centroid`:
+    - `45413817`
+    - `query_acc=0.667`
+    - `avg_decode_sec=1095.4 s`
+- Therefore:
+  - a more principled local `Q-K` signal still did not improve quality
+  - it increased update and attention cost substantially
+  - the immediate next step should not be another online insertion-signal tweak inside the same stack
+
+## 2026-03-17 update (oracle retrieval result)
+- Implemented an oracle decode benchmark mode that bypasses full-GPU graph retrieval during the answer phase with exact top-`k` dynamic token IDs from dense `Q-K` scores.
+- Controlled `e192` result:
+  - baseline `online`:
+    - `45415995`
+    - `query_acc=0.667`
+    - `avg_decode_sec=1095.4 s`
+  - `online_oracle`:
+    - `45415996`
+    - `query_acc=0.667`
+    - `avg_decode_sec=870.2 s`
+- Implication:
+  - fixing dynamic retrieval quality alone does not recover the dense-quality gap
+  - therefore the next design work should move away from insertion-signal tweaking and focus on the sparse attention composition / token budget / static-dynamic partition itself
+
+## 2026-03-17 update (teacher-forced dense ledger result)
+- Added `online_oracle_teacher_dense`:
+  - dense ledger generation
+  - teacher-forced ledger replay into RetrievalAttention
+  - oracle answer-phase retrieval
+- Controlled `e192` result:
+  - no quality improvement versus `online_oracle`
+- Therefore:
+  - trajectory drift from ledger generation is not the main limiting factor here
+  - the next diagnostic should directly measure the trimmed-vs-dense attention distribution and omitted-tail contribution
+
+## 2026-03-17 update (trimmed-vs-dense compare result)
+- Implemented `oracle_compare` on `online_oracle` to measure how much dense dynamic attention mass is retained by the oracle top-`k` token set.
+- Controlled `e192` diagnostic:
+  - `45470959`
+  - average captured dense dynamic mass by oracle set: `~0.045`
+  - average omitted dense dynamic mass: `~0.417`
+  - average dense-vs-sparse output-vector L2: `~0.0208`
+- Practical implication:
+  - the current token budget is dropping a large amount of aggregate dynamic mass
+  - the sparse distribution is not a small perturbation of dense attention
+  - the next experiments should focus on support-context / budget / composition, not on graph-update heuristics
+
+## 2026-03-17 update (adaptive budget approximation v1 is too optimistic)
+- Implemented a first runtime adaptive-budget approximation under `online_oracle`.
+- Controlled `e192` result:
+  - baseline:
+    - `45474501`
+    - `query_acc=0.667`
+    - `avg_decode_sec=860.9 s`
+    - `adaptive_out/head=57.8`
+  - adaptive:
+    - `45477893`
+    - `query_acc=0.667`
+    - `avg_decode_sec=1685.5 s`
+    - `adaptive_out/head=14.1`
+- Therefore:
+  - the current approximation underestimates omitted-mass risk and trims far too aggressively
+  - the general adaptive-budget idea remains viable, but this first formula should not be used as-is
+
+## 2026-03-17 update (adaptive budget moved toward GPU)
+- Reworked adaptive-budget selection so it now uses attention-space scores and a conservative unseen-tail upper bound.
+- Added `oracle_compare` aggregation to benchmark summaries so each run records:
+  - dense dynamic mass captured
+  - omitted dense dynamic mass
+  - dense-vs-sparse output L2
+  - adaptive bound diagnostics
+- Short fixed-budget oracle baseline at `e12`:
+  - `45486114`
+  - `query_acc=1.0`
+  - `avg_decode_sec=117.18 s`
+  - `avg_oracle_dyn_mass=0.1476`
+  - `avg_omitted_dynamic_mass=0.2566`
+  - `avg_dense_sparse_out_l2=0.0117`
+- First conservative adaptive validation runs at `e48/e24/e12` were too slow and were cancelled:
+  - `45482239`
+  - `45484436`
+  - `45486113`
+  - `45487815`
+  - conclusion:
+    - the conservative bound was no longer underestimating omitted mass
+    - but the host-managed adaptive implementation was too expensive
+- Implemented four adaptive-path reductions before moving to a custom kernel:
+  - cache dynamic max attention-key norms during decode
+  - reuse attention-stage score tensors instead of recomputing extra adaptive matmuls
+  - use prefix/suffix `logsumexp` instead of repeated keep-sweep reductions
+  - remove CPU-side token reorder from the adaptive hot path
+- Tiny `e6` adaptive smoke after those four changes:
+  - `45491673`
+  - `query_acc=1.0`
+  - `avg_decode_sec=169.90 s`
+  - `avg_omitted_dynamic_mass=0.1091`
+  - `avg_dense_sparse_out_l2=0.00158`
+  - bound violation rate `0.0`
+  - remaining adaptive hotspot:
+    - `select=59.269 s`
+- Added a new custom CUDA adaptive-select path:
+  - env:
+    - `RETRIEVALATTN_DYNAMIC_BUDGET_MODE=torch|cuda`
+  - this keeps the original adaptive path available while adding a GPU selector for dynamic keep-count selection
+- Tiny `e6` A/B:
+  - torch mode:
+    - `45494367`
+    - `avg_decode_sec=168.83 s`
+    - `adaptive total=80.025 s`
+    - `select=58.057 s`
+  - cuda mode:
+    - `45494368`
+    - `avg_decode_sec=122.04 s`
+    - `adaptive total=36.780 s`
+    - `select=14.400 s`
+  - both preserved:
+    - `query_acc=1.0`
+    - `avg_omitted_dynamic_mass=0.1091`
+    - `avg_dense_sparse_out_l2=0.00158`
+- Practical conclusion:
+  - moving adaptive keep-count selection into the CUDA extension materially reduced adaptive overhead
+  - this is the strongest current evidence that the remaining adaptive bottleneck was caused by GPU-CPU collaboration / Python-managed micro-ops
+
 ## 2026-03-12 update (online decode graph plan extension)
 - The custom full-GPU decode backend is now being used for online decode update experiments, not just the original 40k decode AB kernel benchmark.
 - Full-GPU runtime changes already implemented:
@@ -443,3 +591,13 @@ Move to **measured optimizations around the stable custom kernel**, not more spe
   1. treat `45248579` as the current best safe online baseline
   2. rerun focused scaling from this version
   3. only after that, consider deeper constant-factor work in dynamic/fullgpu retrieval
+
+## 2026-03-15 post-rerun conclusion
+- Focused `online` vs `full_dense` rerun from the improved baseline still shows no crossover in the tested range:
+  - `online e192`: `886.760s`
+  - `full_dense e192`: `43.602s`
+- So the latest constant-factor wins are real but insufficient.
+- Updated implication:
+  - the asymptotic story may still be acceptable at the per-head graph/update level;
+  - but implementation constants remain far too large for sparse decode to be competitive in the current regime.
+- Before attempting extreme lengths (`100k+` decode), the next round of work should focus on more aggressive but still defensible constant-factor reductions, or on a smaller targeted prototype that isolates the online-update machinery without the rest of the benchmark/task noise.

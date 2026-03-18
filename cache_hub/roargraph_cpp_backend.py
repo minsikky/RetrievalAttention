@@ -553,3 +553,32 @@ def search_roar_graph_csr_cuda_group_fullgpu(
         int(seed_prev_k),
         str(score_agg),
     )
+
+
+def adaptive_budget_select_cuda(
+    sorted_scores,
+    sorted_mask,
+    static_logz,
+    upper_scores,
+    *,
+    min_keep: int,
+    dynamic_span: int,
+    target_omass: float,
+):
+    if not _try_import_torch_kernel():
+        raise RuntimeError(
+            "RoarGraph torch/CUDA kernel extension is unavailable. "
+            "Build it with: "
+            "`module load python/3.10.4 && source .venv/bin/activate && "
+            "python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`"
+        ) from _ROAR_TORCH_KERNEL_EXT_IMPORT_ERROR
+
+    return _ROAR_TORCH_KERNEL_EXT_HANDLE.adaptive_budget_select_cuda(
+        sorted_scores,
+        sorted_mask,
+        static_logz,
+        upper_scores,
+        int(min_keep),
+        int(dynamic_span),
+        float(target_omass),
+    )

@@ -1,5 +1,242 @@
 # Findings Log
 
+## 2026-03-17 update (future-window online insertion signal did not help)
+- Three insertion-signal variants were compared against the current online baseline (`online_next` = birth-step provenance only):
+  1. future-window replacement:
+     - keep birth-step signal only as initialization
+     - choose final inserted neighbors from support accumulated over the next `W=16` queries
+  2. future-window additive hybrid:
+     - keep birth-step neighbors
+     - append extra future-supported neighbors
+  3. future-window rerank-only:
+     - keep birth-step edge set fixed
+     - use future support only to reorder those neighbors before flush
+- Result summary:
+  - replacement-style future-window reduced edge volume and runtime, but also degraded query accuracy:
+    - `45341651` (`online_next`, `e96`): `query_acc=1.0`, `avg_decode_sec=425.5 s`
+    - `45341652` (replacement, `k=8`, `bidir=1`): `query_acc=0.667`, `avg_decode_sec=418.3 s`
+    - `45341653` (replacement, `k=4`, `bidir=0`): `query_acc=0.0`, `avg_decode_sec=386.9 s`
+  - additive hybrid did not improve quality and made the graph denser/slower:
+    - `45387055` (`online_next`, `e96`): `query_acc=1.0`, `avg_decode_sec=418.6 s`
+    - `45387056` (additive hybrid, `k=8`, `bidir=1`): `query_acc=1.0`, `avg_decode_sec=431.9 s`
+    - `45388819` (`online_next`, `e192`): `query_acc=0.667`, `format_acc=1.0`, `avg_decode_sec=878.3 s`
+    - `45388820` (additive hybrid, `k=8`, `bidir=1`): `query_acc=0.0`, `format_acc=0.0`, `avg_decode_sec=932.2 s`
+  - rerank-only preserved `e192` behavior exactly but added latency:
+    - `45411705` (`online_next`, `e192`): `query_acc=0.667`, `avg_decode_sec=902.0 s`
+    - `45411706` (rerank-only, `k=8`, `bidir=1`): `query_acc=0.667`, `avg_decode_sec=1014.2 s`
+- Interpretation:
+  - future-window evidence is not useful as a drop-in replacement or additive extension for the current birth-step provenance signal
+  - appending future-supported edges increases overlay density and traversal cost without improving quality
+  - reranking the fixed edge set by future support does not change retrieval enough to help, but still adds bookkeeping cost
+- Action:
+  - reverted the experimental future-window signal path from source
+  - stable online baseline remains `online_next` only
+
+## 2026-03-17 update (query-centroid insertion also did not help)
+- Hypothesis:
+  - if the prefill graph is fundamentally `Q-K` induced, then a better online signal might come from future query vectors that actually attend to a token, rather than from raw provenance votes
+- Implemented experiment:
+  - `query_centroid`
+  - while a token remains in the static suffix:
+    - accumulate future query vectors that put mass on that token
+    - collect a bounded local candidate pool from those future queries' retrieved dynamic tokens
+  - at retirement:
+    - form a query centroid
+    - score the local candidate pool and insert top neighbors
+- Controlled `e192` A/B:
+  - baseline:
+    - `45413816` / `slurm-45413816.out`
+    - `online_next`
+    - `query_acc=0.667`
+    - `format_acc=1.0`
+    - `avg_decode_sec=872.1 s`
+  - centroid:
+    - `45413817` / `slurm-45413817.out`
+    - `online_query_centroid_t4_c16`
+    - `query_acc=0.667`
+    - `format_acc=1.0`
+    - `avg_decode_sec=1095.4 s`
+- Profile delta:
+  - graph time stayed almost unchanged:
+    - `241.1 s -> 239.1 s`
+  - update got worse:
+    - `55.4 s -> 92.1 s`
+  - attention got much worse:
+    - `93.2 s -> 270.3 s`
+- Interpretation:
+  - the signal change did not improve quality at all
+  - it added substantial overhead
+  - therefore even more principled `Q-K`-style local insertion, as implemented here, is not currently a good direction
+- Current implication:
+  - do not spend more time on simple online insertion-signal variants that still plug into the same per-step decode stack
+  - the next experiment should answer whether the whole online-graph idea can be made useful with an oracle or whether the current benchmark is limited by the sparse decode stack itself
+
+## 2026-03-17 update (oracle dynamic top-k did not recover quality)
+- Implemented an oracle retrieval path for the generated-memory benchmark:
+  - `online_oracle`
+  - during the answer phase only, RetrievalAttention full-GPU retrieval is replaced with exact top-`k` dynamic token IDs from dense `Q-K` scores over the current KV cache
+  - this keeps the sparse attention composition the same while removing graph/update retrieval error from the answer phase
+- Controlled `e192` A/B:
+  - baseline:
+    - `45415995` / `slurm-45415995.out`
+    - `query_acc=0.667`
+    - `format_acc=1.0`
+    - `avg_decode_sec=1095.4 s`
+  - oracle:
+    - `45415996` / `slurm-45415996.out`
+    - `query_acc=0.667`
+    - `format_acc=1.0`
+    - `avg_decode_sec=870.2 s`
+- Important conclusion:
+  - answer-phase oracle retrieval does **not** improve quality at all
+  - it does reduce latency by bypassing graph traversal during the answer phase
+  - therefore the current `e192` quality gap is not mainly due to online update / retrieval choosing the wrong dynamic tokens
+  - the dominant remaining issue is more likely:
+    - sparse attention composition itself,
+    - token-budget insufficiency,
+    - or static-vs-dynamic partitioning
+
+## 2026-03-17 update (teacher-forced dense ledger also did not recover quality)
+- Implemented `online_oracle_teacher_dense`:
+  - dense model (`Full_Flash_Attn`) generates the ledger
+  - RetrievalAttention run is teacher-forced to consume those same ledger token IDs
+  - answer phase still uses oracle dynamic retrieval
+- Controlled `e192` A/B:
+  - `45463779` / `online_oracle_e192`
+    - `query_acc=0.667`
+    - answer `silver / blue / blue`
+  - `45463780` / `online_oracle_teacher_dense_e192`
+    - `query_acc=0.667`
+    - same answer `silver / blue / blue`
+- Conclusion:
+  - ledger-generation trajectory drift is not the dominant source of the quality gap on this benchmark
+  - after this result, the leading hypothesis is attention-composition error after token selection:
+    - trimmed distribution mass
+    - renormalization distortion
+    - missing support-context contribution
+
+## 2026-03-17 update (oracle compare confirms large omitted dynamic mass)
+- Implemented an `oracle_compare` diagnostic on `online_oracle`:
+  - first answer step only
+  - for each layer/head:
+    - compute dense dynamic attention distribution
+    - measure mass captured by the oracle top-`k` dynamic token set
+    - measure omitted dense dynamic mass
+    - compare dense vs sparse output vector
+- Diagnostic run:
+  - `45470959` / `slurm-45470959.out`
+  - data stored in:
+    - `generated_memory_eval_result/online_oracle_compare_e192_diag_v2/generated_memory_results.jsonl`
+- Aggregate result:
+  - average captured dense dynamic mass by oracle set:
+    - `~0.045`
+  - average omitted dense dynamic mass:
+    - `~0.417`
+  - average dense-vs-sparse output-vector L2:
+    - `~0.0208`
+  - layer `0` averages:
+    - captured mass `~0.067`
+    - omitted dynamic mass `~0.764`
+- Interpretation:
+  - the oracle token set is not merely dropping individually negligible probabilities
+  - the omitted dynamic tail carries substantial aggregate mass
+  - the renormalized sparse distribution is therefore very different from dense attention
+  - this strongly supports the idea that the remaining gap is a distribution-composition problem, not a graph/update problem
+
+## 2026-03-17 update (adaptive dynamic-budget v1 approximation failed)
+- Implemented a first runtime approximation for adaptive dynamic budget:
+  - overretrieve up to a larger cap
+  - choose per-head final dynamic count from a tail-mass target
+  - config:
+    - `RETRIEVALATTN_DYNAMIC_BUDGET_ENABLE=1`
+    - `RETRIEVALATTN_DYNAMIC_BUDGET_TARGET_OMASS=0.10`
+    - `RETRIEVALATTN_DYNAMIC_BUDGET_MIN=16`
+    - `RETRIEVALATTN_DYNAMIC_BUDGET_MAX=400`
+- Controlled oracle A/B at `e192`:
+  - baseline:
+    - `45474501` / `slurm-45474501.out`
+    - `query_acc=0.667`
+    - `avg_decode_sec=860.9 s`
+    - `adaptive_out/head=57.8`
+  - adaptive:
+    - `45477893` / `slurm-45477893.out`
+    - `query_acc=0.667`
+    - `avg_decode_sec=1685.5 s`
+    - `adaptive_out/head=14.1`
+- Interpretation:
+  - the first approximation badly underestimates omitted mass
+  - it shrinks the dynamic set when it should grow it
+  - therefore the adaptive-budget direction remains plausible, but this specific bound is unusable
+
+## 2026-03-17 update (conservative adaptive bound and CUDA select)
+- Reworked adaptive dynamic-budget selection to use attention-space scores plus a conservative unseen-tail upper bound.
+- Added `oracle_compare` aggregation to benchmark summaries, including:
+  - `oracle_dyn_mass`
+  - `omitted_dynamic_mass`
+  - `dense_sparse_out_l2`
+  - adaptive bound fields when dynamic budget is enabled
+- Short fixed-budget oracle baseline at `e12`:
+  - `45486114` / `slurm-45486114.out`
+  - `query_acc=1.0`
+  - `avg_decode_sec=117.18 s`
+  - `avg_oracle_dyn_mass=0.1476`
+  - `avg_omitted_dynamic_mass=0.2566`
+  - `avg_dense_sparse_out_l2=0.0117`
+  - takeaway:
+    - fixed `k=100` still omits a large amount of dense dynamic mass even at `e12`
+- First conservative adaptive validation runs were cancelled because they were too slow:
+  - `45482239` (`e48`)
+  - `45484436` (`e24`)
+  - `45486113` (`e12`)
+  - `45487815` (`e12`, looser target)
+  - takeaway:
+    - the conservative bound is directionally correct but too expensive in the original host-managed implementation
+- Implemented four adaptive-path optimization passes:
+  - cache dynamic max attention-key norms incrementally during decode
+  - reuse attention-stage score tensors instead of recomputing separate adaptive matmuls
+  - replace repeated keep-sweep reductions with prefix/suffix `logsumexp`
+  - remove CPU-side token reorder from the adaptive hot path
+- Tiny `e6` adaptive smoke after those changes:
+  - `45491673` / `slurm-45491673.out`
+  - `query_acc=1.0`
+  - `avg_decode_sec=169.90 s`
+  - `avg_oracle_dyn_mass=0.2916`
+  - `avg_omitted_dynamic_mass=0.1091`
+  - `avg_dense_sparse_out_l2=0.00158`
+  - bound violation rate `0.0`
+  - adaptive profile:
+    - `total=81.567 s`
+    - `upper=3.054 s`
+    - `static=3.997 s`
+    - `sort=5.850 s`
+    - `select=59.269 s`
+    - `reorder=8.982 s`
+  - takeaway:
+    - the dominant remaining adaptive bottleneck was still keep-count selection
+- Added a new CUDA adaptive-select path:
+  - env:
+    - `RETRIEVALATTN_DYNAMIC_BUDGET_MODE=torch|cuda`
+  - `torch`: previous adaptive selector
+  - `cuda`: dedicated CUDA keep-count selection kernel in the RoarGraph extension
+- Tiny `e6` A/B:
+  - torch:
+    - `45494367` / `slurm-45494367.out`
+    - `avg_decode_sec=168.83 s`
+    - `adaptive total=80.025 s`
+    - `select=58.057 s`
+  - cuda:
+    - `45494368` / `slurm-45494368.out`
+    - `avg_decode_sec=122.04 s`
+    - `adaptive total=36.780 s`
+    - `select=14.400 s`
+  - distribution/quality were unchanged between the two:
+    - `query_acc=1.0`
+    - `avg_omitted_dynamic_mass=0.1091`
+    - `avg_dense_sparse_out_l2=0.00158`
+  - takeaway:
+    - custom CUDA adaptive selection materially reduces adaptive overhead
+    - dynamic budget remains expensive overall, but the Python-driven selection bottleneck has been reduced substantially
+
 ## 2026-03-12 update (online decode graph smoke results + automation)
 - Generated-memory benchmark is now correct and two-phase:
   - ledger generation first
@@ -1613,3 +1850,32 @@
   - same `query_acc=1.0`
 - Conclusion:
   - this version is a valid new short-run online baseline and should replace `45081113` for future scaling tests.
+
+## 2026-03-15 focused online-vs-dense sweep from new baseline
+- Sweep root:
+  - `generated_memory_eval_result/length_sweep_s16_online_vs_dense_v4`
+- Modes:
+  - `online`
+  - `full_dense`
+- Lengths:
+  - `24`, `48`, `96`, `192`
+- Results:
+  - `online`
+    - `e24`: `173.841s`, `query_acc=1.0`
+    - `e48`: `273.068s`, `query_acc=1.0`
+    - `e96`: `474.380s`, `query_acc=0.667`
+    - `e192`: `886.760s`, `query_acc=0.333`
+  - `full_dense`
+    - `e24`: `11.765s`, `query_acc=1.0`
+    - `e48`: `16.466s`, `query_acc=0.667`
+    - `e96`: `23.553s`, `query_acc=1.0`
+    - `e192`: `43.602s`, `query_acc=1.0`
+- Online update breakdown from logs:
+  - `e24`: `update=18.508s`, `d2h=3.071s`, `build=5.782s`
+  - `e48`: `update=28.282s`, `d2h=5.585s`, `build=9.280s`
+  - `e96`: `update=48.521s`, `d2h=10.748s`, `build=16.215s`
+  - `e192`: `update=88.979s`, `d2h=21.375s`, `build=30.123s`
+- Read:
+  - the new safe improvements reduced online constants, but not enough to change the overall picture;
+  - there is still no sign of a dense crossover in this range;
+  - online quality also degrades by `e96/e192` on this benchmark.

@@ -15,6 +15,7 @@ except Exception:
     faiss = None
 
 from .roargraph_cpp_backend import (
+    adaptive_budget_select_cuda,
     build_roar_graph_csr_cpp,
     search_roar_graph_csr_cpp,
     search_roar_graph_csr_cuda,
@@ -313,6 +314,25 @@ class retrievalattention_cache(KV_Cache):
         except Exception:
             self.online_graph_neighbor_cap = 16
         self.online_graph_neighbor_cap = max(self.online_graph_insert_k, self.online_graph_neighbor_cap)
+        self.online_graph_signal = os.environ.get("RETRIEVALATTN_ONLINE_GRAPH_SIGNAL", "next").strip().lower()
+        if self.online_graph_signal not in {"next", "query_centroid"}:
+            print(
+                f"[RetrievalAttention] WARNING: unknown RETRIEVALATTN_ONLINE_GRAPH_SIGNAL="
+                f"{self.online_graph_signal}; falling back to next."
+            )
+            self.online_graph_signal = "next"
+        try:
+            self.online_graph_query_topk = int(os.environ.get("RETRIEVALATTN_ONLINE_GRAPH_QUERY_TOPK", "4"))
+        except Exception:
+            self.online_graph_query_topk = 4
+        self.online_graph_query_topk = max(1, self.online_graph_query_topk)
+        try:
+            self.online_graph_query_cand_per_step = int(
+                os.environ.get("RETRIEVALATTN_ONLINE_GRAPH_QUERY_CAND_PER_STEP", str(self.online_graph_neighbor_cap))
+            )
+        except Exception:
+            self.online_graph_query_cand_per_step = int(self.online_graph_neighbor_cap)
+        self.online_graph_query_cand_per_step = max(1, self.online_graph_query_cand_per_step)
         try:
             self.online_graph_defer = int(os.environ.get("RETRIEVALATTN_ONLINE_GRAPH_DEFER", "-1"))
         except Exception:
@@ -321,6 +341,32 @@ class retrievalattention_cache(KV_Cache):
             self.online_graph_defer = int(self.static_pattern_end)
         self.online_graph_defer = max(0, self.online_graph_defer)
         self.online_graph_log = os.environ.get("RETRIEVALATTN_ONLINE_GRAPH_LOG", "1") == "1"
+        self.dynamic_budget_enable = os.environ.get("RETRIEVALATTN_DYNAMIC_BUDGET_ENABLE", "0") == "1"
+        try:
+            self.dynamic_budget_target_omass = float(
+                os.environ.get("RETRIEVALATTN_DYNAMIC_BUDGET_TARGET_OMASS", "0.10")
+            )
+        except Exception:
+            self.dynamic_budget_target_omass = 0.10
+        self.dynamic_budget_target_omass = min(max(self.dynamic_budget_target_omass, 0.0), 0.99)
+        try:
+            self.dynamic_budget_min = int(os.environ.get("RETRIEVALATTN_DYNAMIC_BUDGET_MIN", "16"))
+        except Exception:
+            self.dynamic_budget_min = 16
+        self.dynamic_budget_min = max(1, self.dynamic_budget_min)
+        try:
+            self.dynamic_budget_max = int(
+                os.environ.get(
+                    "RETRIEVALATTN_DYNAMIC_BUDGET_MAX",
+                    str(max(int(self.token_budget), int(self.token_budget) * 4)),
+                )
+            )
+        except Exception:
+            self.dynamic_budget_max = max(int(self.token_budget), int(self.token_budget) * 4)
+        self.dynamic_budget_max = max(int(self.dynamic_budget_min), int(self.dynamic_budget_max))
+        self.dynamic_budget_mode = os.environ.get("RETRIEVALATTN_DYNAMIC_BUDGET_MODE", "torch").strip().lower()
+        if self.dynamic_budget_mode not in {"torch", "cuda"}:
+            self.dynamic_budget_mode = "torch"
         try:
             self.roar_decode_lpq = int(os.environ.get("RETRIEVALATTN_ROAR_DECODE_LPQ", "0"))
         except Exception:
@@ -569,6 +615,14 @@ class retrievalattention_cache(KV_Cache):
             "online_overlay_edges": 0,
             "online_generated_hits": 0,
             "online_generated_head_hits": 0,
+            "adaptive_outputs_total": 0,
+            "adaptive_total_sec": 0.0,
+            "adaptive_upper_bound_sec": 0.0,
+            "adaptive_static_logz_sec": 0.0,
+            "adaptive_candidate_score_sec": 0.0,
+            "adaptive_sort_sec": 0.0,
+            "adaptive_select_sec": 0.0,
+            "adaptive_reorder_sec": 0.0,
         }
         self._parity_records = []
         self._parity_lock = threading.Lock()
@@ -654,6 +708,8 @@ class retrievalattention_cache(KV_Cache):
         self._decode_key_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_key_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_attn_key_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._decode_cuda_attn_key_norm_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._decode_cuda_attn_key_prefixmax_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_value_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_graph_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._decode_cuda_graph_device_cache = [[None for _ in range(self.kv_head)] for _ in range(self.layer_num)]
@@ -663,6 +719,12 @@ class retrievalattention_cache(KV_Cache):
         self._decode_cuda_hub_seed_ids = [None for _ in range(self.layer_num)]
         self._decode_cuda_prev_seed_ids = [None for _ in range(self.layer_num)]
         self._decode_cuda_prev_seed_counts = [None for _ in range(self.layer_num)]
+        self.oracle_retrieval_enable = False
+        self.oracle_debug_enable = False
+        self.oracle_answer_start_pos = None
+        self.oracle_debug_records = []
+        self.oracle_compare_enable = False
+        self.oracle_compare_records = []
         self._decode_cpp_warned = False
         self._decode_cuda_warned = False
         self.fused_prefill_knn = [None for _ in range(self.layer_num)]
@@ -683,7 +745,9 @@ class retrievalattention_cache(KV_Cache):
         self._online_graph_pending_order = [[[] for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._online_graph_pending_cursor = [[0 for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         self._online_graph_overlay = [[{} for _ in range(self.kv_head)] for _ in range(self.layer_num)]
-
+        self._online_graph_query_sum = [[{} for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._online_graph_query_weight = [[{} for _ in range(self.kv_head)] for _ in range(self.layer_num)]
+        self._online_graph_query_candidates = [[{} for _ in range(self.kv_head)] for _ in range(self.layer_num)]
         # Track suffix window positions
         self.suffix_start = max(0, self.input_length - self.static_pattern_end)
         self.decode_pos = 0
@@ -731,6 +795,11 @@ class retrievalattention_cache(KV_Cache):
         if self.online_dynamic_range or self.online_graph_enable or self.growing_static_suffix:
             return max(int(self.input_length), int(self.context))
         return int(self.input_length)
+
+    def _effective_dynamic_budget_cap(self) -> int:
+        if self.dynamic_budget_enable:
+            return min(512, int(self.dynamic_budget_max))
+        return min(512, int(self.token_budget))
 
     def _rebuild_static_index_set(self, total_tokens: int):
         total_tokens = max(0, int(total_tokens))
@@ -829,6 +898,137 @@ class retrievalattention_cache(KV_Cache):
             if len(cur) >= int(self.online_graph_insert_k):
                 break
 
+    def _record_online_graph_query_centroid_fullgpu(
+        self,
+        layer_idx: int,
+        kv_hdx: int,
+        q_batch_t: torch.Tensor,
+        payloads,
+        attn: torch.Tensor,
+    ):
+        if not self.online_graph_enable or self.online_graph_signal != "query_centroid":
+            return
+        total_tokens = int(self._decode_token_limit())
+        prefix_len = min(int(self.dynamic_start), total_tokens)
+        suffix_start = min(max(int(self.dynamic_start), int(self.dynamic_end)), total_tokens)
+        suffix_len = max(0, int(total_tokens - suffix_start))
+        if suffix_len <= 0:
+            return
+
+        suffix_attn = attn[:, prefix_len:prefix_len + suffix_len].float()
+        if suffix_attn.numel() <= 0:
+            return
+        topk = min(int(self.online_graph_query_topk), int(suffix_attn.shape[1]))
+        if topk <= 0:
+            return
+
+        top_vals_t, top_idx_t = torch.topk(suffix_attn, k=topk, dim=1)
+        top_vals = top_vals_t.detach().cpu()
+        top_idx = top_idx_t.detach().cpu()
+        q_cpu = q_batch_t.detach().float().cpu()
+
+        for row_idx, payload in enumerate(payloads):
+            if not isinstance(payload, dict):
+                continue
+            cand_tokens = payload.get("cpu_tokens") or []
+            if not cand_tokens and "device_ids" in payload:
+                take = max(0, int(payload.get("final_count", 0)))
+                if take > 0:
+                    cand_tokens = [
+                        int(tok) for tok in payload["device_ids"][:take].detach().cpu().tolist()
+                        if int(tok) >= 0
+                    ]
+            if not cand_tokens:
+                continue
+            cand_keep = []
+            seen_cands = set()
+            for tok in cand_tokens:
+                tok = int(tok)
+                if tok < int(self.dynamic_start) or tok >= int(total_tokens):
+                    continue
+                if tok in seen_cands:
+                    continue
+                seen_cands.add(tok)
+                cand_keep.append(tok)
+                if len(cand_keep) >= int(self.online_graph_query_cand_per_step):
+                    break
+            if not cand_keep:
+                continue
+
+            q_vec = q_cpu[row_idx]
+            for j in range(int(top_vals.shape[1])):
+                weight = float(top_vals[row_idx, j].item())
+                if weight <= 0.0:
+                    continue
+                tok = int(suffix_start + int(top_idx[row_idx, j].item()))
+                if tok < int(self.input_length) or tok >= int(total_tokens):
+                    continue
+                sum_map = self._online_graph_query_sum[layer_idx][kv_hdx]
+                weight_map = self._online_graph_query_weight[layer_idx][kv_hdx]
+                cand_map_all = self._online_graph_query_candidates[layer_idx][kv_hdx]
+                cur_sum = sum_map.get(tok)
+                if cur_sum is None:
+                    sum_map[tok] = q_vec.clone().mul_(weight)
+                else:
+                    cur_sum.add_(q_vec, alpha=weight)
+                weight_map[tok] = float(weight_map.get(tok, 0.0)) + weight
+                cand_map = cand_map_all.get(tok)
+                if cand_map is None:
+                    cand_map = {}
+                    cand_map_all[tok] = cand_map
+                for cand in cand_keep:
+                    if cand == tok:
+                        continue
+                    cand_map[int(cand)] = int(cand_map.get(int(cand), 0)) + 1
+
+    def _select_online_graph_centroid_neighbors(self, layer_idx: int, kv_hdx: int, token_pos: int, neighbors):
+        if self.online_graph_signal != "query_centroid":
+            return neighbors
+        q_sum = self._online_graph_query_sum[layer_idx][kv_hdx].pop(int(token_pos), None)
+        weight = float(self._online_graph_query_weight[layer_idx][kv_hdx].pop(int(token_pos), 0.0))
+        cand_counts = self._online_graph_query_candidates[layer_idx][kv_hdx].pop(int(token_pos), None)
+        if q_sum is None or weight <= 0.0:
+            return neighbors
+
+        candidate_ids = []
+        seen = set()
+        if neighbors:
+            for tok in neighbors:
+                tok = int(tok)
+                if tok in seen:
+                    continue
+                seen.add(tok)
+                candidate_ids.append(tok)
+        if cand_counts:
+            ranked = sorted(cand_counts.items(), key=lambda item: (-int(item[1]), int(item[0])))
+            cap = max(int(self.online_graph_neighbor_cap), int(self.online_graph_insert_k) * 4)
+            for tok, _score in ranked:
+                tok = int(tok)
+                if tok in seen:
+                    continue
+                seen.add(tok)
+                candidate_ids.append(tok)
+                if len(candidate_ids) >= cap:
+                    break
+        if not candidate_ids:
+            return neighbors
+
+        key_cpu = self.cpu_keys[layer_idx][kv_hdx]
+        cand_idx = torch.as_tensor(candidate_ids, dtype=torch.long, device="cpu")
+        cand_keys = torch.index_select(key_cpu, 0, cand_idx).detach().float()
+        cand_keys = self._score_transform_torch(cand_keys)
+        q_vec = self._score_transform_torch((q_sum / max(weight, 1e-6)).unsqueeze(0).float())
+        scores = torch.matmul(q_vec, cand_keys.transpose(0, 1)).squeeze(0)
+        take = min(int(self.online_graph_insert_k), int(scores.numel()))
+        if take <= 0:
+            return neighbors
+        vals, pos = torch.topk(scores, k=take, dim=0)
+        out = []
+        for i in range(int(pos.numel())):
+            tok = int(candidate_ids[int(pos[i].item())])
+            out.append(tok)
+        return out if out else neighbors
+
     def _fullgpu_payload_token_ids(self, payload):
         if not isinstance(payload, dict) or "device_ids" not in payload:
             return []
@@ -916,6 +1116,12 @@ class retrievalattention_cache(KV_Cache):
                         break
                     cursor += 1
                     neighbors = pending.pop(token_pos, None)
+                    neighbors = self._select_online_graph_centroid_neighbors(
+                        layer_idx,
+                        kv_hdx,
+                        token_pos,
+                        neighbors,
+                    )
                     if not neighbors:
                         continue
                     inserted_nodes += 1
@@ -2286,6 +2492,20 @@ class retrievalattention_cache(KV_Cache):
         prefill_keys = self.cpu_keys[ldx][hdx, :self.input_length, :].detach().to(device, non_blocking=True)
         key_tensor[:self.input_length, :].copy_(prefill_keys, non_blocking=True)
         self._decode_cuda_attn_key_cache[ldx][hdx] = key_tensor.contiguous()
+        norm_tensor = torch.zeros((total_len,), dtype=torch.float32, device=device)
+        prefixmax_tensor = torch.zeros((total_len,), dtype=torch.float32, device=device)
+        if int(self.input_length) > 0:
+            prefill_norms = torch.linalg.vector_norm(prefill_keys.float(), dim=-1)
+            norm_tensor[:self.input_length].copy_(prefill_norms, non_blocking=True)
+            if int(self.input_length) > int(self.dynamic_start):
+                dyn_prefill = prefill_norms[int(self.dynamic_start):int(self.input_length)]
+                if int(dyn_prefill.numel()) > 0:
+                    prefixmax_tensor[int(self.dynamic_start):int(self.input_length)] = torch.cummax(
+                        dyn_prefill,
+                        dim=0,
+                    ).values
+        self._decode_cuda_attn_key_norm_cache[ldx][hdx] = norm_tensor
+        self._decode_cuda_attn_key_prefixmax_cache[ldx][hdx] = prefixmax_tensor
         return self._decode_cuda_attn_key_cache[ldx][hdx]
 
     def _get_decode_value_tensor_cuda(self, ldx: int, hdx: int):
@@ -2474,6 +2694,18 @@ class retrievalattention_cache(KV_Cache):
                 dtype=torch.int32,
                 device=device,
             )
+
+    def _get_dynamic_attn_max_norm_fullgpu(self, ldx: int, hdx: int):
+        prefixmax_t = self._decode_cuda_attn_key_prefixmax_cache[ldx][hdx]
+        if prefixmax_t is None:
+            self._get_decode_attn_key_tensor_cuda(ldx, hdx)
+            prefixmax_t = self._decode_cuda_attn_key_prefixmax_cache[ldx][hdx]
+        dyn_end = int(self.dynamic_end)
+        if prefixmax_t is None or dyn_end <= int(self.dynamic_start):
+            device = self.layer_mapping[str(ldx)]
+            return torch.tensor(0.0, dtype=torch.float32, device=device)
+        idx = min(max(0, dyn_end - 1), int(prefixmax_t.shape[0]) - 1)
+        return prefixmax_t[idx]
 
     def _build_graph_csr_from_knn_roar_cpp(self, knn: np.ndarray, keys_cpu: np.ndarray):
         meta = {
@@ -3992,6 +4224,7 @@ class retrievalattention_cache(KV_Cache):
             "visited_total",
             "candidates_total",
             "final_outputs_total",
+            "adaptive_outputs_total",
             "kernel_round_total",
             "forced_seed_total",
             "stop_frontier_empty",
@@ -4038,6 +4271,7 @@ class retrievalattention_cache(KV_Cache):
         visited_total = int(stats["visited_total"])
         candidates_total = int(stats["candidates_total"])
         final_outputs_total = int(stats["final_outputs_total"])
+        adaptive_outputs_total = int(stats["adaptive_outputs_total"])
         kernel_round_total = int(stats["kernel_round_total"])
         forced_seed_total = int(stats["forced_seed_total"])
         search_space_total = int(stats["search_space_total"])
@@ -4053,6 +4287,13 @@ class retrievalattention_cache(KV_Cache):
         online_overlay_edges = int(stats["online_overlay_edges"])
         online_generated_hits = int(stats["online_generated_hits"])
         online_generated_head_hits = int(stats["online_generated_head_hits"])
+        adaptive_total_sec = float(stats["adaptive_total_sec"])
+        adaptive_upper_bound_sec = float(stats["adaptive_upper_bound_sec"])
+        adaptive_static_logz_sec = float(stats["adaptive_static_logz_sec"])
+        adaptive_candidate_score_sec = float(stats["adaptive_candidate_score_sec"])
+        adaptive_sort_sec = float(stats["adaptive_sort_sec"])
+        adaptive_select_sec = float(stats["adaptive_select_sec"])
+        adaptive_reorder_sec = float(stats["adaptive_reorder_sec"])
 
         def pct(v: float) -> float:
             return 100.0 * v / total if total > 0 else 0.0
@@ -4080,6 +4321,10 @@ class retrievalattention_cache(KV_Cache):
         )
         outputs_per_head = (
             float(final_outputs_total) / float(heads)
+            if heads > 0 else 0.0
+        )
+        adaptive_outputs_per_head = (
+            float(adaptive_outputs_total) / float(heads)
             if heads > 0 else 0.0
         )
         rounds_per_head = (
@@ -4130,6 +4375,7 @@ class retrievalattention_cache(KV_Cache):
             f"prune_rate={100.0 * prune_rate_weighted:.2f}%, "
             f"cand/visit={cand_per_visit:.2f}x, "
             f"out/head={outputs_per_head:.1f}, "
+            f"adaptive_out/head={adaptive_outputs_per_head:.1f}, "
             f"rounds/head={rounds_per_head:.1f}, "
             f"forced/head={forced_per_head:.1f}, "
             f"stop={stop_counts}]"
@@ -4145,6 +4391,16 @@ class retrievalattention_cache(KV_Cache):
                 f"overlay_edges={online_overlay_edges}, "
                 f"aged_gen/head={online_generated_per_head:.2f}, "
                 f"aged_gen_head_rate={online_generated_head_rate:.1f}%]"
+            )
+        if adaptive_total_sec > 0.0:
+            msg += (
+                f" | adaptive=[total={adaptive_total_sec:.3f}s, "
+                f"upper={adaptive_upper_bound_sec:.3f}s, "
+                f"static={adaptive_static_logz_sec:.3f}s, "
+                f"score={adaptive_candidate_score_sec:.3f}s, "
+                f"sort={adaptive_sort_sec:.3f}s, "
+                f"select={adaptive_select_sec:.3f}s, "
+                f"reorder={adaptive_reorder_sec:.3f}s]"
             )
         if reset:
             self.reset_decode_profile()
@@ -4162,6 +4418,9 @@ class retrievalattention_cache(KV_Cache):
         self._decode_profile_stats["visited_total"] += int(retrieve_profile["visited"])
         self._decode_profile_stats["candidates_total"] += int(retrieve_profile["candidates"])
         self._decode_profile_stats["final_outputs_total"] += int(retrieve_profile.get("final_outputs", 0))
+        self._decode_profile_stats["adaptive_outputs_total"] += int(
+            retrieve_profile.get("adaptive_final_outputs", retrieve_profile.get("final_outputs", 0))
+        )
         self._decode_profile_stats["kernel_round_total"] += int(retrieve_profile.get("kernel_rounds", 0))
         self._decode_profile_stats["forced_seed_total"] += int(retrieve_profile.get("forced_seeds", 0))
         stop_reason = str(retrieve_profile.get("stop_reason", ""))
@@ -4202,6 +4461,7 @@ class retrievalattention_cache(KV_Cache):
                 key_row = key_states[0, 0].to(device, non_blocking=True)
                 value_row = value_states[0, 0].to(device, non_blocking=True)
                 score_row = self._score_transform_torch(key_row.float())
+                attn_norm_row = torch.linalg.vector_norm(key_row.float(), dim=-1)
                 for kv_hdx in range(self.kv_head):
                     key_cache = self._decode_cuda_key_cache[layer_idx][kv_hdx]
                     if key_cache is not None:
@@ -4209,6 +4469,18 @@ class retrievalattention_cache(KV_Cache):
                     attn_key_cache = self._decode_cuda_attn_key_cache[layer_idx][kv_hdx]
                     if attn_key_cache is not None:
                         attn_key_cache[pos:pos + 1, :].copy_(key_row[kv_hdx:kv_hdx + 1], non_blocking=True)
+                    norm_cache = self._decode_cuda_attn_key_norm_cache[layer_idx][kv_hdx]
+                    prefixmax_cache = self._decode_cuda_attn_key_prefixmax_cache[layer_idx][kv_hdx]
+                    if norm_cache is not None:
+                        norm_cache[pos] = attn_norm_row[kv_hdx]
+                    if prefixmax_cache is not None:
+                        if pos < int(self.dynamic_start):
+                            prefixmax_cache[pos] = 0.0
+                        elif pos == int(self.dynamic_start):
+                            prefixmax_cache[pos] = attn_norm_row[kv_hdx]
+                        else:
+                            prev = prefixmax_cache[pos - 1]
+                            prefixmax_cache[pos] = torch.maximum(prev, attn_norm_row[kv_hdx])
                     value_cache = self._decode_cuda_value_cache[layer_idx][kv_hdx]
                     if value_cache is not None:
                         value_cache[pos:pos + 1, :].copy_(value_row[kv_hdx:kv_hdx + 1], non_blocking=True)
@@ -4458,11 +4730,12 @@ class retrievalattention_cache(KV_Cache):
         q_seed_cuda = self._score_transform_torch(q_seed.to(device, non_blocking=True).float())
         q_rank_cuda = self._score_transform_torch(q_group.to(device, non_blocking=True).float())
 
-        candidate_target = self.token_budget * self.candidate_multiplier
-        candidate_target = max(self.token_budget, candidate_target)
-        candidate_target = min(candidate_target, self.input_length)
-        seed_floor = int(math.ceil(self.token_budget * self.seed_ratio))
-        seed_floor = min(self.token_budget, max(0, seed_floor))
+        budget_cap = int(self._effective_dynamic_budget_cap())
+        candidate_target = budget_cap * self.candidate_multiplier
+        candidate_target = max(budget_cap, candidate_target)
+        candidate_target = min(candidate_target, self.input_length, 512)
+        seed_floor = int(math.ceil(budget_cap * self.seed_ratio))
+        seed_floor = min(budget_cap, max(0, seed_floor))
         seed_k = max(self.q_knn, self.q_knn * self.seed_k_mult)
         seed_k = min(self.input_length, seed_k)
         if profile is not None:
@@ -4924,7 +5197,7 @@ class retrievalattention_cache(KV_Cache):
             neighbors=graph_neighbors_t,
             init_ids=init_ids_t,
             init_scores=init_scores_t,
-            token_budget=int(self.token_budget),
+            token_budget=int(self._effective_dynamic_budget_cap()),
             candidate_target=int(active_states[0]["candidate_target"]),
             expand_width=int(self.expand_width),
             min_visits=int(self.min_visits),
@@ -5575,6 +5848,593 @@ class retrievalattention_cache(KV_Cache):
 
         return results
 
+    def _retrieve_tokens_oracle_fullgpu_group(
+        self,
+        ldx: int,
+        kv_hdx: int,
+        states,
+    ):
+        results = {}
+        active_states = []
+        for state in states:
+            if state.get("empty", False):
+                results[int(state["hdx"])] = (list(state.get("tokens", [])), state.get("profile"))
+            else:
+                active_states.append(state)
+
+        if not active_states:
+            return results
+
+        key_score_t = self._get_decode_key_tensor_cuda(ldx, kv_hdx)
+        key_attn_t = self._get_decode_attn_key_tensor_cuda(ldx, kv_hdx)
+        value_t = self._get_decode_value_tensor_cuda(ldx, kv_hdx)
+        if key_score_t is None or key_attn_t is None or value_t is None:
+            raise RuntimeError("oracle fullgpu decode state is unavailable")
+
+        dyn_start = int(self.dynamic_start)
+        dyn_end = int(self.dynamic_end)
+        dyn_len = max(0, dyn_end - dyn_start)
+        q_count = len(active_states)
+        device = key_score_t.device
+        queries_seed = torch.cat([state["q_seed_cuda"] for state in active_states], dim=0)
+
+        if self.decode_profile and self.fullgpu_profile_sync:
+            torch.cuda.synchronize(device)
+        graph_start = time.perf_counter()
+        if dyn_len > 0:
+            dyn_keys_t = key_score_t[dyn_start:dyn_end, :]
+            topk = min(int(self._effective_dynamic_budget_cap()), int(dyn_keys_t.shape[0]))
+            score_t = torch.matmul(queries_seed, dyn_keys_t.transpose(0, 1))
+            top_vals_t, top_pos_t = torch.topk(score_t, k=max(1, topk), dim=1)
+            top_ids_t = top_pos_t.to(torch.int32) + int(dyn_start)
+        else:
+            topk = 0
+            top_vals_t = torch.empty((q_count, 1), dtype=torch.float32, device=device)
+            top_ids_t = torch.full((q_count, 1), -1, dtype=torch.int32, device=device)
+        if self.decode_profile and self.fullgpu_profile_sync:
+            torch.cuda.synchronize(device)
+        graph_elapsed = time.perf_counter() - graph_start
+        per_graph_sec = graph_elapsed / float(max(1, q_count))
+
+        out_ids_cpu = None
+        if self.online_dynamic_range or self.online_graph_enable:
+            out_ids_cpu = top_ids_t.detach().cpu()
+        out_mask_t = top_ids_t.ge(0)
+
+        for i, state in enumerate(active_states):
+            count_i = int(topk)
+            final_tokens_i = []
+            if out_ids_cpu is not None and count_i > 0:
+                final_tokens_i = [
+                    int(tok) for tok in out_ids_cpu[i, :count_i].tolist()
+                    if int(tok) >= 0
+                ]
+            profile = state["profile"]
+            if profile is not None:
+                profile["graph_sec"] += per_graph_sec
+                self._finish_decode_retrieve_profile(
+                    state["total_start"],
+                    profile,
+                    "oracle_topk",
+                    count_i,
+                    dyn_len,
+                )
+                profile["final_outputs"] = count_i
+                profile["kernel_rounds"] = 0
+                profile["forced_seeds"] = 0
+                profile["frontier_at_stop"] = 0
+                profile["kernel_phase_cycles"] = {
+                    "init": 0,
+                    "score": 0,
+                    "merge": 0,
+                    "expand": 0,
+                    "finalize": 0,
+                }
+                profile["kernel_work"] = {
+                    "scored": dyn_len,
+                    "edges": 0,
+                    "accepted": count_i,
+                    "frontier_expanded": 0,
+                    "find_probes": 0,
+                    "overlay_edges": 0,
+                }
+                profile["online_overlay_edges"] = 0
+                if final_tokens_i:
+                    online_generated_hits_i = sum(
+                        1 for tok in final_tokens_i if self._is_dynamic_generated_token(tok)
+                    )
+                    profile["online_generated_hits"] = int(online_generated_hits_i)
+                    profile["online_generated_any"] = 1 if online_generated_hits_i > 0 else 0
+                else:
+                    profile["online_generated_hits"] = 0
+                    profile["online_generated_any"] = 0
+                profile["total_sec"] = (
+                    float(profile.get("seed_sec", 0.0))
+                    + float(profile.get("graph_sec", 0.0))
+                    + float(profile.get("rerank_sec", 0.0))
+                    + float(profile.get("finalize_sec", 0.0))
+                )
+            results[int(state["hdx"])] = (
+                {
+                    "device_ids": top_ids_t[i],
+                    "device_scores": top_vals_t[i].float(),
+                    "device_mask": out_mask_t[i],
+                    "device_attn_keys": key_attn_t,
+                    "device_attn_values": value_t,
+                    "cpu_tokens": final_tokens_i if out_ids_cpu is not None else None,
+                    "final_count": count_i,
+                    "candidate_count": int(dyn_len),
+                    "rounds": 0,
+                    "frontier_at_stop": 0,
+                    "forced_seeds": 0,
+                    "kernel_phase_cycles": {
+                        "init": 0,
+                        "score": 0,
+                        "merge": 0,
+                        "expand": 0,
+                        "finalize": 0,
+                    },
+                    "kernel_work": {
+                        "scored": int(dyn_len),
+                        "edges": 0,
+                        "accepted": count_i,
+                        "frontier_expanded": 0,
+                        "find_probes": 0,
+                    },
+                },
+                profile,
+            )
+
+        return results
+
+    def _maybe_record_oracle_debug_fullgpu(self, layer_idx: int, kv_hdx: int, head_ids, token_results):
+        if not self.oracle_debug_enable:
+            return
+        if self.oracle_answer_start_pos is None:
+            return
+        answer_step = int(max(0, int(self.decode_pos) - int(self.oracle_answer_start_pos)))
+        for hdx in head_ids:
+            payload, _profile = token_results.get(hdx, ({}, None))
+            if not isinstance(payload, dict):
+                continue
+            tokens = payload.get("cpu_tokens")
+            if tokens is None and "device_ids" in payload:
+                take = max(0, int(payload.get("final_count", 0)))
+                if take > 0:
+                    tokens = [
+                        int(tok) for tok in payload["device_ids"][:take].detach().cpu().tolist()
+                        if int(tok) >= 0
+                    ]
+            self.oracle_debug_records.append(
+                {
+                    "step": int(answer_step),
+                    "decode_pos": int(self.decode_pos),
+                    "layer": int(layer_idx),
+                    "kv_head": int(kv_hdx),
+                    "head": int(hdx),
+                    "tokens": [int(tok) for tok in (tokens or [])],
+                }
+            )
+
+    def _maybe_record_oracle_compare_fullgpu(
+        self,
+        layer_idx: int,
+        kv_hdx: int,
+        head_ids,
+        q_batch_t: torch.Tensor,
+        payloads,
+        static_k: torch.Tensor,
+        static_v: torch.Tensor,
+        dyn_k: torch.Tensor,
+        dyn_v: torch.Tensor,
+        mask_t: torch.Tensor,
+        scores: torch.Tensor,
+        attn: torch.Tensor,
+    ):
+        if not self.oracle_compare_enable:
+            return
+        if self.oracle_answer_start_pos is None:
+            return
+        answer_step = int(max(0, int(self.decode_pos) - int(self.oracle_answer_start_pos)))
+        if answer_step > 0:
+            return
+        device = q_batch_t.device
+        total_tokens = int(self._decode_token_limit())
+        prefix_len = min(int(self.dynamic_start), int(total_tokens))
+        suffix_start = min(max(int(self.dynamic_start), int(self.dynamic_end)), int(total_tokens))
+        scale = 1.0 / math.sqrt(self.head_dim)
+        for idx, hdx in enumerate(head_ids):
+            dense_scores_static = torch.matmul(q_batch_t[idx:idx + 1], static_k.transpose(0, 1)) * scale
+            dense_scores_dyn = torch.matmul(q_batch_t[idx:idx + 1], self._get_decode_attn_key_tensor_cuda(layer_idx, kv_hdx)[self.dynamic_start:self.dynamic_end].transpose(0, 1)) * scale
+            dense_scores = torch.cat([dense_scores_static.float(), dense_scores_dyn.float()], dim=-1)
+            dense_attn = torch.softmax(dense_scores, dim=-1).squeeze(0)
+            sparse_attn = attn[idx]
+            sparse_mask = mask_t[idx]
+            dyn_ids = payloads[idx].get("cpu_tokens") or []
+            if not dyn_ids and "device_ids" in payloads[idx]:
+                take = max(0, int(payloads[idx].get("final_count", 0)))
+                if take > 0:
+                    dyn_ids = [
+                        int(tok) for tok in payloads[idx]["device_ids"][:take].detach().cpu().tolist()
+                        if int(tok) >= 0
+                    ]
+            oracle_dyn_mass = 0.0
+            oracle_dense_masses = []
+            if dyn_ids:
+                for tok in dyn_ids:
+                    tok = int(tok)
+                    if tok < int(self.dynamic_start) or tok >= int(self.dynamic_end):
+                        continue
+                    pos = prefix_len + (tok - int(self.dynamic_start))
+                    mass = float(dense_attn[pos].item())
+                    oracle_dyn_mass += mass
+                    oracle_dense_masses.append((tok, mass))
+            dense_v_cat = torch.cat([static_v, self._get_decode_value_tensor_cuda(layer_idx, kv_hdx)[self.dynamic_start:self.dynamic_end]], dim=0)
+            sparse_v_cat = torch.cat([static_v, dyn_v[idx]], dim=0)
+            dense_out = torch.matmul(dense_attn.unsqueeze(0).to(dense_v_cat.dtype), dense_v_cat).squeeze(0)
+            sparse_out = torch.matmul(sparse_attn.unsqueeze(0).to(sparse_v_cat.dtype), sparse_v_cat).squeeze(0)
+            total_dynamic_mass = float(dense_attn[prefix_len:].sum().item()) if dense_attn.numel() > prefix_len else 0.0
+            omitted_dynamic_mass = max(0.0, total_dynamic_mass - oracle_dyn_mass)
+            self.oracle_compare_records.append(
+                {
+                    "step": int(answer_step),
+                    "decode_pos": int(self.decode_pos),
+                    "layer": int(layer_idx),
+                    "kv_head": int(kv_hdx),
+                    "head": int(hdx),
+                    "oracle_dyn_mass": float(oracle_dyn_mass),
+                    "total_dynamic_mass": float(total_dynamic_mass),
+                    "omitted_dynamic_mass": float(omitted_dynamic_mass),
+                    "oracle_token_count": int(len(dyn_ids)),
+                    "sparse_dynamic_count": int(int(sparse_mask.sum().item())),
+                    "dense_sparse_out_l2": float(torch.norm(dense_out - sparse_out).item()),
+                    "top_oracle_dense_mass": oracle_dense_masses[:8],
+                    "adaptive_mass_bound": float(payloads[idx].get("adaptive_mass_bound", -1.0)),
+                    "adaptive_upper_score_bound": float(payloads[idx].get("adaptive_upper_score_bound", float("nan"))),
+                    "adaptive_dynamic_span": int(payloads[idx].get("adaptive_dynamic_span", 0)),
+                    "adaptive_candidate_count": int(payloads[idx].get("adaptive_candidate_count", 0)),
+                    "adaptive_keep_count": int(payloads[idx].get("adaptive_keep_count", len(dyn_ids))),
+                }
+            )
+
+    def _get_dynamic_attn_score_upper_bound_fullgpu(
+        self,
+        layer_idx: int,
+        kv_hdx: int,
+        q_attn: torch.Tensor,
+    ) -> float:
+        upper_start = time.perf_counter() if self.decode_profile else None
+        dyn_start = int(self.dynamic_start)
+        dyn_end = int(self.dynamic_end)
+        dyn_len = max(0, dyn_end - dyn_start)
+        if dyn_len <= 0:
+            return float("-inf")
+        attn_key_t = self._get_decode_attn_key_tensor_cuda(layer_idx, kv_hdx)
+        if attn_key_t is None:
+            return float("inf")
+        dyn_keys_t = attn_key_t[dyn_start:dyn_end]
+        if int(dyn_keys_t.shape[0]) <= 0:
+            return float("-inf")
+        q_vec = q_attn.squeeze(0).float()
+        q_norm = float(torch.linalg.vector_norm(q_vec).item())
+        if not math.isfinite(q_norm) or q_norm <= 0.0:
+            return float("-inf")
+        max_k_norm = float(torch.linalg.vector_norm(dyn_keys_t.float(), dim=-1).max().item())
+        if not math.isfinite(max_k_norm) or max_k_norm <= 0.0:
+            return float("-inf")
+        bound = float((q_norm * max_k_norm) / math.sqrt(float(self.head_dim)))
+        if self.decode_profile and upper_start is not None:
+            if self.fullgpu_profile_sync:
+                torch.cuda.synchronize(q_attn.device)
+            self._decode_profile_stats["adaptive_upper_bound_sec"] += (
+                time.perf_counter() - upper_start
+            )
+        return bound
+
+    def _select_dynamic_budget_count_fullgpu(
+        self,
+        layer_idx: int,
+        kv_hdx: int,
+        q_attn: torch.Tensor,
+        static_k: torch.Tensor,
+        payload,
+        dynamic_score_upper: float,
+    ):
+        count_i = int(payload.get("final_count", 0))
+        if not self.dynamic_budget_enable or count_i <= 0:
+            return count_i, None, {}
+
+        device = q_attn.device
+        ids_t = payload["device_ids"][:count_i].to(torch.long)
+        if int(ids_t.numel()) <= 0:
+            return count_i, None, {}
+
+        attn_key_t = payload.get("device_attn_keys")
+        if attn_key_t is None:
+            return count_i, None, {}
+        score_start = time.perf_counter() if self.decode_profile else None
+        cand_k = torch.index_select(attn_key_t, 0, ids_t)
+        q_vec = q_attn.squeeze(0).float()
+        scale = 1.0 / math.sqrt(float(self.head_dim))
+        dyn_scores = torch.matmul(cand_k.float(), q_vec) * scale
+        if self.decode_profile and score_start is not None:
+            if self.fullgpu_profile_sync:
+                torch.cuda.synchronize(device)
+            self._decode_profile_stats["adaptive_candidate_score_sec"] += (
+                time.perf_counter() - score_start
+            )
+        if dyn_scores.numel() <= 0:
+            return count_i, None, {}
+        sort_start = time.perf_counter() if self.decode_profile else None
+        dyn_scores, sort_idx = torch.sort(dyn_scores.float(), descending=True)
+        if self.decode_profile and sort_start is not None:
+            if self.fullgpu_profile_sync:
+                torch.cuda.synchronize(device)
+            self._decode_profile_stats["adaptive_sort_sec"] += (
+                time.perf_counter() - sort_start
+            )
+
+        min_keep = min(count_i, max(1, int(self.dynamic_budget_min)))
+        search_space = max(0, int(self.dynamic_end - self.dynamic_start))
+        unseen_count = max(0, int(search_space) - int(count_i))
+        static_start = time.perf_counter() if self.decode_profile else None
+        static_scores = (torch.matmul(q_attn, static_k.transpose(0, 1)) * scale).float().squeeze(0)
+        static_logz = torch.logsumexp(static_scores, dim=0) if static_scores.numel() > 0 else None
+        if self.decode_profile and static_start is not None:
+            if self.fullgpu_profile_sync:
+                torch.cuda.synchronize(device)
+            self._decode_profile_stats["adaptive_static_logz_sec"] += (
+                time.perf_counter() - static_start
+            )
+        last_bound = 0.0
+        select_start = time.perf_counter() if self.decode_profile else None
+
+        for keep in range(int(min_keep), int(count_i) + 1):
+            kept = dyn_scores[:keep]
+            omitted = dyn_scores[keep:]
+            kept_logz = torch.logsumexp(kept, dim=0)
+            tail_terms = []
+            if omitted.numel() > 0:
+                tail_terms.append(torch.logsumexp(omitted, dim=0))
+            if unseen_count > 0 and math.isfinite(float(dynamic_score_upper)):
+                unseen_log = float(dynamic_score_upper) + math.log(float(unseen_count))
+                tail_terms.append(torch.tensor(float(unseen_log), dtype=torch.float32, device=kept.device))
+            if not tail_terms:
+                stats = {
+                    "mass_bound": 0.0,
+                    "upper_score_bound": float(dynamic_score_upper),
+                    "dynamic_span": int(search_space),
+                    "candidate_count": int(count_i),
+                }
+                return int(keep), sort_idx, stats
+            tail_logz = torch.logsumexp(torch.stack(tail_terms), dim=0)
+            denom_terms = [kept_logz, tail_logz]
+            if static_logz is not None:
+                denom_terms.append(static_logz.to(kept.device))
+            denom_logz = torch.logsumexp(torch.stack(denom_terms), dim=0)
+            omitted_mass_bound = float(torch.exp(tail_logz - denom_logz).item())
+            last_bound = omitted_mass_bound
+            if omitted_mass_bound <= float(self.dynamic_budget_target_omass):
+                stats = {
+                    "mass_bound": float(omitted_mass_bound),
+                    "upper_score_bound": float(dynamic_score_upper),
+                    "dynamic_span": int(search_space),
+                    "candidate_count": int(count_i),
+                }
+                if self.decode_profile and select_start is not None:
+                    if self.fullgpu_profile_sync:
+                        torch.cuda.synchronize(device)
+                    self._decode_profile_stats["adaptive_select_sec"] += (
+                        time.perf_counter() - select_start
+                    )
+                return int(keep), sort_idx, stats
+
+        stats = {
+            "mass_bound": float(last_bound),
+            "upper_score_bound": float(dynamic_score_upper),
+            "dynamic_span": int(search_space),
+            "candidate_count": int(count_i),
+        }
+        if self.decode_profile and select_start is not None:
+            if self.fullgpu_profile_sync:
+                torch.cuda.synchronize(device)
+            self._decode_profile_stats["adaptive_select_sec"] += (
+                time.perf_counter() - select_start
+            )
+        return int(count_i), sort_idx, stats
+
+    def _apply_dynamic_budget_fullgpu_group(
+        self,
+        layer_idx: int,
+        kv_hdx: int,
+        head_ids,
+        payloads,
+        profiles,
+        q_batch_t: torch.Tensor,
+        ids_t: torch.Tensor,
+        mask_t: torch.Tensor,
+        static_scores: torch.Tensor,
+        dyn_scores: torch.Tensor,
+        dyn_k: torch.Tensor,
+        dyn_v: torch.Tensor,
+        scale: float,
+    ):
+        if not self.dynamic_budget_enable:
+            return ids_t, mask_t, dyn_scores, dyn_k, dyn_v
+        adaptive_start = time.perf_counter() if self.decode_profile else None
+        device = q_batch_t.device
+        upper_start = time.perf_counter() if self.decode_profile else None
+        max_k_norm_t = self._get_dynamic_attn_max_norm_fullgpu(layer_idx, kv_hdx).to(device=device)
+        q_norms_t = torch.linalg.vector_norm(q_batch_t.float(), dim=-1)
+        upper_scores_t = q_norms_t * max_k_norm_t * float(scale)
+        if self.decode_profile and upper_start is not None:
+            if self.fullgpu_profile_sync:
+                torch.cuda.synchronize(device)
+            self._decode_profile_stats["adaptive_upper_bound_sec"] += (
+                time.perf_counter() - upper_start
+            )
+
+        static_start = time.perf_counter() if self.decode_profile else None
+        static_logz_t = torch.logsumexp(static_scores.float(), dim=-1) if static_scores.numel() > 0 else None
+        if self.decode_profile and static_start is not None:
+            if self.fullgpu_profile_sync:
+                torch.cuda.synchronize(device)
+            self._decode_profile_stats["adaptive_static_logz_sec"] += (
+                time.perf_counter() - static_start
+            )
+
+        sort_start = time.perf_counter() if self.decode_profile else None
+        sortable_scores = dyn_scores.float().masked_fill(~mask_t, float("-inf"))
+        sorted_scores_t, sort_idx_t = torch.sort(sortable_scores, dim=1, descending=True)
+        sorted_mask_t = torch.gather(mask_t, 1, sort_idx_t)
+        sorted_ids_t = torch.gather(ids_t, 1, sort_idx_t)
+        gather_idx = sort_idx_t.unsqueeze(-1).expand(-1, -1, dyn_k.shape[-1])
+        sorted_dyn_k = torch.gather(dyn_k, 1, gather_idx)
+        sorted_dyn_v = torch.gather(dyn_v, 1, gather_idx)
+        if self.decode_profile and sort_start is not None:
+            if self.fullgpu_profile_sync:
+                torch.cuda.synchronize(device)
+            self._decode_profile_stats["adaptive_sort_sec"] += (
+                time.perf_counter() - sort_start
+            )
+
+        select_start = time.perf_counter() if self.decode_profile else None
+        search_space = max(0, int(self.dynamic_end - self.dynamic_start))
+        target_omass = float(self.dynamic_budget_target_omass)
+        min_keep_global = max(1, int(self.dynamic_budget_min))
+        if self.dynamic_budget_mode == "cuda":
+            keep_counts_t, mass_bounds_t = adaptive_budget_select_cuda(
+                sorted_scores_t,
+                sorted_mask_t,
+                static_logz_t if static_logz_t is not None else torch.zeros(
+                    (sorted_scores_t.shape[0],),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                upper_scores_t,
+                min_keep=min_keep_global,
+                dynamic_span=int(search_space),
+                target_omass=float(target_omass),
+            )
+            keep_counts = [int(x) for x in keep_counts_t.detach().cpu().tolist()]
+            mass_bounds = [float(x) for x in mass_bounds_t.detach().cpu().tolist()]
+            budget_stats_by_row = []
+            for row_idx, _hdx in enumerate(head_ids):
+                payload = payloads[row_idx]
+                old_count = int(payload.get("final_count", 0)) if isinstance(payload, dict) else 0
+                old_count = min(old_count, int(sorted_scores_t.shape[1]))
+                budget_stats_by_row.append(
+                    {
+                        "mass_bound": float(mass_bounds[row_idx]) if row_idx < len(mass_bounds) else 0.0,
+                        "upper_score_bound": float(upper_scores_t[row_idx].item()) if torch.isfinite(upper_scores_t[row_idx]) else float("nan"),
+                        "dynamic_span": int(search_space),
+                        "candidate_count": int(old_count),
+                    }
+                )
+        else:
+            keep_counts = []
+            budget_stats_by_row = []
+            for row_idx, hdx in enumerate(head_ids):
+                payload = payloads[row_idx]
+                old_count = int(payload.get("final_count", 0)) if isinstance(payload, dict) else 0
+                old_count = min(old_count, int(sorted_scores_t.shape[1]))
+                if old_count <= 0:
+                    keep_counts.append(0)
+                    budget_stats_by_row.append(
+                        {
+                            "mass_bound": 0.0,
+                            "upper_score_bound": float("nan"),
+                            "dynamic_span": int(search_space),
+                            "candidate_count": 0,
+                        }
+                    )
+                    continue
+                min_keep = min(old_count, min_keep_global)
+                scores_i = sorted_scores_t[row_idx, :old_count]
+                prefix_logz = torch.logcumsumexp(scores_i, dim=0)
+                omitted_local = torch.full_like(scores_i, float("-inf"))
+                if old_count > 1:
+                    suffix_logz = torch.logcumsumexp(scores_i.flip(0), dim=0).flip(0)
+                    omitted_local[:-1] = suffix_logz[1:]
+                unseen_count = max(0, int(search_space) - int(old_count))
+                tail_logz = omitted_local
+                upper_i = upper_scores_t[row_idx]
+                if unseen_count > 0 and torch.isfinite(upper_i):
+                    unseen_log_t = torch.full_like(scores_i, float("-inf"))
+                    unseen_log_t[:] = upper_i + math.log(float(unseen_count))
+                    tail_logz = torch.logaddexp(tail_logz, unseen_log_t)
+                denom_logz = torch.logaddexp(prefix_logz, tail_logz)
+                if static_logz_t is not None:
+                    denom_logz = torch.logaddexp(denom_logz, static_logz_t[row_idx].expand_as(denom_logz))
+                omitted_bounds = torch.exp(tail_logz - denom_logz)
+                valid_slice = omitted_bounds[min_keep - 1:]
+                keep = int(old_count)
+                mass_bound = float(omitted_bounds[-1].item()) if int(omitted_bounds.numel()) > 0 else 0.0
+                if int(valid_slice.numel()) > 0:
+                    good = torch.nonzero(valid_slice <= target_omass, as_tuple=False)
+                    if int(good.numel()) > 0:
+                        keep = int(min_keep + int(good[0, 0].item()))
+                        mass_bound = float(valid_slice[int(good[0, 0].item())].item())
+                keep_counts.append(int(keep))
+                budget_stats_by_row.append(
+                    {
+                        "mass_bound": float(mass_bound),
+                        "upper_score_bound": float(upper_i.item()) if torch.isfinite(upper_i) else float("nan"),
+                        "dynamic_span": int(search_space),
+                        "candidate_count": int(old_count),
+                    }
+                )
+        if self.decode_profile and select_start is not None:
+            if self.fullgpu_profile_sync:
+                torch.cuda.synchronize(device)
+            self._decode_profile_stats["adaptive_select_sec"] += (
+                time.perf_counter() - select_start
+            )
+
+        reorder_start = time.perf_counter() if self.decode_profile else None
+        keep_counts_t = torch.as_tensor(keep_counts, dtype=torch.long, device=device)
+        col_idx_t = torch.arange(sorted_mask_t.shape[1], dtype=torch.long, device=device).unsqueeze(0)
+        new_mask_t = sorted_mask_t & (col_idx_t < keep_counts_t.unsqueeze(1))
+        sorted_scores_t = sorted_scores_t.masked_fill(~new_mask_t, float("-inf"))
+        for row_idx, hdx in enumerate(head_ids):
+            payload = payloads[row_idx]
+            retrieve_profile = profiles[row_idx]
+            if not isinstance(payload, dict):
+                continue
+            keep = int(keep_counts[row_idx])
+            payload["device_ids"] = sorted_ids_t[row_idx].to(payload["device_ids"].dtype)
+            payload["device_mask"] = new_mask_t[row_idx]
+            payload["device_scores"] = sorted_scores_t[row_idx].to(dtype=torch.float32)
+            payload["final_count"] = int(keep)
+            payload["cpu_tokens"] = None
+            budget_stats = budget_stats_by_row[row_idx]
+            payload["adaptive_mass_bound"] = float(budget_stats.get("mass_bound", 0.0))
+            payload["adaptive_upper_score_bound"] = float(
+                budget_stats.get("upper_score_bound", float("nan"))
+            )
+            payload["adaptive_dynamic_span"] = int(budget_stats.get("dynamic_span", 0))
+            payload["adaptive_candidate_count"] = int(budget_stats.get("candidate_count", 0))
+            payload["adaptive_keep_count"] = int(keep)
+            if retrieve_profile is not None:
+                retrieve_profile["adaptive_final_outputs"] = int(keep)
+                retrieve_profile["adaptive_mass_bound"] = float(budget_stats.get("mass_bound", 0.0))
+                retrieve_profile["adaptive_upper_score_bound"] = float(
+                    budget_stats.get("upper_score_bound", float("nan"))
+                )
+        if self.decode_profile and reorder_start is not None:
+            if self.fullgpu_profile_sync:
+                torch.cuda.synchronize(device)
+            self._decode_profile_stats["adaptive_reorder_sec"] += (
+                time.perf_counter() - reorder_start
+            )
+        if self.decode_profile and adaptive_start is not None:
+            if self.fullgpu_profile_sync:
+                torch.cuda.synchronize(device)
+            self._decode_profile_stats["adaptive_total_sec"] += (
+                time.perf_counter() - adaptive_start
+            )
+        return sorted_ids_t, new_mask_t, sorted_scores_t, sorted_dyn_k, sorted_dyn_v
+
     def _get_fullgpu_static_kv(self, layer_idx: int, kv_hdx: int):
         if not self.growing_static_suffix:
             return self.static_gpu_keys[layer_idx][kv_hdx], self.static_gpu_values[layer_idx][kv_hdx]
@@ -5608,10 +6468,12 @@ class retrievalattention_cache(KV_Cache):
     ):
         device = self.layer_mapping[str(layer_idx)]
         payloads = []
+        profiles = []
         q_batch = []
         for hdx in head_ids:
-            payload, _profile = token_results.get(hdx, ({}, None))
+            payload, profile = token_results.get(hdx, ({}, None))
             payloads.append(payload)
+            profiles.append(profile)
             q_batch.append(q_attn_by_head[hdx].squeeze(0))
 
         static_k, static_v = self._get_fullgpu_static_kv(layer_idx, kv_hdx)
@@ -5625,8 +6487,9 @@ class retrievalattention_cache(KV_Cache):
         value_t = payloads[0]["device_attn_values"]
         ids_t = torch.stack([p["device_ids"].to(torch.long) for p in payloads], dim=0)
         mask_t = torch.stack([p["device_mask"] for p in payloads], dim=0)
-        dyn_k = key_t[ids_t]
-        dyn_v = value_t[ids_t]
+        gather_ids_t = ids_t.clamp_min(0)
+        dyn_k = key_t[gather_ids_t]
+        dyn_v = value_t[gather_ids_t]
 
         if self.decode_profile:
             if self.fullgpu_profile_sync:
@@ -5641,11 +6504,48 @@ class retrievalattention_cache(KV_Cache):
         static_scores = torch.matmul(q_batch_t, static_k.transpose(0, 1)) * scale
         dyn_scores = torch.bmm(dyn_k, q_batch_t.unsqueeze(-1)).squeeze(-1) * scale
         dyn_scores = dyn_scores.float().masked_fill(~mask_t, float("-inf"))
+        if self.dynamic_budget_enable:
+            ids_t, mask_t, dyn_scores, dyn_k, dyn_v = self._apply_dynamic_budget_fullgpu_group(
+                layer_idx=layer_idx,
+                kv_hdx=kv_hdx,
+                head_ids=head_ids,
+                payloads=payloads,
+                profiles=profiles,
+                q_batch_t=q_batch_t,
+                ids_t=ids_t,
+                mask_t=mask_t,
+                static_scores=static_scores,
+                dyn_scores=dyn_scores,
+                dyn_k=dyn_k,
+                dyn_v=dyn_v,
+                scale=scale,
+            )
         scores = torch.cat([static_scores.float(), dyn_scores], dim=-1)
         static_v_expand = static_v.unsqueeze(0).expand(len(head_ids), -1, -1)
         v_cat = torch.cat([static_v_expand, dyn_v], dim=1)
         attn = torch.softmax(scores, dim=-1).to(v_cat.dtype)
         out_batch = torch.bmm(attn.unsqueeze(1), v_cat).squeeze(1)
+        self._record_online_graph_query_centroid_fullgpu(
+            layer_idx=layer_idx,
+            kv_hdx=kv_hdx,
+            q_batch_t=q_batch_t,
+            payloads=payloads,
+            attn=attn,
+        )
+        self._maybe_record_oracle_compare_fullgpu(
+            layer_idx=layer_idx,
+            kv_hdx=kv_hdx,
+            head_ids=head_ids,
+            q_batch_t=q_batch_t,
+            payloads=payloads,
+            static_k=static_k,
+            static_v=static_v,
+            dyn_k=dyn_k,
+            dyn_v=dyn_v,
+            mask_t=mask_t,
+            scores=scores,
+            attn=attn,
+        )
 
         if self.decode_profile:
             if self.fullgpu_profile_sync:
@@ -6559,20 +7459,27 @@ class retrievalattention_cache(KV_Cache):
                         enforce_seed_floor=True,
                     )
                 elif use_roar_cuda_fullgpu:
-                    group_results = self._retrieve_tokens_roar_cuda_fullgpu_group(
-                        layer_idx,
-                        kv_hdx,
-                        states,
-                        update_decode_state=True,
-                        enforce_seed_floor=True,
-                    )
-                    self._maybe_compare_fullgpu_reference(
-                        layer_idx=layer_idx,
-                        kv_hdx=kv_hdx,
-                        q=q,
-                        head_count=head_count,
-                        fg_results=group_results,
-                    )
+                    if self.oracle_retrieval_enable:
+                        group_results = self._retrieve_tokens_oracle_fullgpu_group(
+                            layer_idx,
+                            kv_hdx,
+                            states,
+                        )
+                    else:
+                        group_results = self._retrieve_tokens_roar_cuda_fullgpu_group(
+                            layer_idx,
+                            kv_hdx,
+                            states,
+                            update_decode_state=True,
+                            enforce_seed_floor=True,
+                        )
+                        self._maybe_compare_fullgpu_reference(
+                            layer_idx=layer_idx,
+                            kv_hdx=kv_hdx,
+                            q=q,
+                            head_count=head_count,
+                            fg_results=group_results,
+                        )
                 elif use_roar_cuda_frontier:
                     group_results = self._retrieve_tokens_roar_cuda_frontier_group(
                         layer_idx,
@@ -6647,7 +7554,6 @@ class retrievalattention_cache(KV_Cache):
                             hdx,
                             provenance_map.get(hdx, ()),
                         )
-                    self._accumulate_decode_retrieve_profile(retrieve_profile)
                 if self.decode_profile:
                     self._decode_profile_stats["other_group_bookkeeping_sec"] += (
                         time.perf_counter() - bookkeeping_start
@@ -6660,6 +7566,16 @@ class retrievalattention_cache(KV_Cache):
                     token_results=token_results,
                     scale=scale,
                 )
+                if self.oracle_retrieval_enable:
+                    self._maybe_record_oracle_debug_fullgpu(
+                        layer_idx=layer_idx,
+                        kv_hdx=kv_hdx,
+                        head_ids=head_ids,
+                        token_results=token_results,
+                    )
+                for hdx in head_ids:
+                    _token_ids, retrieve_profile = token_results.get(hdx, ({}, None))
+                    self._accumulate_decode_retrieve_profile(retrieve_profile)
                 empty_heads += group_empty
                 dynamic_counts.extend(group_dyn_counts)
                 outputs.extend(group_outputs)
