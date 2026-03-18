@@ -236,6 +236,25 @@
   - takeaway:
     - custom CUDA adaptive selection materially reduces adaptive overhead
     - dynamic budget remains expensive overall, but the Python-driven selection bottleneck has been reduced substantially
+- Tried a second adaptive hot-path refactor after the CUDA selector:
+  - keep adaptive keep-count tensors on GPU until the existing output loop
+  - avoid full dynamic `K/V` reorder before keep count is known
+  - delay dynamic `V` gather until after keep selection
+  - fold payload/profile writes into the existing per-head output loop
+- Tiny `e6` sanity rerun:
+  - `45496127` / `slurm-45496127.out`
+  - decode profile improved slightly vs the immediate pre-patch run `45495775`:
+    - total `115.266 s -> 109.709 s`
+    - gather `6.002 s -> 5.029 s`
+    - attn `40.534 s -> 38.398 s`
+  - but adaptive behavior regressed:
+    - `avg_adaptive_keep_count=16.0`
+    - `avg_omitted_dynamic_mass=0.4100`
+    - `bound_violation_rate=1.0`
+    - `avg_adaptive_dynamic_span=0.0`
+  - takeaway:
+    - the speed direction is plausible
+    - but the adaptive selector / bookkeeping is now inconsistent, so the path should not be trusted for long-run evaluation until fixed
 
 ## 2026-03-12 update (online decode graph smoke results + automation)
 - Generated-memory benchmark is now correct and two-phase:

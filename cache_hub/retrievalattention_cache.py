@@ -905,6 +905,8 @@ class retrievalattention_cache(KV_Cache):
         q_batch_t: torch.Tensor,
         payloads,
         attn: torch.Tensor,
+        dyn_ids_t: torch.Tensor = None,
+        keep_counts_t: torch.Tensor = None,
     ):
         if not self.online_graph_enable or self.online_graph_signal != "query_centroid":
             return
@@ -930,14 +932,23 @@ class retrievalattention_cache(KV_Cache):
         for row_idx, payload in enumerate(payloads):
             if not isinstance(payload, dict):
                 continue
-            cand_tokens = payload.get("cpu_tokens") or []
-            if not cand_tokens and "device_ids" in payload:
-                take = max(0, int(payload.get("final_count", 0)))
+            cand_tokens = []
+            if dyn_ids_t is not None and keep_counts_t is not None:
+                take = int(keep_counts_t[row_idx].item())
                 if take > 0:
                     cand_tokens = [
-                        int(tok) for tok in payload["device_ids"][:take].detach().cpu().tolist()
+                        int(tok) for tok in dyn_ids_t[row_idx, :take].detach().cpu().tolist()
                         if int(tok) >= 0
                     ]
+            else:
+                cand_tokens = payload.get("cpu_tokens") or []
+                if not cand_tokens and "device_ids" in payload:
+                    take = max(0, int(payload.get("final_count", 0)))
+                    if take > 0:
+                        cand_tokens = [
+                            int(tok) for tok in payload["device_ids"][:take].detach().cpu().tolist()
+                            if int(tok) >= 0
+                        ]
             if not cand_tokens:
                 continue
             cand_keep = []
@@ -6030,6 +6041,11 @@ class retrievalattention_cache(KV_Cache):
         mask_t: torch.Tensor,
         scores: torch.Tensor,
         attn: torch.Tensor,
+        dyn_ids_t: torch.Tensor = None,
+        keep_counts_t: torch.Tensor = None,
+        adaptive_mass_bounds_t: torch.Tensor = None,
+        adaptive_upper_scores_t: torch.Tensor = None,
+        adaptive_candidate_counts_t: torch.Tensor = None,
     ):
         if not self.oracle_compare_enable:
             return
@@ -6050,31 +6066,70 @@ class retrievalattention_cache(KV_Cache):
             dense_attn = torch.softmax(dense_scores, dim=-1).squeeze(0)
             sparse_attn = attn[idx]
             sparse_mask = mask_t[idx]
-            dyn_ids = payloads[idx].get("cpu_tokens") or []
-            if not dyn_ids and "device_ids" in payloads[idx]:
-                take = max(0, int(payloads[idx].get("final_count", 0)))
-                if take > 0:
-                    dyn_ids = [
-                        int(tok) for tok in payloads[idx]["device_ids"][:take].detach().cpu().tolist()
-                        if int(tok) >= 0
-                    ]
             oracle_dyn_mass = 0.0
             oracle_dense_masses = []
-            if dyn_ids:
-                for tok in dyn_ids:
-                    tok = int(tok)
-                    if tok < int(self.dynamic_start) or tok >= int(self.dynamic_end):
-                        continue
-                    pos = prefix_len + (tok - int(self.dynamic_start))
-                    mass = float(dense_attn[pos].item())
-                    oracle_dyn_mass += mass
-                    oracle_dense_masses.append((tok, mass))
+            dyn_ids = []
+            if dyn_ids_t is not None and keep_counts_t is not None:
+                take = int(keep_counts_t[idx].item())
+                if take > 0:
+                    dyn_ids_row = dyn_ids_t[idx, :take]
+                    valid_mask = (dyn_ids_row >= int(self.dynamic_start)) & (dyn_ids_row < int(self.dynamic_end))
+                    valid_ids_t = dyn_ids_row[valid_mask].to(torch.long)
+                    if int(valid_ids_t.numel()) > 0:
+                        pos_t = (valid_ids_t - int(self.dynamic_start) + prefix_len).to(torch.long)
+                        mass_t = dense_attn.index_select(0, pos_t)
+                        oracle_dyn_mass = float(mass_t.sum().item())
+                        valid_ids_cpu = valid_ids_t.detach().cpu().tolist()
+                        mass_cpu = mass_t.detach().cpu().tolist()
+                        dyn_ids = [int(tok) for tok in valid_ids_cpu]
+                        oracle_dense_masses = [
+                            (int(tok), float(mass))
+                            for tok, mass in zip(valid_ids_cpu[:8], mass_cpu[:8])
+                        ]
+            else:
+                dyn_ids = payloads[idx].get("cpu_tokens") or []
+                if not dyn_ids and "device_ids" in payloads[idx]:
+                    take = max(0, int(payloads[idx].get("final_count", 0)))
+                    if take > 0:
+                        dyn_ids = [
+                            int(tok) for tok in payloads[idx]["device_ids"][:take].detach().cpu().tolist()
+                            if int(tok) >= 0
+                        ]
+                if dyn_ids:
+                    for tok in dyn_ids:
+                        tok = int(tok)
+                        if tok < int(self.dynamic_start) or tok >= int(self.dynamic_end):
+                            continue
+                        pos = prefix_len + (tok - int(self.dynamic_start))
+                        mass = float(dense_attn[pos].item())
+                        oracle_dyn_mass += mass
+                        oracle_dense_masses.append((tok, mass))
             dense_v_cat = torch.cat([static_v, self._get_decode_value_tensor_cuda(layer_idx, kv_hdx)[self.dynamic_start:self.dynamic_end]], dim=0)
             sparse_v_cat = torch.cat([static_v, dyn_v[idx]], dim=0)
             dense_out = torch.matmul(dense_attn.unsqueeze(0).to(dense_v_cat.dtype), dense_v_cat).squeeze(0)
             sparse_out = torch.matmul(sparse_attn.unsqueeze(0).to(sparse_v_cat.dtype), sparse_v_cat).squeeze(0)
             total_dynamic_mass = float(dense_attn[prefix_len:].sum().item()) if dense_attn.numel() > prefix_len else 0.0
             omitted_dynamic_mass = max(0.0, total_dynamic_mass - oracle_dyn_mass)
+            adaptive_mass_bound = (
+                float(adaptive_mass_bounds_t[idx].item())
+                if adaptive_mass_bounds_t is not None
+                else float(payloads[idx].get("adaptive_mass_bound", -1.0))
+            )
+            adaptive_upper_score_bound = (
+                float(adaptive_upper_scores_t[idx].item())
+                if adaptive_upper_scores_t is not None
+                else float(payloads[idx].get("adaptive_upper_score_bound", float("nan")))
+            )
+            adaptive_candidate_count = (
+                int(adaptive_candidate_counts_t[idx].item())
+                if adaptive_candidate_counts_t is not None
+                else int(payloads[idx].get("adaptive_candidate_count", 0))
+            )
+            adaptive_keep_count = (
+                int(keep_counts_t[idx].item())
+                if keep_counts_t is not None
+                else int(payloads[idx].get("adaptive_keep_count", len(dyn_ids)))
+            )
             self.oracle_compare_records.append(
                 {
                     "step": int(answer_step),
@@ -6089,11 +6144,11 @@ class retrievalattention_cache(KV_Cache):
                     "sparse_dynamic_count": int(int(sparse_mask.sum().item())),
                     "dense_sparse_out_l2": float(torch.norm(dense_out - sparse_out).item()),
                     "top_oracle_dense_mass": oracle_dense_masses[:8],
-                    "adaptive_mass_bound": float(payloads[idx].get("adaptive_mass_bound", -1.0)),
-                    "adaptive_upper_score_bound": float(payloads[idx].get("adaptive_upper_score_bound", float("nan"))),
+                    "adaptive_mass_bound": float(adaptive_mass_bound),
+                    "adaptive_upper_score_bound": float(adaptive_upper_score_bound),
                     "adaptive_dynamic_span": int(payloads[idx].get("adaptive_dynamic_span", 0)),
-                    "adaptive_candidate_count": int(payloads[idx].get("adaptive_candidate_count", 0)),
-                    "adaptive_keep_count": int(payloads[idx].get("adaptive_keep_count", len(dyn_ids))),
+                    "adaptive_candidate_count": int(adaptive_candidate_count),
+                    "adaptive_keep_count": int(adaptive_keep_count),
                 }
             )
 
@@ -6249,18 +6304,17 @@ class retrievalattention_cache(KV_Cache):
         kv_hdx: int,
         head_ids,
         payloads,
-        profiles,
         q_batch_t: torch.Tensor,
         ids_t: torch.Tensor,
         mask_t: torch.Tensor,
         static_scores: torch.Tensor,
         dyn_scores: torch.Tensor,
         dyn_k: torch.Tensor,
-        dyn_v: torch.Tensor,
+        value_t: torch.Tensor,
         scale: float,
     ):
         if not self.dynamic_budget_enable:
-            return ids_t, mask_t, dyn_scores, dyn_k, dyn_v
+            return ids_t, mask_t, dyn_scores, value_t[ids_t.clamp_min(0)], None
         adaptive_start = time.perf_counter() if self.decode_profile else None
         device = q_batch_t.device
         upper_start = time.perf_counter() if self.decode_profile else None
@@ -6288,9 +6342,15 @@ class retrievalattention_cache(KV_Cache):
         sorted_scores_t, sort_idx_t = torch.sort(sortable_scores, dim=1, descending=True)
         sorted_mask_t = torch.gather(mask_t, 1, sort_idx_t)
         sorted_ids_t = torch.gather(ids_t, 1, sort_idx_t)
-        gather_idx = sort_idx_t.unsqueeze(-1).expand(-1, -1, dyn_k.shape[-1])
-        sorted_dyn_k = torch.gather(dyn_k, 1, gather_idx)
-        sorted_dyn_v = torch.gather(dyn_v, 1, gather_idx)
+        candidate_counts_t = torch.as_tensor(
+            [
+                max(0, min(int(payload.get("final_count", 0)), int(sorted_scores_t.shape[1])))
+                if isinstance(payload, dict) else 0
+                for payload in payloads
+            ],
+            dtype=torch.long,
+            device=device,
+        )
         if self.decode_profile and sort_start is not None:
             if self.fullgpu_profile_sync:
                 torch.cuda.synchronize(device)
@@ -6316,38 +6376,16 @@ class retrievalattention_cache(KV_Cache):
                 dynamic_span=int(search_space),
                 target_omass=float(target_omass),
             )
-            keep_counts = [int(x) for x in keep_counts_t.detach().cpu().tolist()]
-            mass_bounds = [float(x) for x in mass_bounds_t.detach().cpu().tolist()]
-            budget_stats_by_row = []
-            for row_idx, _hdx in enumerate(head_ids):
-                payload = payloads[row_idx]
-                old_count = int(payload.get("final_count", 0)) if isinstance(payload, dict) else 0
-                old_count = min(old_count, int(sorted_scores_t.shape[1]))
-                budget_stats_by_row.append(
-                    {
-                        "mass_bound": float(mass_bounds[row_idx]) if row_idx < len(mass_bounds) else 0.0,
-                        "upper_score_bound": float(upper_scores_t[row_idx].item()) if torch.isfinite(upper_scores_t[row_idx]) else float("nan"),
-                        "dynamic_span": int(search_space),
-                        "candidate_count": int(old_count),
-                    }
-                )
+            keep_counts_t = torch.minimum(keep_counts_t.to(dtype=torch.long), candidate_counts_t)
+            keep_counts_t = keep_counts_t.clamp_min(0)
         else:
             keep_counts = []
-            budget_stats_by_row = []
-            for row_idx, hdx in enumerate(head_ids):
-                payload = payloads[row_idx]
-                old_count = int(payload.get("final_count", 0)) if isinstance(payload, dict) else 0
-                old_count = min(old_count, int(sorted_scores_t.shape[1]))
+            mass_bounds = []
+            for row_idx in range(sorted_scores_t.shape[0]):
+                old_count = int(candidate_counts_t[row_idx].item())
                 if old_count <= 0:
                     keep_counts.append(0)
-                    budget_stats_by_row.append(
-                        {
-                            "mass_bound": 0.0,
-                            "upper_score_bound": float("nan"),
-                            "dynamic_span": int(search_space),
-                            "candidate_count": 0,
-                        }
-                    )
+                    mass_bounds.append(0.0)
                     continue
                 min_keep = min(old_count, min_keep_global)
                 scores_i = sorted_scores_t[row_idx, :old_count]
@@ -6376,14 +6414,9 @@ class retrievalattention_cache(KV_Cache):
                         keep = int(min_keep + int(good[0, 0].item()))
                         mass_bound = float(valid_slice[int(good[0, 0].item())].item())
                 keep_counts.append(int(keep))
-                budget_stats_by_row.append(
-                    {
-                        "mass_bound": float(mass_bound),
-                        "upper_score_bound": float(upper_i.item()) if torch.isfinite(upper_i) else float("nan"),
-                        "dynamic_span": int(search_space),
-                        "candidate_count": int(old_count),
-                    }
-                )
+                mass_bounds.append(float(mass_bound))
+            keep_counts_t = torch.as_tensor(keep_counts, dtype=torch.long, device=device)
+            mass_bounds_t = torch.as_tensor(mass_bounds, dtype=torch.float32, device=device)
         if self.decode_profile and select_start is not None:
             if self.fullgpu_profile_sync:
                 torch.cuda.synchronize(device)
@@ -6392,35 +6425,22 @@ class retrievalattention_cache(KV_Cache):
             )
 
         reorder_start = time.perf_counter() if self.decode_profile else None
-        keep_counts_t = torch.as_tensor(keep_counts, dtype=torch.long, device=device)
-        col_idx_t = torch.arange(sorted_mask_t.shape[1], dtype=torch.long, device=device).unsqueeze(0)
-        new_mask_t = sorted_mask_t & (col_idx_t < keep_counts_t.unsqueeze(1))
-        sorted_scores_t = sorted_scores_t.masked_fill(~new_mask_t, float("-inf"))
-        for row_idx, hdx in enumerate(head_ids):
-            payload = payloads[row_idx]
-            retrieve_profile = profiles[row_idx]
-            if not isinstance(payload, dict):
-                continue
-            keep = int(keep_counts[row_idx])
-            payload["device_ids"] = sorted_ids_t[row_idx].to(payload["device_ids"].dtype)
-            payload["device_mask"] = new_mask_t[row_idx]
-            payload["device_scores"] = sorted_scores_t[row_idx].to(dtype=torch.float32)
-            payload["final_count"] = int(keep)
-            payload["cpu_tokens"] = None
-            budget_stats = budget_stats_by_row[row_idx]
-            payload["adaptive_mass_bound"] = float(budget_stats.get("mass_bound", 0.0))
-            payload["adaptive_upper_score_bound"] = float(
-                budget_stats.get("upper_score_bound", float("nan"))
-            )
-            payload["adaptive_dynamic_span"] = int(budget_stats.get("dynamic_span", 0))
-            payload["adaptive_candidate_count"] = int(budget_stats.get("candidate_count", 0))
-            payload["adaptive_keep_count"] = int(keep)
-            if retrieve_profile is not None:
-                retrieve_profile["adaptive_final_outputs"] = int(keep)
-                retrieve_profile["adaptive_mass_bound"] = float(budget_stats.get("mass_bound", 0.0))
-                retrieve_profile["adaptive_upper_score_bound"] = float(
-                    budget_stats.get("upper_score_bound", float("nan"))
-                )
+        max_keep = int(keep_counts_t.max().item()) if int(keep_counts_t.numel()) > 0 else 0
+        max_keep = max(0, min(max_keep, int(sorted_scores_t.shape[1])))
+        if max_keep > 0:
+            sorted_ids_t = sorted_ids_t[:, :max_keep]
+            sorted_scores_t = sorted_scores_t[:, :max_keep]
+            sorted_mask_t = sorted_mask_t[:, :max_keep]
+            col_idx_t = torch.arange(max_keep, dtype=torch.long, device=device).unsqueeze(0)
+            new_mask_t = sorted_mask_t & (col_idx_t < keep_counts_t.unsqueeze(1))
+            sorted_scores_t = sorted_scores_t.masked_fill(~new_mask_t, float("-inf"))
+            sorted_dyn_v = value_t[sorted_ids_t.clamp_min(0)]
+        else:
+            batch = int(sorted_scores_t.shape[0])
+            sorted_ids_t = sorted_ids_t[:, :0]
+            sorted_scores_t = sorted_scores_t[:, :0]
+            new_mask_t = sorted_mask_t[:, :0]
+            sorted_dyn_v = value_t.new_empty((batch, 0, value_t.shape[-1]))
         if self.decode_profile and reorder_start is not None:
             if self.fullgpu_profile_sync:
                 torch.cuda.synchronize(device)
@@ -6433,7 +6453,14 @@ class retrievalattention_cache(KV_Cache):
             self._decode_profile_stats["adaptive_total_sec"] += (
                 time.perf_counter() - adaptive_start
             )
-        return sorted_ids_t, new_mask_t, sorted_scores_t, sorted_dyn_k, sorted_dyn_v
+        budget_meta = {
+            "keep_counts_t": keep_counts_t,
+            "mass_bounds_t": mass_bounds_t,
+            "upper_scores_t": upper_scores_t,
+            "candidate_counts_t": candidate_counts_t,
+            "dynamic_span": int(search_space),
+        }
+        return sorted_ids_t, new_mask_t, sorted_scores_t, sorted_dyn_v, budget_meta
 
     def _get_fullgpu_static_kv(self, layer_idx: int, kv_hdx: int):
         if not self.growing_static_suffix:
@@ -6489,7 +6516,7 @@ class retrievalattention_cache(KV_Cache):
         mask_t = torch.stack([p["device_mask"] for p in payloads], dim=0)
         gather_ids_t = ids_t.clamp_min(0)
         dyn_k = key_t[gather_ids_t]
-        dyn_v = value_t[gather_ids_t]
+        dyn_v = None
 
         if self.decode_profile:
             if self.fullgpu_profile_sync:
@@ -6504,33 +6531,42 @@ class retrievalattention_cache(KV_Cache):
         static_scores = torch.matmul(q_batch_t, static_k.transpose(0, 1)) * scale
         dyn_scores = torch.bmm(dyn_k, q_batch_t.unsqueeze(-1)).squeeze(-1) * scale
         dyn_scores = dyn_scores.float().masked_fill(~mask_t, float("-inf"))
+        budget_meta = None
         if self.dynamic_budget_enable:
-            ids_t, mask_t, dyn_scores, dyn_k, dyn_v = self._apply_dynamic_budget_fullgpu_group(
+            ids_t, mask_t, dyn_scores, dyn_v, budget_meta = self._apply_dynamic_budget_fullgpu_group(
                 layer_idx=layer_idx,
                 kv_hdx=kv_hdx,
                 head_ids=head_ids,
                 payloads=payloads,
-                profiles=profiles,
                 q_batch_t=q_batch_t,
                 ids_t=ids_t,
                 mask_t=mask_t,
                 static_scores=static_scores,
                 dyn_scores=dyn_scores,
                 dyn_k=dyn_k,
-                dyn_v=dyn_v,
+                value_t=value_t,
                 scale=scale,
             )
+        else:
+            dyn_v = value_t[gather_ids_t]
         scores = torch.cat([static_scores.float(), dyn_scores], dim=-1)
         static_v_expand = static_v.unsqueeze(0).expand(len(head_ids), -1, -1)
         v_cat = torch.cat([static_v_expand, dyn_v], dim=1)
         attn = torch.softmax(scores, dim=-1).to(v_cat.dtype)
         out_batch = torch.bmm(attn.unsqueeze(1), v_cat).squeeze(1)
+        keep_counts_t = (
+            budget_meta["keep_counts_t"]
+            if budget_meta is not None
+            else mask_t.to(dtype=torch.long).sum(dim=1)
+        )
         self._record_online_graph_query_centroid_fullgpu(
             layer_idx=layer_idx,
             kv_hdx=kv_hdx,
             q_batch_t=q_batch_t,
             payloads=payloads,
             attn=attn,
+            dyn_ids_t=ids_t,
+            keep_counts_t=keep_counts_t,
         )
         self._maybe_record_oracle_compare_fullgpu(
             layer_idx=layer_idx,
@@ -6545,6 +6581,11 @@ class retrievalattention_cache(KV_Cache):
             mask_t=mask_t,
             scores=scores,
             attn=attn,
+            dyn_ids_t=ids_t,
+            keep_counts_t=keep_counts_t,
+            adaptive_mass_bounds_t=(budget_meta["mass_bounds_t"] if budget_meta is not None else None),
+            adaptive_upper_scores_t=(budget_meta["upper_scores_t"] if budget_meta is not None else None),
+            adaptive_candidate_counts_t=(budget_meta["candidate_counts_t"] if budget_meta is not None else None),
         )
 
         if self.decode_profile:
@@ -6557,7 +6598,32 @@ class retrievalattention_cache(KV_Cache):
         dynamic_counts = []
         for idx, hdx in enumerate(head_ids):
             payload = payloads[idx]
-            dyn_count = int(payload.get("final_count", 0))
+            retrieve_profile = profiles[idx]
+            dyn_count = int(keep_counts_t[idx].item())
+            if self.dynamic_budget_enable and isinstance(payload, dict):
+                payload["device_ids"] = ids_t[idx].to(payload["device_ids"].dtype)
+                payload["device_mask"] = mask_t[idx]
+                payload["device_scores"] = dyn_scores[idx].to(dtype=torch.float32)
+                payload["final_count"] = dyn_count
+                payload["cpu_tokens"] = None
+                if budget_meta is not None:
+                    payload["adaptive_mass_bound"] = float(budget_meta["mass_bounds_t"][idx].item())
+                    payload["adaptive_upper_score_bound"] = float(
+                        budget_meta["upper_scores_t"][idx].item()
+                    )
+                    payload["adaptive_dynamic_span"] = int(budget_meta["dynamic_span"])
+                    payload["adaptive_candidate_count"] = int(
+                        budget_meta["candidate_counts_t"][idx].item()
+                    )
+                    payload["adaptive_keep_count"] = dyn_count
+                    if retrieve_profile is not None:
+                        retrieve_profile["adaptive_final_outputs"] = int(dyn_count)
+                        retrieve_profile["adaptive_mass_bound"] = float(
+                            budget_meta["mass_bounds_t"][idx].item()
+                        )
+                        retrieve_profile["adaptive_upper_score_bound"] = float(
+                            budget_meta["upper_scores_t"][idx].item()
+                        )
             if dyn_count == 0:
                 empty_heads += 1
             dynamic_counts.append(dyn_count)

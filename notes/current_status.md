@@ -230,6 +230,24 @@
   - interpretation:
     - moving adaptive selection into a CUDA kernel materially reduced adaptive overhead
     - the adaptive path is still expensive, but the main Python-driven select bottleneck has been cut substantially
+- Attempted one more adaptive hot-path reduction in `cache_hub/retrievalattention_cache.py`:
+  - keep `keep_counts` on GPU until the existing output loop
+  - avoid full dynamic `K/V` reorder before keep count is known
+  - delay dynamic `V` gather until after keep selection
+  - fold most payload/profile writes into the existing output loop
+- Tiny `e6` sanity rerun after that refactor:
+  - `45496127` / `slurm-45496127.out`
+  - small runtime win vs the immediate pre-patch run `45495775`:
+    - decode profile total `115.266 s -> 109.709 s`
+    - gather `6.002 s -> 5.029 s`
+    - attn `40.534 s -> 38.398 s`
+  - but adaptive correctness regressed badly:
+    - `avg_adaptive_keep_count=16.0`
+    - `avg_omitted_dynamic_mass=0.4100`
+    - `bound_violation_rate=1.0`
+  - interpretation:
+    - the speed refactor is directionally useful
+    - but the adaptive selector / metadata path is now inconsistent again, so this code path is not ready for real evaluation yet
 
 ## 2026-03-12 update (online decode graph experiment + app-server steering)
 - Current focus is no longer only the 40k decode AB kernel benchmark.

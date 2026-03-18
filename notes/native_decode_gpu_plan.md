@@ -147,6 +147,23 @@
 - Practical conclusion:
   - moving adaptive keep-count selection into the CUDA extension materially reduced adaptive overhead
   - this is the strongest current evidence that the remaining adaptive bottleneck was caused by GPU-CPU collaboration / Python-managed micro-ops
+- Follow-up hot-path refactor attempt:
+  - keep adaptive keep-count tensors on GPU until the existing output loop
+  - avoid full dynamic `K/V` reorder before keep count is known
+  - delay dynamic `V` gather until after keep selection
+  - fold payload/profile writes into the existing per-head output loop
+- Tiny `e6` rerun after that refactor:
+  - `45496127`
+  - runtime improved modestly vs the immediate pre-patch run `45495775`
+  - but adaptive correctness regressed:
+    - `avg_adaptive_keep_count=16.0`
+    - `avg_omitted_dynamic_mass=0.4100`
+    - `bound_violation_rate=1.0`
+    - `avg_adaptive_dynamic_span=0.0`
+- Current status of adaptive budget path:
+  - the GPU-first direction is still correct for speed
+  - but the latest refactor introduced a bookkeeping / selector inconsistency
+  - do not use this newest adaptive path for `e192` evaluation until the bound logic is fixed again
 
 ## 2026-03-12 update (online decode graph plan extension)
 - The custom full-GPU decode backend is now being used for online decode update experiments, not just the original 40k decode AB kernel benchmark.
