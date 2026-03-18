@@ -493,7 +493,11 @@ def search_roar_graph_csr_cuda_group_kernel(
 def search_roar_graph_csr_cuda_group_fullgpu(
     queries_seed,
     queries_rank,
+    queries_attn,
     keys,
+    attn_keys,
+    static_logz,
+    upper_scores,
     offsets,
     neighbors,
     overlay_counts,
@@ -516,6 +520,9 @@ def search_roar_graph_csr_cuda_group_fullgpu(
     seed_floor: int,
     seed_tail_k: int,
     seed_prev_k: int,
+    adaptive_enable: bool = False,
+    adaptive_min_keep: int = 1,
+    adaptive_target_omass: float = 0.0,
     score_agg: str = "max",
 ):
     if not _try_import_torch_kernel():
@@ -529,7 +536,11 @@ def search_roar_graph_csr_cuda_group_fullgpu(
     return _ROAR_TORCH_KERNEL_EXT_HANDLE.search_graph_csr_cuda_group_fullgpu(
         queries_seed,
         queries_rank,
+        queries_attn,
         keys,
+        attn_keys,
+        static_logz,
+        upper_scores,
         offsets,
         neighbors,
         overlay_counts,
@@ -551,6 +562,9 @@ def search_roar_graph_csr_cuda_group_fullgpu(
         int(seed_floor),
         int(seed_tail_k),
         int(seed_prev_k),
+        bool(adaptive_enable),
+        int(adaptive_min_keep),
+        float(adaptive_target_omass),
         str(score_agg),
     )
 

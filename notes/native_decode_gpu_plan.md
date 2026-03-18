@@ -164,6 +164,42 @@
   - the GPU-first direction is still correct for speed
   - but the latest refactor introduced a bookkeeping / selector inconsistency
   - do not use this newest adaptive path for `e192` evaluation until the bound logic is fixed again
+- Oracle-compare offset fix:
+  - the previously alarming `avg_omitted_dynamic_mass=0.4100` result was a diagnostic bug
+  - dense compare had been indexing dynamic tokens with a prefix-only offset even though fullgpu static memory is `prefix + suffix`
+  - after fixing the offset:
+    - `45498084`
+    - `avg_adaptive_keep_count=16.0`
+    - `avg_adaptive_mass_bound=0.00425`
+    - `avg_omitted_dynamic_mass=0.00425`
+    - `bound_violation_rate=0.0`
+- Benchmark-specific generated-memory setup:
+  - default static split in the wrapper is now `16/32`
+  - this avoids the excessive filler padding induced by `128/512`
+- Fixed-budget oracle calibration on `16/32`:
+  - `e48`: `k≈64` is the first clearly good point
+  - `e96`: `k≈128` is clearly better than `k≤64`
+  - practical interpretation:
+    - adaptive saturation at `400` was overly conservative on this benchmark
+    - a useful adaptive policy should land much closer to the `64-128` range here
+- Implemented first traversal-time adaptive kernel mode:
+  - env:
+    - `RETRIEVALATTN_DYNAMIC_BUDGET_MODE=traversal_cuda`
+  - fullgpu traversal now receives:
+    - attention-space queries
+    - attention-space keys
+    - static `logZ`
+    - unseen-score upper bound
+  - kernel returns adaptive keep count / mass bound directly
+- First traversal-time validation:
+  - `45539711`
+  - succeeded end-to-end, but adaptive early stopping is still too weak:
+    - `avg_adaptive_keep_count≈73.9`
+    - `avg_omitted_dynamic_mass≈0.0945`
+    - `avg_adaptive_mass_bound≈0.999`
+  - conclusion:
+    - traversal-time adaptive plumbing is working
+    - the remaining blocker is the looseness of the unseen-score upper bound, not host overhead anymore
 
 ## 2026-03-12 update (online decode graph plan extension)
 - The custom full-GPU decode backend is now being used for online decode update experiments, not just the original 40k decode AB kernel benchmark.

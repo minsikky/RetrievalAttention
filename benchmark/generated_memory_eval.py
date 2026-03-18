@@ -596,12 +596,12 @@ def main():
         )
         if (
             args.attn_type == "RetrievalAttention"
-            and os.environ.get("RETRIEVALATTN_ORACLE_RETRIEVE", "0") == "1"
             and hasattr(llm, "kv_cache")
         ):
+            oracle_retrieve_flag = os.environ.get("RETRIEVALATTN_ORACLE_RETRIEVE", "0") == "1"
             oracle_compare_flag = os.environ.get("RETRIEVALATTN_ORACLE_COMPARE", "1") == "1"
-            setattr(llm.kv_cache, "oracle_retrieval_enable", True)
-            setattr(llm.kv_cache, "oracle_debug_enable", True)
+            setattr(llm.kv_cache, "oracle_retrieval_enable", oracle_retrieve_flag)
+            setattr(llm.kv_cache, "oracle_debug_enable", oracle_retrieve_flag)
             setattr(llm.kv_cache, "oracle_compare_enable", oracle_compare_flag)
             setattr(llm.kv_cache, "oracle_answer_start_pos", int(llm.kv_cache.decode_pos))
             setattr(llm.kv_cache, "oracle_debug_records", [])
@@ -622,7 +622,6 @@ def main():
         oracle_debug_summary = None
         if (
             args.attn_type == "RetrievalAttention"
-            and os.environ.get("RETRIEVALATTN_ORACLE_RETRIEVE", "0") == "1"
             and hasattr(llm, "kv_cache")
         ):
             records = list(getattr(llm.kv_cache, "oracle_debug_records", []))

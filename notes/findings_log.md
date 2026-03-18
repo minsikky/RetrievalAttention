@@ -255,6 +255,51 @@
   - takeaway:
     - the speed direction is plausible
     - but the adaptive selector / bookkeeping is now inconsistent, so the path should not be trusted for long-run evaluation until fixed
+- Fixed the dense-compare regression:
+  - the large `avg_omitted_dynamic_mass=0.4100` result was a diagnostic bug
+  - oracle compare was indexing dynamic tokens as if the static bank were prefix-only
+  - fullgpu decode actually uses `prefix + suffix` as the static bank
+  - after fixing the offset, the same tiny adaptive run became:
+    - `45498084`
+    - `avg_adaptive_keep_count=16.0`
+    - `avg_adaptive_mass_bound=0.00425`
+    - `avg_omitted_dynamic_mass=0.00425`
+    - `bound_violation_rate=0.0`
+- Added benchmark-specific static defaults for generated-memory:
+  - `static_pattern_start=16`
+  - `static_pattern_end=32`
+  - reason:
+    - the previous `128/512` split forced heavy filler padding and was not a good fit for this benchmark
+- Fixed-budget oracle calibration on the `16/32` setup:
+  - `e48`
+    - `k=16`: omitted mass `0.1547`, `query_acc=0.667`
+    - `k=32`: omitted mass `0.0549`, `query_acc=0.667`
+    - `k=64`: omitted mass `0.0253`, `query_acc=1.0`
+    - `k=128`: omitted mass `0.0119`, `query_acc=1.0`
+  - `e96`
+    - `k=16`: omitted mass `0.1839`, `query_acc=0.333`
+    - `k=32`: omitted mass `0.0555`, `query_acc=0.333`
+    - `k=64`: omitted mass `0.0302`, `query_acc=0.333`
+    - `k=128`: omitted mass `0.0143`, `query_acc=0.667`
+  - takeaway:
+    - `k=400` was not needed on this benchmark
+    - useful dynamic budgets are much closer to `64-128`
+- Implemented `RETRIEVALATTN_DYNAMIC_BUDGET_MODE=traversal_cuda`
+  - instead of traversing to a fixed candidate pool and post-trimming later, the fullgpu kernel now tracks an adaptive omitted-mass estimate during traversal
+  - kernel receives attention-space queries / keys and per-query static `logZ`
+  - kernel returns adaptive keep count and mass bound directly
+- First traversal-time validation:
+  - `45539711`
+  - end-to-end run succeeded with:
+    - `query_acc=1.0`
+    - `format_acc=1.0`
+  - but the traversal-time bound is still much too loose:
+    - `avg_adaptive_keep_count≈73.9`
+    - `avg_omitted_dynamic_mass≈0.0945`
+    - `avg_adaptive_mass_bound≈0.999`
+  - takeaway:
+    - traversal-time adaptive plumbing works
+    - current unseen-score upper bound is still too conservative for useful early stopping
 
 ## 2026-03-12 update (online decode graph smoke results + automation)
 - Generated-memory benchmark is now correct and two-phase:

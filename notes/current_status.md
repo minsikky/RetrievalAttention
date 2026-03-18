@@ -248,6 +248,57 @@
   - interpretation:
     - the speed refactor is directionally useful
     - but the adaptive selector / metadata path is now inconsistent again, so this code path is not ready for real evaluation yet
+- Fixed the scary adaptive regression diagnosis:
+  - the large `avg_omitted_dynamic_mass=0.4100` result was caused by an oracle-compare indexing bug
+  - the dense compare path was treating the static bank as prefix-only, but fullgpu decode uses `prefix + suffix` static memory
+  - after fixing the offset, the same tiny adaptive run became sane again:
+    - `45498084`
+    - `avg_adaptive_keep_count=16.0`
+    - `avg_adaptive_mass_bound=0.00425`
+    - `avg_omitted_dynamic_mass=0.00425`
+    - `bound_violation_rate=0.0`
+- Switched the generated-memory benchmark defaults to a benchmark-specific static split:
+  - `RETRIEVALATTN_STATIC_PATTERN_START=16`
+  - `RETRIEVALATTN_STATIC_PATTERN_END=32`
+  - motivation:
+    - the old `128/512` defaults forced artificial filler padding (`ledger_prompt_tokens≈756`)
+    - `16/32` is a better fit for this fixed-template benchmark
+- Fixed-budget oracle calibration on the new `16/32` setup:
+  - `e48`
+    - `k=16`: omitted mass `0.1547`, `query_acc=0.667`
+    - `k=32`: omitted mass `0.0549`, `query_acc=0.667`
+    - `k=64`: omitted mass `0.0253`, `query_acc=1.0`
+    - `k=128`: omitted mass `0.0119`, `query_acc=1.0`
+  - `e96`
+    - `k=16`: omitted mass `0.1839`, `query_acc=0.333`
+    - `k=32`: omitted mass `0.0555`, `query_acc=0.333`
+    - `k=64`: omitted mass `0.0302`, `query_acc=0.333`
+    - `k=128`: omitted mass `0.0143`, `query_acc=0.667`
+  - interpretation:
+    - for this benchmark and static split, useful dynamic budgets are in the `64-128` range
+    - earlier adaptive saturation at `400` was overly conservative
+- Implemented the first real traversal-time adaptive mode:
+  - env:
+    - `RETRIEVALATTN_DYNAMIC_BUDGET_MODE=traversal_cuda`
+  - fullgpu kernel now receives:
+    - attention-space query vectors
+    - attention-space key tensor
+    - per-query static `logZ`
+    - unseen-score upper bound
+  - kernel returns adaptive keep counts and mass bounds directly
+- First traversal-time validation:
+  - `45539711` / `generated_memory_eval_result/online_traversal_cuda_e12_compare_v2`
+  - it runs end-to-end and keeps correctness:
+    - `query_acc=1.0`
+    - `format_acc=1.0`
+  - but the traversal-time bound is still too loose:
+    - `avg_adaptive_keep_count≈73.9`
+    - `avg_omitted_dynamic_mass≈0.0945`
+    - `avg_adaptive_mass_bound≈0.999`
+  - stop was still dominated by normal traversal termination, not adaptive early stopping
+  - interpretation:
+    - the new mode is mechanically working
+    - the current unseen-score upper bound is far too conservative to make traversal stop early
 
 ## 2026-03-12 update (online decode graph experiment + app-server steering)
 - Current focus is no longer only the 40k decode AB kernel benchmark.
