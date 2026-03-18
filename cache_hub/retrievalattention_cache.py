@@ -6046,6 +6046,7 @@ class retrievalattention_cache(KV_Cache):
         adaptive_mass_bounds_t: torch.Tensor = None,
         adaptive_upper_scores_t: torch.Tensor = None,
         adaptive_candidate_counts_t: torch.Tensor = None,
+        adaptive_dynamic_span: int = None,
     ):
         if not self.oracle_compare_enable:
             return
@@ -6057,8 +6058,8 @@ class retrievalattention_cache(KV_Cache):
         device = q_batch_t.device
         total_tokens = int(self._decode_token_limit())
         prefix_len = min(int(self.dynamic_start), int(total_tokens))
-        suffix_start = min(max(int(self.dynamic_start), int(self.dynamic_end)), int(total_tokens))
         scale = 1.0 / math.sqrt(self.head_dim)
+        static_len = int(static_k.shape[0])
         for idx, hdx in enumerate(head_ids):
             dense_scores_static = torch.matmul(q_batch_t[idx:idx + 1], static_k.transpose(0, 1)) * scale
             dense_scores_dyn = torch.matmul(q_batch_t[idx:idx + 1], self._get_decode_attn_key_tensor_cuda(layer_idx, kv_hdx)[self.dynamic_start:self.dynamic_end].transpose(0, 1)) * scale
@@ -6076,7 +6077,7 @@ class retrievalattention_cache(KV_Cache):
                     valid_mask = (dyn_ids_row >= int(self.dynamic_start)) & (dyn_ids_row < int(self.dynamic_end))
                     valid_ids_t = dyn_ids_row[valid_mask].to(torch.long)
                     if int(valid_ids_t.numel()) > 0:
-                        pos_t = (valid_ids_t - int(self.dynamic_start) + prefix_len).to(torch.long)
+                        pos_t = (valid_ids_t - int(self.dynamic_start) + static_len).to(torch.long)
                         mass_t = dense_attn.index_select(0, pos_t)
                         oracle_dyn_mass = float(mass_t.sum().item())
                         valid_ids_cpu = valid_ids_t.detach().cpu().tolist()
@@ -6100,7 +6101,7 @@ class retrievalattention_cache(KV_Cache):
                         tok = int(tok)
                         if tok < int(self.dynamic_start) or tok >= int(self.dynamic_end):
                             continue
-                        pos = prefix_len + (tok - int(self.dynamic_start))
+                        pos = static_len + (tok - int(self.dynamic_start))
                         mass = float(dense_attn[pos].item())
                         oracle_dyn_mass += mass
                         oracle_dense_masses.append((tok, mass))
@@ -6108,7 +6109,7 @@ class retrievalattention_cache(KV_Cache):
             sparse_v_cat = torch.cat([static_v, dyn_v[idx]], dim=0)
             dense_out = torch.matmul(dense_attn.unsqueeze(0).to(dense_v_cat.dtype), dense_v_cat).squeeze(0)
             sparse_out = torch.matmul(sparse_attn.unsqueeze(0).to(sparse_v_cat.dtype), sparse_v_cat).squeeze(0)
-            total_dynamic_mass = float(dense_attn[prefix_len:].sum().item()) if dense_attn.numel() > prefix_len else 0.0
+            total_dynamic_mass = float(dense_attn[static_len:].sum().item()) if dense_attn.numel() > static_len else 0.0
             omitted_dynamic_mass = max(0.0, total_dynamic_mass - oracle_dyn_mass)
             adaptive_mass_bound = (
                 float(adaptive_mass_bounds_t[idx].item())
@@ -6130,6 +6131,11 @@ class retrievalattention_cache(KV_Cache):
                 if keep_counts_t is not None
                 else int(payloads[idx].get("adaptive_keep_count", len(dyn_ids)))
             )
+            adaptive_dynamic_span_i = (
+                int(adaptive_dynamic_span)
+                if adaptive_dynamic_span is not None
+                else int(payloads[idx].get("adaptive_dynamic_span", 0))
+            )
             self.oracle_compare_records.append(
                 {
                     "step": int(answer_step),
@@ -6146,7 +6152,7 @@ class retrievalattention_cache(KV_Cache):
                     "top_oracle_dense_mass": oracle_dense_masses[:8],
                     "adaptive_mass_bound": float(adaptive_mass_bound),
                     "adaptive_upper_score_bound": float(adaptive_upper_score_bound),
-                    "adaptive_dynamic_span": int(payloads[idx].get("adaptive_dynamic_span", 0)),
+                    "adaptive_dynamic_span": int(adaptive_dynamic_span_i),
                     "adaptive_candidate_count": int(adaptive_candidate_count),
                     "adaptive_keep_count": int(adaptive_keep_count),
                 }
@@ -6586,6 +6592,7 @@ class retrievalattention_cache(KV_Cache):
             adaptive_mass_bounds_t=(budget_meta["mass_bounds_t"] if budget_meta is not None else None),
             adaptive_upper_scores_t=(budget_meta["upper_scores_t"] if budget_meta is not None else None),
             adaptive_candidate_counts_t=(budget_meta["candidate_counts_t"] if budget_meta is not None else None),
+            adaptive_dynamic_span=(budget_meta["dynamic_span"] if budget_meta is not None else None),
         )
 
         if self.decode_profile:
