@@ -300,6 +300,12 @@
   - takeaway:
     - traversal-time adaptive plumbing works
     - current unseen-score upper bound is still too conservative for useful early stopping
+- Next implementation direction:
+  - do not add context-length-scaling metadata such as token-to-bucket summaries
+  - instead, try a prior-based unseen-tail estimate from constant-size attention-key moments
+  - maintain per-`(layer, kv_head)` dynamic-region sums / squared sums of attention-key coordinates
+  - combine those with the current attention query to estimate unseen score mean / second moment online during traversal
+  - replace the current worst-case `upper_score + log(unseen_count)` term with that moment-based unseen `logZ` estimate
 
 ## 2026-03-12 update (online decode graph smoke results + automation)
 - Generated-memory benchmark is now correct and two-phase:

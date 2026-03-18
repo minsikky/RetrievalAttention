@@ -299,6 +299,12 @@
   - interpretation:
     - the new mode is mechanically working
     - the current unseen-score upper bound is far too conservative to make traversal stop early
+  - next bound direction:
+    - keep the omitted-mass stopping objective
+    - replace the current worst-case global `||q|| max||k||` unseen-score bound with a moment-based unseen-tail estimate
+    - use constant-size per-`(layer, kv_head)` attention-key moment summaries over the dynamic region
+    - derive per-query unseen score mean / second moment online from those summaries plus the current query
+    - goal: get a much tighter traversal-time unseen estimate without storing metadata that scales with context length
 
 ## 2026-03-12 update (online decode graph experiment + app-server steering)
 - Current focus is no longer only the 40k decode AB kernel benchmark.

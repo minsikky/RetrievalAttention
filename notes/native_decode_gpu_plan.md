@@ -200,6 +200,10 @@
   - conclusion:
     - traversal-time adaptive plumbing is working
     - the remaining blocker is the looseness of the unseen-score upper bound, not host overhead anymore
+- Next experiment:
+  - add a moment-prior unseen-tail estimator that uses constant-size attention-key summaries
+  - keep the same omitted-mass stopping objective and traversal-time kernel plumbing
+  - validate on small compare-on runs before any longer sweep
 
 ## 2026-03-12 update (online decode graph plan extension)
 - The custom full-GPU decode backend is now being used for online decode update experiments, not just the original 40k decode AB kernel benchmark.
