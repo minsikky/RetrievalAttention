@@ -380,6 +380,17 @@ class retrievalattention_cache(KV_Cache):
         except Exception:
             self.dynamic_budget_prior_var_scale = 1.0
         self.dynamic_budget_prior_var_scale = max(0.0, float(self.dynamic_budget_prior_var_scale))
+        self.dynamic_budget_binding = os.environ.get("RETRIEVALATTN_DYNAMIC_BUDGET_BINDING", "1") == "1"
+        self.dynamic_budget_global_reseed = os.environ.get(
+            "RETRIEVALATTN_DYNAMIC_BUDGET_GLOBAL_RESEED", "1"
+        ) == "1"
+        try:
+            self.dynamic_budget_retry_max = int(
+                os.environ.get("RETRIEVALATTN_DYNAMIC_BUDGET_RETRY_MAX", "0")
+            )
+        except Exception:
+            self.dynamic_budget_retry_max = 0
+        self.dynamic_budget_retry_max = max(0, int(self.dynamic_budget_retry_max))
         self.dynamic_tail_enable = os.environ.get("RETRIEVALATTN_DYNAMIC_TAIL_ENABLE", "0") == "1"
         self.dynamic_tail_mode = os.environ.get(
             "RETRIEVALATTN_DYNAMIC_TAIL_MODE",
@@ -492,6 +503,24 @@ class retrievalattention_cache(KV_Cache):
             self.stop_margin = float(os.environ.get("RETRIEVALATTN_STOP_MARGIN", "0.0"))
         except Exception:
             self.stop_margin = 0.0
+        self.stop_margin = max(0.0, self.stop_margin)
+        try:
+            self.dynamic_budget_binding_max_visits = int(
+                os.environ.get(
+                    "RETRIEVALATTN_DYNAMIC_BUDGET_BINDING_MAX_VISITS",
+                    str(max(int(self.max_visits), int(self.max_visits) * 8)),
+                )
+            )
+        except Exception:
+            self.dynamic_budget_binding_max_visits = max(int(self.max_visits), int(self.max_visits) * 8)
+        self.dynamic_budget_binding_max_visits = max(int(self.max_visits), int(self.dynamic_budget_binding_max_visits))
+        try:
+            self.dynamic_budget_exact_tile = int(
+                os.environ.get("RETRIEVALATTN_DYNAMIC_BUDGET_EXACT_TILE", "65536")
+            )
+        except Exception:
+            self.dynamic_budget_exact_tile = 65536
+        self.dynamic_budget_exact_tile = max(1024, int(self.dynamic_budget_exact_tile))
         try:
             self.frontier_topn = int(os.environ.get("RETRIEVALATTN_FRONTIER_TOPN", "0"))
         except Exception:
@@ -820,8 +849,248 @@ class retrievalattention_cache(KV_Cache):
 
     def _effective_dynamic_budget_cap(self) -> int:
         if self.dynamic_budget_enable:
-            return min(512, int(self.dynamic_budget_max))
-        return min(512, int(self.token_budget))
+            return max(1, int(self.dynamic_budget_max))
+        return max(1, int(self.token_budget))
+
+    def _build_fullgpu_global_reseed(
+        self,
+        queries_seed: torch.Tensor,
+        key_score_t: torch.Tensor,
+        dyn_start: int,
+        dyn_end: int,
+        existing_ids_t: torch.Tensor,
+        seed_width: int,
+    ):
+        dyn_len = max(0, int(dyn_end) - int(dyn_start))
+        q_count = int(queries_seed.shape[0])
+        seed_width = max(1, int(seed_width))
+        device = queries_seed.device
+        reseed_ids_t = torch.full((q_count, seed_width), -1, dtype=torch.int32, device=device)
+        reseed_counts_t = torch.zeros((q_count,), dtype=torch.int32, device=device)
+        if dyn_len <= 0:
+            return reseed_ids_t, reseed_counts_t
+
+        dyn_keys_t = key_score_t[int(dyn_start):int(dyn_end), :]
+        score_t = torch.matmul(queries_seed, dyn_keys_t.transpose(0, 1))
+        if existing_ids_t is not None and int(existing_ids_t.numel()) > 0:
+            existing_pos_t = existing_ids_t.to(torch.long) - int(dyn_start)
+            valid_existing_t = (existing_pos_t >= 0) & (existing_pos_t < dyn_len)
+            masked_pos_t = existing_pos_t.masked_fill(~valid_existing_t, 0)
+            score_t = score_t.scatter(
+                1,
+                masked_pos_t,
+                torch.full_like(masked_pos_t, float("-inf"), dtype=score_t.dtype),
+            )
+
+        take = min(seed_width, dyn_len)
+        if take <= 0:
+            return reseed_ids_t, reseed_counts_t
+
+        # Use one high-score anchor per span segment instead of global top-k.
+        # This keeps retries coverage-oriented when the current frontier is exhausted.
+        segment_count = max(1, take)
+        segment_size = max(1, int(math.ceil(float(dyn_len) / float(segment_count))))
+        seg_vals = []
+        seg_pos = []
+        for seg_start in range(0, dyn_len, segment_size):
+            seg_end = min(dyn_len, seg_start + segment_size)
+            if seg_end <= seg_start:
+                continue
+            local_vals_t, local_pos_t = torch.max(score_t[:, seg_start:seg_end], dim=1)
+            seg_vals.append(local_vals_t)
+            seg_pos.append(local_pos_t + int(seg_start))
+
+        if not seg_vals:
+            return reseed_ids_t, reseed_counts_t
+
+        winner_vals_t = torch.stack(seg_vals, dim=1)
+        winner_pos_t = torch.stack(seg_pos, dim=1)
+        order_t = torch.argsort(winner_vals_t, dim=1, descending=True)
+        winner_vals_t = torch.gather(winner_vals_t, 1, order_t)
+        winner_pos_t = torch.gather(winner_pos_t, 1, order_t)
+        take = min(take, int(winner_pos_t.shape[1]))
+        valid_t = torch.isfinite(winner_vals_t[:, :take])
+        reseed_ids_t[:, :take] = (winner_pos_t[:, :take].to(torch.int32) + int(dyn_start))
+        reseed_ids_t[:, :take] = reseed_ids_t[:, :take].masked_fill(~valid_t, -1)
+        reseed_counts_t = valid_t.sum(dim=1, dtype=torch.int32)
+        return reseed_ids_t, reseed_counts_t
+
+    def _merge_fullgpu_seed_sets(
+        self,
+        base_ids_t: torch.Tensor,
+        base_counts_t: torch.Tensor,
+        extra_ids_t: torch.Tensor,
+        extra_counts_t: torch.Tensor,
+        seed_width: int,
+    ):
+        seed_width = max(1, int(seed_width))
+        device = base_ids_t.device
+        merged_ids_t = torch.full((int(base_ids_t.shape[0]), seed_width), -1, dtype=torch.int32, device=device)
+        merged_counts_t = torch.zeros((int(base_ids_t.shape[0]),), dtype=torch.int32, device=device)
+        base_ids_cpu = base_ids_t.detach().cpu()
+        base_counts_cpu = base_counts_t.detach().cpu()
+        extra_ids_cpu = extra_ids_t.detach().cpu()
+        extra_counts_cpu = extra_counts_t.detach().cpu()
+        merged_ids_cpu = merged_ids_t.detach().cpu()
+        merged_counts_cpu = merged_counts_t.detach().cpu()
+
+        for row_idx in range(int(base_ids_t.shape[0])):
+            seen = set()
+            merged = []
+            base_take = min(seed_width, max(0, int(base_counts_cpu[row_idx].item())))
+            extra_take = min(seed_width, max(0, int(extra_counts_cpu[row_idx].item())))
+            for tok in base_ids_cpu[row_idx, :base_take].tolist():
+                tok = int(tok)
+                if tok < 0 or tok in seen:
+                    continue
+                seen.add(tok)
+                merged.append(tok)
+                if len(merged) >= seed_width:
+                    break
+            if len(merged) < seed_width:
+                for tok in extra_ids_cpu[row_idx, :extra_take].tolist():
+                    tok = int(tok)
+                    if tok < 0 or tok in seen:
+                        continue
+                    seen.add(tok)
+                    merged.append(tok)
+                    if len(merged) >= seed_width:
+                        break
+            if merged:
+                merged_ids_cpu[row_idx, :len(merged)] = torch.as_tensor(merged, dtype=torch.int32)
+            merged_counts_cpu[row_idx] = int(len(merged))
+
+        merged_ids_t = merged_ids_cpu.to(device=device, dtype=torch.int32)
+        merged_counts_t = merged_counts_cpu.to(device=device, dtype=torch.int32)
+        return merged_ids_t, merged_counts_t
+
+    def _fullgpu_exact_cover_until_target(
+        self,
+        queries_attn: torch.Tensor,
+        key_attn_t: torch.Tensor,
+        static_logz_t: torch.Tensor,
+        dyn_start: int,
+        dyn_end: int,
+        seed_prev_k: int,
+    ):
+        q_count = int(queries_attn.shape[0])
+        dyn_len = max(0, int(dyn_end) - int(dyn_start))
+        device = queries_attn.device
+        dim = int(queries_attn.shape[-1])
+
+        if dyn_len <= 0:
+            out_ids_t = torch.full((q_count, 0), -1, dtype=torch.int32, device=device)
+            out_scores_t = torch.empty((q_count, 0), dtype=torch.float32, device=device)
+            out_counts_t = torch.zeros((q_count,), dtype=torch.int32, device=device)
+            out_visited_t = torch.zeros((q_count,), dtype=torch.int32, device=device)
+            out_stop_t = torch.full((q_count,), 6, dtype=torch.int32, device=device)
+            next_prev_ids_t = torch.full((q_count, seed_prev_k), -1, dtype=torch.int32, device=device)
+            next_prev_counts_t = torch.zeros((q_count,), dtype=torch.int32, device=device)
+            out_debug_t = torch.zeros((q_count, 15), dtype=torch.int64, device=device)
+            out_adaptive_keep_t = torch.zeros((q_count,), dtype=torch.int32, device=device)
+            out_adaptive_mass_t = torch.zeros((q_count,), dtype=torch.float32, device=device)
+            return (
+                out_ids_t,
+                out_scores_t,
+                out_counts_t,
+                out_visited_t,
+                out_stop_t,
+                next_prev_ids_t,
+                next_prev_counts_t,
+                out_debug_t,
+                out_adaptive_keep_t,
+                out_adaptive_mass_t,
+            )
+
+        scale = 1.0 / math.sqrt(float(dim))
+        tile = min(int(self.dynamic_budget_exact_tile), dyn_len)
+        all_scores_t = torch.empty((q_count, dyn_len), dtype=torch.float32, device=device)
+        dyn_keys_t = key_attn_t[int(dyn_start):int(dyn_end), :]
+        queries_attn_score_t = queries_attn.to(dtype=dyn_keys_t.dtype)
+        for start in range(0, dyn_len, tile):
+            end = min(dyn_len, start + tile)
+            all_scores_t[:, start:end] = torch.matmul(
+                queries_attn_score_t, dyn_keys_t[start:end, :].transpose(0, 1)
+            ).float() * scale
+
+        sorted_scores_t, sorted_pos_t = torch.sort(all_scores_t, dim=1, descending=True)
+        sorted_ids_t = sorted_pos_t.to(torch.int32) + int(dyn_start)
+
+        prefix_logz_t = torch.logcumsumexp(sorted_scores_t, dim=1)
+        tail_logz_t = torch.full_like(sorted_scores_t, float("-inf"))
+        if dyn_len > 1:
+            suffix_logz_t = torch.logcumsumexp(sorted_scores_t.flip(1), dim=1).flip(1)
+            tail_logz_t[:, :-1] = suffix_logz_t[:, 1:]
+
+        denom_logz_t = torch.logaddexp(prefix_logz_t, tail_logz_t)
+        if static_logz_t is not None:
+            denom_logz_t = torch.logaddexp(
+                denom_logz_t,
+                static_logz_t.to(device=device, dtype=torch.float32).unsqueeze(1).expand_as(denom_logz_t),
+            )
+
+        omitted_t = torch.zeros_like(sorted_scores_t)
+        valid_mass_t = torch.isfinite(tail_logz_t) & torch.isfinite(denom_logz_t)
+        omitted_t[valid_mass_t] = torch.exp(tail_logz_t[valid_mass_t] - denom_logz_t[valid_mass_t])
+
+        min_keep = max(1, min(int(self.dynamic_budget_min), dyn_len))
+        col_idx_t = torch.arange(dyn_len, device=device).unsqueeze(0)
+        meets_target_t = (col_idx_t >= (min_keep - 1)) & (
+            omitted_t <= float(self.dynamic_budget_target_omass)
+        )
+        keep_idx_t = torch.argmax(meets_target_t.to(torch.int32), dim=1)
+        keep_counts_t = (keep_idx_t + 1).to(torch.int32)
+        gather_keep_t = keep_idx_t.to(torch.long).unsqueeze(1)
+        mass_bounds_t = omitted_t.gather(1, gather_keep_t).squeeze(1).to(torch.float32)
+
+        max_keep = int(keep_counts_t.max().item()) if q_count > 0 else 0
+        max_keep = max(0, min(max_keep, dyn_len))
+        if max_keep > 0:
+            out_ids_t = sorted_ids_t[:, :max_keep].contiguous()
+            out_scores_t = sorted_scores_t[:, :max_keep].contiguous()
+            keep_mask_t = torch.arange(max_keep, device=device).unsqueeze(0) < keep_counts_t.to(torch.long).unsqueeze(1)
+            out_ids_t = out_ids_t.masked_fill(~keep_mask_t, -1)
+            out_scores_t = out_scores_t.masked_fill(~keep_mask_t, float("-inf"))
+        else:
+            out_ids_t = torch.full((q_count, 0), -1, dtype=torch.int32, device=device)
+            out_scores_t = torch.empty((q_count, 0), dtype=torch.float32, device=device)
+
+        out_counts_t = keep_counts_t.contiguous()
+        out_visited_t = torch.full((q_count,), dyn_len, dtype=torch.int32, device=device)
+        out_stop_t = torch.full((q_count,), 6, dtype=torch.int32, device=device)
+        out_debug_t = torch.zeros((q_count, 15), dtype=torch.int64, device=device)
+        out_debug_t[:, 0] = int(dyn_len)
+        out_debug_t[:, 1] = 1
+        out_debug_t[:, 2] = 0
+        out_debug_t[:, 3] = 0
+        out_debug_t[:, 9] = int(dyn_len)
+        out_debug_t[:, 11] = int(dyn_len)
+        out_adaptive_keep_t = keep_counts_t.contiguous()
+        out_adaptive_mass_t = mass_bounds_t.contiguous()
+
+        next_prev_ids_t = torch.full((q_count, seed_prev_k), -1, dtype=torch.int32, device=device)
+        next_prev_counts_t = torch.minimum(
+            keep_counts_t,
+            torch.full_like(keep_counts_t, int(seed_prev_k)),
+        )
+        seed_take = min(int(seed_prev_k), max_keep)
+        if seed_take > 0:
+            next_prev_ids_t[:, :seed_take] = sorted_ids_t[:, :seed_take]
+            prev_mask_t = torch.arange(seed_take, device=device).unsqueeze(0) < next_prev_counts_t.to(torch.long).unsqueeze(1)
+            next_prev_ids_t[:, :seed_take] = next_prev_ids_t[:, :seed_take].masked_fill(~prev_mask_t, -1)
+
+        return (
+            out_ids_t,
+            out_scores_t,
+            out_counts_t,
+            out_visited_t,
+            out_stop_t,
+            next_prev_ids_t,
+            next_prev_counts_t,
+            out_debug_t,
+            out_adaptive_keep_t,
+            out_adaptive_mass_t,
+        )
 
     def _rebuild_static_index_set(self, total_tokens: int):
         total_tokens = max(0, int(total_tokens))
@@ -4646,6 +4915,7 @@ class retrievalattention_cache(KV_Cache):
             3: "stability_gap",
             4: "empty_init",
             5: "adaptive_bound",
+            6: "adaptive_exact_cover",
         }
         return mapping.get(int(code), f"code_{int(code)}")
 
@@ -4799,6 +5069,7 @@ class retrievalattention_cache(KV_Cache):
     def _prepare_decode_seed_state_fullgpu(self, ldx: int, hdx: int, query_group):
         total_start, profile = self._make_decode_retrieve_profile()
         kv_hdx = self._retrieval_head_to_kv_head(hdx)
+        token_limit = int(self._decode_token_limit())
         graph = self.graphs[ldx][kv_hdx]
         graph_is_csr = isinstance(graph, tuple) and len(graph) >= 2
         if not graph_is_csr:
@@ -4829,11 +5100,11 @@ class retrievalattention_cache(KV_Cache):
         budget_cap = int(self._effective_dynamic_budget_cap())
         candidate_target = budget_cap * self.candidate_multiplier
         candidate_target = max(budget_cap, candidate_target)
-        candidate_target = min(candidate_target, self.input_length, 512)
+        candidate_target = min(candidate_target, token_limit)
         seed_floor = int(math.ceil(budget_cap * self.seed_ratio))
         seed_floor = min(budget_cap, max(0, seed_floor))
         seed_k = max(self.q_knn, self.q_knn * self.seed_k_mult)
-        seed_k = min(self.input_length, seed_k)
+        seed_k = min(token_limit, seed_k)
         if profile is not None:
             profile["seed_sec"] += 0.0
         return {
@@ -4854,6 +5125,7 @@ class retrievalattention_cache(KV_Cache):
     def _prepare_decode_seed_state(self, ldx, hdx, query_group, defer_seed_scoring: bool = False):
         total_start, profile = self._make_decode_retrieve_profile()
         kv_hdx = self._retrieval_head_to_kv_head(hdx)
+        token_limit = int(self._decode_token_limit())
         index = self.indexes[ldx][kv_hdx]
         graph = self.graphs[ldx][kv_hdx]
         graph_is_csr = isinstance(graph, tuple) and len(graph) >= 2
@@ -4883,7 +5155,7 @@ class retrievalattention_cache(KV_Cache):
         q_rank_cuda = self._score_transform_torch(q_group.to(device, non_blocking=True).float())
         seed_scores = {}
         seed_k = max(self.q_knn, self.q_knn * self.seed_k_mult)
-        seed_k = min(self.input_length, seed_k)
+        seed_k = min(token_limit, seed_k)
         if seed_k <= 0:
             if profile is not None:
                 profile["seed_sec"] += time.perf_counter() - seed_start
@@ -4917,7 +5189,7 @@ class retrievalattention_cache(KV_Cache):
                         "Set RETRIEVALATTN_DECODE_INDEX=faiss for stable quality."
                     )
                     self._fallback_seed_warned = True
-                k = self.cpu_keys[ldx][kv_hdx, :self.input_length, :].detach().float().cpu()
+                k = self.cpu_keys[ldx][kv_hdx, :token_limit, :].detach().float().cpu()
                 k = self._score_transform_torch(k)
                 scores = torch.matmul(q_seed_cpu, k.transpose(0, 1))
                 k_take = min(seed_k, scores.shape[1])
@@ -4965,7 +5237,7 @@ class retrievalattention_cache(KV_Cache):
             filtered_seen = set()
             for tok in seed_candidates:
                 tok = int(tok)
-                if tok < 0 or tok >= self.input_length:
+                if tok < 0 or tok >= token_limit:
                     continue
                 if tok in static_indices or tok in filtered_seen:
                     continue
@@ -5003,7 +5275,7 @@ class retrievalattention_cache(KV_Cache):
                 profile["seed_sec"] += time.perf_counter() - seed_start
             candidate_target = self.token_budget * self.candidate_multiplier
             candidate_target = max(self.token_budget, candidate_target)
-            candidate_target = min(candidate_target, self.input_length)
+            candidate_target = min(candidate_target, token_limit)
             if not seed_candidate_ids:
                 if profile is not None:
                     self._finish_decode_retrieve_profile(total_start, profile, "empty_seed_ranked", 0, 0)
@@ -5066,7 +5338,7 @@ class retrievalattention_cache(KV_Cache):
 
         candidate_target = self.token_budget * self.candidate_multiplier
         candidate_target = max(self.token_budget, candidate_target)
-        candidate_target = min(candidate_target, self.input_length)
+        candidate_target = min(candidate_target, token_limit)
 
         init_candidates = []
         init_scores = []
@@ -5810,9 +6082,23 @@ class retrievalattention_cache(KV_Cache):
         hub_ids_t = hub_seed_ids[kv_hdx]
 
         device = queries_seed.device
-        kernel_token_budget = int(self.token_budget)
-        if self.dynamic_budget_enable and self.dynamic_budget_mode == "traversal_cuda":
-            kernel_token_budget = min(128, int(self.dynamic_budget_max))
+        base_kernel_token_budget = int(self.token_budget)
+        adaptive_traversal_enable = bool(self.dynamic_budget_enable and self.dynamic_budget_mode == "traversal_cuda")
+        adaptive_binding_enable = bool(adaptive_traversal_enable and self.dynamic_budget_binding)
+        candidate_target_cur = int(active_states[0]["candidate_target"])
+        beam_width_cur = int(self.expand_width)
+        max_visits_cur = int(self.max_visits)
+        graph_elapsed_total = 0.0
+        graph_elapsed_last = 0.0
+        adaptive_retry_count = 0
+        adaptive_target_met = not adaptive_binding_enable
+        adaptive_binding_exhausted = False
+        out_ids_t = out_scores_t = out_counts_t = out_visited_t = out_stop_t = None
+        next_prev_ids_t = next_prev_counts_t = out_debug_t = None
+        out_adaptive_keep_t = out_adaptive_mass_t = None
+        hard_candidate_cap = max(1, int(self.dynamic_end - self.dynamic_start))
+        exact_cover_elapsed_total = 0.0
+
         if self.decode_profile and self.fullgpu_profile_sync:
             torch.cuda.synchronize(device)
         graph_start = time.perf_counter()
@@ -5844,12 +6130,14 @@ class retrievalattention_cache(KV_Cache):
             prev_seed_ids=prev_ids_t,
             prev_seed_counts=prev_counts_t,
             hub_seed_ids=hub_ids_t,
-            token_budget=int(kernel_token_budget),
-            candidate_target=int(active_states[0]["candidate_target"]),
-            beam_width=int(self.expand_width),
+            token_budget=int(
+                candidate_target_cur if adaptive_traversal_enable else base_kernel_token_budget
+            ),
+            candidate_target=int(candidate_target_cur),
+            beam_width=int(beam_width_cur),
             max_degree=int(graph_max_degree),
             min_visits=int(self.min_visits),
-            max_visits=int(self.max_visits),
+            max_visits=int(max_visits_cur),
             stop_patience=int(self.stop_patience),
             stop_margin=float(self.stop_margin),
             dynamic_start=int(self.dynamic_start),
@@ -5858,7 +6146,7 @@ class retrievalattention_cache(KV_Cache):
             seed_floor=int(active_states[0]["seed_floor"]),
             seed_tail_k=int(self.seed_tail_k),
             seed_prev_k=int(self.seed_prev_k),
-            adaptive_enable=bool(self.dynamic_budget_enable and self.dynamic_budget_mode == "traversal_cuda"),
+            adaptive_enable=adaptive_traversal_enable,
             adaptive_min_keep=int(self.dynamic_budget_min),
             adaptive_target_omass=float(self.dynamic_budget_target_omass),
             adaptive_prior_mode=str(self.dynamic_budget_prior),
@@ -5867,8 +6155,81 @@ class retrievalattention_cache(KV_Cache):
         )
         if self.decode_profile and self.fullgpu_profile_sync:
             torch.cuda.synchronize(device)
-        graph_elapsed = time.perf_counter() - graph_start
-        per_graph_sec = graph_elapsed / float(max(1, q_count))
+        graph_elapsed_last = (time.perf_counter() - graph_start)
+        graph_elapsed_total += graph_elapsed_last
+
+        if adaptive_binding_enable:
+            out_counts_retry = out_counts_t.detach().cpu()
+            out_adaptive_mass_retry = out_adaptive_mass_t.detach().cpu()
+            unmet_rows = []
+            for i in range(q_count):
+                count_i = int(out_counts_retry[i].item())
+                if count_i <= 0 or float(out_adaptive_mass_retry[i].item()) > float(self.dynamic_budget_target_omass):
+                    unmet_rows.append(i)
+            if unmet_rows:
+                if self.decode_profile and self.fullgpu_profile_sync:
+                    torch.cuda.synchronize(device)
+                exact_cover_start = time.perf_counter()
+                unmet_idx_t = torch.as_tensor(unmet_rows, dtype=torch.long, device=device)
+                exact_static_logz_t = (
+                    torch.index_select(static_logz_t, 0, unmet_idx_t)
+                    if static_logz_t is not None else None
+                )
+                (
+                    exact_ids_t,
+                    exact_scores_t,
+                    exact_counts_t,
+                    exact_visited_t,
+                    exact_stop_t,
+                    exact_next_prev_ids_t,
+                    exact_next_prev_counts_t,
+                    exact_debug_t,
+                    exact_adaptive_keep_t,
+                    exact_adaptive_mass_t,
+                ) = self._fullgpu_exact_cover_until_target(
+                    queries_attn=torch.index_select(queries_attn, 0, unmet_idx_t),
+                    key_attn_t=key_attn_t,
+                    static_logz_t=exact_static_logz_t,
+                    dyn_start=int(self.dynamic_start),
+                    dyn_end=int(self.dynamic_end),
+                    seed_prev_k=int(self.seed_prev_k),
+                )
+                final_width = max(int(out_ids_t.shape[1]), int(exact_ids_t.shape[1]))
+                merged_ids_t = torch.full((q_count, final_width), -1, dtype=out_ids_t.dtype, device=device)
+                merged_scores_t = torch.full((q_count, final_width), float('-inf'), dtype=out_scores_t.dtype, device=device)
+                if int(out_ids_t.shape[1]) > 0:
+                    merged_ids_t[:, :int(out_ids_t.shape[1])] = out_ids_t
+                    merged_scores_t[:, :int(out_scores_t.shape[1])] = out_scores_t
+                if int(exact_ids_t.shape[1]) > 0:
+                    merged_ids_t.index_copy_(0, unmet_idx_t, torch.nn.functional.pad(exact_ids_t, (0, final_width - int(exact_ids_t.shape[1])), value=-1))
+                    merged_scores_t.index_copy_(0, unmet_idx_t, torch.nn.functional.pad(exact_scores_t, (0, final_width - int(exact_scores_t.shape[1])), value=float('-inf')))
+                out_ids_t = merged_ids_t
+                out_scores_t = merged_scores_t
+                out_counts_t = out_counts_t.clone()
+                out_counts_t.index_copy_(0, unmet_idx_t, exact_counts_t)
+                out_visited_t = out_visited_t.clone()
+                out_visited_t.index_copy_(0, unmet_idx_t, exact_visited_t)
+                out_stop_t = out_stop_t.clone()
+                out_stop_t.index_copy_(0, unmet_idx_t, exact_stop_t)
+                next_prev_ids_t = next_prev_ids_t.clone()
+                next_prev_ids_t.index_copy_(0, unmet_idx_t, exact_next_prev_ids_t)
+                next_prev_counts_t = next_prev_counts_t.clone()
+                next_prev_counts_t.index_copy_(0, unmet_idx_t, exact_next_prev_counts_t)
+                out_debug_t = out_debug_t.clone()
+                out_debug_t.index_copy_(0, unmet_idx_t, exact_debug_t)
+                out_adaptive_keep_t = out_adaptive_keep_t.clone()
+                out_adaptive_keep_t.index_copy_(0, unmet_idx_t, exact_adaptive_keep_t)
+                out_adaptive_mass_t = out_adaptive_mass_t.clone()
+                out_adaptive_mass_t.index_copy_(0, unmet_idx_t, exact_adaptive_mass_t)
+                if self.decode_profile and self.fullgpu_profile_sync:
+                    torch.cuda.synchronize(device)
+                exact_cover_elapsed_total = (time.perf_counter() - exact_cover_start)
+            adaptive_target_met = True
+        else:
+            adaptive_target_met = True
+
+        per_graph_sec = graph_elapsed_total / float(max(1, q_count))
+        per_exact_cover_sec = exact_cover_elapsed_total / float(max(1, q_count))
 
         if update_decode_state:
             self._decode_cuda_prev_seed_ids[ldx].index_copy_(0, head_indices_t, next_prev_ids_t)
@@ -5888,7 +6249,7 @@ class retrievalattention_cache(KV_Cache):
             layer_idx=ldx,
             kv_hdx=kv_hdx,
             out_debug=out_debug,
-            graph_elapsed=graph_elapsed,
+            graph_elapsed=graph_elapsed_last,
         )
 
         for i, state in enumerate(active_states):
@@ -5923,6 +6284,7 @@ class retrievalattention_cache(KV_Cache):
             profile = state["profile"]
             if profile is not None:
                 profile["graph_sec"] += per_graph_sec
+                profile["finalize_sec"] += per_exact_cover_sec
                 self._finish_decode_retrieve_profile(
                     state["total_start"],
                     profile,
@@ -5957,6 +6319,12 @@ class retrievalattention_cache(KV_Cache):
                         if self.dynamic_budget_prior == "global_norm"
                         else float("nan")
                     )
+                    profile["adaptive_target_met"] = 1 if adaptive_target_met else 0
+                    profile["adaptive_retry_count"] = int(adaptive_retry_count)
+                    profile["adaptive_binding_exhausted"] = 1 if adaptive_binding_exhausted else 0
+                    profile["adaptive_candidate_target_final"] = int(candidate_target_cur)
+                    profile["adaptive_beam_width_final"] = int(beam_width_cur)
+                    profile["adaptive_max_visits_final"] = int(max_visits_cur)
                 profile["online_overlay_edges"] = overlay_edges_i
                 if final_tokens_i:
                     online_generated_hits_i = sum(
@@ -5995,6 +6363,12 @@ class retrievalattention_cache(KV_Cache):
                     "adaptive_dynamic_span": int(max(0, int(self.dynamic_end - self.dynamic_start))),
                     "adaptive_candidate_count": int(cand_raw_i),
                     "adaptive_keep_count": int(final_count_i),
+                    "adaptive_target_met": bool(adaptive_target_met),
+                    "adaptive_retry_count": int(adaptive_retry_count),
+                    "adaptive_binding_exhausted": bool(adaptive_binding_exhausted),
+                    "adaptive_candidate_target_final": int(candidate_target_cur),
+                    "adaptive_beam_width_final": int(beam_width_cur),
+                    "adaptive_max_visits_final": int(max_visits_cur),
                     "kernel_phase_cycles": {
                         "init": init_cycles_i,
                         "score": score_cycles_i,
