@@ -776,6 +776,11 @@ class retrievalattention_cache(KV_Cache):
         self.oracle_debug_records = []
         self.oracle_compare_enable = False
         self.oracle_compare_records = []
+        self.attention_input_debug_enable = False
+        self.attention_input_debug_answer_start_pos = None
+        self.attention_input_debug_layer = int(os.environ.get("RETRIEVALATTN_ATTENTION_INPUT_DEBUG_LAYER", "0"))
+        self.attention_input_debug_head = int(os.environ.get("RETRIEVALATTN_ATTENTION_INPUT_DEBUG_HEAD", "0"))
+        self.attention_input_debug_records = []
         self._decode_cpp_warned = False
         self._decode_cuda_warned = False
         self.fused_prefill_knn = [None for _ in range(self.layer_num)]
@@ -7024,6 +7029,111 @@ class retrievalattention_cache(KV_Cache):
             return prefix_k, prefix_v
         return torch.cat([prefix_k, suffix_k], dim=0), torch.cat([prefix_v, suffix_v], dim=0)
 
+    def _get_fullgpu_static_token_ids(self):
+        total_tokens = int(self._decode_token_limit())
+        if not self.growing_static_suffix:
+            return sorted(int(tok) for tok in self.static_index_set if 0 <= int(tok) < total_tokens)
+        prefix_len = min(int(self.dynamic_start), int(total_tokens))
+        suffix_start = min(max(int(self.dynamic_start), int(self.dynamic_end)), int(total_tokens))
+        return list(range(prefix_len)) + list(range(suffix_start, total_tokens))
+
+    def _maybe_record_attention_input_debug_fullgpu(
+        self,
+        layer_idx: int,
+        kv_hdx: int,
+        head_ids,
+        q_batch_t: torch.Tensor,
+        static_k: torch.Tensor,
+        ids_t: torch.Tensor,
+        mask_t: torch.Tensor,
+        keep_counts_t: torch.Tensor,
+        scores: torch.Tensor,
+        sparse_out_batch: torch.Tensor = None,
+    ):
+        if not self.attention_input_debug_enable:
+            return
+        if self.attention_input_debug_answer_start_pos is None:
+            return
+        answer_step = int(max(0, int(self.decode_pos) - int(self.attention_input_debug_answer_start_pos)))
+        if answer_step != 0:
+            return
+        if int(layer_idx) != int(self.attention_input_debug_layer):
+            return
+        target_head = int(self.attention_input_debug_head)
+        if target_head not in [int(h) for h in head_ids]:
+            return
+        if any(
+            int(r.get("step", -1)) == 0
+            and int(r.get("layer", -1)) == int(layer_idx)
+            and int(r.get("head", -1)) == target_head
+            for r in self.attention_input_debug_records
+        ):
+            return
+        idx = [int(h) for h in head_ids].index(target_head)
+        static_ids = self._get_fullgpu_static_token_ids()
+        keep = int(keep_counts_t[idx].item()) if keep_counts_t is not None else int(mask_t[idx].sum().item())
+        dyn_ids = []
+        if keep > 0:
+            dyn_row = ids_t[idx, :keep]
+            dyn_ids = [
+                int(tok) for tok in dyn_row.detach().cpu().tolist()
+                if int(tok) >= 0
+            ]
+        final_ids = list(static_ids) + list(dyn_ids)
+        top_dense = []
+        try:
+            dyn_start = int(self.dynamic_start)
+            dyn_end = int(self.dynamic_end)
+            dyn_key_t = self._get_decode_attn_key_tensor_cuda(layer_idx, kv_hdx)[dyn_start:dyn_end]
+            token_ids = list(static_ids) + list(range(dyn_start, dyn_end))
+            scale = 1.0 / math.sqrt(float(self.head_dim))
+            static_scores = torch.matmul(q_batch_t[idx:idx + 1].float(), static_k.float().transpose(0, 1)) * scale
+            dyn_scores = torch.matmul(q_batch_t[idx:idx + 1].float(), dyn_key_t.float().transpose(0, 1)) * scale
+            dense_scores = torch.cat([static_scores.float(), dyn_scores.float()], dim=-1).squeeze(0)
+            topk = min(32, int(dense_scores.numel()))
+            if topk > 0:
+                vals_t, pos_t = torch.topk(dense_scores, k=topk)
+                vals = vals_t.detach().cpu().tolist()
+                pos = pos_t.detach().cpu().tolist()
+                top_dense = [
+                    {"token": int(token_ids[int(p)]), "score": float(v)}
+                    for p, v in zip(pos, vals)
+                    if int(p) < len(token_ids)
+                ]
+        except Exception as exc:
+            top_dense = [{"error": str(exc)[:200]}]
+        sparse_out = None
+        sparse_out_norm = None
+        if sparse_out_batch is not None:
+            try:
+                out_t = sparse_out_batch[idx].detach().float().cpu()
+                sparse_out_norm = float(torch.linalg.vector_norm(out_t).item())
+                sparse_out = [float(x) for x in out_t.tolist()]
+            except Exception:
+                sparse_out = None
+                sparse_out_norm = None
+        self.attention_input_debug_records.append(
+            {
+                "step": int(answer_step),
+                "decode_pos": int(self.decode_pos),
+                "layer": int(layer_idx),
+                "kv_head": int(kv_hdx),
+                "head": int(target_head),
+                "dynamic_start": int(self.dynamic_start),
+                "dynamic_end": int(self.dynamic_end),
+                "dynamic_span": int(max(0, int(self.dynamic_end) - int(self.dynamic_start))),
+                "static_count": int(len(static_ids)),
+                "dynamic_count": int(len(dyn_ids)),
+                "final_count": int(len(final_ids)),
+                "static_ids": [int(tok) for tok in static_ids],
+                "dynamic_ids": [int(tok) for tok in dyn_ids],
+                "final_ids": [int(tok) for tok in final_ids],
+                "dense_top_tokens": top_dense,
+                "sparse_out_norm": sparse_out_norm,
+                "sparse_out": sparse_out,
+            }
+        )
+
     def _apply_fullgpu_group_attention(
         self,
         layer_idx: int,
@@ -7119,6 +7229,18 @@ class retrievalattention_cache(KV_Cache):
             budget_meta["keep_counts_t"]
             if budget_meta is not None
             else mask_t.to(dtype=torch.long).sum(dim=1)
+        )
+        self._maybe_record_attention_input_debug_fullgpu(
+            layer_idx=layer_idx,
+            kv_hdx=kv_hdx,
+            head_ids=head_ids,
+            q_batch_t=q_batch_t,
+            static_k=static_k,
+            ids_t=ids_t,
+            mask_t=mask_t,
+            keep_counts_t=keep_counts_t,
+            scores=scores,
+            sparse_out_batch=out_batch,
         )
         self._record_online_graph_query_centroid_fullgpu(
             layer_idx=layer_idx,
