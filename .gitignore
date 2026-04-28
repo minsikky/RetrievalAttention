@@ -1,5 +1,7 @@
 ## Local experiment artifacts
 .venv/
+.hf_pydeps/
+.hf_cache/
 __pycache__/
 *.pyc
 *.swp
@@ -77,6 +79,7 @@ dlldata.c
 
 # Benchmark Results
 BenchmarkDotNet.Artifacts/
+generated_memory_hf_eval_result/
 
 # .NET Core
 project.lock.json
