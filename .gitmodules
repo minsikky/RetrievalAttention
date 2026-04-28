@@ -1,0 +1,8 @@
+[submodule "third_party/RoarGraph"]
+	path = third_party/RoarGraph
+	url = https://github.com/minsikky/RoarGraph.git
+	branch = main
+[submodule "third_party/flash-attn-ra"]
+	path = third_party/flash-attn-ra
+	url = https://github.com/minsikky/flash-attention-weighted.git
+	branch = flash-attn-ra
