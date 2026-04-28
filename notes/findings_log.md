@@ -1,5 +1,45 @@
 # Findings Log
 
+## 2026-04-27 update (Qwen3.5 LongBench v2 reproduction did not match public score)
+- Public reference:
+  - Qwen3.5-9B model card reports `LongBench v2=55.2` and `AA-LCR=63.0`
+- Implemented a local reproduction path:
+  - HF-native evaluator: `benchmark/longbench_v2_hf_eval.py`
+  - Slurm wrapper: `benchmark/run_longbench_v2_hf.sh`
+  - dataset: `THUDM/LongBench-v2`
+  - parse rule: exact A/B/C/D answer extraction
+- Main result:
+  - job `48800874`
+  - output `longbench_v2_hf_result/qwen35_9b_all503_direct_temp01_64k_v1`
+  - `503` examples
+  - `accuracy=27.63%`
+  - `max_input_tokens=65536`
+  - `321 / 503` examples truncated
+  - average prompt length before truncation: `268,724.5` tokens
+  - average prompt length after truncation: `53,212.5` tokens
+  - elapsed `03:33:45`
+- Accuracy breakdown from the completed run:
+  - length: short `38.89%`, medium `22.79%`, long `18.52%`
+  - domain:
+    - Code Repository Understanding `34.00%`
+    - Long In-context Learning `30.86%`
+    - Long Structured Data Understanding `6.06%`
+    - Long-dialogue History Understanding `10.26%`
+    - Multi-Document QA `31.20%`
+    - Single-Document QA `29.71%`
+- Supporting subset results:
+  - 16 short examples at 120k cap, direct deterministic: `31.25%`
+  - all 180 short examples at 64k cap, direct temperature `0.1`: `38.89%`
+  - 16 short examples with thinking enabled: `25.0%`; many generations did not reach a parseable final answer within the decode budget
+- Important caveats:
+  - this is not an exact public reproduction because the local run used a 64k cap; a 120k-cap full-short attempt OOMed on the current GPU setup
+  - most full-dataset examples were truncated, so the local result should be treated as an under-resourced reproduction attempt rather than a contradiction of the model-card score
+  - the local environment lacks optimized Qwen linear-attention kernels (`flash-linear-attention` / `causal-conv1d`), so Qwen falls back to a slower torch implementation
+- Interpretation for our project:
+  - Qwen3.5 has nontrivial long-context ability on LongBench v2 under our local path, especially on short/code/in-context subsets
+  - the generated-memory benchmark failure is therefore likely workload/prompt specific, not simply "Qwen cannot do long context"
+  - to reproduce the public `55.2` more faithfully, the next requirement is infrastructure: optimized Qwen long-context kernels or hardware that can run 120k+ input lengths without truncation
+
 ## 2026-03-17 update (future-window online insertion signal did not help)
 - Three insertion-signal variants were compared against the current online baseline (`online_next` = birth-step provenance only):
   1. future-window replacement:
@@ -1996,3 +2036,478 @@
   - the new safe improvements reduced online constants, but not enough to change the overall picture;
   - there is still no sign of a dense crossover in this range;
   - online quality also degrades by `e96/e192` on this benchmark.
+
+## 2026-03-18 dense omitted-mass sweep around `e12`
+- Goal:
+  - find where the `traversal_cuda + moment_diag` path starts recovering answer quality as the target omitted mass is tightened
+  - also record how sparse retrieval remains at that point
+- Coarse sweep:
+  - `generated_memory_eval_result/threshold_sweep_e12_moment_v1`
+  - first fully correct point appeared at target `0.01` with:
+    - actual omitted dynamic mass `~0.0859`
+    - `query_acc=1.0`
+    - `format_acc=1.0`
+  - neighboring settings with similar actual omitted mass still failed, so there is no clean monotonic threshold yet
+- Dense sweep:
+  - `generated_memory_eval_result/threshold_sweep_e12_moment_dense_v1`
+  - results:
+    - `0.006`: omitted mass `~0.0949`, `query_acc=1.0`, `format_acc=0.0`
+    - `0.007`: omitted mass `~0.0924`, `query_acc=0.0`
+    - `0.008`: omitted mass `~0.0965`, `query_acc=0.333`
+    - `0.009`: omitted mass `~0.0898`, `query_acc=0.667`
+    - `0.010`: omitted mass `~0.0859`, `query_acc=1.0`, `format_acc=1.0`
+    - `0.011-0.015`: omitted mass `~0.0876-0.0917`, all failed on `query_acc`
+- Sparsity at the successful `0.010` point:
+  - `avg_adaptive_keep_count ~68.7`
+  - `avg_adaptive_dynamic_span ~242.0`
+  - keep fraction of dynamic range `~28.4%`
+  - decode traversal:
+    - `visited_total=8.75M`
+    - `candidates_total=9.16M`
+    - `space/head=183.0`
+    - `visited/head=43.0`
+    - `out/head=44.5`
+    - `rounds/head=3.5`
+- Neighboring runs (`0.006-0.009`, `0.011-0.015`) generally had:
+  - larger dynamic span `~307`
+  - larger keep counts `~92-101`
+  - keep fraction still only `~30-33%`
+  - much larger traversal work (`visited_total ~14.6M-16.2M`)
+- Conclusion:
+  - the best observed recovery on this sample happens around actual omitted mass in the high-`8%` range;
+  - but success is not a monotonic function of actual omitted mass alone;
+  - the stopping rule is also changing ledger trajectory / decode length, which likely confounds the threshold.
+
+## 2026-03-18 `e12` with 10 questions invalidates the earlier crossover
+- Reran the same dense threshold sweep, but with:
+  - `NUM_QUERIES=10`
+  - query positions: `1,2,4,5,6,7,8,9,10,11`
+- Sweep root:
+  - `generated_memory_eval_result/threshold_sweep_e12_q10_moment_dense_v1`
+- Result:
+  - all thresholds `0.006 .. 0.015` failed
+  - `query_acc=0.0` and `format_acc=0.0` everywhere
+- Actual omitted mass was much larger than in the 3-query sweep:
+  - range `~0.164 .. 0.182`
+  - even target `0.010` only reached `~0.1638`
+- Sparsity at this 10-query workload:
+  - dynamic span `~454` (or `389` at target `0.010`)
+  - keep count `~115 .. 123`
+  - keep fraction of dynamic range `~25% .. 30%`
+  - `visited_total ~22M .. 24M`
+  - `candidates_total ~40M .. 44M`
+  - `out/head ~82 .. 88`
+- Conclusion:
+  - the apparent high-`8%` omitted-mass crossover from the 3-query sample does not generalize
+  - with a denser question set, the task demands much broader memory support and the current sparse decode remains far from sufficient
+
+## 2026-03-20 removing the old retrieval cap did not make adaptive search truly binding
+- Validation run:
+  - `45651060`
+  - `generated_memory_eval_result/binding_check_e12_q10_0p01_v6`
+- Result:
+  - `query_acc=0.0`
+  - `format_acc=0.0`
+  - `avg_decode_sec=4188.7 s`
+  - `avg_total_generated_tokens=242`
+- Important metrics:
+  - `avg_adaptive_keep_count ~166.6`
+  - `avg_adaptive_candidate_count ~167.6`
+  - `avg_omitted_dynamic_mass ~0.1236`
+  - `avg_adaptive_mass_bound ~0.3125`
+- Decode profile:
+  - total `4110.5 s`
+  - retrieve/graph `3755.8 s` (`91.4%`)
+  - gather `16.5 s`
+  - attn `44.8 s`
+  - `visited_total=51.46M`
+  - `candidates_total=52.48M`
+  - stop reasons:
+    - `frontier_empty=429036`
+    - `candidate_cap=0`
+    - `max_visits=0`
+    - `stability_gap=0`
+- Conclusion:
+  - removing the old small cap allowed retrieval to grow well beyond the previous `~117` range;
+  - but the omitted-mass target (`0.01`) was still nowhere close to being met;
+  - the run stopped because the graph frontier exhausted, not because the selector believed the target had been satisfied;
+  - latency is now clearly unacceptable for this benchmark (`~17.3 s/token`)
+
+## 2026-03-20 naive global-reseed retry made retrieval quality worse
+- Hypothesis:
+  - if traversal stops with `frontier_empty` before meeting target mass, retry from fresh global GPU seeds
+- Validation run:
+  - `45654017`
+  - `generated_memory_eval_result/binding_check_e12_q10_0p01_v7_global_reseed_spgpu`
+- Result:
+  - `query_acc=0.0`
+  - `format_acc=0.0`
+  - `avg_decode_sec=2814.9 s`
+- Retrieval metrics regressed badly:
+  - `avg_adaptive_keep_count ~32.9`
+  - `avg_adaptive_candidate_count ~33.2`
+  - `avg_omitted_dynamic_mass ~0.2637`
+  - `avg_adaptive_mass_bound ~0.3929`
+- Decode profile:
+  - retrieve/graph `2013.6 s`
+  - `visited_total=10.73M`
+  - `candidates_total=11.19M`
+  - `out/head=26.6`
+  - stop reasons still dominated by `frontier_empty`
+- Conclusion:
+  - the run got faster only because the returned set collapsed;
+  - this naive reseed policy is not a valid fix for true adaptive retrieval
+
+## 2026-03-20 teacher-forced hidden-state drift is real
+- Benchmark-side setup:
+  - dense (`Full_Flash_Attn`) teacher ledger
+  - fixed-budget RetrievalAttention student (`k=100`)
+  - same forced ledger token IDs
+  - measure per-layer decode hidden-state L2 over the first `32` forced ledger decode steps
+- Final run:
+  - `45655324`
+  - output root:
+    - `generated_memory_eval_result/teacher_drift_fixedk_e12_v3_spgpu`
+- Result:
+  - `query_acc=0.667`
+  - `format_acc=1.0`
+  - first-layer drift stayed tiny:
+    - first forced step `0.0398`
+    - last forced step `0.0591`
+  - last-layer drift became large:
+    - first forced step `3.43`
+    - last forced step `22.07`
+  - average L2 by layer rose from `0.0539` at layer `1` to `9.8635` at layer `32`
+- Conclusion:
+  - same visible tokens do not preserve the same internal decode state
+  - sparse decode induces hidden-state drift that amplifies strongly with depth
+
+## 2026-03-20 dense-KV refresh recovered the small fixed-budget case
+- Added a second teacher-forced control:
+  - same dense teacher ledger tokens
+  - same fixed-budget RetrievalAttention student (`k=100`)
+  - after each sparse decode step, overwrite the newly written student KV row with the corresponding dense teacher KV row
+- Comparison:
+  - baseline teacher-forced sparse:
+    - `teacher_drift_fixedk_e12_v3_spgpu`
+    - `query_acc=0.667`
+    - `strict_acc=0.0`
+    - `format_acc=1.0`
+    - `avg_decode_sec=231.43 s`
+  - dense-KV refresh:
+    - `teacher_dense_kv_refresh_fixedk_e12_v1`
+    - `query_acc=1.0`
+    - `strict_acc=1.0`
+    - `format_acc=1.0`
+    - `avg_decode_sec=162.52 s`
+- Conclusion:
+  - multi-step KV-cache drift is a real quality limiter on this benchmark
+  - eliminating cross-step KV corruption was enough to recover correct final answers on the small teacher-forced case, even though sparse layer-level drift within each step still exists
+
+## 2026-03-27 larger `e24,q10` sweep does not support KV-drift as the main limiter
+- Important correction:
+  - the teacher-forced sparse control is a diagnostic tool, not the right end-to-end baseline
+  - the correct end-to-end comparison is:
+    - normal RetrievalAttention (`ONLINE_MODE=online`)
+    - dense-KV refresh diagnostic
+    - `full_dense`
+- Controlled 4-seed sweep:
+  - `e24`
+  - `q10`
+  - fixed `k=100`
+  - seeds `2025, 2026, 2027, 2028`
+- Aggregate metrics:
+  - normal RetrievalAttention baseline:
+    - avg `query_acc=0.975`
+    - avg `strict_acc=0.75`
+    - avg `format_acc=1.0`
+  - dense-KV refresh:
+    - avg `query_acc=0.675`
+    - avg `strict_acc=0.5`
+    - avg `format_acc=0.75`
+  - `full_dense`:
+    - avg `query_acc=0.475`
+    - avg `strict_acc=0.25`
+    - avg `format_acc=0.5`
+- Per-seed summary:
+  - `2025`:
+    - all three succeeded
+  - `2026`:
+    - normal RetrievalAttention succeeded
+    - dense-KV refresh failed
+    - full dense failed
+  - `2027`:
+    - normal RetrievalAttention succeeded
+    - dense-KV refresh succeeded
+    - full dense failed
+  - `2028`:
+    - normal RetrievalAttention `0.9`
+    - dense-KV refresh `0.7`
+    - full dense `0.9`
+- Conclusion:
+  - the small `e12,q3` dense-KV-refresh win does not generalize cleanly
+  - at `e24,q10`, correcting KV rows alone is not a reliable quality improvement
+  - drift exists, but these results do not support “drift is the dominant reason sparse quality is poor” at this larger scale
+  - this benchmark is also not one where full dense is always the strongest reference, so caution is required when using it as a ground-truth recovery target
+
+## 2026-03-27 longer `e240,q100` comparison shows a true long-context failure regime
+- Ran a 3-seed comparison on:
+  - `e240`
+  - `q100`
+  - fixed `k=100`
+  - seeds `2025, 2026, 2027`
+  - three conditions:
+    - normal end-to-end RetrievalAttention
+    - dense-KV refresh diagnostic
+    - `full_dense`
+- Actual token scale:
+  - ledger prompt `132`
+  - question prompt `2120`
+  - ledger generated `1443`
+  - answer generated `732`
+  - answer-phase context at start `~3695`
+  - end-of-session context `~4427`
+- Aggregate metrics:
+  - normal RetrievalAttention:
+    - avg `query_acc=0.0`
+    - avg `strict_acc=0.0`
+    - avg `format_acc=0.0`
+    - avg `decode_sec=4860.4 s`
+  - dense-KV refresh:
+    - avg `query_acc=0.0`
+    - avg `strict_acc=0.0`
+    - avg `format_acc=0.0`
+    - avg `decode_sec=4996.1 s`
+  - `full_dense`:
+    - avg `query_acc=0.0`
+    - avg `strict_acc=0.0`
+    - avg `format_acc=0.333`
+    - avg `decode_sec=136.4 s`
+- Per-seed summary:
+  - `2025`: all three failed completely
+  - `2026`: all three failed completely
+  - `2027`: all three still had `query_acc=0.0`; `full_dense` at least emitted 100 parseable answers
+- Conclusion:
+  - `e240,q100` is finally a genuinely long-context regime for this benchmark
+  - but it is too hard for all three compared methods at current settings
+  - this point is useful as a failure regime, but not yet a discriminative one for testing the dense-KV-refresh hypothesis
+  - it also highlights a severe latency problem for the sparse path relative to `full_dense`
+
+## 2026-03-20 strict exact-cover adaptive path reduced runtime a lot, but correctness still failed
+- Replaced the retry/reseed adaptive path with a stricter control flow:
+  - single graph traversal pass first
+  - if target omitted mass is still unmet, run exact GPU tiled score coverage over the dynamic range
+  - select the minimal keep set from exact attention scores
+- Validation run:
+  - `45656142`
+  - `generated_memory_eval_result/binding_check_e12_q10_0p01_v9_exact_cover`
+- Result:
+  - `query_acc=0.0`
+  - `format_acc=0.0`
+  - `avg_decode_sec=1365.8 s`
+  - `avg_total_generated_tokens=177`
+- Adaptive / oracle-compare metrics:
+  - `avg_adaptive_candidate_count ~347.2`
+  - `avg_adaptive_keep_count ~150.9`
+  - `avg_adaptive_mass_bound ~0.00936`
+  - `avg_omitted_dynamic_mass ~0.01137`
+  - `avg_dense_sparse_out_l2 ~0.0148`
+  - `avg_oracle_dyn_mass ~0.2859`
+  - `avg_total_dynamic_mass ~0.2972`
+  - `bound_violation_rate ~0.543`
+- Decode profile:
+  - total `1304.4 s`
+  - retrieve `1041.5 s`
+  - graph `880.4 s`
+  - exact-cover finalize `161.1 s`
+  - gather `13.5 s`
+  - attn `35.8 s`
+- Conclusion:
+  - this is a substantial runtime improvement vs `v6`:
+    - `4188.7 s -> 1365.8 s`
+    - omitted mass `~0.124 -> ~0.011`
+  - so the new strict path is a success as an engineering control-flow change
+  - but low average omitted mass still did not recover answer correctness on this brittle `q10` case
+  - the next bottleneck is no longer “can retrieval adapt?” but “is omitted-mass control by itself a sufficient quality metric?”
+
+## 2026-04-24 HF scaffolded A/B confirms sparse patcher correctness but exposes graph latency
+- The HF-native generated-memory runner now supports:
+  - `native`
+  - `oracle_topk`
+  - `graph_topk`
+  - answer-prefix scaffold
+  - constrained color-codebook answers
+- A serialization/evaluation bug was fixed:
+  - before the fix, constrained scaffold runs generated values while prefixes were injected into the KV cache, but artifacts only stored decoded value tokens such as ` red silver`
+  - this made `format_acc=0.0` even when the model was effectively producing the right constrained values after the prefixes
+- Clean v3 run configuration:
+  - model: `meta-llama/Llama-3.1-8B-Instruct`
+  - entries/queries: `e6,q2`
+  - seed: `2025`
+  - `MIN_PROMPT_TOKENS=96`
+  - answer prefix scaffold enabled
+  - constrained codebook enabled
+- Results:
+  - native dense, job `48677561`:
+    - `query_acc=1.0`
+    - `strict_acc=1.0`
+    - `format_acc=1.0`
+    - `avg_decode_sec=1.49 s`
+  - oracle top-k, job `48677562`:
+    - `query_acc=1.0`
+    - `strict_acc=1.0`
+    - `format_acc=1.0`
+    - `avg_decode_sec=1.97 s`
+    - `decode_calls=1312`
+    - `keep_ratio=0.298`
+  - graph top-k, job `48677563`:
+    - `query_acc=1.0`
+    - `strict_acc=1.0`
+    - `format_acc=1.0`
+    - `avg_decode_sec=540.96 s`
+    - `decode_calls=1312`
+    - `graph_builds=96`
+    - `visited_total=2.69M`
+    - `candidates_total=2.69M`
+    - `online_edges_total=155.6K`
+    - `keep_ratio=0.298`
+- Conclusion:
+  - the HF sparse attention replacement path is functionally usable for A/B tests on standard HF models with replaceable full-attention modules
+  - exact oracle sparse attention preserves dense behavior on the tiny scaffolded case
+  - graph-topk also preserves behavior on this tiny case, but its current Python traversal is far too slow to scale
+  - next engineering target should be moving graph traversal/keep-mask construction out of Python before running larger graph-topk quality sweeps
+
+## 2026-04-24 Qwen3.5 compatibility findings
+- Qwen3.5-9B loads under the HF overlay as `Qwen3_5ForCausalLM`.
+- Architecture inventory confirms the hybrid attention structure:
+  - 8 full-attention layers are replaceable by RA-style sparse attention
+  - 24 linear-attention layers are not RA replacement targets
+  - full-attention layers are `[3, 7, 11, 15, 19, 23, 27, 31]`
+- Native dense smoke on `e6,q2`, seed `2025`, answer-prefix scaffold + constrained codebook:
+  - job `48678334`
+  - `query_acc=0.5`
+  - `strict_acc=0.0`
+  - `format_acc=1.0`
+  - correct ledger, but answer 2 copied `red` instead of expected `silver`
+- First oracle-topk attempt exposed a real wrapper portability bug:
+  - job `48678335` failed
+  - error came from treating Qwen's fused query/gate projection as Llama-style query projection
+  - wrapper also did not account for Qwen's `q_norm/k_norm`, output gate, and `past_key_values` naming
+- Fix:
+  - added architecture-aware Q/K/V projection and output projection helpers
+  - sparse wrapper now supports Qwen-style gated full attention and both HF cache argument names
+  - local regression test now covers tiny hybrid Qwen3.5 `oracle_topk`
+- Pending:
+  - fixed Qwen oracle-topk Slurm validation completed
+  - chat-template native/oracle controls completed
+- Completed validation results:
+  - raw native, job `48678334`:
+    - `query_acc=0.5`
+    - `strict_acc=0.0`
+    - `format_acc=1.0`
+    - answer output `ANSWER 1: red`, `ANSWER 2: red`
+  - raw oracle-topk, job `48679410`:
+    - `query_acc=0.5`
+    - `strict_acc=0.0`
+    - `format_acc=1.0`
+    - `installed_count=8`
+    - `keep_ratio=0.286`
+  - chat native, job `48679484`:
+    - `query_acc=0.5`
+    - `strict_acc=0.0`
+    - `format_acc=1.0`
+    - answer output unchanged
+  - chat oracle-topk, job `48679485`:
+    - `query_acc=0.5`
+    - `strict_acc=0.0`
+    - `format_acc=1.0`
+    - `installed_count=8`
+    - `keep_ratio=0.268`
+- Conclusion:
+  - Qwen3.5's dense/native path fails this tiny seed even with the chat template and thinking disabled
+  - exact oracle sparse replacement of full-attention layers preserves native behavior on this seed
+  - this is a model/prompt/benchmark behavior issue, not evidence that the sparse replacement broke Qwen
+
+## 2026-04-24 HF graph-topk Python latency likely dominated by GPU syncs
+- The graph-topk prototype was previously correct but extremely slow:
+  - Llama `e6,q2` graph-topk v3 decode time was `540.96 s`
+- Code inspection found per-candidate GPU synchronization:
+  - `_graph_keep_mask` called `scores[...].item()` inside the Python heap traversal loop
+  - this synchronizes the GPU for every seed/neighbor score lookup
+- Fix:
+  - copy `scores[0, head, 0, :]` to CPU once per head
+  - do all Python heap score comparisons against that CPU vector
+- Pending validation:
+  - Llama graph-topk remeasure job `48679542` completed
+- Result:
+  - old graph-topk v3 decode time: `540.96 s`
+  - new graph-topk v4 decode time: `82.85 s`
+  - quality unchanged: `query_acc=1.0`, `strict_acc=1.0`, `format_acc=1.0`
+  - `visited_total` unchanged at `2.69M`
+  - `candidates_total` unchanged at `2.69M`
+- Conclusion:
+  - the `.item()` synchronization fix produced about a `6.5x` speedup without changing traversal behavior
+  - Python graph traversal is still too slow for scaling, but the largest obvious GPU-sync pathology is removed
+
+## 2026-04-25 Qwen3.5 generated-memory failure is systematic at `e24,q10`
+- Motivation:
+  - tiny `e6,q2` Qwen3.5 dense/native had `query_acc=0.5`
+  - needed to test whether this was just single-sample noise
+- Main longer run:
+  - model: `Qwen/Qwen3.5-9B`
+  - setting: `e24,q10`
+  - seeds: `2025, 2026, 2027, 2028`
+  - chat template enabled
+  - thinking disabled
+  - answer-prefix scaffold enabled
+  - constrained codebook enabled
+  - compared dense native vs exact oracle-topk on Qwen's 8 full-attention layers
+- Results:
+  - dense native jobs `48686538`, `48686540`, `48686542`, `48686544`
+    - avg `query_acc=0.075`
+    - avg `strict_acc=0.0`
+    - avg `format_acc=1.0`
+  - oracle-topk jobs `48686539`, `48686541`, `48686543`, `48686545`
+    - avg `query_acc=0.075`
+    - avg `strict_acc=0.0`
+    - avg `format_acc=1.0`
+    - avg `keep_ratio=0.622`
+- Observed failure mode:
+  - constrained runs emit `red` for all 10 answers across all seeds
+  - hits only occur when the expected value is actually `red`
+  - oracle-topk exactly preserves dense-native behavior
+- Prompt diagnostics:
+  - prefix scaffold without constrained codebook, jobs `48686615`-`48686618`
+    - avg `query_acc=0.05`
+    - avg `format_acc=0.0`
+    - output degenerates into `ANSWER 1: 100000...`
+  - plain answer prompt without prefix scaffold or constrained codebook, jobs `48686619`-`48686622`
+    - avg `query_acc=0.05`
+    - avg `format_acc=1.0`
+    - output is the first 10 ledger values in order: `red, blue, green, gold, silver, ...`
+- Conclusion:
+  - the Qwen3.5 failure is not tiny-sample noise
+  - Qwen3.5 is following shallow output patterns in this benchmark instead of performing the queried lookup
+  - this is not a sparse attention degradation signal, because oracle-topk preserves dense-native behavior
+  - to use Qwen3.5 meaningfully, the benchmark prompt/scaffold needs redesign before larger sparse-quality sweeps
+
+## 2026-04-27 `roar_cuda_fullgpu` works, but first HF bridge was upload-bound
+- Implementation:
+  - added `graph_topk_roar` backend in the HF generated-memory harness
+  - added `HF_GRAPH_SEARCH_BACKEND=cpp|cuda_group|cuda_fullgpu`
+  - rebuilt RoarGraph extension and raised fullgpu kernel head-dim cap from 128 to 256
+  - added runtime fallback accounting for fullgpu contract failures
+- Qwen validation:
+  - previous Qwen fullgpu smoke failed on `head_dim <= 128`
+  - after the 256-dim rebuild, Qwen fullgpu job `48848447` completed
+  - result: `cuda_fallbacks=0`, `decode_calls=928`, `avg_decode_sec=22.35`, `query_acc=0.5`
+- Llama fixed-decode latency control:
+  - `cuda_group` job `48848687`: `116.31s` decode for `4800` backend calls, `24.23 ms/call`
+  - stale pre-overlay `cuda_fullgpu` job `48848685`: `134.66s` decode for `4800` backend calls, `28.05 ms/call`
+  - stale fullgpu had `38400` CSR uploads, so the first fullgpu bridge was dominated by repeated merged-CSR transfer/rebuild overhead
+- Follow-up fix:
+  - fullgpu path now passes cached padded base CSR plus online-edge overlay tensors to the kernel
+  - this avoids using merged CSR as the fullgpu input path
+- Pending jobs:
+  - Llama fullgpu fixed-decode overlay-cache v2: `48849585`
+  - Qwen fullgpu overlay-cache v3: `48849634`

@@ -1,5 +1,79 @@
 # Runbook
 
+## Generic HuggingFace Backend Smoke Commands (2026-04-24)
+- Config-only check against cached Llama:
+```bash
+module load python/3.10.4
+.venv/bin/python benchmark/generated_memory_hf_eval.py \
+  --model_name meta-llama/Llama-3.1-8B-Instruct \
+  --config_only \
+  --local_files_only \
+  --output_dir /tmp/generated_memory_hf_config_smoke_llama31
+```
+- Slurm inventory check:
+```bash
+sbatch --parsable --time=60:00 \
+  --export=ALL,MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct,OUTPUT_DIR=generated_memory_hf_eval_result/inventory_llama31,INVENTORY_ONLY=1,LOCAL_FILES_ONLY=1 \
+  benchmark/run_generated_memory_hf.sh
+```
+- Tiny native HF generated-memory smoke:
+```bash
+sbatch --parsable --time=90:00 \
+  --export=ALL,MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct,OUTPUT_DIR=generated_memory_hf_eval_result/smoke_llama31_native,LOCAL_FILES_ONLY=1,NUM_SAMPLES=1,NUM_ENTRIES=6,NUM_QUERIES=2,HF_ATTENTION_MODE=native \
+  benchmark/run_generated_memory_hf.sh
+```
+- Tiny oracle-topk sparse decode smoke:
+```bash
+sbatch --parsable --time=90:00 \
+  --export=ALL,MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct,OUTPUT_DIR=generated_memory_hf_eval_result/smoke_llama31_oracle_topk,LOCAL_FILES_ONLY=1,NUM_SAMPLES=1,NUM_ENTRIES=6,NUM_QUERIES=2,HF_ATTENTION_MODE=oracle_topk,HF_SPARSE_TOPK=16,HF_SPARSE_STATIC_PREFIX=16,HF_SPARSE_STATIC_SUFFIX=16 \
+  benchmark/run_generated_memory_hf.sh
+```
+- Tiny RoarGraph-backed HF sparse decode smoke:
+```bash
+sbatch --parsable --time=60:00 \
+  --export=ALL,MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct,LOCAL_FILES_ONLY=1,OUTPUT_DIR=generated_memory_hf_eval_result/smoke_llama31_graph_topk_roar,NUM_SAMPLES=1,NUM_ENTRIES=6,NUM_QUERIES=2,HF_ATTENTION_MODE=graph_topk_roar,HF_GRAPH_SEARCH_BACKEND=cuda_group,HF_SPARSE_TOPK=16,HF_SPARSE_STATIC_PREFIX=16,HF_SPARSE_STATIC_SUFFIX=16,HF_GRAPH_DEGREE=8,HF_GRAPH_VISIT_BUDGET=64,HF_GRAPH_SEED_COUNT=16,HF_GRAPH_ONLINE_EDGES=8,HF_GRAPH_CANDIDATE_TARGET=32,HF_GRAPH_EXPAND_WIDTH=16,HF_GRAPH_MIN_VISITS=8,HF_GRAPH_FRONTIER_TOPN=32 \
+  benchmark/run_generated_memory_hf.sh
+```
+- `graph_topk_roar` keeps the generic HF replacement boundary but uses the RoarGraph wrapper path instead of the Python heap traversal:
+  - graph build: `build_roar_graph_csr_cpp`
+  - search backend: `HF_GRAPH_SEARCH_BACKEND=cpp|cuda_group|cuda_fullgpu`
+  - `cuda_group` uses native CUDA scoring with CPU frontier bookkeeping
+  - `cuda_fullgpu` calls the RoarGraph full-GPU traversal kernel; this is the closer analogue to the optimized RetrievalAttention decode backend
+  - online birth-time edges are merged into CSR before search
+- For Qwen3.5 / newer HF models:
+  - use the overlay installed by `scripts/setup_hf_pydeps.sh`:
+```bash
+scripts/setup_hf_pydeps.sh
+```
+  - then pass `HF_EXTRA_PYTHONPATH=.hf_pydeps`
+  - this overlays Transformers main while keeping `.venv` torch active
+  - keep `HF_ATTENTION_MODE=native` for first load/inventory
+  - only target `full_attention` layers for sparse/RA replacement; leave `linear_attention` layers native
+  - use `HF_LANGUAGE_MODEL_ONLY=1` for text-only generated-memory runs
+  - do not use `TRUST_REMOTE_CODE=1` for config/tokenizer checks unless explicitly required and approved
+- Qwen3.5 config/tokenizer checks:
+```bash
+module load python/3.10.4
+PYTHONPATH=.hf_pydeps .venv/bin/python benchmark/generated_memory_hf_eval.py \
+  --model_name Qwen/Qwen3.5-9B \
+  --config_only \
+  --output_dir /tmp/generated_memory_hf_config_qwen35_9b
+
+PYTHONPATH=.hf_pydeps .venv/bin/python benchmark/generated_memory_hf_eval.py \
+  --model_name Qwen/Qwen3.5-9B \
+  --tokenizer_only \
+  --output_dir /tmp/generated_memory_hf_tokenizer_qwen35_9b
+```
+- Qwen3.5 expected attention plan:
+  - full-attention layers: `3,7,11,15,19,23,27,31`
+  - linear-attention layers: all other layers
+  - RA/sparse replacement should only target those 8 full-attention layers
+- CPU-only sparse patcher unit test:
+```bash
+module load python/3.10.4
+.venv/bin/python scripts/test_hf_sparse_patchers.py
+```
+
 ## Current runtime contract (2026-02-26)
 - RetrievalAttention prefill/index build is fused-only.
 - Required components:
@@ -754,3 +828,99 @@ sbatch test.sh
   - replace/augment adaptive frontier expansion with beam candidate maintenance over built graph,
   - keep token budget fairness fixed (`TOKEN_BUDGET_OVERRIDE=100`) during A/B,
   - compare quality/latency against current adaptive traversal baseline.
+
+## HF RoarGraph FullGPU Smokes
+- FullGPU backend selection:
+```bash
+HF_ATTENTION_MODE=graph_topk_roar \
+HF_GRAPH_SEARCH_BACKEND=cuda_fullgpu \
+sbatch benchmark/run_generated_memory_hf.sh
+```
+- Latency-only fixed-decode mode:
+```bash
+FORCE_MAX_DECODE_STEPS=1 \
+HF_ATTENTION_MODE=graph_topk_roar \
+HF_GRAPH_SEARCH_BACKEND=cuda_fullgpu \
+sbatch benchmark/run_generated_memory_hf.sh
+```
+- Extension rebuild used for the current fullgpu path:
+```bash
+module load cuda/12.6.3 python/3.10.4
+source .venv/bin/activate
+python third_party/RoarGraph/python_ext/setup.py build_ext --inplace
+```
+- Current fullgpu constraints:
+  - kernel supports `head_dim <= 256`
+  - `beam_width <= 64`
+  - `max_degree <= 16`
+  - hub seeds `<= 128`
+  - previous seeds `<= 512`
+- Key summary fields:
+  - `cuda_fallbacks`: should be `0` for a valid fullgpu run
+  - `fullgpu_fallback_reasons`: should be empty unless a model violates a fullgpu contract
+  - `csr_cuda_uploads`: should be `0` on the overlay-cache fullgpu path
+  - `base_csr_cuda_uploads` and `overlay_cuda_uploads`: measure remaining graph-transfer overhead
+
+## HF Candidate Model Inventory
+- Supported presets in `benchmark/run_generated_memory_hf.sh`:
+```bash
+HF_MODEL_PRESET=qwen3_8b
+HF_MODEL_PRESET=mistral_nemo_12b
+HF_MODEL_PRESET=glm4_9b
+```
+- Preset model IDs:
+  - `qwen3_8b`: `Qwen/Qwen3-8B`
+  - `mistral_nemo_12b`: `mistralai/Mistral-Nemo-Instruct-2407`
+  - `glm4_9b`: `zai-org/glm-4-9b-chat-hf`
+- Submit all three inventory-only smokes:
+```bash
+bash benchmark/submit_hf_candidate_inventory.sh
+```
+- Minimal single-model inventory smoke:
+```bash
+HF_MODEL_PRESET=qwen3_8b \
+INVENTORY_ONLY=1 \
+HF_ATTENTION_MODE=native \
+sbatch benchmark/run_generated_memory_hf.sh
+```
+- Inspect after completion:
+  - `config_summary.json`
+  - `tokenizer_summary.json`
+  - `attention_inventory.json`
+  - `counts_by_kind`
+  - `replaceable_full_attention_count`
+
+## HuggingFace Cache Location
+- HF scripts default caches to the workspace, not home:
+```bash
+HF_CACHE_DIR=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/.hf_cache
+HF_HOME=${HF_CACHE_DIR}
+HF_HUB_CACHE=${HF_CACHE_DIR}/hub
+HF_DATASETS_CACHE=${HF_CACHE_DIR}/datasets
+TRANSFORMERS_CACHE=${HF_CACHE_DIR}/transformers
+```
+- `benchmark/run_generated_memory_hf.sh`, `benchmark/run_longbench_v2_hf.sh`, and direct Python entrypoints set these defaults unless already overridden.
+- This avoids writing model/dataset caches to `~/.cache/huggingface` on quota-limited home storage.
+
+## Slurm Partition Racing
+- Submit the same job to multiple GPU partitions and keep the first viable winner:
+```bash
+scripts/slurm_race_submit.sh \
+  --partitions spgpu,gpu_mig40,gpu-rtx6000 \
+  --safe spgpu,gpu_mig40 \
+  --risky gpu-rtx6000 \
+  --output-base generated_memory_hf_eval_result/race_smoke \
+  --job-name hf-race \
+  --export 'MODEL_NAME=meta-llama/Llama-3.1-8B-Instruct,LOCAL_FILES_ONLY=1,NUM_SAMPLES=1,NUM_ENTRIES=6,NUM_QUERIES=2,HF_ATTENTION_MODE=graph_topk_roar,HF_GRAPH_SEARCH_BACKEND=cuda_fullgpu' \
+  --watch \
+  -- benchmark/run_generated_memory_hf.sh
+```
+- Watcher policy:
+  - `spgpu` and `gpu_mig40` are safe; first `RUNNING` job wins immediately.
+  - `gpu-rtx6000` is risky; it wins only after `OUTPUT_DIR/hf_job_ready` exists.
+  - once a winner is selected, other non-terminal jobs are canceled.
+- Output files:
+  - manifest: `/tmp/slurm_race_<tag>.tsv`
+  - winner: `/tmp/slurm_race_<tag>.winner`
+  - watcher log: `.codex/slurm/race-watch-<tag>.log`
+- HF jobs write `hf_job_ready` after model load, tokenizer/config load, and attention inventory/patcher install.

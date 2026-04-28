@@ -683,3 +683,199 @@ Move to **measured optimizations around the stable custom kernel**, not more spe
   - the asymptotic story may still be acceptable at the per-head graph/update level;
   - but implementation constants remain far too large for sparse decode to be competitive in the current regime.
 - Before attempting extreme lengths (`100k+` decode), the next round of work should focus on more aggressive but still defensible constant-factor reductions, or on a smaller targeted prototype that isolates the online-update machinery without the rest of the benchmark/task noise.
+
+## 2026-03-18 `e12` omitted-mass threshold sweep
+- Used the current adaptive decode path:
+  - `RETRIEVALATTN_DYNAMIC_BUDGET_MODE=traversal_cuda`
+  - `RETRIEVALATTN_DYNAMIC_BUDGET_PRIOR=moment_diag`
+  - `static_pattern_start=16`
+  - `static_pattern_end=32`
+- Sweep roots:
+  - coarse: `generated_memory_eval_result/threshold_sweep_e12_moment_v1`
+  - dense: `generated_memory_eval_result/threshold_sweep_e12_moment_dense_v1`
+- Best observed fully correct point:
+  - target `0.010`
+  - actual omitted dynamic mass `~0.0859`
+  - `query_acc=1.0`
+  - `format_acc=1.0`
+- At that point, decode is still fairly sparse but not tiny:
+  - `avg_adaptive_keep_count ~68.7`
+  - `avg_adaptive_dynamic_span ~242.0`
+  - keep fraction of dynamic range `~28.4%`
+  - traversal work:
+    - `visited_total=8.75M`
+    - `candidates_total=9.16M`
+    - `visited/head=43.0`
+    - `out/head=44.5`
+- Important caveat:
+  - neighboring thresholds with similar actual omitted mass still failed
+  - so omitted mass alone is not yet a stable control knob under the current stopping implementation
+  - the stopping rule is changing ledger decode length / trajectory enough that threshold behavior is non-monotonic
+- Updated implication:
+  - high-`8%` omitted mass looks like the right order of magnitude for recovery on this sample
+  - but before using this as a universal target, we need a less trajectory-sensitive stopping rule or a teacher-forced comparison that holds the ledger fixed
+
+## 2026-03-18 follow-up with 10 questions
+- Repeated the dense threshold sweep at `e12`, but increased to `NUM_QUERIES=10`.
+- Sweep root:
+  - `generated_memory_eval_result/threshold_sweep_e12_q10_moment_dense_v1`
+- Outcome:
+  - no threshold in `0.006 .. 0.015` recovered quality
+  - all runs had `query_acc=0.0`, `format_acc=0.0`
+- The retrieval regime was much less sparse than the 3-query case:
+  - actual omitted dynamic mass remained `~0.164 .. 0.182`
+  - dynamic span `~454` (or `389` at target `0.010`)
+  - keep count `~115 .. 123`
+  - keep fraction `~25% .. 30%`
+  - `visited_total ~22M .. 24M`
+  - `out/head ~82 .. 88`
+- Updated implication:
+  - the earlier `~8.6%` crossover was not robust
+  - once the question workload asks for most of the ledger, the current sparse decode formulation is still far from sufficient
+
+## 2026-03-20 current status of “true adaptive retrieval”
+- The old retrieval/output cap has been lifted enough to test the real failure mode:
+  - `45651060`
+  - `generated_memory_eval_result/binding_check_e12_q10_0p01_v6`
+- Result:
+  - `avg_adaptive_keep_count ~166.6`
+  - `avg_omitted_dynamic_mass ~0.1236`
+  - `avg_adaptive_mass_bound ~0.3125`
+  - `query_acc=0.0`
+  - `avg_decode_sec=4188.7 s`
+- Decode profile shows the real blocker:
+  - retrieve/graph `3755.8 s` (`91.4%`)
+  - stop reasons dominated by `frontier_empty`
+  - `candidate_cap=0`
+- Interpretation:
+  - the target was still not binding;
+  - the search now fails because the local graph exploration exhausts before enough mass is found;
+  - the current host-side retry loop is too expensive to be the long-term answer
+
+## 2026-03-20 naive global-reseed retry does not solve frontier exhaustion
+- Tried a host-side retry policy that injects fresh global GPU seeds when traversal stops with `frontier_empty` before meeting target mass.
+- Validation run:
+  - `45654017`
+  - `generated_memory_eval_result/binding_check_e12_q10_0p01_v7_global_reseed_spgpu`
+- Result:
+  - much lower keep count (`~32.9`)
+  - much worse omitted mass (`~0.2637`)
+  - `query_acc=0.0`
+  - `avg_decode_sec=2814.9 s`
+- Interpretation:
+  - the naive reseed logic fragments search and collapses the returned set;
+  - this is not a good approximation to true adaptive search
+- Updated recommendation:
+  - do not pursue ad-hoc host-side reseed heuristics further;
+  - the next real step should be a better GPU-side search controller / reservoir design, not another retry tweak
+
+## 2026-03-20 teacher-forced hidden-state drift diagnostic
+- Added a benchmark-side diagnostic to compare dense vs fixed-budget RetrievalAttention under the same teacher-forced ledger token sequence and record per-layer decode hidden-state L2.
+- Initial jobs OOM’d because multiple 8B models were simultaneously resident.
+- Fixed by:
+  - running dense and sparse trace passes sequentially
+  - explicitly clearing the outer `llm` reference before loading the trace model
+- Final validation run:
+  - `45655324`
+  - output root:
+    - `generated_memory_eval_result/teacher_drift_fixedk_e12_v3_spgpu`
+- Result:
+  - hidden-state drift is real under fixed-budget sparse retrieval
+  - first-layer L2 stayed very small (`0.0398 -> 0.0591` across the first `32` forced steps)
+  - last-layer L2 grew very large (`3.43 -> 22.07`)
+  - average L2 by layer rose from `0.0539` at layer `1` to `9.8635` at layer `32`
+- Follow-up control:
+  - `teacher_dense_kv_refresh_fixedk_e12_v1`
+  - overwrite each newly written sparse KV row with the dense teacher KV row during the same teacher-forced run
+  - this recovered the small fixed-budget case:
+    - baseline teacher-forced sparse: `query_acc=0.667`
+    - dense-KV refresh: `query_acc=1.0`
+- Planning implication:
+  - hidden-state / KV-state drift is now directly measured, not just hypothesized
+  - future decode designs should optimize not only retrieval correctness but also how well the resulting attention output preserves the dense internal state across steps
+
+## 2026-03-27 larger `e24,q10` comparison corrected the interpretation
+- The earlier teacher-forced sparse control should not be treated as the end-to-end baseline.
+- We ran the proper 4-seed comparison on:
+  - `e24`
+  - `q10`
+  - fixed `k=100`
+  - seeds `2025..2028`
+  - three conditions:
+    - normal end-to-end RetrievalAttention
+    - dense-KV refresh diagnostic
+    - `full_dense`
+- Aggregate result:
+  - normal RetrievalAttention:
+    - avg `query_acc=0.975`
+    - avg `strict_acc=0.75`
+    - avg `format_acc=1.0`
+  - dense-KV refresh:
+    - avg `query_acc=0.675`
+    - avg `strict_acc=0.5`
+    - avg `format_acc=0.75`
+  - `full_dense`:
+    - avg `query_acc=0.475`
+    - avg `strict_acc=0.25`
+    - avg `format_acc=0.5`
+- Implication:
+  - the small teacher-forced dense-KV-refresh win is not a robust larger-scale fix
+  - correcting KV rows alone is not sufficient as a general systems solution here
+  - more importantly, this benchmark is not a clean monotonic setting where full dense is always best, so “recovery to dense” is not itself a stable target at `e24,q10`
+
+## 2026-03-27 `e240,q100` established a real long-context regime but not a discriminative refresh test
+- Ran a 3-seed comparison on:
+  - `e240`
+  - `q100`
+  - fixed `k=100`
+  - normal RetrievalAttention vs dense-KV refresh vs `full_dense`
+- Token scale on this setup:
+  - answer-phase context starts around `3695` tokens
+  - full session ends around `4427` tokens
+- Aggregate result:
+  - normal RetrievalAttention:
+    - avg `query_acc=0.0`
+    - avg `format_acc=0.0`
+    - avg `decode_sec=4860.4 s`
+  - dense-KV refresh:
+    - avg `query_acc=0.0`
+    - avg `format_acc=0.0`
+    - avg `decode_sec=4996.1 s`
+  - `full_dense`:
+    - avg `query_acc=0.0`
+    - avg `format_acc=0.333`
+    - avg `decode_sec=136.4 s`
+- Implication:
+  - this is finally a real long-context failure regime for the benchmark
+  - but all three methods are failing, so it is not yet a good setting for isolating whether dense-KV refresh helps quality
+  - the result does, however, make the current sparse latency problem impossible to ignore
+
+## 2026-03-20 strict exact-cover adaptive controller
+- Replaced the host-side retry / reseed loop with a stricter adaptive controller:
+  - graph traversal runs once as the cheap accelerator
+  - any head that still misses the omitted-mass target falls through to exact GPU tiled score coverage over the dynamic range
+  - final keep count is chosen from exact attention scores
+- First validation:
+  - `45656142`
+  - `generated_memory_eval_result/binding_check_e12_q10_0p01_v9_exact_cover`
+- Result:
+  - `avg_decode_sec=1365.8 s`
+  - `avg_adaptive_candidate_count ~347.2`
+  - `avg_adaptive_keep_count ~150.9`
+  - `avg_adaptive_mass_bound ~0.00936`
+  - `avg_omitted_dynamic_mass ~0.01137`
+  - `query_acc=0.0`
+  - `format_acc=0.0`
+- Profile:
+  - graph `880.4 s`
+  - exact-cover finalize `161.1 s`
+  - retrieve total `1041.5 s`
+- Implication:
+  - this is a clear structural improvement over `v6`:
+    - no retry-heavy graph loop
+    - no fake `frontier_empty` adaptive success
+    - much lower runtime than the old path
+  - however, even with omitted dynamic mass near `1%` on average, this sample still failed
+  - so the next research question is no longer “how do we make adaptive search bind?” but:
+    - whether omitted-mass control alone is sufficient for decode quality
+    - or whether we need an additional criterion tied more directly to output / state fidelity
