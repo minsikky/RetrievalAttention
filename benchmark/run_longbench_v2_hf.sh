@@ -69,6 +69,8 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 TEMPERATURE="${TEMPERATURE:-0.1}"
 STREAMING="${STREAMING:-1}"
 DATASET_SCAN_LIMIT="${DATASET_SCAN_LIMIT:-200}"
+QWEN_YARN_FACTOR="${QWEN_YARN_FACTOR:-0}"
+QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS:-262144}"
 
 echo "[INFO] Job started at: $(date)"
 echo "[INFO] Host: $(hostname)"
@@ -87,6 +89,8 @@ echo "[INFO] DOMAIN_FILTER=${DOMAIN_FILTER}"
 echo "[INFO] ID_FILTER=${ID_FILTER}"
 echo "[INFO] SELECTION=${SELECTION}"
 echo "[INFO] MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS}"
+echo "[INFO] QWEN_YARN_FACTOR=${QWEN_YARN_FACTOR}"
+echo "[INFO] QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS=${QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
 echo "[INFO] USE_CHAT_TEMPLATE=${USE_CHAT_TEMPLATE}"
 echo "[INFO] DISABLE_THINKING=${DISABLE_THINKING}"
 echo "[INFO] HF_EXTRA_PYTHONPATH=${HF_EXTRA_PYTHONPATH}"
@@ -111,6 +115,8 @@ python -V
   --max_new_tokens "${MAX_NEW_TOKENS}" \
   --temperature "${TEMPERATURE}" \
   --dataset_scan_limit "${DATASET_SCAN_LIMIT}" \
+  --qwen_yarn_factor "${QWEN_YARN_FACTOR}" \
+  --qwen_yarn_original_max_position_embeddings "${QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}" \
   $( [ -n "${ATTN_IMPLEMENTATION}" ] && printf '%s %s' "--attn_implementation" "${ATTN_IMPLEMENTATION}" ) \
   $( [ "${TRUST_REMOTE_CODE}" = "1" ] && printf '%s' "--trust_remote_code" ) \
   $( [ "${LOCAL_FILES_ONLY}" = "1" ] && printf '%s' "--local_files_only" ) \

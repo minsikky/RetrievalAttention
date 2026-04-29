@@ -86,6 +86,8 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--streaming", action="store_true")
     parser.add_argument("--dataset_scan_limit", type=int, default=200)
+    parser.add_argument("--qwen_yarn_factor", type=float, default=0.0)
+    parser.add_argument("--qwen_yarn_original_max_position_embeddings", type=int, default=262144)
     return parser.parse_args()
 
 
@@ -122,6 +124,36 @@ def truncate_middle(input_ids, max_input_tokens: int):
     half = int(max_input_tokens) // 2
     keep_tail = int(max_input_tokens) - half
     return torch.cat([input_ids[:, :half], input_ids[:, -keep_tail:]], dim=1), True
+
+
+def maybe_apply_qwen_yarn(config, args):
+    factor = float(args.qwen_yarn_factor)
+    if factor <= 0.0:
+        return False
+
+    original_max = int(args.qwen_yarn_original_max_position_embeddings)
+    max_position_embeddings = max(
+        int(args.max_input_tokens) + int(args.max_new_tokens),
+        int(round(original_max * factor)),
+    )
+    rope_parameters = {
+        "mrope_interleaved": True,
+        "mrope_section": [11, 11, 10],
+        "rope_type": "yarn",
+        "rope_theta": 10000000,
+        "partial_rotary_factor": 0.25,
+        "factor": factor,
+        "original_max_position_embeddings": original_max,
+    }
+
+    targets = [config]
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        targets.append(text_config)
+    for target in targets:
+        setattr(target, "rope_parameters", dict(rope_parameters))
+        setattr(target, "max_position_embeddings", int(max_position_embeddings))
+    return True
 
 
 def extract_answer(text: str):
@@ -291,6 +323,7 @@ def main():
         trust_remote_code=bool(args.trust_remote_code),
         local_files_only=bool(args.local_files_only),
     )
+    yarn_enabled = maybe_apply_qwen_yarn(config, args)
     tokenizer = load_tokenizer(args)
     dtype = dtype_from_name(args.dtype)
     model, auto_class = load_hf_model(args, dtype, config)
@@ -327,6 +360,11 @@ def main():
             "streaming": bool(args.streaming),
             "dataset_scan_limit": int(args.dataset_scan_limit),
             "scanned": int(scanned),
+            "qwen_yarn_enabled": bool(yarn_enabled),
+            "qwen_yarn_factor": float(args.qwen_yarn_factor),
+            "qwen_yarn_original_max_position_embeddings": int(
+                args.qwen_yarn_original_max_position_embeddings
+            ),
         }
     )
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))

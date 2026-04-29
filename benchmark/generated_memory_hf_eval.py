@@ -2313,6 +2313,8 @@ def load_hf_model(args, dtype, config):
         kwargs["low_cpu_mem_usage"] = True
     if args.device_map:
         kwargs["device_map"] = args.device_map
+    if config is not None:
+        kwargs["config"] = config
 
     attempts = []
 
