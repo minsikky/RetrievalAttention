@@ -1,0 +1,414 @@
+# binary_gated_pqcache_research_proposal_2026-05-02.pptx
+
+## Slide 1
+- RESEARCH PROPOSAL
+- Binary-Gated PQCache
+- A retrofit compressed sparse-KV algorithm that makes K directly searchable, uses PQ for reranking, and only becomes a chip target after CPU/GPU evidence.
+- 1. Algorithm
+- CPU implementation proves quality, bytes saved, and selector recall before kernel work.
+- 2. Systems
+- GPU prototype exposes bit-packing, top-k, compaction, and sparse page-fetch bottlenecks.
+- 3. Hardware
+- Custom datapath accelerates the measured bottleneck primitives, not one fixed paper design.
+- May 2, 2026
+- Proposal synthesized from PQCache, self-indexing/hash KV, completion fallback, and chip-oriented discussion.
+- 1
+
+## Slide 2
+- PROPOSAL
+- The research bet is not PQCache alone; it is a searchable compressed-KV substrate.
+- Treat PQCache as a strong component inside a more general selector-plus-memory design.
+- No benchmark claims here; this slide defines the proposal.
+- 2
+- Thesis
+- Binary/hash codes should do recall; PQ should repair ranking; quantized V pages should carry the bandwidth win.
+- Why now
+- Long decode turns KV cache into the dominant memory object; retrofit methods fit deployed dense/GQA/MLA models.
+- Main question
+- Can selector metadata also be the compressed K representation without losing attention quality?
+- Go/no-go
+- Proceed toward hardware only if CPU quality holds and GPU bottlenecks map to compact custom primitives.
+
+## Slide 3
+- BOTTLENECK
+- Long decode is a memory-system problem before it is an attention-math problem.
+- The algorithm should be judged by selected bytes and recovered quality, not by asymptotic sparsity alone.
+- Variables are evaluation targets, not reported results.
+- 3
+- Dense step
+- read all K + read all V + softmax over N
+- Hybrid step
+- K sidecar scan
+- M candidates
+- K final rows
+- completion
+- BYTES SAVED
+- measure
+- K sidecar + sparse V pages vs dense KV
+- QUALITY LOSS
+- bound
+- top-k recall, logit error, KL, task score
+- IRREGULARITY COST
+- expose
+- top-k, gather, compaction, bit ops on GPU
+- HARDWARE CASE
+- justify
+- only if custom primitives beat GPU pain
+
+## Slide 4
+- ALGORITHM
+- Binary-gated PQCache turns selection into a hierarchy, not one approximate scan.
+- The binary stage maximizes cheap recall; the PQ stage spends accuracy only on a small candidate set.
+- M is the coarse candidate budget; K is the final sparse attention budget.
+- 4
+- q
+- current query
+- binary code
+- sign/hash encoder
+- bit match
+- XNOR + popcount
+- top M
+- candidate IDs/pages
+- PQ rerank
+- LUT score
+- top K
+- final rows
+- V pages
+- int4/int8 fetch
+- output
+- softmax + fallback
+- Coarse stage
+- Full-cache scan is allowed only because each token is a few packed bits.
+- Fine stage
+- PQ LUT scores are paid only for M candidates, not every cached key.
+- Final stage
+- Sparse V fetch is the expensive read; it must be page-aware and coalesced.
+
+## Slide 5
+- MEMORY LAYOUT
+- The selector metadata should also be the compressed K memory.
+- Do not store a compressed key and then build a separate index if the compressed key can be searched directly.
+- Sidecar fields are illustrative; CPU ablations should decide which survive.
+- 5
+- Object
+- Stored fields
+- Used during decode
+- Reason
+- K sidecar
+- b_i, pq_i, norm_i, bank_id
+- every step
+- search and approximate score without FP16 K read
+- K escape tier
+- int8/full K for outliers
+- selected candidates only
+- protect rare keys that PQ/hash represents poorly
+- V page
+- quantized V, scales, token map
+- top K fetch
+- dominant bandwidth object after selection
+- Summary page
+- completion numerator/denominator state
+- fallback path
+- recover diffuse attention mass without fetching all V
+- Per token:
+- b_i bits
+- PQ code
+- norm
+- flags
+- Small enough to scan; expressive enough to rerank.
+
+## Slide 6
+- DECODE FLOW
+- Decode uses bit matching for recall and PQ LUTs for ranking fidelity.
+- The CPU prototype should expose every intermediate set so recall losses are measurable.
+- The final exact-ish step can use reconstructed K_hat or quantized K only for candidates.
+- 6
+- Query path
+- K sidecar
+- Sparse memory
+- encode q
+- b_q and PQ LUTs
+- coarse scan
+- popcount over b_i
+- candidate set
+- top M IDs/pages
+- fine rerank
+- sum LUT[pq_i] + norm
+- fetch top K
+- V pages + optional K
+- attention
+- softmax over selected rows
+- completion
+- add missing mass summary
+
+## Slide 7
+- K RECONSTRUCTION
+- K reconstruction should be residual and versioned, not a growing centroid count.
+- Long decode may widen the key distribution, but changing centroid count dynamically makes old codes hard to interpret.
+- Recommendation: fixed hardware shape, multiple codebook banks, residual PQ, and outlier escape.
+- 7
+- Avoid
+- growing C over time
+- forces recoding or version chaos
+- Accept
+- page/epoch codebook banks
+- old pages keep bank_id; LUTs are generated per active bank
+- Prefer
+- binary coarse + residual PQ
+- k_hat = center(b_i) + residual_PQ(p_i)
+- Proposed K_hat path
+- b_i selects a coarse region; pq_i stores residual code; norm_i restores logit scale; outlier flag routes to higher precision.
+
+## Slide 8
+- V AND FALLBACK
+- V compression is separate, but selected pages and completion summaries share the same scheduler.
+- Binary/PQ metadata can reconstruct K_hat; values still need their own low-bit storage and a missing-mass path.
+- Completion is a quality guardrail, not a replacement for selecting important tokens.
+- 8
+- Selected path
+- top K token IDs -> quantized V page fetch -> local dequant -> exact selected contribution
+- Missing path
+- unfetched pages -> small summary state -> approximate numerator/denominator correction
+- +
+- output = (selected numerator + completion numerator) / (selected denominator + completion denominator)
+- Design implication: the memory controller must fetch sparse V pages and stream summary pages with predictable latency.
+
+## Slide 9
+- CPU PHASE
+- CPU work should answer whether the algorithm is accurate enough before kernel work begins.
+- Start with an exact, inspectable harness; do not optimize before selector failure modes are visible.
+- CPU target: correctness and bytes/quality accounting, not serving throughput.
+- 9
+- Build item
+- What it computes
+- Gate
+- Trace collector
+- Q,K,V and exact attention from target models
+- reproducible tokens, heads, layers, tasks
+- Selector simulator
+- binary recall, PQ rerank, optional K_hat logits
+- recall@M/K and logit error per head
+- Compression accounting
+- sidecar bytes, V bytes, summary bytes
+- capacity and bandwidth estimates
+- Quality harness
+- perplexity, needle, code, reasoning, long-output drift
+- no hidden task cliff at target budgets
+- Kill criterion
+- If candidate recall must be so large that V fetch dominates again, the algorithm is not a chip target.
+
+## Slide 10
+- ABLATIONS
+- The ablation grid should isolate which metadata actually buys quality.
+- Every extra bit in the sidecar must justify itself against attention quality and fetch reduction.
+- Rows become implementation flags in the CPU harness.
+- 10
+- Ablation
+- Knob
+- Quality readout
+- Memory readout
+- Expected decision
+- Binary bits
+- 64 / 128 / 256
+- candidate recall
+- sidecar scan bytes
+- minimum viable m
+- PQ shape
+- M subspaces, C centroids
+- rerank error
+- LUT and code bytes
+- residual or plain PQ
+- Codebook bank
+- global / page / epoch
+- drift by token age
+- LUT setup pressure
+- fixed banks, not growing C
+- Outlier tier
+- none / int8 / full K
+- rare-key failures
+- escape bytes
+- keep only if tails matter
+- Completion
+- off / page / segment
+- softmax KL, long-output drift
+- summary bytes
+- fallback threshold
+
+## Slide 11
+- GPU PHASE
+- GPU work should benchmark the ugly parts, not just count bytes saved.
+- The GPU prototype is valuable because it reveals which theoretical savings survive real kernels.
+- Use dense attention and strong sparse/KV baselines; report both quality and wall-clock decode.
+- 11
+- Prototype path
+- PyTorch reference -> Triton/CUDA kernels -> serving integration slice
+- Measure
+- tokens/s, latency/token, HBM bytes, occupancy, gather efficiency, kernel launch count
+- Compare
+- dense/GQA baseline, KV quant baseline, PQCache-like selector, hash-only selector
+- GPU success is not only speedup.
+- It is a bottleneck map: which stages remain slow because GPUs dislike bit-packed scans, top-k, compaction, and sparse gathers.
+
+## Slide 12
+- BOTTLENECKS
+- GPU bottlenecks become the hardware feature list.
+- If a stage is fast on GPU, do not spend silicon on it; if it is slow but quality-critical, it becomes a primitive.
+- This slide defines what the GPU experiment should report.
+- 12
+- GPU pain
+- Why it happens
+- Custom primitive
+- Decision
+- 1-bit scan
+- packed bits and popcount are not the standard attention path
+- bit-sliced SRAM + popcount lanes
+- keep if M recall works
+- top-M/top-K
+- selection and compaction are irregular
+- streaming threshold/top-k network
+- budget by latency
+- PQ LUT rerank
+- small random LUT access and reductions
+- local centroid SRAM + fixed reduction tree
+- share across heads
+- V page gather
+- selected IDs are not naturally coalesced
+- page scheduler + reorder buffer
+- make pages the unit
+- completion
+- summary path competes with selected path
+- parallel summary accumulator
+- gate by entropy
+
+## Slide 13
+- HARDWARE TARGET
+- Custom hardware should specialize primitives, not freeze one paper's selector.
+- The candidate engine should support a small template: binary recall, PQ refinement, optional exact-ish rerank, sparse V fetch.
+- Hardware sketch assumes an external HBM/DRAM KV store plus on-chip sidecar/codebook SRAM.
+- 13
+- Query encoder
+- sign/hash + PQ LUTs
+- >
+- Sidecar SRAM
+- b_i, pq_i, norm, flags
+- >
+- Popcount lanes
+- coarse scores
+- >
+- Top-M buffer
+- candidate IDs
+- >
+- PQ rerank
+- LUT reduction
+- >
+- Page engine
+- fetch/dequant V
+- Completion accumulator
+- summary numerator/denominator in parallel with selected rows
+
+## Slide 14
+- HARDWARE MODEL
+- The hardware model must translate quality budgets into bytes, SRAM, and energy.
+- Do not claim a chip win from algorithmic sparsity alone; model the memory hierarchy and selector datapath explicitly.
+- Outputs should be comparable against a GPU measured bottleneck profile.
+- 14
+- Input
+- Algorithm source
+- Hardware parameter
+- Output metric
+- m bits/token
+- binary recall ablation
+- sidecar SRAM/HBM traffic
+- scan energy/token
+- PQ bytes/token
+- rerank error ablation
+- codebook SRAM + LUT bandwidth
+- rerank energy/token
+- K and M budgets
+- quality-vs-fetch curve
+- top-k buffer size
+- latency/token
+- V page size
+- sparse fetch locality
+- page scheduler and dequant lanes
+- HBM transactions/token
+- completion summary
+- diffuse-head failure rate
+- summary SRAM and accumulator
+- quality recovery per byte
+
+## Slide 15
+- PLAN
+- The project should have explicit go/no-go gates before tapeout effort.
+- The fastest path is to disprove weak variants early and keep only primitives with measured value.
+- Timeline is a research plan, not a promise about calendar duration.
+- 15
+- 0-2 wk
+- Trace + exact baseline
+- collect Q/K/V, dense attention, task harness
+- >
+- 3-6 wk
+- CPU selector study
+- binary/PQ/residual/completion ablations
+- >
+- 7-10 wk
+- GPU prototype
+- Triton/CUDA kernels, benchmark and counters
+- >
+- 11-13 wk
+- Hardware model
+- primitive sizing, bytes, energy, scheduler model
+- >
+- 14-16 wk
+- Proposal freeze
+- choose chip-facing algorithm or pivot
+- Main gate
+- Do not move to hardware unless the CPU quality curve and GPU bottleneck profile both point to the same small set of primitives.
+
+## Slide 16
+- CONTRIBUTION
+- The expected contribution is an algorithm, benchmark, and chip co-design target.
+- The work should be publishable even if the final answer is that a narrower variant is the right hardware target.
+- Risks are useful because they define the measurement plan.
+- 16
+- Area
+- Contribution
+- Main risk
+- Algorithm
+- Binary-gated residual PQCache with completion-aware fallback
+- binary recall fails on important heads
+- Evaluation
+- CPU/GPU harness that reports quality, bytes, and irregularity cost together
+- benchmark too model/task-specific
+- Systems
+- GPU bottleneck profile for compressed sparse KV selectors
+- savings erased by compaction and gather overhead
+- Hardware
+- datapath template for searchable compressed K and sparse quantized V
+- primitive set too broad or not enough reuse
+- Strong outcome: a selector/memory algorithm that GPUs struggle to exploit but custom hardware can make regular.
+
+## Slide 17
+- SOURCES
+- Primary references for the proposal.
+- The proposed hybrid is a synthesis; these sources motivate the components, not a single reported system.
+- URLs are plain text for easy copy/paste.
+- 17
+- PQCache
+- https://arxiv.org/abs/2407.12820
+- Self-Indexing KVCache
+- https://arxiv.org/abs/2603.14224
+- DASH-KV
+- https://arxiv.org/abs/2604.19351
+- Top-K + Completion
+- https://arxiv.org/abs/2604.05438
+- ShadowKV
+- https://arxiv.org/abs/2410.21465
+- ParisKV
+- https://arxiv.org/abs/2602.07721
+- RetrievalAttention
+- https://arxiv.org/abs/2409.10516
+- RocketKV
+- https://arxiv.org/abs/2502.14051
+- SWAN
+- https://arxiv.org/abs/2511.18936
