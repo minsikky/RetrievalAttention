@@ -3,6 +3,8 @@ import os
 import time
 import heapq
 import threading
+import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 import torch
 import numpy as np
@@ -31,6 +33,23 @@ from .roargraph_cpp_backend import (
     roargraph_cuda_kernel_available,
     roargraph_cuda_kernel_import_error,
 )
+
+
+def _parse_int_filter_env(name: str, default: str = ""):
+    raw = os.environ.get(name, default)
+    raw = str(raw).strip()
+    if raw in {"", "*", "all", "ALL"}:
+        return None
+    out = set()
+    for part in re.split(r"[,;:\s]+", raw):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except Exception:
+            print(f"[RetrievalAttention] WARNING: ignoring invalid integer {part!r} in {name}.")
+    return out
 
 
 class retrievalattention_cache(KV_Cache):
@@ -774,7 +793,20 @@ class retrievalattention_cache(KV_Cache):
         self.oracle_debug_enable = False
         self.oracle_answer_start_pos = None
         self.oracle_debug_records = []
-        self.oracle_compare_enable = False
+        self.oracle_compare_enable = os.environ.get("RETRIEVALATTN_ORACLE_COMPARE_ENABLE", "0") == "1"
+        self.oracle_compare_steps = _parse_int_filter_env("RETRIEVALATTN_ORACLE_COMPARE_STEPS", "0")
+        self.oracle_compare_layers = _parse_int_filter_env("RETRIEVALATTN_ORACLE_COMPARE_LAYERS", "0")
+        self.oracle_compare_heads = _parse_int_filter_env("RETRIEVALATTN_ORACLE_COMPARE_HEADS", "0")
+        try:
+            self.oracle_compare_max_records = int(os.environ.get("RETRIEVALATTN_ORACLE_COMPARE_MAX_RECORDS", "256"))
+        except Exception:
+            self.oracle_compare_max_records = 256
+        self.oracle_compare_max_records = max(1, int(self.oracle_compare_max_records))
+        try:
+            self.oracle_compare_topk = int(os.environ.get("RETRIEVALATTN_ORACLE_COMPARE_TOPK", "32"))
+        except Exception:
+            self.oracle_compare_topk = 32
+        self.oracle_compare_topk = max(1, int(self.oracle_compare_topk))
         self.oracle_compare_records = []
         self.attention_input_debug_enable = False
         self.attention_input_debug_answer_start_pos = None
@@ -6586,23 +6618,37 @@ class retrievalattention_cache(KV_Cache):
     ):
         if not self.oracle_compare_enable:
             return
-        if self.oracle_answer_start_pos is None:
+        if len(self.oracle_compare_records) >= int(self.oracle_compare_max_records):
             return
-        answer_step = int(max(0, int(self.decode_pos) - int(self.oracle_answer_start_pos)))
-        if answer_step > 0:
+        decode_pos = int(self.decode_pos)
+        if self.oracle_compare_steps is not None and decode_pos not in self.oracle_compare_steps:
+            return
+        if self.oracle_compare_layers is not None and int(layer_idx) not in self.oracle_compare_layers:
             return
         device = q_batch_t.device
         total_tokens = int(self._decode_token_limit())
         prefix_len = min(int(self.dynamic_start), int(total_tokens))
         scale = 1.0 / math.sqrt(self.head_dim)
         static_len = int(static_k.shape[0])
+        static_ids = self._get_fullgpu_static_token_ids()
+        dense_dyn_start = int(self.dynamic_start)
+        dense_dyn_end = int(self.dynamic_end)
+        dense_dyn_ids = list(range(dense_dyn_start, dense_dyn_end))
+        dense_token_ids = list(static_ids) + list(dense_dyn_ids)
+        dense_attn_key_t = self._get_decode_attn_key_tensor_cuda(layer_idx, kv_hdx)[dense_dyn_start:dense_dyn_end]
+        dense_value_t = self._get_decode_value_tensor_cuda(layer_idx, kv_hdx)[dense_dyn_start:dense_dyn_end]
         for idx, hdx in enumerate(head_ids):
+            if self.oracle_compare_heads is not None and int(hdx) not in self.oracle_compare_heads:
+                continue
+            if len(self.oracle_compare_records) >= int(self.oracle_compare_max_records):
+                return
             dense_scores_static = torch.matmul(q_batch_t[idx:idx + 1], static_k.transpose(0, 1)) * scale
-            dense_scores_dyn = torch.matmul(q_batch_t[idx:idx + 1], self._get_decode_attn_key_tensor_cuda(layer_idx, kv_hdx)[self.dynamic_start:self.dynamic_end].transpose(0, 1)) * scale
+            dense_scores_dyn = torch.matmul(q_batch_t[idx:idx + 1], dense_attn_key_t.transpose(0, 1)) * scale
             dense_scores = torch.cat([dense_scores_static.float(), dense_scores_dyn.float()], dim=-1)
             dense_attn = torch.softmax(dense_scores, dim=-1).squeeze(0)
             sparse_attn = attn[idx]
             sparse_mask = mask_t[idx]
+            static_dense_mass = float(dense_attn[:static_len].sum().item()) if static_len > 0 else 0.0
             oracle_dyn_mass = 0.0
             oracle_dense_masses = []
             dyn_ids = []
@@ -6610,10 +6656,10 @@ class retrievalattention_cache(KV_Cache):
                 take = int(keep_counts_t[idx].item())
                 if take > 0:
                     dyn_ids_row = dyn_ids_t[idx, :take]
-                    valid_mask = (dyn_ids_row >= int(self.dynamic_start)) & (dyn_ids_row < int(self.dynamic_end))
+                    valid_mask = (dyn_ids_row >= dense_dyn_start) & (dyn_ids_row < dense_dyn_end)
                     valid_ids_t = dyn_ids_row[valid_mask].to(torch.long)
                     if int(valid_ids_t.numel()) > 0:
-                        pos_t = (valid_ids_t - int(self.dynamic_start) + static_len).to(torch.long)
+                        pos_t = (valid_ids_t - dense_dyn_start + static_len).to(torch.long)
                         mass_t = dense_attn.index_select(0, pos_t)
                         oracle_dyn_mass = float(mass_t.sum().item())
                         valid_ids_cpu = valid_ids_t.detach().cpu().tolist()
@@ -6635,13 +6681,13 @@ class retrievalattention_cache(KV_Cache):
                 if dyn_ids:
                     for tok in dyn_ids:
                         tok = int(tok)
-                        if tok < int(self.dynamic_start) or tok >= int(self.dynamic_end):
+                        if tok < dense_dyn_start or tok >= dense_dyn_end:
                             continue
-                        pos = static_len + (tok - int(self.dynamic_start))
+                        pos = static_len + (tok - dense_dyn_start)
                         mass = float(dense_attn[pos].item())
                         oracle_dyn_mass += mass
                         oracle_dense_masses.append((tok, mass))
-            dense_v_cat = torch.cat([static_v, self._get_decode_value_tensor_cuda(layer_idx, kv_hdx)[self.dynamic_start:self.dynamic_end]], dim=0)
+            dense_v_cat = torch.cat([static_v, dense_value_t], dim=0)
             sparse_v_cat = torch.cat([static_v, dyn_v[idx]], dim=0)
             dense_out = torch.matmul(dense_attn.unsqueeze(0).to(dense_v_cat.dtype), dense_v_cat).squeeze(0)
             if sparse_out_batch is not None:
@@ -6650,6 +6696,34 @@ class retrievalattention_cache(KV_Cache):
                 sparse_out = torch.matmul(sparse_attn.unsqueeze(0).to(sparse_v_cat.dtype), sparse_v_cat).squeeze(0)
             total_dynamic_mass = float(dense_attn[static_len:].sum().item()) if dense_attn.numel() > static_len else 0.0
             omitted_dynamic_mass = max(0.0, total_dynamic_mass - oracle_dyn_mass)
+            selected_dense_mass = min(1.0, max(0.0, static_dense_mass + oracle_dyn_mass))
+            dense_out_norm = float(torch.linalg.vector_norm(dense_out.float()).item())
+            dense_sparse_out_l2 = float(torch.norm(dense_out.float() - sparse_out.float()).item())
+            dense_sparse_out_rel_l2 = (
+                float(dense_sparse_out_l2 / max(1.0e-8, dense_out_norm))
+                if math.isfinite(dense_out_norm) else float("nan")
+            )
+            dense_sparse_out_cos = float(
+                F.cosine_similarity(dense_out.float(), sparse_out.float(), dim=0).item()
+            )
+            selected_set = set(int(tok) for tok in dyn_ids)
+            selected_set.update(int(tok) for tok in static_ids)
+            top_dense = []
+            top_overlap = 0
+            topk = min(int(self.oracle_compare_topk), int(dense_attn.numel()))
+            if topk > 0:
+                vals_t, pos_t = torch.topk(dense_attn, k=topk)
+                vals = vals_t.detach().cpu().tolist()
+                pos = pos_t.detach().cpu().tolist()
+                for p, mass in zip(pos, vals):
+                    p_i = int(p)
+                    if p_i >= len(dense_token_ids):
+                        continue
+                    tok = int(dense_token_ids[p_i])
+                    hit = tok in selected_set
+                    top_overlap += 1 if hit else 0
+                    top_dense.append({"token": tok, "mass": float(mass), "selected": bool(hit)})
+            top_recall = float(top_overlap) / float(max(1, len(top_dense)))
             adaptive_mass_bound = (
                 float(adaptive_mass_bounds_t[idx].item())
                 if adaptive_mass_bounds_t is not None
@@ -6677,18 +6751,24 @@ class retrievalattention_cache(KV_Cache):
             )
             self.oracle_compare_records.append(
                 {
-                    "step": int(answer_step),
-                    "decode_pos": int(self.decode_pos),
+                    "step": int(decode_pos),
+                    "decode_pos": int(decode_pos),
                     "layer": int(layer_idx),
                     "kv_head": int(kv_hdx),
                     "head": int(hdx),
+                    "static_dense_mass": float(static_dense_mass),
+                    "selected_dense_mass": float(selected_dense_mass),
                     "oracle_dyn_mass": float(oracle_dyn_mass),
                     "total_dynamic_mass": float(total_dynamic_mass),
                     "omitted_dynamic_mass": float(omitted_dynamic_mass),
                     "oracle_token_count": int(len(dyn_ids)),
                     "sparse_dynamic_count": int(int(sparse_mask.sum().item())),
-                    "dense_sparse_out_l2": float(torch.norm(dense_out - sparse_out).item()),
+                    "dense_sparse_out_l2": float(dense_sparse_out_l2),
+                    "dense_sparse_out_rel_l2": float(dense_sparse_out_rel_l2),
+                    "dense_sparse_out_cos": float(dense_sparse_out_cos),
+                    "top_dense_recall": float(top_recall),
                     "top_oracle_dense_mass": oracle_dense_masses[:8],
+                    "top_dense": top_dense,
                     "adaptive_mass_bound": float(adaptive_mass_bound),
                     "adaptive_upper_score_bound": float(adaptive_upper_score_bound),
                     "adaptive_dynamic_span": int(adaptive_dynamic_span_i),
@@ -6696,6 +6776,70 @@ class retrievalattention_cache(KV_Cache):
                     "adaptive_keep_count": int(adaptive_keep_count),
                 }
             )
+
+    def get_oracle_compare_summary(self, reset: bool = False):
+        records = list(self.oracle_compare_records)
+        if not records:
+            return None
+        numeric_keys = [
+            "static_dense_mass",
+            "selected_dense_mass",
+            "oracle_dyn_mass",
+            "total_dynamic_mass",
+            "omitted_dynamic_mass",
+            "oracle_token_count",
+            "sparse_dynamic_count",
+            "dense_sparse_out_l2",
+            "dense_sparse_out_rel_l2",
+            "dense_sparse_out_cos",
+            "top_dense_recall",
+            "adaptive_mass_bound",
+            "adaptive_dynamic_span",
+            "adaptive_candidate_count",
+            "adaptive_keep_count",
+        ]
+
+        def aggregate(group):
+            out = {"records": int(len(group))}
+            for key in numeric_keys:
+                vals = []
+                for rec in group:
+                    value = rec.get(key)
+                    if value is None:
+                        continue
+                    try:
+                        value_f = float(value)
+                    except Exception:
+                        continue
+                    if math.isfinite(value_f):
+                        vals.append(value_f)
+                if vals:
+                    out[f"{key}_mean"] = float(np.mean(vals))
+            return out
+
+        by_step = {}
+        for rec in records:
+            by_step.setdefault(int(rec.get("decode_pos", rec.get("step", -1))), []).append(rec)
+        summary = {
+            "records": int(len(records)),
+            "overall": aggregate(records),
+            "by_decode_pos": {
+                str(step): aggregate(group)
+                for step, group in sorted(by_step.items())
+            },
+            "sample_records": records[: min(8, len(records))],
+        }
+        if reset:
+            self.oracle_compare_records = []
+        return summary
+
+    def report_oracle_compare(self, reset: bool = False):
+        if not self.oracle_compare_enable:
+            return None
+        summary = self.get_oracle_compare_summary(reset=reset)
+        if summary is None:
+            return "[RetrievalAttention] oracle_compare_summary_json=null"
+        return "[RetrievalAttention] oracle_compare_summary_json=" + json.dumps(summary, sort_keys=True)
 
     def _get_dynamic_attn_score_upper_bound_fullgpu(
         self,

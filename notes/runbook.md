@@ -1,5 +1,38 @@
 # Runbook
 
+## Attention-Efficiency Proxy Sweep (2026-04-29)
+- Purpose: compare dense oracle, static/chunk, RetroInfer-style, and RetrievalAttention-style token selection by algorithmic efficiency, not wall-clock latency.
+- Main outputs:
+  - `attention_efficiency_samples.jsonl`
+  - `summary.csv`
+  - `summary.json`
+  - optional `attention_efficiency_n*.png`
+- Local CPU smoke:
+```bash
+LD_LIBRARY_PATH=/sw/pkgs/arc/python/3.10.4/lib .venv/bin/python benchmark/attention_efficiency_eval.py \
+  --output_dir /tmp/attention_eff_smoke \
+  --context_lengths 1024 \
+  --budgets 32,64 \
+  --num_queries 8 \
+  --num_heads 4 \
+  --num_kv_heads 2 \
+  --head_dim 32 \
+  --static_prefix 16 \
+  --static_suffix 32 \
+  --budget_mode dynamic \
+  --device cpu \
+  --plot
+```
+- Slurm sweep:
+```bash
+sbatch benchmark/run_attention_efficiency_eval.sh
+```
+- Useful overrides:
+```bash
+sbatch --export=ALL,OUTPUT_DIR=attention_efficiency_result/proxy_v2,CONTEXT_LENGTHS=32768,65536,131072,BUDGETS=64,128,256,512,1024,2048,RA_VISIT_BUDGET=2048 benchmark/run_attention_efficiency_eval.sh
+```
+- `BUDGET_MODE=dynamic` means the budget is extra retrieved tokens beyond static prefix/suffix; static tokens are still counted in token-read ratio.
+
 ## Generic HuggingFace Backend Smoke Commands (2026-04-24)
 - Config-only check against cached Llama:
 ```bash

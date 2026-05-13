@@ -146,6 +146,10 @@ class LLM:
 
 
     def sampling(self, logits, do_sample=False, temperature=0.6, top_p=0.95, top_k=20):
+        forbidden_token_ids = getattr(self, "forbidden_token_ids", None)
+        if forbidden_token_ids:
+            logits = logits.clone()
+            logits[..., [int(tok) for tok in forbidden_token_ids]] = torch.finfo(logits.dtype).min
         if not do_sample:
             output_ids = logits.argmax(dim=-1)  # [bsz, 1], torch.int64
         else:
@@ -219,6 +223,10 @@ class LLM:
             decode_profile_msg = self.kv_cache.report_decode_profile(reset=True)
             if decode_profile_msg:
                 print(decode_profile_msg)
+        if hasattr(self, "kv_cache") and hasattr(self.kv_cache, "report_oracle_compare"):
+            oracle_compare_msg = self.kv_cache.report_oracle_compare(reset=True)
+            if oracle_compare_msg:
+                print(oracle_compare_msg)
 
         print(colored(f"End2End Latency: {round((prefill_end - prefill_start + decode_end - decode_start), 4)} s\n", 'green'))
         

@@ -3,6 +3,7 @@
 ## Project context
 RetroInfer (Microsoft) long-context attention repo with CPU-GPU co-execution.
 Current active experiment is RetrievalAttention-style ANN retrieval for `Llama-3.1-8B`.
+High-level research framing: prove dynamic/unstructured sparse attention's algorithmic efficiency first, then use the GPU mismatch to motivate hardware support for long decode. See `notes/research_flow.md`.
 
 ## Environment constraints
 - GPU server with Slurm (`sbatch`).
@@ -102,6 +103,7 @@ Current active experiment is RetrievalAttention-style ANN retrieval for `Llama-3
 - Decode latency reporting: `model_hub/LLM.py`
 
 ## Notes index
+- High-level research flow: `notes/research_flow.md`
 - Current status snapshot: `notes/current_status.md`
 - Debug and verification playbook: `notes/debug_playbook.md`
 - Performance and quality findings log: `notes/findings_log.md`

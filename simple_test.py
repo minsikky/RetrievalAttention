@@ -130,6 +130,9 @@ def generate_config(model_name, context_len, attn_type, token_budget_override=No
     nprobe = max(int(n_clusters*0.018), 1)
 
     if attn_type == 'RetroInfer':
+        retro_core_override = os.environ.get("RETROINFER_CORE", "").strip()
+        if retro_core_override:
+            original_config[attn_type]['core'] = max(int(retro_core_override), 1)
         original_config[attn_type]['n_centroids'] = n_clusters
         original_config[attn_type]['n_segment'] = n_segments
         original_config[attn_type]['nprobe'] = nprobe

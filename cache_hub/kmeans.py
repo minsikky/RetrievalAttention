@@ -1,3 +1,4 @@
+import os
 import torch
 import triton
 import triton.language as tl
@@ -222,6 +223,119 @@ def triton_index_add(
     return value_sum.to(value.dtype)
 
 
+def _torch_assign_update(
+    data: torch.Tensor,
+    centroids: torch.Tensor,
+    max_idx: torch.Tensor = None,
+    normalize_centroids: bool = True,
+    return_indices: bool = False,
+):
+    batch_size, num_tokens, dim = data.shape
+    num_centroids = centroids.shape[1]
+    scores = torch.bmm(data.float(), centroids.float().transpose(1, 2))
+    if max_idx is None:
+        max_idx = torch.empty((batch_size, num_tokens), dtype=torch.int64, device=data.device)
+    max_idx.copy_(torch.argmax(scores, dim=-1).to(max_idx.dtype))
+    assign_idx = max_idx.to(torch.int64)
+
+    data_sum = torch.zeros((batch_size, num_centroids, dim), dtype=torch.float32, device=data.device)
+    data_sum.scatter_add_(1, assign_idx[..., None].expand(-1, -1, dim), data.float())
+    data_cnt = torch.zeros((batch_size, num_centroids), dtype=torch.int32, device=data.device)
+    ones = torch.ones((batch_size, num_tokens), dtype=torch.int32, device=data.device)
+    data_cnt.scatter_add_(1, assign_idx, ones)
+
+    denom = data_cnt.clamp_min(1).to(torch.float32)[..., None]
+    updated = data_sum / denom
+    if normalize_centroids:
+        updated = torch.nn.functional.normalize(updated, p=2, dim=-1)
+    nonempty = data_cnt > 0
+    centroids = torch.where(nonempty[..., None], updated.to(centroids.dtype), centroids)
+
+    if return_indices:
+        return centroids, assign_idx.to(torch.int32), int(data_cnt.max().item())
+    return centroids
+
+
+def _torch_index_add(
+    value: torch.Tensor,
+    max_idx: torch.Tensor,
+    num_centroids: int,
+):
+    batch_size, num_tokens, dim = value.shape
+    value_sum = torch.zeros((batch_size, num_centroids, dim), dtype=torch.float32, device=value.device)
+    value_sum.scatter_add_(1, max_idx.to(torch.int64)[..., None].expand(-1, -1, dim), value.float())
+    return value_sum.to(value.dtype)
+
+
+def _torch_reverse_index(
+    max_idx: torch.Tensor,
+    num_centroids: int,
+    max_cluster_size: int,
+):
+    max_idx_cpu = max_idx.to(torch.int64).cpu()
+    batch_size, num_tokens = max_idx_cpu.shape
+    clusters = torch.zeros((batch_size, num_centroids, max_cluster_size), dtype=torch.int32)
+    cluster_size = torch.zeros((batch_size, num_centroids), dtype=torch.int32)
+    token_ids = torch.arange(num_tokens, dtype=torch.int32)
+    for bdx in range(batch_size):
+        order = torch.argsort(max_idx_cpu[bdx], stable=True)
+        sorted_idx = max_idx_cpu[bdx, order]
+        counts = torch.bincount(sorted_idx, minlength=num_centroids).to(torch.int32)
+        cluster_size[bdx].copy_(counts)
+        offsets = torch.zeros(num_centroids + 1, dtype=torch.int64)
+        offsets[1:] = torch.cumsum(counts.to(torch.int64), dim=0)
+        sorted_tokens = token_ids[order]
+        for cdx in range(num_centroids):
+            start = int(offsets[cdx].item())
+            end = int(offsets[cdx + 1].item())
+            if end > start:
+                clusters[bdx, cdx, :end - start] = sorted_tokens[start:end]
+    return clusters.to(max_idx.device), cluster_size.to(max_idx.device)
+
+
+def _torch_segment_k_means(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    num_centroids: int,
+    num_iters: int = 10,
+    num_segments: int = 1,
+):
+    _, num_tokens, head_dim = key.shape
+
+    centroid_indices = torch.arange(num_centroids, dtype=torch.float32, device=key.device) * (num_tokens / num_centroids)
+    centroid_indices += num_tokens / num_centroids / 2
+    centroid_indices = centroid_indices.to(torch.int64)
+    centroids = torch.index_select(key, dim=1, index=centroid_indices)
+
+    assert num_centroids % num_segments == 0
+    num_tokens_per_segment = num_tokens // num_segments
+    num_centroids_per_segment = num_centroids // num_segments
+    data = key[:, :num_tokens_per_segment * num_segments].reshape((-1, num_tokens_per_segment, head_dim))
+    centroids = centroids.reshape((-1, num_centroids_per_segment, head_dim))
+    max_idx = torch.empty((data.shape[0], data.shape[1]), dtype=torch.int32, device=data.device)
+    with torch.no_grad():
+        for _ in range(num_iters - 1):
+            centroids = _torch_assign_update(
+                data,
+                centroids,
+                max_idx=max_idx,
+                normalize_centroids=True,
+                return_indices=False,
+            )
+
+        data = key.reshape((-1, num_tokens, head_dim))
+        centroids = centroids.reshape((-1, num_centroids, head_dim))
+        centroids, max_idx, max_cluster_size = _torch_assign_update(
+            data,
+            centroids,
+            normalize_centroids=False,
+            return_indices=True,
+        )
+        value_sum = _torch_index_add(value.reshape((-1, num_tokens, head_dim)), max_idx, num_centroids)
+        clusters, cluster_size = _torch_reverse_index(max_idx, num_centroids, max_cluster_size)
+    return centroids, value_sum, clusters, cluster_size
+
+
 def segment_k_means(
     key: torch.Tensor,    # [batch_size*kv_head_num, num_tokens, head_dim]
     value: torch.Tensor,  # [batch_size*kv_head_num, num_tokens, head_dim]
@@ -229,6 +343,16 @@ def segment_k_means(
     num_iters: int = 10,
     num_segments: int = 1
 ):
+    backend = os.environ.get("RETROINFER_KMEANS_BACKEND", "triton").strip().lower()
+    if backend in {"torch", "pytorch"}:
+        return _torch_segment_k_means(
+            key=key,
+            value=value,
+            num_centroids=num_centroids,
+            num_iters=num_iters,
+            num_segments=num_segments,
+        )
+
     _, num_tokens, head_dim = key.shape
 
     # initialize centroids uniformly
