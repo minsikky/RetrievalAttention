@@ -131,6 +131,41 @@ Budget-knee result for decode `76387`, high selected-mass `0.99`:
 
 Interpretation: the long-context c3 outlier is fixable, but it requires a much larger selected-token budget for that query. This weakens the simple fixed-budget frontier; the next algorithmic question is whether an online confidence rule can detect this high-tail-risk query without always paying 40k+ budget.
 
+Online confidence/budget rules tested after the q288 robustness failure:
+
+- `geometric_probe_tail_switch`: start at a small selected budget, compare compressed-tail output against a larger exact probe, and geometrically escalate when the probe check fails. This uses selected/probed exact K/V, PQ scores, and V-PQ tail sidecars only; it does not use dense/oracle mass.
+- `geometric_stable_tail_switch`: same as above, plus a second compressed-tail stability check at the probe budget. This was not materially better than the simpler probe-tail rule.
+- `geometric_exact_delta`: compare exact selected-output prefixes at `k` and `probe(k)` and escalate until the prefix delta is small. This is robust and tail-free, but more expensive.
+
+Hard-query results:
+
+| rule | decode | max layer relL2 | mean step MB/head | budget behavior | interpretation |
+| --- | ---: | ---: | ---: | --- | --- |
+| fixed high selected-mass `0.99` | 76387 | 0.016611 | 9.735 | fixed `16k` | Original q288 c3 failure. |
+| `geometric_probe_tail_switch`, threshold `0.05` | 76387 | 0.002519 | 12.246 | mean `22.2k`, max `63.5k` | Detects the original hard query cheaply. |
+| `geometric_stable_tail_switch`, threshold `0.05` | 76387 | 0.002318 | 12.603 | mean `22.7k`, max `63.5k` | Slight quality gain, small extra confidence cost. |
+| `geometric_exact_delta`, delta `0.02` | 76387 | 0.002564 | 16.383 | mean `36.0k`, max `65.5k` | Robust fallback, but more exact-read heavy. |
+| `geometric_probe_tail_switch`, threshold `0.05` | 92903 | 0.008589 | 12.693 | tail passed all heads | Reveals tail-overtrust; threshold too loose. |
+| `geometric_probe_tail_switch`, threshold `0.02` | 92903 | 0.003209 | 15.237 | mean `30.8k`, max `65.5k` | Stricter probe catches the second hard query. |
+| `geometric_exact_delta`, delta `0.02` | 92903 | 0.003197 | 15.594 | mean `33.7k`, max `65.5k` | Similar quality/cost, no tail estimator. |
+
+Full q288 validation for the current best online rule, `geometric_probe_tail_switch` with tail-probe threshold `0.02` and max budget `65k`:
+
+| scope | rows | max attn relL2 | max layer relL2 | max step MB/head | min head mass | source |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| q288 chunks c0-c3 | 288 | 0.009079 | 0.004510 | 17.156 | 0.884493 | `attention_efficiency_result/confidence_budget_rules_20260512/aggregate_q288_l020_merged/validation_by_config.md` |
+
+Comparison against the fixed q288 rules:
+
+| config | q288 rows | max attn relL2 | max layer relL2 | max step MB/head | interpretation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| fixed low selected-mass `0.90` | 288 | 0.046831 | 0.018593 | 9.455 | Not robust. |
+| fixed mid residual-risk `0.90` | 288 | 0.032440 | 0.016662 | 9.567 | Not robust. |
+| fixed high selected-mass `0.99` | 288 | 0.032276 | 0.016611 | 11.493 | Not robust; misses c3 hard query. |
+| online geometric probe-tail `0.02` | 288 | 0.009079 | 0.004510 | 17.156 | Best robust online rule so far; costs more but removes the large q288 outliers. |
+
+Current recommendation: use `geometric_probe_tail_switch` with threshold `0.02`, max budget `65k`, and selected-mass selected-V allocation as the robust online candidate. Keep `geometric_exact_delta` as a conservative fallback/ablation because it verifies that the remaining errors are mostly tail-confidence issues, not a fundamentally broken selector.
+
 ## Latest Algorithm-Search Update
 
 128k, layer 16, all heads, real Llama-3.1-8B trace. Costs are per head/query and include selector, exact K/V, compressed-tail estimator, and confidence/audit traffic.

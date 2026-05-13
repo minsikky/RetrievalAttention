@@ -642,6 +642,7 @@ def run() -> None:
             "adaptive_entropy_probe_tail_switch",
             "geometric_probe_tail_switch",
             "geometric_stable_tail_switch",
+            "geometric_exact_delta",
         ],
         default="none",
     )
@@ -674,6 +675,7 @@ def run() -> None:
     parser.add_argument("--geometric_probe_scale", type=float, default=1.125)
     parser.add_argument("--geometric_budget_granularity", type=int, default=1024)
     parser.add_argument("--stable_tail_probe_rel_l2_max", type=float, default=0.05)
+    parser.add_argument("--exact_delta_rel_l2_max", type=float, default=0.01)
     parser.add_argument("--audit_tail_samples", type=int, default=0)
     parser.add_argument("--audit_tail_mass_max", type=float, default=1.0)
     parser.add_argument("--audit_tail_logit_gap_max", type=float, default=float("inf"))
@@ -858,7 +860,11 @@ def run() -> None:
             elif str(args.online_confidence_rule) in {"entropy_probe_tail_switch", "adaptive_entropy_probe_tail_switch"}:
                 budget = int(max(confidence_budgets + [int(args.tail_confidence_budget), int(args.entropy_max_budget)]))
                 rank_budget = budget
-            elif str(args.online_confidence_rule) in {"geometric_probe_tail_switch", "geometric_stable_tail_switch"}:
+            elif str(args.online_confidence_rule) in {
+                "geometric_probe_tail_switch",
+                "geometric_stable_tail_switch",
+                "geometric_exact_delta",
+            }:
                 budget = int(args.geometric_max_budget)
                 rank_budget = budget
             else:
@@ -1125,6 +1131,7 @@ def run() -> None:
             entropy_tail_effective_support = 0.0
             entropy_tail_mass = 0.0
             entropy_required_budget = 0
+            exact_delta_rel_l2 = float("inf")
             precomputed_tail_np = None
             precomputed_tail_count = 0
             precomputed_tail_population = 0
@@ -2153,6 +2160,114 @@ def run() -> None:
                     if int(next_k) <= int(probe_budget):
                         break
                     k = int(next_k)
+            elif online_rule == "geometric_exact_delta":
+                max_budget = int(args.geometric_max_budget)
+                granularity = max(1, int(args.geometric_budget_granularity))
+                growth = max(1.01, float(args.geometric_growth))
+                probe_scale = max(1.01, float(args.geometric_probe_scale))
+                k = _round_budget_up(
+                    int(args.geometric_min_budget),
+                    granularity=granularity,
+                    max_budget=max_budget,
+                )
+                selected_cpu = _selected_for_budget(base=base, ranked_cpu=ranked_cpu, budget=0, context_len=context_len)
+                selected_only_np = np.zeros((trace.head_dim,), dtype=np.float32)
+                effective_tail_blend = 0.0
+                while True:
+                    tail_budget = min(int(k), max_budget)
+                    tail_selected = _selected_for_budget(
+                        base=base,
+                        ranked_cpu=ranked_cpu,
+                        budget=tail_budget,
+                        context_len=context_len,
+                    )
+                    tail_selected_only, _tail_selected_values_np = selected_output(tail_selected)
+                    if str(args.tail_score_calibration) == "affine_selected":
+                        (
+                            tail_score_scale,
+                            tail_score_bias,
+                            tail_calibration_tokens,
+                            tail_pq_relrmse,
+                            tail_pq_corr,
+                            tail_pq_residual_std,
+                        ) = _fit_selected_pq_logit_uncertainty(
+                            selected_cpu=tail_selected,
+                            ranked_cpu=ranked_cpu,
+                            ranked_scores_cpu=ranked_scores_cpu,
+                            scores_np=scores_np,
+                            query_dim=int(trace.head_dim),
+                        )
+                    proxy_mass, proxy_tail_mass = _proxy_selected_mass(
+                        selected_cpu=tail_selected,
+                        ranked_cpu=ranked_cpu,
+                        ranked_scores_cpu=ranked_scores_cpu,
+                        scores_np=scores_np,
+                        query_dim=int(trace.head_dim),
+                        tail_score_scale=tail_score_scale,
+                        tail_score_bias=tail_score_bias,
+                    )
+                    chosen_proxy_mass = float(proxy_mass)
+                    chosen_proxy_tail_mass = float(proxy_tail_mass)
+                    probe_budget = _round_budget_up(
+                        max(float(tail_budget + granularity), probe_scale * float(tail_budget)),
+                        granularity=granularity,
+                        max_budget=max_budget,
+                    )
+                    probe_budget = max(tail_budget, int(probe_budget))
+                    if probe_budget <= tail_budget:
+                        selected_cpu = tail_selected
+                        selected_only_np = tail_selected_only
+                        budget = int(tail_budget)
+                        break
+                    probe_selected = _selected_for_budget(
+                        base=base,
+                        ranked_cpu=ranked_cpu,
+                        budget=probe_budget,
+                        context_len=context_len,
+                    )
+                    probe_selected_only, _probe_selected_values_np = selected_output(probe_selected)
+                    exact_delta_rel_l2 = float(
+                        np.linalg.norm(
+                            probe_selected_only.astype(np.float64, copy=False)
+                            - tail_selected_only.astype(np.float64, copy=False)
+                        )
+                    ) / max(float(np.linalg.norm(probe_selected_only.astype(np.float64, copy=False))), 1e-20)
+                    marginal_exact_mass, marginal_score_gap = _selected_exact_marginal_metrics(
+                        selected_cpu=probe_selected,
+                        previous_selected_cpu=tail_selected,
+                        scores_np=scores_np,
+                    )
+                    probe_proxy_mass, probe_proxy_tail_mass = _proxy_selected_mass(
+                        selected_cpu=probe_selected,
+                        ranked_cpu=ranked_cpu,
+                        ranked_scores_cpu=ranked_scores_cpu,
+                        scores_np=scores_np,
+                        query_dim=int(trace.head_dim),
+                        tail_score_scale=tail_score_scale,
+                        tail_score_bias=tail_score_bias,
+                    )
+                    selected_cpu = probe_selected
+                    selected_only_np = probe_selected_only
+                    budget = int(probe_budget)
+                    chosen_proxy_mass = float(probe_proxy_mass)
+                    chosen_proxy_tail_mass = float(probe_proxy_tail_mass)
+                    tail_confidence_pass = (
+                        exact_delta_rel_l2 <= float(args.exact_delta_rel_l2_max)
+                        and chosen_proxy_mass >= float(args.tail_proxy_mass_min)
+                        and chosen_proxy_tail_mass <= float(args.tail_proxy_mass_max)
+                        and marginal_exact_mass <= float(args.marginal_mass_max)
+                        and marginal_score_gap <= float(args.marginal_score_gap_max)
+                    )
+                    if tail_confidence_pass or probe_budget >= max_budget:
+                        break
+                    next_k = _round_budget_up(
+                        max(float(probe_budget + granularity), growth * float(probe_budget)),
+                        granularity=granularity,
+                        max_budget=max_budget,
+                    )
+                    if int(next_k) <= int(probe_budget):
+                        break
+                    k = int(next_k)
             else:
                 raise ValueError(f"unknown online_confidence_rule: {online_rule}")
 
@@ -2250,6 +2365,12 @@ def run() -> None:
                     if key_bytes_ == final_key:
                         continue
                     confidence_selected_value_mb += float(cached[2]) + float(cached[3])
+                if online_rule == "geometric_exact_delta":
+                    # Exact-delta probes are nested selected prefixes. A real
+                    # implementation can retain fetched selected values until
+                    # the final prefix decision, so the final selected-value
+                    # traffic covers the probe prefixes.
+                    confidence_selected_value_mb = 0.0
                 confidence_mb += confidence_selected_value_mb
             else:
                 selected_value_mb = float(selected_cpu.size * trace.head_dim * int(args.value_bytes)) / MB
@@ -2348,6 +2469,8 @@ def run() -> None:
                     "geometric_growth": float(args.geometric_growth),
                     "geometric_probe_scale": float(args.geometric_probe_scale),
                     "stable_tail_probe_rel_l2_max": float(args.stable_tail_probe_rel_l2_max),
+                    "exact_delta_rel_l2": float(exact_delta_rel_l2),
+                    "exact_delta_rel_l2_max": float(args.exact_delta_rel_l2_max),
                     "attention_mass": mass,
                     "head_attention_relative_L2": head_metric["output_relative_l2"],
                     "head_attention_cosine": head_metric["output_cosine"],
@@ -2418,7 +2541,8 @@ def run() -> None:
         )
         elapsed = time.perf_counter() - q_start
         if str(args.online_confidence_rule) != "none":
-            algorithm = f"{args.selector_mode}_paged_pq_{args.online_confidence_rule}_rank{max(confidence_budgets + [int(args.tail_confidence_budget)])}+{args.tail_mode}_tail"
+            max_rank_budget = max([int(r.get("rank_budget", default_budget)) for r in head_rows] or [default_budget])
+            algorithm = f"{args.selector_mode}_paged_pq_{args.online_confidence_rule}_rank{max_rank_budget}+{args.tail_mode}_tail"
         elif budget_by_head:
             algorithm = f"{args.selector_mode}_paged_pq_head_budget+{args.tail_mode}_tail"
         else:
@@ -2461,6 +2585,7 @@ def run() -> None:
             "geometric_probe_scale": float(args.geometric_probe_scale),
             "geometric_budget_granularity": int(args.geometric_budget_granularity),
             "stable_tail_probe_rel_l2_max": float(args.stable_tail_probe_rel_l2_max),
+            "exact_delta_rel_l2_max": float(args.exact_delta_rel_l2_max),
             "audit_tail_samples": int(args.audit_tail_samples),
             "audit_tail_mass_max": float(args.audit_tail_mass_max),
             "audit_tail_logit_gap_max": float(args.audit_tail_logit_gap_max),
@@ -2535,6 +2660,8 @@ def run() -> None:
             "mean_entropy_effective_support": float(np.mean([r["entropy_effective_support"] for r in head_rows])),
             "mean_entropy_tail_mass": float(np.mean([r["entropy_tail_mass"] for r in head_rows])),
             "mean_entropy_required_budget": float(np.mean([r["entropy_required_budget"] for r in head_rows])),
+            "mean_exact_delta_rel_l2": float(np.mean([r["exact_delta_rel_l2"] for r in head_rows if np.isfinite(float(r["exact_delta_rel_l2"]))])) if any(np.isfinite(float(r["exact_delta_rel_l2"])) for r in head_rows) else float("inf"),
+            "max_exact_delta_rel_l2": float(np.max([r["exact_delta_rel_l2"] for r in head_rows if np.isfinite(float(r["exact_delta_rel_l2"]))])) if any(np.isfinite(float(r["exact_delta_rel_l2"])) for r in head_rows) else float("inf"),
             "mean_step_MB_per_head": float(np.mean([r["step_MB_per_query"] for r in head_rows])),
             "max_step_MB_per_head": float(np.max([r["step_MB_per_query"] for r in head_rows])),
         }
@@ -2622,6 +2749,8 @@ def run() -> None:
             "mean_entropy_effective_support",
             "mean_entropy_tail_mass",
             "mean_entropy_required_budget",
+            "mean_exact_delta_rel_l2",
+            "max_exact_delta_rel_l2",
             "mean_step_MB_per_head",
             "max_step_MB_per_head",
             "query_seconds",
