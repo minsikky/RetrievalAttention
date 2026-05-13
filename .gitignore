@@ -7,6 +7,12 @@ __pycache__/
 *.swp
 tmp/
 benchmark/ncu_reports/
+.codex/
+.graphify_python
+attention_efficiency_result/
+generated_memory_eval_result/
+graphify-out/
+longbench_v2_hf_result/
 slurm-*.out
 slurm-c90-*.out
 slurm-cmp64-*.out
