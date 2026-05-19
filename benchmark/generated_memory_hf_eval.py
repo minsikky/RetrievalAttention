@@ -2333,10 +2333,15 @@ def load_hf_model(args, dtype, config):
     architectures = config_get(config, "architectures", []) or []
     text_architectures = config_get(get_text_config(config), "architectures", []) or []
     if bool(args.hf_language_model_only):
-        if text_model_type in {"qwen3", "qwen3_5", "qwen3_5_text"} or top_model_type in {"qwen3", "qwen3_5"}:
+        if text_model_type == "qwen3" or top_model_type == "qwen3":
+            for class_name in (
+                "Qwen3ForCausalLM",
+                "AutoModelForCausalLM",
+            ):
+                add_transformers_class(class_name)
+        elif text_model_type in {"qwen3_5", "qwen3_5_text"} or top_model_type == "qwen3_5":
             for class_name in (
                 "Qwen3_5ForCausalLM",
-                "Qwen3ForCausalLM",
                 "AutoModelForCausalLM",
             ):
                 add_transformers_class(class_name)
@@ -2349,9 +2354,10 @@ def load_hf_model(args, dtype, config):
         add_transformers_class("LlamaForCausalLM")
     if text_model_type in {"qwen2", "qwen2_moe"} or top_model_type in {"qwen2", "qwen2_moe"}:
         add_transformers_class("Qwen2ForCausalLM")
-    if text_model_type in {"qwen3", "qwen3_5"} or top_model_type in {"qwen3", "qwen3_5"}:
+    if text_model_type == "qwen3" or top_model_type == "qwen3":
+        add_transformers_class("Qwen3ForCausalLM")
+    if text_model_type in {"qwen3_5", "qwen3_5_text"} or top_model_type == "qwen3_5":
         for class_name in (
-            "Qwen3ForCausalLM",
             "Qwen3_5ForCausalLM",
             "Qwen3_5ForConditionalGeneration",
         ):

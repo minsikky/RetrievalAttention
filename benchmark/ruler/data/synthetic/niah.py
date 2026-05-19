@@ -35,14 +35,27 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 import random
-import wonderwords
+try:
+    import wonderwords
+except Exception:
+    wonderwords = None
 import sys
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")) 
 from utils import dump_jsonl
 from tokenizer import select_tokenizer
-import nltk
-nltk.download('punkt_tab')
-from nltk.tokenize import sent_tokenize
+try:
+    import nltk
+    if hasattr(nltk, "download"):
+        try:
+            nltk.download('punkt_tab')
+        except Exception:
+            pass
+    from nltk.tokenize import sent_tokenize
+except Exception as exc:
+    print(f"[WARN] NLTK sentence tokenizer unavailable; using regex fallback: {exc}")
+
+    def sent_tokenize(text):
+        return [part.strip() for part in re.split(r"(?<=[.!?])\\s+", text) if part.strip()]
 
 
 parser = argparse.ArgumentParser()
@@ -90,8 +103,25 @@ else:
 
 
 # Words
-nouns = wonderwords.random_word._get_words_from_text_file("nounlist.txt")
-adjs = wonderwords.random_word._get_words_from_text_file("adjectivelist.txt")
+try:
+    if wonderwords is None or not hasattr(wonderwords, "random_word"):
+        raise AttributeError("wonderwords.random_word unavailable")
+    nouns = wonderwords.random_word._get_words_from_text_file("nounlist.txt")
+    adjs = wonderwords.random_word._get_words_from_text_file("adjectivelist.txt")
+except Exception as exc:
+    print(f"[WARN] wonderwords unavailable; using deterministic fallback words: {exc}")
+    nouns = [
+        "anchor", "bridge", "copper", "delta", "ember", "forest", "garden", "harbor",
+        "island", "jacket", "kernel", "lantern", "meadow", "nebula", "orbit", "pencil",
+        "quartz", "river", "signal", "temple", "unit", "violet", "window", "xenon",
+        "yonder", "zephyr",
+    ]
+    adjs = [
+        "amber", "brisk", "calm", "daring", "eager", "faint", "gentle", "hidden",
+        "ivory", "jolly", "kind", "lunar", "merry", "noble", "opal", "plain",
+        "quick", "royal", "silent", "tidy", "urban", "vivid", "warm", "young",
+        "zesty",
+    ]
 # verbs = wonderwords.random_word._get_words_from_text_file("verblist.txt")
 words = [f"{adj}-{noun}" for adj in adjs for noun in nouns]
 words = sorted(list(set(words)))

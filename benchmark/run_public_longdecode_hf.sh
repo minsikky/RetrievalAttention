@@ -1,13 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=lbv2-hf
+#SBATCH --job-name=public-ldecode
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=128000m
-#SBATCH --time=02:00:00
+#SBATCH --time=06:00:00
 #SBATCH --account=zhengya98
 #SBATCH --partition=spgpu
 #SBATCH --gpus-per-node=1
+
+set -euo pipefail
+
+cd /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention
 
 module purge
 module load python/3.10.4
@@ -72,57 +76,46 @@ if [ -n "${HF_EXTRA_PYTHONPATH}" ]; then
   fi
 fi
 export TOKENIZERS_PARALLELISM=false
-set -euo pipefail
 
-MODEL_NAME="${MODEL_NAME:-${PRESET_MODEL_NAME}}"
-if [ -e "${MODEL_NAME}" ]; then
-  MODEL_NAME="$(readlink -f "${MODEL_NAME}")"
-fi
-if [ "${STAGE_MODEL_TO_TMP:-0}" = "1" ]; then
-  if [ ! -d "${MODEL_NAME}" ]; then
-    echo "[ERROR] STAGE_MODEL_TO_TMP=1 requires MODEL_NAME to be a local directory: ${MODEL_NAME}" >&2
-    exit 1
-  fi
-  TMP_MODEL_ROOT="${SLURM_TMPDIR:-/tmp/${USER}/longbench_model_${SLURM_JOB_ID:-manual}}"
-  mkdir -p "${TMP_MODEL_ROOT}"
-  echo "[INFO] Staging model to ${TMP_MODEL_ROOT}"
-  if command -v rsync >/dev/null 2>&1; then
-    # HF snapshot directories are symlink farms into blobs/. Dereference them
-    # when staging, otherwise /tmp gets broken ../../blobs links.
-    rsync -aL --delete "${MODEL_NAME}/" "${TMP_MODEL_ROOT}/"
-  else
-    cp -aL "${MODEL_NAME}/." "${TMP_MODEL_ROOT}/"
-  fi
-  MODEL_NAME="${TMP_MODEL_ROOT}"
-fi
+DEFAULT_MODEL_PATH="${PRESET_MODEL_NAME}"
+MODEL_NAME="${MODEL_NAME:-${DEFAULT_MODEL_PATH}}"
+BENCHMARK="${BENCHMARK:-aime24}"
+ATTENTION_MODE="${ATTENTION_MODE:-dense}"
+APPROX_PREFILL="${APPROX_PREFILL:-0}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-public_longdecode_result}"
+RUN_NAME="${RUN_NAME:-${ATTENTION_MODE}_${BENCHMARK}_smoke}"
+OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}}"
+
 DTYPE="${DTYPE:-bf16}"
 DEVICE_MAP="${DEVICE_MAP:-auto}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-0}"
-LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-0}"
+LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-1}"
 LOW_CPU_MEM_USAGE="${LOW_CPU_MEM_USAGE:-1}"
-HF_LANGUAGE_MODEL_ONLY="${HF_LANGUAGE_MODEL_ONLY:-1}"
+HF_LANGUAGE_MODEL_ONLY="${HF_LANGUAGE_MODEL_ONLY:-0}"
 USE_CHAT_TEMPLATE="${USE_CHAT_TEMPLATE:-1}"
-DISABLE_THINKING="${DISABLE_THINKING:-1}"
-DATASET_NAME="${DATASET_NAME:-THUDM/LongBench-v2}"
-SPLIT="${SPLIT:-train}"
-OUTPUT_DIR="${OUTPUT_DIR:-longbench_v2_hf_result}"
-MAX_EXAMPLES="${MAX_EXAMPLES:-16}"
-LENGTH_FILTER="${LENGTH_FILTER:-}"
-DIFFICULTY_FILTER="${DIFFICULTY_FILTER:-}"
-DOMAIN_FILTER="${DOMAIN_FILTER:-}"
-ID_FILTER="${ID_FILTER:-}"
-SELECTION="${SELECTION:-first}"
+DISABLE_THINKING="${DISABLE_THINKING:-0}"
 SEED="${SEED:-2026}"
+MAX_EXAMPLES="${MAX_EXAMPLES:-1}"
+SELECTION="${SELECTION:-first}"
 MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-120000}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
-TEMPERATURE="${TEMPERATURE:-0.1}"
-STREAMING="${STREAMING:-1}"
-DATASET_SCAN_LIMIT="${DATASET_SCAN_LIMIT:-1000}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+MIN_NEW_TOKENS="${MIN_NEW_TOKENS:-0}"
+TEMPERATURE="${TEMPERATURE:-0.0}"
+TOP_P="${TOP_P:-1.0}"
+FORCE_MAX_NEW_TOKENS="${FORCE_MAX_NEW_TOKENS:-0}"
 QWEN_YARN_FACTOR="${QWEN_YARN_FACTOR:-0}"
 QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS:-${PRESET_QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}}"
-ATTENTION_MODE="${ATTENTION_MODE:-dense}"
-APPROX_PREFILL="${APPROX_PREFILL:-0}"
+
+LIVE_CODE_RELEASE="${LIVE_CODE_RELEASE:-release_v6}"
+LIVE_CODE_START_DATE="${LIVE_CODE_START_DATE:-}"
+LIVE_CODE_END_DATE="${LIVE_CODE_END_DATE:-}"
+EVALUATE_CODE="${EVALUATE_CODE:-0}"
+CODE_EVAL_PROCESSES="${CODE_EVAL_PROCESSES:-4}"
+CODE_EVAL_TIMEOUT="${CODE_EVAL_TIMEOUT:-6}"
+LONGGENBENCH_GSM8K_K="${LONGGENBENCH_GSM8K_K:-32}"
+LONGGENBENCH_GSM8K_QUESTION_LIMIT="${LONGGENBENCH_GSM8K_QUESTION_LIMIT:-256}"
+
 LAYERS="${LAYERS:-all}"
 SELECTOR_MODE="${SELECTOR_MODE:-fullscan}"
 SELECTOR_BACKEND="${SELECTOR_BACKEND:-cuda_ext}"
@@ -153,14 +146,18 @@ SELECTED_VALUE_MAX_EXACT_TOP="${SELECTED_VALUE_MAX_EXACT_TOP:-0}"
 SELECTED_VALUE_EXACT_ALL_CONTEXT_MAX="${SELECTED_VALUE_EXACT_ALL_CONTEXT_MAX:-0}"
 SELECTED_VALUE_EXACT_ALL_FRACTION_MIN="${SELECTED_VALUE_EXACT_ALL_FRACTION_MIN:-0.0}"
 TAIL_BLEND="${TAIL_BLEND:-1.0}"
-PREFILL_TAIL_BLEND="${PREFILL_TAIL_BLEND:-}"
-DECODE_TAIL_BLEND="${DECODE_TAIL_BLEND:-}"
 PAGE_SIZE="${PAGE_SIZE:-5632}"
 PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-0}"
 PREFILL_SELECTOR_BACKEND="${PREFILL_SELECTOR_BACKEND:-native}"
-PREFILL_SELECTOR_TILE_SIZE="${PREFILL_SELECTOR_TILE_SIZE:-0}"
-PREFILL_RANK_BUFFER_LIMIT_MB="${PREFILL_RANK_BUFFER_LIMIT_MB:-4096}"
+if [[ -z "${PREFILL_SELECTOR_TILE_SIZE+x}" ]]; then
+  if [[ "${PREFILL_SELECTOR_BACKEND}" == "native" ]]; then
+    PREFILL_SELECTOR_TILE_SIZE=2048
+  else
+    PREFILL_SELECTOR_TILE_SIZE=256
+  fi
+fi
 PREFILL_SELECTOR_PAGE_BLOCK_SIZE="${PREFILL_SELECTOR_PAGE_BLOCK_SIZE:-0}"
+PREFILL_RANK_BUFFER_LIMIT_MB="${PREFILL_RANK_BUFFER_LIMIT_MB:-4096}"
 PREFILL_TAIL_SCORE_REUSE="${PREFILL_TAIL_SCORE_REUSE:-1}"
 PREFILL_ATTENTION_BACKEND="${PREFILL_ATTENTION_BACKEND:-native}"
 SUBVECS="${SUBVECS:-4}"
@@ -171,7 +168,6 @@ VALUE_PQ_GROUP_PAGES="${VALUE_PQ_GROUP_PAGES:-1}"
 KMEANS_ITERS="${KMEANS_ITERS:-3}"
 INDEX_BUILD_BACKEND="${INDEX_BUILD_BACKEND:-torch_gpu}"
 NPROBES="${NPROBES:-16,32,64,128,256,512}"
-DIAGNOSE_DENSE_REFERENCE="${DIAGNOSE_DENSE_REFERENCE:-0}"
 PROFILE_NATIVE_OPS="${PROFILE_NATIVE_OPS:-0}"
 DISABLE_COST_STATS="${DISABLE_COST_STATS:-0}"
 DISABLE_NATIVE_DECODE_FUSED="${DISABLE_NATIVE_DECODE_FUSED:-1}"
@@ -183,104 +179,53 @@ NATIVE_DECODE_TAIL="${NATIVE_DECODE_TAIL:-1}"
 echo "[INFO] Job started at: $(date)"
 echo "[INFO] Host: $(hostname)"
 echo "[INFO] HF_MODEL_PRESET=${HF_MODEL_PRESET}"
-echo "[INFO] MODEL_NAME=${MODEL_NAME}"
-echo "[INFO] DATASET_NAME=${DATASET_NAME}"
-echo "[INFO] OUTPUT_DIR=${OUTPUT_DIR}"
-echo "[INFO] HF_CACHE_DIR=${HF_CACHE_DIR}"
-echo "[INFO] HF_HOME=${HF_HOME}"
-echo "[INFO] HF_HUB_CACHE=${HF_HUB_CACHE}"
-echo "[INFO] HF_DATASETS_CACHE=${HF_DATASETS_CACHE}"
-echo "[INFO] TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE}"
-echo "[INFO] MAX_EXAMPLES=${MAX_EXAMPLES}"
-echo "[INFO] LENGTH_FILTER=${LENGTH_FILTER}"
-echo "[INFO] DIFFICULTY_FILTER=${DIFFICULTY_FILTER}"
-echo "[INFO] DOMAIN_FILTER=${DOMAIN_FILTER}"
-echo "[INFO] ID_FILTER=${ID_FILTER}"
-echo "[INFO] SELECTION=${SELECTION}"
-echo "[INFO] MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS}"
-echo "[INFO] QWEN_YARN_FACTOR=${QWEN_YARN_FACTOR}"
-echo "[INFO] QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS=${QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}"
-echo "[INFO] USE_CHAT_TEMPLATE=${USE_CHAT_TEMPLATE}"
-echo "[INFO] DISABLE_THINKING=${DISABLE_THINKING}"
+echo "[INFO] BENCHMARK=${BENCHMARK}"
 echo "[INFO] ATTENTION_MODE=${ATTENTION_MODE}"
 echo "[INFO] APPROX_PREFILL=${APPROX_PREFILL}"
-echo "[INFO] FRONTIER_CANONICAL_GPU=${FRONTIER_CANONICAL_GPU}"
-echo "[INFO] LAYERS=${LAYERS}"
-echo "[INFO] BUDGET=${BUDGET}"
+echo "[INFO] MODEL_NAME=${MODEL_NAME}"
+echo "[INFO] OUTPUT_DIR=${OUTPUT_DIR}"
+echo "[INFO] MAX_EXAMPLES=${MAX_EXAMPLES}"
+echo "[INFO] MAX_INPUT_TOKENS=${MAX_INPUT_TOKENS}"
+echo "[INFO] MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
+echo "[INFO] MIN_NEW_TOKENS=${MIN_NEW_TOKENS}"
+echo "[INFO] FORCE_MAX_NEW_TOKENS=${FORCE_MAX_NEW_TOKENS}"
+echo "[INFO] LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY}"
+echo "[INFO] HF_EXTRA_PYTHONPATH=${HF_EXTRA_PYTHONPATH}"
 echo "[INFO] ONLINE_CONFIDENCE_RULE=${ONLINE_CONFIDENCE_RULE}"
-echo "[INFO] TAIL_MODE=${TAIL_MODE}"
-echo "[INFO] TAIL_SCORE_CALIBRATION=${TAIL_SCORE_CALIBRATION}"
-echo "[INFO] TAIL_PROBE_REL_L2_MAX=${TAIL_PROBE_REL_L2_MAX}"
-echo "[INFO] TAIL_PROXY_MASS_MIN=${TAIL_PROXY_MASS_MIN}"
-echo "[INFO] TAIL_PROXY_MASS_MAX=${TAIL_PROXY_MASS_MAX}"
-echo "[INFO] TAIL_PQ_CORR_MIN=${TAIL_PQ_CORR_MIN}"
-echo "[INFO] TAIL_PQ_RELRMSE_MAX=${TAIL_PQ_RELRMSE_MAX}"
-echo "[INFO] RANKED_CONFIDENCE_COST_MODE=${RANKED_CONFIDENCE_COST_MODE}"
-echo "[INFO] GEOMETRIC_MIN_BUDGET=${GEOMETRIC_MIN_BUDGET}"
-echo "[INFO] GEOMETRIC_MAX_BUDGET=${GEOMETRIC_MAX_BUDGET}"
-echo "[INFO] GEOMETRIC_GROWTH=${GEOMETRIC_GROWTH}"
-echo "[INFO] GEOMETRIC_PROBE_SCALE=${GEOMETRIC_PROBE_SCALE}"
-echo "[INFO] GEOMETRIC_BUDGET_GRANULARITY=${GEOMETRIC_BUDGET_GRANULARITY}"
+echo "[INFO] FRONTIER_CANONICAL_GPU=${FRONTIER_CANONICAL_GPU}"
 echo "[INFO] SELECTED_VALUE_MODE=${SELECTED_VALUE_MODE}"
-echo "[INFO] SELECTED_VALUE_EXACT_RULE=${SELECTED_VALUE_EXACT_RULE}"
-echo "[INFO] SELECTED_VALUE_EXACT_TOP=${SELECTED_VALUE_EXACT_TOP}"
-echo "[INFO] SELECTED_VALUE_EXACT_MASS=${SELECTED_VALUE_EXACT_MASS}"
-echo "[INFO] SELECTED_VALUE_EXACT_RISK_MASS=${SELECTED_VALUE_EXACT_RISK_MASS}"
-echo "[INFO] SELECTED_VALUE_MIN_EXACT_TOP=${SELECTED_VALUE_MIN_EXACT_TOP}"
-echo "[INFO] SELECTED_VALUE_MAX_EXACT_TOP=${SELECTED_VALUE_MAX_EXACT_TOP}"
-echo "[INFO] TAIL_BLEND=${TAIL_BLEND}"
-echo "[INFO] PREFILL_TAIL_BLEND=${PREFILL_TAIL_BLEND}"
-echo "[INFO] DECODE_TAIL_BLEND=${DECODE_TAIL_BLEND}"
-echo "[INFO] SELECTOR_MODE=${SELECTOR_MODE}"
-echo "[INFO] SELECTOR_BACKEND=${SELECTOR_BACKEND}"
-echo "[INFO] PAGE_SIZE=${PAGE_SIZE}"
-echo "[INFO] PREFILL_CHUNK_SIZE=${PREFILL_CHUNK_SIZE}"
-echo "[INFO] PREFILL_SELECTOR_BACKEND=${PREFILL_SELECTOR_BACKEND}"
-echo "[INFO] PREFILL_SELECTOR_TILE_SIZE=${PREFILL_SELECTOR_TILE_SIZE}"
-echo "[INFO] PREFILL_RANK_BUFFER_LIMIT_MB=${PREFILL_RANK_BUFFER_LIMIT_MB}"
-echo "[INFO] PREFILL_SELECTOR_PAGE_BLOCK_SIZE=${PREFILL_SELECTOR_PAGE_BLOCK_SIZE}"
-echo "[INFO] PREFILL_TAIL_SCORE_REUSE=${PREFILL_TAIL_SCORE_REUSE}"
-echo "[INFO] PREFILL_ATTENTION_BACKEND=${PREFILL_ATTENTION_BACKEND}"
-echo "[INFO] SUBVECS=${SUBVECS}"
-echo "[INFO] SUBBITS=${SUBBITS}"
-echo "[INFO] VALUE_SUBVECS=${VALUE_SUBVECS}"
-echo "[INFO] VALUE_SUBBITS=${VALUE_SUBBITS}"
-echo "[INFO] VALUE_PQ_GROUP_PAGES=${VALUE_PQ_GROUP_PAGES}"
-echo "[INFO] INDEX_BUILD_BACKEND=${INDEX_BUILD_BACKEND}"
-echo "[INFO] DIAGNOSE_DENSE_REFERENCE=${DIAGNOSE_DENSE_REFERENCE}"
-echo "[INFO] PROFILE_NATIVE_OPS=${PROFILE_NATIVE_OPS}"
-echo "[INFO] DISABLE_COST_STATS=${DISABLE_COST_STATS}"
 echo "[INFO] DISABLE_NATIVE_DECODE_FUSED=${DISABLE_NATIVE_DECODE_FUSED}"
 echo "[INFO] ENABLE_NATIVE_DECODE_FUSED=${ENABLE_NATIVE_DECODE_FUSED}"
 echo "[INFO] NATIVE_DECODE_SCORELESS_FUSED=${NATIVE_DECODE_SCORELESS_FUSED}"
-echo "[INFO] NATIVE_DECODE_TAIL=${NATIVE_DECODE_TAIL}"
-echo "[INFO] HF_EXTRA_PYTHONPATH=${HF_EXTRA_PYTHONPATH}"
-echo "[INFO] Python: $(which python)"
-python -V
+echo "[INFO] PREFILL_SELECTOR_BACKEND=${PREFILL_SELECTOR_BACKEND}"
+echo "[INFO] PREFILL_RANK_BUFFER_LIMIT_MB=${PREFILL_RANK_BUFFER_LIMIT_MB}"
 
-"${HF_VENV_DIR}/bin/python" benchmark/longbench_v2_hf_eval.py \
+"${HF_VENV_DIR}/bin/python" benchmark/public_longdecode_eval.py \
+  --benchmark "${BENCHMARK}" \
+  --output_dir "${OUTPUT_DIR}" \
   --model_name "${MODEL_NAME}" \
   --dtype "${DTYPE}" \
   --device_map "${DEVICE_MAP}" \
-  --dataset_name "${DATASET_NAME}" \
-  --split "${SPLIT}" \
-  --output_dir "${OUTPUT_DIR}" \
   --max_examples "${MAX_EXAMPLES}" \
-  --length_filter "${LENGTH_FILTER}" \
-  --difficulty_filter "${DIFFICULTY_FILTER}" \
-  --domain_filter "${DOMAIN_FILTER}" \
-  --id_filter "${ID_FILTER}" \
   --selection "${SELECTION}" \
   --seed "${SEED}" \
   --max_input_tokens "${MAX_INPUT_TOKENS}" \
   --max_new_tokens "${MAX_NEW_TOKENS}" \
+  --min_new_tokens "${MIN_NEW_TOKENS}" \
   --temperature "${TEMPERATURE}" \
-  --dataset_scan_limit "${DATASET_SCAN_LIMIT}" \
+  --top_p "${TOP_P}" \
   --qwen_yarn_factor "${QWEN_YARN_FACTOR}" \
   --qwen_yarn_original_max_position_embeddings "${QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}" \
   --attention_mode "${ATTENTION_MODE}" \
   $( [ "${APPROX_PREFILL}" = "1" ] && printf '%s' "--approx_prefill" ) \
   --layers "${LAYERS}" \
+  --livecodebench_release "${LIVE_CODE_RELEASE}" \
+  --livecodebench_start_date "${LIVE_CODE_START_DATE}" \
+  --livecodebench_end_date "${LIVE_CODE_END_DATE}" \
+  --code_eval_processes "${CODE_EVAL_PROCESSES}" \
+  --code_eval_timeout "${CODE_EVAL_TIMEOUT}" \
+  --longgenbench_gsm8k_k "${LONGGENBENCH_GSM8K_K}" \
+  --longgenbench_gsm8k_question_limit "${LONGGENBENCH_GSM8K_QUESTION_LIMIT}" \
   --selector_mode "${SELECTOR_MODE}" \
   --selector_backend "${SELECTOR_BACKEND}" \
   --budget "${BUDGET}" \
@@ -308,15 +253,12 @@ python -V
   --selected_value_exact_all_context_max "${SELECTED_VALUE_EXACT_ALL_CONTEXT_MAX}" \
   --selected_value_exact_all_fraction_min "${SELECTED_VALUE_EXACT_ALL_FRACTION_MIN}" \
   --tail_blend "${TAIL_BLEND}" \
-  $( [ -n "${PREFILL_TAIL_BLEND}" ] && printf '%s %s' "--prefill_tail_blend" "${PREFILL_TAIL_BLEND}" ) \
-  $( [ -n "${DECODE_TAIL_BLEND}" ] && printf '%s %s' "--decode_tail_blend" "${DECODE_TAIL_BLEND}" ) \
   --page_size "${PAGE_SIZE}" \
   --prefill_chunk_size "${PREFILL_CHUNK_SIZE}" \
   --prefill_selector_backend "${PREFILL_SELECTOR_BACKEND}" \
   --prefill_selector_tile_size "${PREFILL_SELECTOR_TILE_SIZE}" \
   --prefill_rank_buffer_limit_mb "${PREFILL_RANK_BUFFER_LIMIT_MB}" \
   --prefill_selector_page_block_size "${PREFILL_SELECTOR_PAGE_BLOCK_SIZE}" \
-  $( [ "${PREFILL_TAIL_SCORE_REUSE}" = "1" ] && printf '%s' "--prefill_tail_score_reuse" ) \
   --prefill_attention_backend "${PREFILL_ATTENTION_BACKEND}" \
   --subvecs "${SUBVECS}" \
   --subbits "${SUBBITS}" \
@@ -326,21 +268,19 @@ python -V
   --kmeans_iters "${KMEANS_ITERS}" \
   --index_build_backend "${INDEX_BUILD_BACKEND}" \
   --nprobes "${NPROBES}" \
-  $( [ -n "${ATTN_IMPLEMENTATION}" ] && printf '%s %s' "--attn_implementation" "${ATTN_IMPLEMENTATION}" ) \
   $( [ "${TRUST_REMOTE_CODE}" = "1" ] && printf '%s' "--trust_remote_code" ) \
   $( [ "${LOCAL_FILES_ONLY}" = "1" ] && printf '%s' "--local_files_only" ) \
   $( [ "${LOW_CPU_MEM_USAGE}" = "1" ] && printf '%s' "--low_cpu_mem_usage" ) \
   $( [ "${HF_LANGUAGE_MODEL_ONLY}" = "1" ] && printf '%s' "--hf_language_model_only" ) \
   $( [ "${USE_CHAT_TEMPLATE}" = "1" ] && printf '%s' "--use_chat_template" ) \
   $( [ "${DISABLE_THINKING}" = "1" ] && printf '%s' "--disable_thinking" ) \
-  $( [ "${STREAMING}" = "1" ] && printf '%s' "--streaming" ) \
+  $( [ "${FORCE_MAX_NEW_TOKENS}" = "1" ] && printf '%s' "--force_max_new_tokens" ) \
+  $( [ "${EVALUATE_CODE}" = "1" ] && printf '%s' "--evaluate_code" ) \
+  $( [ "${PREFILL_TAIL_SCORE_REUSE}" = "1" ] && printf '%s' "--prefill_tail_score_reuse" ) \
   $( [ "${PROFILE_NATIVE_OPS}" = "1" ] && printf '%s' "--profile_native_ops" ) \
   $( [ "${DISABLE_COST_STATS}" = "1" ] && printf '%s' "--disable_cost_stats" ) \
   $( [ "${DISABLE_NATIVE_DECODE_FUSED}" = "1" ] && printf '%s' "--disable_native_decode_fused" ) \
   $( [ "${ENABLE_NATIVE_DECODE_FUSED}" = "1" ] && printf '%s' "--enable_native_decode_fused" ) \
   $( [ "${NATIVE_DECODE_SCORELESS_FUSED}" = "1" ] && printf '%s %s' "--native_decode_scoreless_fused --native_decode_scoreless_force_mode" "${NATIVE_DECODE_SCORELESS_FORCE_MODE}" ) \
-  $( [ "${ALLOW_TF32_SELECTOR:-0}" = "1" ] && printf '%s' "--allow_tf32_selector" ) \
   $( [ "${NATIVE_DECODE_TAIL}" = "1" ] && printf '%s' "--native_decode_tail" ) \
-  $( [ "${DIAGNOSE_DENSE_REFERENCE}" = "1" ] && printf '%s' "--diagnose_dense_reference" )
-
-echo "[INFO] Job finished at: $(date)"
+  $( [ -n "${ATTN_IMPLEMENTATION}" ] && printf '%s %s' "--attn_implementation" "${ATTN_IMPLEMENTATION}" )

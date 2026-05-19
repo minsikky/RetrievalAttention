@@ -27,18 +27,28 @@ import re
 import os
 import sys
 import argparse
-import nltk
 try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
+    import nltk
+    if hasattr(nltk, "data"):
+        try:
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            nltk.download('punkt')
+except Exception as exc:
+    print(f"[WARN] NLTK unavailable; continuing because current synthetic metrics do not require punkt: {exc}")
     
-import pandas as pd
+try:
+    import pandas as pd
+    if not hasattr(pd, "DataFrame"):
+        pd = None
+except Exception:
+    pd = None
 import importlib
 import yaml
 from pathlib import Path
 from tqdm import tqdm
 from collections import defaultdict
+import csv
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")) 
 from utils import load_data, dump_jsonl
 
@@ -117,6 +127,11 @@ def run_evaluation_per_task(task_config: dict, predictions_file: str, verbose: i
 
 def write_evaluation(results: dict):
     tasks = list(results.keys())
+    if not tasks:
+        raise RuntimeError(
+            f"No prediction files were evaluated under {args.data_dir}. "
+            "Check the prediction step logs instead of treating this as an empty benchmark."
+        )
     score = [results[task]['score'] for task in tasks]
     nulls = [results[task]['nulls'] for task in tasks]
     dfs = [
@@ -126,8 +141,21 @@ def write_evaluation(results: dict):
     ]
 
     output_file = os.path.join(args.data_dir, 'summary.csv' if len(tasks) > 1 else f'summary-{tasks[0]}.csv')
-    df = pd.DataFrame(dfs)
-    df.to_csv(output_file, index=False)
+    if pd is not None:
+        try:
+            df = pd.DataFrame(dfs)
+            df.to_csv(output_file, index=False)
+            pd_fallback = False
+        except Exception as exc:
+            print(f"[WARN] pandas summary writer failed; falling back to csv module: {exc}")
+            pd_fallback = True
+    else:
+        pd_fallback = True
+    if pd_fallback:
+        with open(output_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerows(dfs)
+        df = dfs
     print('\n=============================================\n')
     print(df)
     print(f'\nSaved eval results to {output_file}')
@@ -135,19 +163,32 @@ def write_evaluation(results: dict):
 
 def write_submission(results: dict):
     COLUMNS = ["Task", "ID", "Prediction"]
-    dfs = pd.DataFrame(columns=COLUMNS, data=[])
-    
-    for task, result in results.items():
-        df = pd.DataFrame({
-            'Task': task,
-            'ID': result['indices'], 
-            'Prediction': result['predicts']
-        })
-        dfs = pd.concat((dfs, df[COLUMNS]))
-        
     output_file = os.path.join(args.data_dir, 'submission.csv')
-    dfs = dfs.reset_index(drop=True)
-    dfs.to_csv(output_file, index=False)
+    if pd is not None:
+        try:
+            dfs = pd.DataFrame(columns=COLUMNS, data=[])
+            for task, result in results.items():
+                df = pd.DataFrame({
+                    'Task': task,
+                    'ID': result['indices'],
+                    'Prediction': result['predicts']
+                })
+                dfs = pd.concat((dfs, df[COLUMNS]))
+            dfs = dfs.reset_index(drop=True)
+            dfs.to_csv(output_file, index=False)
+            pd_fallback = False
+        except Exception as exc:
+            print(f"[WARN] pandas submission writer failed; falling back to csv module: {exc}")
+            pd_fallback = True
+    else:
+        pd_fallback = True
+    if pd_fallback:
+        with open(output_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(COLUMNS)
+            for task, result in results.items():
+                for idx, pred in zip(result['indices'], result['predicts']):
+                    writer.writerow([task, idx, pred])
     print(f'\nSaved submission results to {output_file}')
 
 

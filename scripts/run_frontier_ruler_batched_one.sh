@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+#SBATCH --job-name=frontier-ruler
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=128000m
+#SBATCH --time=01:00:00
+#SBATCH --account=zhengya98
+#SBATCH --partition=spgpu
+#SBATCH --gpus-per-node=1
+set -euo pipefail
+
+# Benchmark-ready frontier preset for one RULER task.
+# Submit with: sbatch scripts/run_frontier_ruler_batched_one.sh
+
+cd /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention
+
+export MODE="${MODE:-pagedpq_batched}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-ruler_eval_result/frontier_batched}"
+export TASK_NAME="${TASK_NAME:-niah_single_1}"
+export CONTEXT_LEN="${CONTEXT_LEN:-8192}"
+export NUM_SAMPLES="${NUM_SAMPLES:-4}"
+
+export SELECTOR_MODE="${SELECTOR_MODE:-fullscan}"
+export SELECTOR_BACKEND="${SELECTOR_BACKEND:-cuda_ext}"
+export BUDGET="${BUDGET:-4096}"
+export ONLINE_CONFIDENCE_RULE="${ONLINE_CONFIDENCE_RULE:-geometric_probe_tail_switch}"
+export TAIL_MODE="${TAIL_MODE:-vpq_value}"
+export TAIL_SCORE_CALIBRATION="${TAIL_SCORE_CALIBRATION:-affine_selected}"
+export TAIL_PROBE_REL_L2_MAX="${TAIL_PROBE_REL_L2_MAX:-0.020}"
+export TAIL_PROXY_MASS_MIN="${TAIL_PROXY_MASS_MIN:-0.990}"
+export TAIL_PROXY_MASS_MAX="${TAIL_PROXY_MASS_MAX:-1.0}"
+export TAIL_PQ_CORR_MIN="${TAIL_PQ_CORR_MIN:-0.70}"
+export TAIL_PQ_RELRMSE_MAX="${TAIL_PQ_RELRMSE_MAX:-inf}"
+export RANKED_CONFIDENCE_COST_MODE="${RANKED_CONFIDENCE_COST_MODE:-exact}"
+export FRONTIER_CANONICAL_GPU="${FRONTIER_CANONICAL_GPU:-1}"
+
+export GEOMETRIC_MIN_BUDGET="${GEOMETRIC_MIN_BUDGET:-${BUDGET}}"
+export GEOMETRIC_MAX_BUDGET="${GEOMETRIC_MAX_BUDGET:-65536}"
+export GEOMETRIC_GROWTH="${GEOMETRIC_GROWTH:-1.5}"
+export GEOMETRIC_PROBE_SCALE="${GEOMETRIC_PROBE_SCALE:-1.5}"
+export GEOMETRIC_BUDGET_GRANULARITY="${GEOMETRIC_BUDGET_GRANULARITY:-1024}"
+
+export SELECTED_VALUE_MODE="${SELECTED_VALUE_MODE:-vpq_value}"
+export SELECTED_VALUE_EXACT_RULE="${SELECTED_VALUE_EXACT_RULE:-selected_mass}"
+export SELECTED_VALUE_EXACT_TOP="${SELECTED_VALUE_EXACT_TOP:-0}"
+export SELECTED_VALUE_EXACT_MASS="${SELECTED_VALUE_EXACT_MASS:-0.99}"
+export SELECTED_VALUE_MIN_EXACT_TOP="${SELECTED_VALUE_MIN_EXACT_TOP:-1024}"
+export SELECTED_VALUE_MAX_EXACT_TOP="${SELECTED_VALUE_MAX_EXACT_TOP:-0}"
+
+export TAIL_BLEND="${TAIL_BLEND:-1.0}"
+export NATIVE_DECODE_TAIL="${NATIVE_DECODE_TAIL:-1}"
+export PROFILE_NATIVE_OPS="${PROFILE_NATIVE_OPS:-0}"
+
+export PAGE_SIZE="${PAGE_SIZE:-5632}"
+export PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-0}"
+export PREFILL_SELECTOR_BACKEND="${PREFILL_SELECTOR_BACKEND:-native}"
+if [[ -z "${PREFILL_SELECTOR_TILE_SIZE+x}" ]]; then
+  if [[ "${PREFILL_SELECTOR_BACKEND}" == "native" ]]; then
+    export PREFILL_SELECTOR_TILE_SIZE=2048
+  else
+    export PREFILL_SELECTOR_TILE_SIZE=256
+  fi
+else
+  export PREFILL_SELECTOR_TILE_SIZE
+fi
+export PREFILL_SELECTOR_PAGE_BLOCK_SIZE="${PREFILL_SELECTOR_PAGE_BLOCK_SIZE:-0}"
+export PREFILL_TAIL_SCORE_REUSE="${PREFILL_TAIL_SCORE_REUSE:-1}"
+export PREFILL_ATTENTION_BACKEND="${PREFILL_ATTENTION_BACKEND:-native}"
+export INDEX_BUILD_BACKEND="${INDEX_BUILD_BACKEND:-torch_gpu}"
+export NPROBES="${NPROBES:-16,32,64,128,256,512}"
+
+export SUBVECS="${SUBVECS:-4}"
+export SUBBITS="${SUBBITS:-8}"
+export VALUE_SUBVECS="${VALUE_SUBVECS:-1}"
+export VALUE_SUBBITS="${VALUE_SUBBITS:-4}"
+export VALUE_PQ_GROUP_PAGES="${VALUE_PQ_GROUP_PAGES:-1}"
+export KMEANS_ITERS="${KMEANS_ITERS:-3}"
+
+exec bash scripts/run_ruler_pagedpq_stream_smoke_one.sh

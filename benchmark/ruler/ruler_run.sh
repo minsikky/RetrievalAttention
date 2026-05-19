@@ -15,20 +15,21 @@
 
 
 if [ $# -ne 8 ]; then
-    echo "Usage: $0 <model_name> $1 <prefill_method> $2 <attn_type> $3 <context length> $4 <task> $5 <dtype> $6 <budget_ratio> $7 <estimate_ratio>"
+    echo "Usage: $0 <model_name> <prefill_method> <attn_type> <context_length> <task> <dtype> <budget_ratio> <estimate_ratio>"
     exit 1
 fi
 
 # Root Directories
 ROOT_DIR="./ruler_eval_result" # the path that stores generated task samples and model predictions.
 
-NUM_SAMPLES=200
+NUM_SAMPLES="${NUM_SAMPLES:-200}"
 MAX_SEQ_LENGTH=${4}
 ATTN_TYPE=${3}
 DEVICE=auto
 BUDGET_RATIO=${7}
 ESTIMATE_RATIO=${8}
 PREFILL_METHOD=${2}
+echo "[INFO] PREFILL_METHOD=${PREFILL_METHOD}"
 
 # Model and Tokenizer
 source ruler_config_models.sh
@@ -53,8 +54,12 @@ fi
 RESULTS_DIR="${ROOT_DIR}/${MODEL_NAME}/${BENCHMARK}/${MAX_SEQ_LENGTH}/${ATTN_TYPE}"
 DATA_DIR="${RESULTS_DIR}/data"
 PRED_DIR="${RESULTS_DIR}/pred"
-rm -rf ${DATA_DIR}
-rm -rf ${PRED_DIR}
+if [ "${REUSE_DATA:-0}" != "1" ]; then
+    rm -rf ${DATA_DIR}
+fi
+if [ "${FORCE_PRED:-1}" = "1" ]; then
+    rm -rf ${PRED_DIR}
+fi
 mkdir -p ${DATA_DIR}
 mkdir -p ${PRED_DIR}
 

@@ -86,5 +86,5 @@ cat <<EOF
 [INFO] Run HF jobs with:
   HF_EXTRA_PYTHONPATH=${HF_PYDEPS_DIR} benchmark/run_generated_memory_hf.sh
 or through sbatch:
-  --export=ALL,HF_EXTRA_PYTHONPATH=${HF_PYDEPS_DIR},MODEL_NAME=Qwen/Qwen3.5-9B,...
+  --export=ALL,HF_EXTRA_PYTHONPATH=${HF_PYDEPS_DIR},MODEL_NAME=Qwen/Qwen3-8B,...
 EOF

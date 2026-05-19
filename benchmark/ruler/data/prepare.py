@@ -40,13 +40,17 @@ import time
 import math
 import yaml
 from pathlib import Path
-import nltk
 import resource
 import subprocess as sp
 try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt')
+    import nltk
+    if hasattr(nltk, "data"):
+        try:
+            nltk.data.find('tokenizers/punkt')
+        except LookupError:
+            nltk.download('punkt')
+except Exception as exc:
+    print(f"[WARN] NLTK unavailable; continuing because synthetic preparation does not require punkt here: {exc}")
 
 
 Templates = {
