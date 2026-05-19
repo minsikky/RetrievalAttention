@@ -109,6 +109,7 @@ def _compressed_tail_output(
     value_subvecs: int = 0,
     value_subbits: int = 0,
     selected_values_np: np.ndarray | None = None,
+    selected_scores_override: np.ndarray | None = None,
     tail_score_scale: float = 1.0,
     tail_score_bias: float = 0.0,
 ) -> tuple[np.ndarray, int, int, float]:
@@ -120,7 +121,13 @@ def _compressed_tail_output(
         int(tok): float(tail_score_scale) * (float(score) / float(np.sqrt(float(query_dim)))) + float(tail_score_bias)
         for tok, score in zip(ranked_cpu.tolist(), ranked_scores_cpu.tolist(), strict=False)
     }
-    selected_scores = scores_np[selected_cpu].astype(np.float64, copy=False) if selected_cpu.size else np.asarray([], dtype=np.float64)
+    selected_scores = (
+        selected_scores_override.astype(np.float64, copy=False)
+        if selected_scores_override is not None and selected_cpu.size
+        else scores_np[selected_cpu].astype(np.float64, copy=False)
+        if selected_cpu.size
+        else np.asarray([], dtype=np.float64)
+    )
     tail_scores = np.asarray([score_by_token[int(tok)] for tok in tail_tokens], dtype=np.float64) if tail_tokens.size else np.asarray([], dtype=np.float64)
     max_score = max(
         float(np.max(selected_scores)) if selected_scores.size else -np.inf,
@@ -314,7 +321,7 @@ def run() -> None:
             subvecs=int(args.subvecs),
             subbits=int(args.subbits),
             kmeans_iters=int(args.kmeans_iters),
-            seed=2025 + int(kv_head),
+            seed=2025 + 2027 * int(kv_head),
             key_bytes=int(args.key_bytes),
             router_enabled=str(args.selector_mode) == "routed",
             router_prototypes=int(args.router_prototypes),
@@ -346,6 +353,7 @@ def run() -> None:
             query,
             index,
             mode=str(args.selector_mode),
+            selector_backend="torch",
             nprobes=nprobes,
             budget=int(args.budget),
             key_bytes=int(args.key_bytes),

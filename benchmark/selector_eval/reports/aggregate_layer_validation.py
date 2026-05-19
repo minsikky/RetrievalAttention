@@ -96,6 +96,7 @@ def normalize_config(label: str) -> str:
     name = str(label)
     name = re.sub(r"^val_q36_", "", name)
     name = re.sub(r"^val_q288c\d+_", "", name)
+    name = re.sub(r"^q288c\d+_", "", name)
     name = re.sub(r"^cpu_val_q36_", "", name)
     name = re.sub(r"^val_", "", name)
     name = re.sub(r"_(gpu|cpu)_v\d+$", "", name)

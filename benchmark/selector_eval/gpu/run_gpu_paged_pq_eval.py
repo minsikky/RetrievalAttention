@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,6 +60,52 @@ class GPUIndex:
     router_group_means: torch.Tensor | None = None
     router_group_tokens: list[torch.Tensor] | None = None
     router_group_member_refs: list[int] | None = None
+    native_codebooks: torch.Tensor | None = None
+    native_codes: torch.Tensor | None = None
+    native_page_starts: torch.Tensor | None = None
+
+
+_SELECTOR_PAGED_PQ_EXT = None
+_SELECTOR_PAGED_PQ_EXT_ERROR: Exception | None = None
+
+
+def load_selector_paged_pq_ext():
+    global _SELECTOR_PAGED_PQ_EXT, _SELECTOR_PAGED_PQ_EXT_ERROR
+    if _SELECTOR_PAGED_PQ_EXT is not None:
+        return _SELECTOR_PAGED_PQ_EXT
+    if _SELECTOR_PAGED_PQ_EXT_ERROR is not None:
+        raise _SELECTOR_PAGED_PQ_EXT_ERROR
+    ext_root = PROJECT_ROOT / "benchmark" / "selector_eval" / "cuda_ext"
+    if str(ext_root) not in sys.path:
+        sys.path.insert(0, str(ext_root))
+    try:
+        import selector_paged_pq
+    except Exception as exc:  # pragma: no cover - exercised on clusters without the built extension.
+        _SELECTOR_PAGED_PQ_EXT_ERROR = exc
+        raise
+    _SELECTOR_PAGED_PQ_EXT = selector_paged_pq
+    return _SELECTOR_PAGED_PQ_EXT
+
+
+def ensure_native_fullscan_pack(index: GPUIndex, *, subbits: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if index.native_codebooks is not None and index.native_codes is not None and index.native_page_starts is not None:
+        return index.native_codebooks, index.native_codes, index.native_page_starts
+    if not index.pages:
+        raise ValueError("cannot pack native selector for an empty index")
+    page_size = int(index.pages[0].size)
+    if any(int(page.size) != page_size for page in index.pages):
+        raise ValueError("native fullscan selector requires uniform sealed page sizes")
+    index.native_codebooks = torch.stack([page.codebooks for page in index.pages], dim=0).contiguous()
+    codes = torch.stack([page.codes for page in index.pages], dim=0).contiguous()
+    if int(subbits) <= 8:
+        codes = codes.to(torch.uint8)
+    index.native_codes = codes
+    index.native_page_starts = torch.as_tensor(
+        [int(page.start) for page in index.pages],
+        dtype=torch.long,
+        device=index.native_codebooks.device,
+    )
+    return index.native_codebooks, index.native_codes, index.native_page_starts
 
 
 def build_page_pq_gpu(
@@ -78,13 +125,17 @@ def build_page_pq_gpu(
     router_merge_var: float,
     router_max_groups: int,
     device: torch.device,
+    page_id_offset: int = 0,
+    seed_scheme: str = "cpu",
+    score_key_bytes: int | None = None,
 ) -> GPUIndex:
+    score_key_bytes = int(key_bytes) if score_key_bytes is None else int(score_key_bytes)
     t0 = time.perf_counter()
     pages: list[PagePQ] = []
     write_bytes = 0.0
     read_bytes = 0.0
     cursor = int(dynamic_start)
-    page_id = 0
+    page_id = int(page_id_offset)
     groups: list[dict] = []
 
     def merge_page_prototypes(page_idx: int, centers: np.ndarray, proto_rows: list[np.ndarray], proto_sse: list[float]) -> None:
@@ -145,7 +196,11 @@ def build_page_pq_gpu(
             block.shape[0],
             subvecs=int(subvecs),
             subbits=int(subbits),
-            seed=int(seed) + 1009 * page_id + int(cursor),
+            seed=(
+                int(seed) + 7919 + int(cursor)
+                if str(seed_scheme) in {"cpu", "paged_local", "paged_local_pq"}
+                else int(seed) + 1009 * page_id + int(cursor)
+            ),
             max_iter=int(kmeans_iters),
         )
         codebooks_t = torch.as_tensor(codebooks, dtype=torch.float32, device=device)
@@ -169,11 +224,11 @@ def build_page_pq_gpu(
                     diff = block[rows] - proto_centers[proto_id].reshape(1, -1)
                     proto_sse.append(float(np.sum(diff * diff)))
             merge_page_prototypes(len(pages), proto_centers.astype(np.float32, copy=False), proto_rows, proto_sse)
-            read_bytes += float(int(kmeans_iters) * block.shape[0] * max(1, min(int(router_prototypes), int(block.shape[0]))) * block.shape[1] * int(key_bytes))
-            write_bytes += float(proto_centers.size * int(key_bytes) + block.shape[0] * 8)
+            read_bytes += float(int(kmeans_iters) * block.shape[0] * max(1, min(int(router_prototypes), int(block.shape[0]))) * block.shape[1] * score_key_bytes)
+            write_bytes += float(proto_centers.size * score_key_bytes + block.shape[0] * 8)
         pages.append(PagePQ(start=cursor, size=end - cursor, codebooks=codebooks_t, codes=codes_t, proto_rows=proto_rows))
         read_bytes += float(block.shape[0] * block.shape[1] * int(key_bytes))
-        write_bytes += float(codebooks.size * int(key_bytes) + codes.size)
+        write_bytes += float(codebooks.size * score_key_bytes + codes.size)
         cursor = end
         page_id += 1
     router_group_means = None
@@ -197,7 +252,7 @@ def build_page_pq_gpu(
             tokens = np.unique(np.concatenate(pieces)) if pieces else np.empty((0,), dtype=np.int64)
             router_group_tokens.append(torch.as_tensor(tokens, dtype=torch.long, device=device))
             router_group_member_refs.append(int(len(group["members"])))
-        write_bytes += float(router_group_means.numel() * int(key_bytes) + sum(t.numel() * 8 for t in router_group_tokens))
+        write_bytes += float(router_group_means.numel() * score_key_bytes + sum(t.numel() * 8 for t in router_group_tokens))
     return GPUIndex(
         pages=pages,
         pending_start=int(sealed_end),
@@ -211,6 +266,169 @@ def build_page_pq_gpu(
     )
 
 
+def build_page_pq_torch(
+    keys: torch.Tensor,
+    *,
+    dynamic_start: int,
+    indexed_end: int,
+    page_size: int,
+    subvecs: int,
+    subbits: int,
+    kmeans_iters: int,
+    seed: int,
+    key_bytes: int,
+    router_enabled: bool,
+    router_prototypes: int,
+    router_merge_rel: float,
+    router_merge_var: float,
+    router_max_groups: int,
+    device: torch.device,
+    page_id_offset: int = 0,
+) -> GPUIndex:
+    """Build fullscan page-local PQ state on device.
+
+    This is intentionally limited to the non-routed selector path. It avoids the
+    current CPU NumPy round-trip and keeps the codebooks/codes resident on GPU.
+    """
+    if bool(router_enabled):
+        raise NotImplementedError("torch GPU page-PQ builder currently supports fullscan only")
+    del router_prototypes, router_merge_rel, router_merge_var, router_max_groups
+    device = torch.device(device)
+    _sync_if_cuda(device)
+    t0 = time.perf_counter()
+
+    keys = keys.detach().to(device=device)
+    dim = int(keys.shape[-1])
+    subvecs = max(1, min(int(subvecs), dim))
+    if dim % subvecs != 0:
+        raise ValueError(f"PQ subvecs must divide head_dim: dim={dim} subvecs={subvecs}")
+    subdim = dim // subvecs
+    centroids = 1 << int(subbits)
+    page_size = max(1, int(page_size))
+    dynamic_start = int(dynamic_start)
+    indexed_end = int(indexed_end)
+    sealed_end = dynamic_start + ((max(0, indexed_end - dynamic_start) // page_size) * page_size)
+    token_count = max(0, sealed_end - dynamic_start)
+    if token_count <= 0:
+        _sync_if_cuda(device)
+        return GPUIndex(
+            pages=[],
+            pending_start=int(sealed_end),
+            indexed_end=int(indexed_end),
+            build_seconds=time.perf_counter() - t0,
+            build_read_mb=0.0,
+            build_write_mb=0.0,
+        )
+
+    num_pages = token_count // page_size
+    block = keys[dynamic_start:sealed_end].to(dtype=torch.float32).contiguous()
+    data = (
+        block.view(num_pages, page_size, subvecs, subdim)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .view(num_pages * subvecs, page_size, subdim)
+    )
+
+    active_centroids = min(int(centroids), int(page_size))
+    init_idx_np = np.empty((num_pages, subvecs, active_centroids), dtype=np.int64)
+    pad_idx_np = (
+        np.empty((num_pages, subvecs, int(centroids) - active_centroids), dtype=np.int64)
+        if active_centroids < int(centroids)
+        else None
+    )
+    for page_id in range(num_pages):
+        page_start = int(dynamic_start + page_id * page_size)
+        page_rng = np.random.default_rng(int(seed) + 7919 + page_start)
+        for sub in range(subvecs):
+            sub_seed = int(page_rng.integers(0, 2**31 - 1))
+            init_idx_np[page_id, sub] = np.random.default_rng(sub_seed).choice(
+                page_size,
+                size=active_centroids,
+                replace=False,
+            )
+            if pad_idx_np is not None:
+                pad_idx_np[page_id, sub] = page_rng.choice(
+                    page_size,
+                    size=int(centroids) - active_centroids,
+                    replace=True,
+                )
+    init_idx = torch.as_tensor(
+        init_idx_np.reshape(num_pages * subvecs, active_centroids),
+        dtype=torch.long,
+        device=device,
+    )
+    centers_active = torch.gather(data, 1, init_idx.unsqueeze(-1).expand(-1, -1, subdim)).clone()
+    if active_centroids < int(page_size):
+        assign = torch.zeros((data.shape[0], page_size), dtype=torch.long, device=device)
+        ones = torch.ones((data.shape[0], page_size), dtype=torch.float32, device=device)
+        for _ in range(max(1, int(kmeans_iters))):
+            dist = (
+                (data * data).sum(dim=2, keepdim=True)
+                + (centers_active * centers_active).sum(dim=2).unsqueeze(1)
+                - 2.0 * torch.bmm(data, centers_active.transpose(1, 2))
+            )
+            assign = torch.argmin(dist, dim=2)
+            sums = torch.zeros_like(centers_active)
+            sums.scatter_add_(1, assign.unsqueeze(-1).expand(-1, -1, subdim), data)
+            counts = torch.zeros((data.shape[0], active_centroids), dtype=torch.float32, device=device)
+            counts.scatter_add_(1, assign, ones)
+            centers_active = torch.where(counts.unsqueeze(-1) > 0, sums / counts.clamp_min(1.0).unsqueeze(-1), centers_active)
+
+    if active_centroids < centroids:
+        assert pad_idx_np is not None
+        pad_idx = torch.as_tensor(
+            pad_idx_np.reshape(num_pages * subvecs, int(centroids) - active_centroids),
+            dtype=torch.long,
+            device=device,
+        )
+        pad = torch.gather(data, 1, pad_idx.unsqueeze(-1).expand(-1, -1, subdim))
+        centers = torch.cat([centers_active, pad], dim=1)
+    else:
+        centers = centers_active
+    dist = (
+        (data * data).sum(dim=2, keepdim=True)
+        + (centers * centers).sum(dim=2).unsqueeze(1)
+        - 2.0 * torch.bmm(data, centers.transpose(1, 2))
+    )
+    assign = torch.argmin(dist, dim=2)
+
+    codebooks = centers.view(num_pages, subvecs, centroids, subdim).contiguous()
+    codes_long = assign.view(num_pages, subvecs, page_size).permute(0, 2, 1).contiguous().to(torch.long)
+    native_codes = codes_long.to(torch.uint8) if int(subbits) <= 8 else codes_long
+    page_starts = torch.arange(
+        int(dynamic_start),
+        int(sealed_end),
+        int(page_size),
+        dtype=torch.long,
+        device=device,
+    )
+    pages = [
+        PagePQ(
+            start=int(dynamic_start + page_id * page_size),
+            size=int(page_size),
+            codebooks=codebooks[page_id],
+            codes=native_codes[page_id],
+            proto_rows=None,
+        )
+        for page_id in range(num_pages)
+    ]
+    read_bytes = float(block.numel() * int(key_bytes))
+    code_bytes = 1 if int(subbits) <= 8 else 2
+    write_bytes = float(codebooks.numel() * int(key_bytes) + native_codes.numel() * code_bytes)
+    _sync_if_cuda(device)
+    return GPUIndex(
+        pages=pages,
+        pending_start=int(sealed_end),
+        indexed_end=int(indexed_end),
+        build_seconds=time.perf_counter() - t0,
+        build_read_mb=read_bytes / MB,
+        build_write_mb=write_bytes / MB,
+        native_codebooks=codebooks,
+        native_codes=native_codes,
+        native_page_starts=page_starts,
+    )
+
+
 def pq_page_scores(query: torch.Tensor, page: PagePQ) -> tuple[torch.Tensor, torch.Tensor]:
     subvecs = int(page.codebooks.shape[0])
     subdim = int(page.codebooks.shape[-1])
@@ -219,7 +437,7 @@ def pq_page_scores(query: torch.Tensor, page: PagePQ) -> tuple[torch.Tensor, tor
     scores = torch.zeros((page.size,), dtype=torch.float32, device=query.device)
     rows = torch.arange(page.size, device=query.device)
     for sub in range(subvecs):
-        scores += table[sub].gather(0, page.codes[:, sub])
+        scores += table[sub].gather(0, page.codes[:, sub].to(torch.long))
     tokens = torch.arange(page.start, page.start + page.size, dtype=torch.long, device=query.device)
     return tokens, scores
 
@@ -237,7 +455,7 @@ def pq_page_scores_rows(query: torch.Tensor, page: PagePQ, rows: torch.Tensor) -
     row_codes = page.codes.index_select(0, rows)
     scores = torch.zeros((rows.numel(),), dtype=torch.float32, device=query.device)
     for sub in range(subvecs):
-        scores += table[sub].gather(0, row_codes[:, sub])
+        scores += table[sub].gather(0, row_codes[:, sub].to(torch.long))
     return rows + int(page.start), scores
 
 
@@ -278,6 +496,7 @@ def rank_paged_pq(
     index: GPUIndex,
     *,
     mode: str,
+    selector_backend: str,
     nprobes: list[int],
     budget: int,
     key_bytes: int,
@@ -330,6 +549,29 @@ def rank_paged_pq(
         assert best is not None
         return best[0], best[1], time.perf_counter() - t0, best[2] / MB, best[3]
 
+    if str(selector_backend) in {"cuda_ext", "auto"} and query.is_cuda:
+        try:
+            native = load_selector_paged_pq_ext()
+            codebooks, codes, page_starts = ensure_native_fullscan_pack(index, subbits=int(subbits))
+            top_tokens, top_scores = native.fullscan_pq_topk(
+                query.reshape(1, -1).contiguous(),
+                codebooks,
+                codes,
+                page_starts,
+                int(budget),
+            )
+            _sync_if_cuda(query.device)
+            return (
+                top_tokens[0],
+                top_scores[0],
+                time.perf_counter() - t0,
+                selector_bytes_fullscan(index, key_bytes=int(key_bytes), subbits=int(subbits)) / MB,
+                0,
+            )
+        except Exception:
+            if str(selector_backend) == "cuda_ext":
+                raise
+
     token_chunks = []
     score_chunks = []
     for page in index.pages:
@@ -341,6 +583,8 @@ def rank_paged_pq(
             torch.empty((0,), dtype=torch.long, device=query.device),
             torch.empty((0,), dtype=torch.float32, device=query.device),
             0.0,
+            0.0,
+            0,
         )
     tokens_all = torch.cat(token_chunks)
     scores_all = torch.cat(score_chunks)
@@ -352,6 +596,160 @@ def rank_paged_pq(
         time.perf_counter() - t0,
         selector_bytes_fullscan(index, key_bytes=int(key_bytes), subbits=int(subbits)) / MB,
         0,
+    )
+
+
+def rank_paged_pq_batched(
+    queries: torch.Tensor,
+    index: GPUIndex,
+    *,
+    mode: str,
+    selector_backend: str,
+    nprobes: list[int],
+    budget: int,
+    key_bytes: int,
+    subbits: int,
+    sync_for_timing: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, float, float, int]:
+    if queries.dim() == 1:
+        tokens, scores, seconds, selector_mb, nprobe = rank_paged_pq(
+            queries,
+            index,
+            mode=mode,
+            selector_backend=selector_backend,
+            nprobes=nprobes,
+            budget=budget,
+            key_bytes=key_bytes,
+            subbits=subbits,
+        )
+        return tokens.reshape(1, -1), scores.reshape(1, -1), seconds, selector_mb, nprobe
+    if queries.dim() != 2:
+        raise ValueError("queries must have shape [heads, dim]")
+    if bool(sync_for_timing):
+        _sync_if_cuda(queries.device)
+    t0 = time.perf_counter()
+    if str(mode) == "fullscan" and str(selector_backend) in {"cuda_ext", "auto"} and queries.is_cuda:
+        try:
+            native = load_selector_paged_pq_ext()
+            codebooks, codes, page_starts = ensure_native_fullscan_pack(index, subbits=int(subbits))
+            top_tokens, top_scores = native.fullscan_pq_topk(
+                queries.contiguous(),
+                codebooks,
+                codes,
+                page_starts,
+                int(budget),
+            )
+            if bool(sync_for_timing):
+                _sync_if_cuda(queries.device)
+            return (
+                top_tokens,
+                top_scores,
+                time.perf_counter() - t0 if bool(sync_for_timing) else 0.0,
+                selector_bytes_fullscan(index, key_bytes=int(key_bytes), subbits=int(subbits)) / MB,
+                0,
+            )
+        except Exception:
+            if str(selector_backend) == "cuda_ext":
+                raise
+    token_rows = []
+    score_rows = []
+    seconds_total = 0.0
+    selector_mb = 0.0
+    nprobe = 0
+    for row in range(int(queries.shape[0])):
+        tokens, scores, seconds, selector_mb, nprobe = rank_paged_pq(
+            queries[row],
+            index,
+            mode=mode,
+            selector_backend="torch",
+            nprobes=nprobes,
+            budget=budget,
+            key_bytes=key_bytes,
+            subbits=subbits,
+        )
+        token_rows.append(tokens)
+        score_rows.append(scores)
+        seconds_total += float(seconds)
+    return torch.stack(token_rows, dim=0), torch.stack(score_rows, dim=0), seconds_total, selector_mb, nprobe
+
+
+def rank_paged_pq_batched_with_scores(
+    queries: torch.Tensor,
+    index: GPUIndex,
+    *,
+    mode: str,
+    selector_backend: str,
+    nprobes: list[int],
+    budget: int,
+    key_bytes: int,
+    subbits: int,
+    sync_for_timing: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float, int]:
+    if queries.dim() != 2:
+        raise ValueError("queries must have shape [heads, dim]")
+    if str(mode) != "fullscan":
+        raise ValueError("dense score return is implemented only for fullscan page-PQ")
+    if bool(sync_for_timing):
+        _sync_if_cuda(queries.device)
+    t0 = time.perf_counter()
+    if str(selector_backend) in {"cuda_ext", "auto"} and queries.is_cuda:
+        try:
+            native = load_selector_paged_pq_ext()
+            codebooks, codes, page_starts = ensure_native_fullscan_pack(index, subbits=int(subbits))
+            top_tokens, top_scores, scores = native.fullscan_pq_topk_scores(
+                queries.contiguous(),
+                codebooks,
+                codes,
+                page_starts,
+                int(budget),
+            )
+            if bool(sync_for_timing):
+                _sync_if_cuda(queries.device)
+            return (
+                top_tokens,
+                top_scores,
+                scores,
+                time.perf_counter() - t0 if bool(sync_for_timing) else 0.0,
+                selector_bytes_fullscan(index, key_bytes=int(key_bytes), subbits=int(subbits)) / MB,
+                0,
+            )
+        except Exception:
+            if str(selector_backend) == "cuda_ext":
+                raise
+    token_rows = []
+    score_rows = []
+    dense_score_rows = []
+    seconds_total = 0.0
+    selector_mb = 0.0
+    nprobe = 0
+    for row in range(int(queries.shape[0])):
+        token_chunks = []
+        score_chunks = []
+        for page in index.pages:
+            tokens, scores = pq_page_scores(queries[row], page)
+            token_chunks.append(tokens)
+            score_chunks.append(scores)
+        if token_chunks:
+            tokens_all = torch.cat(token_chunks)
+            scores_all = torch.cat(score_chunks)
+            order = torch.argsort(scores_all, descending=True, stable=True)
+            k = min(max(0, int(budget)), int(tokens_all.numel()))
+            token_rows.append(tokens_all[order[:k]])
+            score_rows.append(scores_all[order[:k]])
+            dense_score_rows.append(scores_all.reshape(1, -1))
+        else:
+            token_rows.append(torch.empty((0,), dtype=torch.long, device=queries.device))
+            score_rows.append(torch.empty((0,), dtype=torch.float32, device=queries.device))
+            dense_score_rows.append(torch.empty((1, 0), dtype=torch.float32, device=queries.device))
+        selector_mb = selector_bytes_fullscan(index, key_bytes=int(key_bytes), subbits=int(subbits)) / MB
+    _sync_if_cuda(queries.device)
+    return (
+        torch.stack(token_rows, dim=0),
+        torch.stack(score_rows, dim=0),
+        torch.cat(dense_score_rows, dim=0),
+        seconds_total + (time.perf_counter() - t0),
+        selector_mb,
+        nprobe,
     )
 
 
@@ -516,6 +914,12 @@ def run() -> None:
     parser.add_argument("--key_bytes", type=int, default=2)
     parser.add_argument("--value_bytes", type=int, default=2)
     parser.add_argument("--selector_mode", choices=["fullscan", "routed"], default="fullscan")
+    parser.add_argument(
+        "--selector_backend",
+        choices=["torch", "cuda_ext", "auto"],
+        default=os.environ.get("SELECTOR_PAGED_PQ_BACKEND", "torch"),
+        help="fullscan selector backend; cuda_ext returns top-budget candidates without full selector-score ranking",
+    )
     parser.add_argument("--nprobes", default="1,2,4,8,16,32,64,128,256,512")
     parser.add_argument("--router_prototypes", type=int, default=16)
     parser.add_argument("--router_merge_rel", type=float, default=0.05)
@@ -593,7 +997,7 @@ def run() -> None:
                     subvecs=int(args.subvecs),
                     subbits=int(args.subbits),
                     kmeans_iters=int(args.kmeans_iters),
-                    seed=2025 + int(kv_head),
+                    seed=2025 + 2027 * int(kv_head),
                     key_bytes=int(args.key_bytes),
                     router_enabled=str(args.selector_mode) == "routed",
                     router_prototypes=int(args.router_prototypes),
@@ -615,6 +1019,7 @@ def run() -> None:
                     query,
                     index,
                     mode=str(args.selector_mode),
+                    selector_backend=str(args.selector_backend),
                     nprobes=nprobes,
                     budget=max(budgets) if budgets else 0,
                     key_bytes=int(args.key_bytes),
@@ -627,6 +1032,7 @@ def run() -> None:
                         query,
                         index,
                         mode=str(args.selector_mode),
+                        selector_backend=str(args.selector_backend),
                         nprobes=nprobes,
                         budget=int(budget),
                         key_bytes=int(args.key_bytes),
@@ -657,6 +1063,7 @@ def run() -> None:
                         query,
                         index,
                         mode=str(args.selector_mode),
+                        selector_backend=str(args.selector_backend),
                         nprobes=nprobes,
                         budget=int(budget),
                         key_bytes=int(args.key_bytes),
@@ -724,6 +1131,7 @@ def run() -> None:
                             "subvecs": int(args.subvecs),
                             "subbits": int(args.subbits),
                             "selector_mode": str(args.selector_mode),
+                            "selector_backend": str(args.selector_backend),
                             "nprobe": int(chosen_nprobe),
                             "router_groups": int(index.router_group_means.shape[0]) if index.router_group_means is not None else 0,
                         }

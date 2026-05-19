@@ -22,6 +22,7 @@ from benchmark.selector_eval.data.trace import attention_probs, load_trace, stat
 from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import (
     build_page_pq_gpu,
     parse_csv_ints,
+    pq_page_scores,
     rank_paged_pq,
     selected_plus_tail_output,
 )
@@ -74,6 +75,163 @@ def parse_int_set(text: str) -> set[int]:
     return {int(part.strip()) for part in str(text or "").split(",") if part.strip()}
 
 
+def _page_tokens(index) -> np.ndarray:
+    parts = [
+        np.arange(int(page.start), int(page.start) + int(page.size), dtype=np.int64)
+        for page in index.pages
+        if int(page.size) > 0
+    ]
+    return np.concatenate(parts) if parts else np.empty((0,), dtype=np.int64)
+
+
+def _sparq_rank_tokens(
+    *,
+    keys_np: np.ndarray,
+    query_np: np.ndarray,
+    index,
+    rank: int,
+    key_bytes: int,
+    index_bytes: int,
+) -> tuple[np.ndarray, np.ndarray, float, float]:
+    tokens = _page_tokens(index)
+    if tokens.size == 0:
+        return tokens, np.empty((0,), dtype=np.float32), 0.0, 0.0
+    rank = min(max(1, int(rank)), int(query_np.shape[0]))
+    dims = np.argsort(-np.abs(query_np), kind="stable")[:rank]
+    coverage = max(float(np.abs(query_np[dims]).sum()) / max(float(np.abs(query_np).sum()), 1e-20), 1e-6)
+    # Scale partial-dot scores back to the full-dot scale expected by the
+    # shared confidence calibration. Calibration can still correct query-local
+    # bias, but this keeps initial ranking comparable to K-PQ scores.
+    scores = (keys_np[tokens[:, None], dims] @ query_np[dims]).astype(np.float32, copy=False) / float(coverage)
+    order = np.argsort(-scores, kind="stable")
+    selector_mb = float(rank * int(index_bytes) + tokens.size * rank * int(key_bytes)) / MB
+    return tokens[order].astype(np.int64, copy=False), scores[order].astype(np.float32, copy=False), selector_mb, float(coverage)
+
+
+def _quest_page_scores(
+    *,
+    keys_np: np.ndarray,
+    query_np: np.ndarray,
+    index,
+    rank: int,
+) -> tuple[list[tuple[int, float]], float]:
+    if not index.pages:
+        return [], 0.0
+    rank = min(max(1, int(rank)), int(query_np.shape[0]))
+    dims = np.argsort(-np.abs(query_np), kind="stable")[:rank]
+    q = query_np[dims].astype(np.float32, copy=False)
+    coverage = max(float(np.abs(q).sum()) / max(float(np.abs(query_np).sum()), 1e-20), 1e-6)
+    page_scores: list[tuple[int, float]] = []
+    for page_id, page in enumerate(index.pages):
+        start = int(page.start)
+        end = min(start + int(page.size), int(keys_np.shape[0]))
+        if end <= start:
+            page_scores.append((int(page_id), float("-inf")))
+            continue
+        vals = keys_np[start:end, :][:, dims].astype(np.float32, copy=False)
+        mins = vals.min(axis=0)
+        maxs = vals.max(axis=0)
+        bound = np.where(q >= 0.0, maxs, mins)
+        page_scores.append((int(page_id), float(np.dot(bound, q) / coverage)))
+    page_scores.sort(key=lambda item: (-item[1], item[0]))
+    return page_scores, float(coverage)
+
+
+def _rank_quest_pages(
+    *,
+    keys_np: np.ndarray,
+    query_np: np.ndarray,
+    index,
+    rank: int,
+    key_bytes: int,
+    index_bytes: int,
+) -> tuple[np.ndarray, np.ndarray, float, int, float]:
+    page_scores, coverage = _quest_page_scores(keys_np=keys_np, query_np=query_np, index=index, rank=rank)
+    tokens: list[int] = []
+    scores: list[float] = []
+    for page_id, score in page_scores:
+        page = index.pages[int(page_id)]
+        page_tokens = range(int(page.start), int(page.start) + int(page.size))
+        tokens.extend(int(tok) for tok in page_tokens)
+        scores.extend(float(score) for _ in range(int(page.size)))
+    rank = min(max(1, int(rank)), int(query_np.shape[0]))
+    selector_mb = float(rank * int(index_bytes) + len(index.pages) * rank * 2 * int(key_bytes)) / MB
+    return (
+        np.asarray(tokens, dtype=np.int64),
+        np.asarray(scores, dtype=np.float32),
+        selector_mb,
+        int(len(index.pages)),
+        float(coverage),
+    )
+
+
+def _rank_quest_pq(
+    *,
+    query: torch.Tensor,
+    keys_np: np.ndarray,
+    query_np: np.ndarray,
+    index,
+    rank: int,
+    nprobes: list[int],
+    budget: int,
+    key_bytes: int,
+    subbits: int,
+    index_bytes: int,
+) -> tuple[np.ndarray, np.ndarray, float, int, float]:
+    page_scores, coverage = _quest_page_scores(keys_np=keys_np, query_np=query_np, index=index, rank=rank)
+    if not page_scores:
+        return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.float32), 0.0, 0, float(coverage)
+    probe_choices = sorted(set(max(1, int(p)) for p in nprobes))
+    chosen_nprobe = min(probe_choices[-1], len(page_scores))
+    for nprobe in probe_choices:
+        chosen_nprobe = min(int(nprobe), len(page_scores))
+        candidate_count = sum(int(index.pages[pid].size) for pid, _score in page_scores[:chosen_nprobe])
+        if candidate_count >= int(budget):
+            break
+
+    scanned_page_ids = {int(pid) for pid, _score in page_scores[:chosen_nprobe]}
+    scanned_tokens = []
+    scanned_scores = []
+    for page_id, _page_score in page_scores[:chosen_nprobe]:
+        tokens_t, scores_t = pq_page_scores(query, index.pages[int(page_id)])
+        scanned_tokens.append(tokens_t.detach().cpu().numpy().astype(np.int64, copy=False))
+        scanned_scores.append(scores_t.detach().cpu().numpy().astype(np.float32, copy=False))
+    if scanned_tokens:
+        scanned_tok = np.concatenate(scanned_tokens)
+        scanned_score = np.concatenate(scanned_scores)
+        order = np.argsort(-scanned_score, kind="stable")
+        ranked_tokens = [int(tok) for tok in scanned_tok[order].tolist()]
+        ranked_scores = [float(score) for score in scanned_score[order].tolist()]
+    else:
+        ranked_tokens = []
+        ranked_scores = []
+
+    # Append unscanned pages by QUEST page score so tail confidence still sees
+    # an explicit score proxy for the full indexed tail. Selected tokens from
+    # this suffix are allowed, but they are selected by page-bound score only.
+    for page_id, page_score in page_scores:
+        if int(page_id) in scanned_page_ids:
+            continue
+        page = index.pages[int(page_id)]
+        for tok in range(int(page.start), int(page.start) + int(page.size)):
+            ranked_tokens.append(int(tok))
+            ranked_scores.append(float(page_score))
+
+    rank = min(max(1, int(rank)), int(query_np.shape[0]))
+    code_bytes = 1 if int(subbits) <= 8 else 2
+    selector_bytes = float(rank * int(index_bytes) + len(index.pages) * rank * 2 * int(key_bytes))
+    for page_id in scanned_page_ids:
+        page = index.pages[int(page_id)]
+        selector_bytes += float(page.codebooks.numel() * int(key_bytes) + page.codes.numel() * code_bytes)
+    return (
+        np.asarray(ranked_tokens, dtype=np.int64),
+        np.asarray(ranked_scores, dtype=np.float32),
+        selector_bytes / MB,
+        int(chosen_nprobe),
+        float(coverage),
+    )
+
+
 def _selected_for_budget(
     *,
     base: list[int],
@@ -84,6 +242,20 @@ def _selected_for_budget(
     base_set = set(int(tok) for tok in base)
     add = [int(tok) for tok in ranked_cpu.tolist() if int(tok) < int(context_len) and int(tok) not in base_set][: int(budget)]
     return np.asarray(unique_tokens(base + add, context_len=int(context_len)), dtype=np.int64)
+
+
+def _nan_output_metrics() -> dict[str, float]:
+    return {
+        "output_cosine": float("nan"),
+        "output_relative_l2": float("nan"),
+        "output_rmsnorm_relative_l2": float("nan"),
+        "output_centered_cosine": float("nan"),
+        "output_mean_abs_relative_error": float("nan"),
+        "output_p95_abs_relative_error": float("nan"),
+        "output_p99_abs_relative_error": float("nan"),
+        "output_max_abs_relative_error": float("nan"),
+        "output_linf_relative": float("nan"),
+    }
 
 
 def _proxy_selected_mass(
@@ -138,6 +310,135 @@ def _selected_only_output(
     selected_values = values_override if values_override is not None else values_np[selected_cpu]
     scores, probs = attention_probs(keys_np[selected_cpu], query_np)
     return (probs.astype(np.float32) @ selected_values.astype(np.float32, copy=False)).astype(np.float32, copy=False)
+
+
+def _selected_output_from_scores(
+    values_np: np.ndarray,
+    selected_cpu: np.ndarray,
+    selected_scores: np.ndarray,
+    *,
+    values_override: np.ndarray | None = None,
+) -> np.ndarray:
+    if selected_cpu.size == 0:
+        return np.zeros((values_np.shape[-1],), dtype=np.float32)
+    selected_values = values_override if values_override is not None else values_np[selected_cpu]
+    scores = selected_scores.astype(np.float64, copy=False)
+    weights = np.exp(scores - float(np.max(scores)))
+    weights /= max(float(weights.sum()), 1e-20)
+    return (weights.astype(np.float32, copy=False) @ selected_values.astype(np.float32, copy=False)).astype(
+        np.float32,
+        copy=False,
+    )
+
+
+def _ranked_score_map(ranked_cpu: np.ndarray, ranked_scores_cpu: np.ndarray, query_dim: int) -> dict[int, float]:
+    scale = float(np.sqrt(float(query_dim)))
+    return {
+        int(tok): float(score) / scale
+        for tok, score in zip(ranked_cpu.tolist(), ranked_scores_cpu.tolist(), strict=False)
+    }
+
+
+def _band_calibrated_selected_scores(
+    *,
+    selected_cpu: np.ndarray,
+    ranked_cpu: np.ndarray,
+    ranked_scores_cpu: np.ndarray,
+    exact_scores_np: np.ndarray,
+    query_dim: int,
+    probes: int,
+    bands: int,
+    exact_selector_mass: float = 0.0,
+    min_exact_top: int = 0,
+    max_exact_top: int = 0,
+) -> tuple[np.ndarray, int, int, int]:
+    """Calibrate selector logits for selected tokens using rank-band probes.
+
+    Exact fallback is used for selected tokens that do not have a selector score
+    proxy, e.g. static/pending tokens. Probe tokens are also kept exact.
+    """
+
+    if selected_cpu.size == 0:
+        return np.empty((0,), dtype=np.float64), 0, 0, 0
+    approx_by_token = _ranked_score_map(ranked_cpu, ranked_scores_cpu, query_dim)
+    selected_set = set(int(tok) for tok in selected_cpu.tolist())
+    ordered = [int(tok) for tok in ranked_cpu.tolist() if int(tok) in selected_set]
+    seen = set(ordered)
+    ordered.extend(int(tok) for tok in selected_cpu.tolist() if int(tok) not in seen)
+    token_to_pos = {int(tok): idx for idx, tok in enumerate(selected_cpu.tolist())}
+    scores = exact_scores_np[selected_cpu].astype(np.float64, copy=True)
+    compressible = np.asarray([int(tok) in approx_by_token for tok in selected_cpu.tolist()], dtype=bool)
+    compressed_count = int(np.count_nonzero(compressible))
+    if compressed_count == 0:
+        return scores, int(selected_cpu.size), 0, 0
+
+    probe_count = min(max(0, int(probes)), compressed_count)
+    exact_mask = ~compressible
+    approx_scores_for_selected = np.asarray(
+        [
+            float(approx_by_token[int(tok)]) if int(tok) in approx_by_token else -float("inf")
+            for tok in selected_cpu.tolist()
+        ],
+        dtype=np.float64,
+    )
+    exact_selector_count = 0
+    if float(exact_selector_mass) > 0.0 and bool(np.any(compressible)):
+        compressible_pos = np.nonzero(compressible)[0]
+        selector_scores = approx_scores_for_selected[compressible_pos]
+        order_local = np.argsort(-selector_scores, kind="stable")
+        ordered_pos = compressible_pos[order_local]
+        shifted = selector_scores[order_local] - float(np.max(selector_scores[order_local]))
+        probs = np.exp(shifted)
+        probs /= max(float(probs.sum()), 1e-20)
+        cumulative = np.cumsum(probs)
+        target = float(max(0.0, min(1.0, exact_selector_mass)))
+        exact_selector_count = int(np.searchsorted(cumulative, target, side="left") + 1)
+        exact_selector_count = max(int(min_exact_top), exact_selector_count)
+        if int(max_exact_top) > 0:
+            exact_selector_count = min(int(max_exact_top), exact_selector_count)
+        exact_selector_count = max(0, min(int(ordered_pos.size), exact_selector_count))
+        if exact_selector_count > 0:
+            exact_mask[ordered_pos[:exact_selector_count]] = True
+    if probe_count > 0:
+        ordered_compressible = np.asarray([tok for tok in ordered if int(tok) in approx_by_token], dtype=np.int64)
+        band_count = max(1, min(int(bands), int(ordered_compressible.size)))
+        ordered_bands = [arr.astype(np.int64, copy=False) for arr in np.array_split(ordered_compressible, band_count)]
+        per_band = max(1, int(np.ceil(float(probe_count) / float(band_count))))
+        for band in ordered_bands:
+            if band.size == 0:
+                continue
+            if per_band >= int(band.size):
+                probe_tokens = band
+            else:
+                positions = np.unique(np.linspace(0, int(band.size) - 1, num=per_band, dtype=np.int64))
+                probe_tokens = band[positions]
+            exact_mask[[token_to_pos[int(tok)] for tok in probe_tokens.tolist()]] = True
+            x = np.asarray([approx_by_token[int(tok)] for tok in probe_tokens.tolist()], dtype=np.float64)
+            y = exact_scores_np[probe_tokens].astype(np.float64, copy=False)
+            x_mean = float(np.mean(x))
+            y_mean = float(np.mean(y))
+            x_var = float(np.mean((x - x_mean) * (x - x_mean)))
+            if x_var > 1e-12:
+                slope = float(np.mean((x - x_mean) * (y - y_mean)) / x_var)
+                intercept = y_mean - slope * x_mean
+            else:
+                slope = 1.0
+                intercept = y_mean - x_mean
+            for tok in band.tolist():
+                pos = token_to_pos[int(tok)]
+                scores[pos] = slope * float(approx_by_token[int(tok)]) + intercept
+            for tok in probe_tokens.tolist():
+                scores[token_to_pos[int(tok)]] = float(exact_scores_np[int(tok)])
+    else:
+        for tok in ordered:
+            if int(tok) in approx_by_token:
+                scores[token_to_pos[int(tok)]] = float(approx_by_token[int(tok)])
+
+    if bool(np.any(exact_mask)):
+        scores[exact_mask] = exact_scores_np[selected_cpu[exact_mask]].astype(np.float64, copy=False)
+    exact_count = int(np.count_nonzero(exact_mask))
+    compressed_logits = int(selected_cpu.size) - exact_count
+    return scores, exact_count, compressed_logits, probe_count
 
 
 def _vpq_values_for_tokens(
@@ -197,6 +498,62 @@ def _vpq_values_for_tokens(
     return out, float(codebook_bytes + code_bytes_total) / MB, fallback_mb
 
 
+def _vpq_residual_norms_for_index(
+    *,
+    index,
+    values_np: np.ndarray,
+    subbits: int,
+    value_subvecs: int,
+    value_subbits: int,
+) -> np.ndarray:
+    """Residual-norm sidecar used by selected-V risk rules.
+
+    This models a deployable page-seal sidecar: each token stores a small norm
+    of (exact V - VPQ-reconstructed V). Query time reads only that scalar to
+    decide which selected V vectors must remain exact.
+    """
+
+    actual_value_subbits = int(value_subbits) if int(value_subbits) > 0 else int(subbits)
+    cache_key = (int(subbits), int(value_subvecs), actual_value_subbits)
+    cached_by_key = getattr(index, "_value_vpq_residual_norms_by_params", None)
+    if isinstance(cached_by_key, dict) and cache_key in cached_by_key:
+        return cached_by_key[cache_key]
+
+    norms = np.zeros((int(values_np.shape[0]),), dtype=np.float32)
+    value_sidecars = _build_value_vpq_sidecars(
+        index,
+        values_np,
+        int(subbits),
+        value_subvecs=int(value_subvecs),
+        value_subbits=actual_value_subbits,
+    )
+    for page_id, page in enumerate(index.pages):
+        start = int(page.start)
+        size = int(page.size)
+        if size <= 0:
+            continue
+        codebook, page_codes = value_sidecars[int(page_id)]
+        if codebook.size == 0 or page_codes.size == 0:
+            continue
+        codes = page_codes.astype(np.int64, copy=False)
+        subvecs = int(codes.shape[1])
+        subdim = int(codebook.shape[-1])
+        approx_values = np.zeros((size, subvecs * subdim), dtype=np.float32)
+        for sub in range(subvecs):
+            approx_values[:, sub * subdim : (sub + 1) * subdim] = codebook[sub, codes[:, sub]]
+        exact_values = values_np[start : start + size].astype(np.float32, copy=False)
+        norms[start : start + size] = (
+            np.linalg.norm(exact_values - approx_values, axis=1).astype(np.float32, copy=False)
+            / float(np.sqrt(float(values_np.shape[-1])))
+        )
+
+    if not isinstance(cached_by_key, dict):
+        cached_by_key = {}
+    cached_by_key[cache_key] = norms
+    setattr(index, "_value_vpq_residual_norms_by_params", cached_by_key)
+    return norms
+
+
 def _selected_value_exact_mask(
     *,
     selected_arr: np.ndarray,
@@ -219,12 +576,17 @@ def _selected_value_exact_mask(
     if count <= 0:
         return exact_mask, 0, 0.0
 
-    order = np.argsort(-selected_scores.astype(np.float64, copy=False), kind="stable")
+    selector_rank_order = str(rule) == "selector_rank"
+    order = (
+        np.arange(count, dtype=np.int64)
+        if selector_rank_order
+        else np.argsort(-selected_scores.astype(np.float64, copy=False), kind="stable")
+    )
     shifted = selected_scores.astype(np.float64, copy=False) - float(np.max(selected_scores))
     probs = np.exp(shifted)
     probs /= max(float(probs.sum()), 1e-20)
     cumulative = np.cumsum(probs[order])
-    if str(rule) == "fixed":
+    if str(rule) in {"fixed", "selector_rank"}:
         exact_count = int(fixed_top)
         exact_count_for_mass = max(0, min(count, exact_count))
         achieved_mass = float(cumulative[exact_count_for_mass - 1]) if exact_count_for_mass > 0 else 0.0
@@ -516,20 +878,56 @@ def _round_budget_up(value: float, *, granularity: int, max_budget: int) -> int:
 def _sample_tail_audit(
     *,
     selected_cpu: np.ndarray,
+    ranked_cpu: np.ndarray | None = None,
     scores_np: np.ndarray,
     context_len: int,
     samples: int,
     seed: int,
     qidx: int,
     head: int,
+    mode: str = "uniform",
+    bands: int = 8,
 ) -> tuple[float, float, int, int]:
     selected_set = set(int(tok) for tok in selected_cpu.tolist())
-    tail = np.asarray([tok for tok in range(int(context_len)) if int(tok) not in selected_set], dtype=np.int64)
+    mode = str(mode)
+    if ranked_cpu is not None and mode in {"rank_prefix", "rank_stratified"}:
+        ranked_tail = [int(tok) for tok in ranked_cpu.tolist() if int(tok) not in selected_set and int(tok) < int(context_len)]
+        ranked_seen = set(ranked_tail)
+        # Include static/pending tokens that may not be present in ranked_cpu so
+        # the population denominator remains honest.
+        tail_list = ranked_tail + [
+            int(tok) for tok in range(int(context_len)) if int(tok) not in selected_set and int(tok) not in ranked_seen
+        ]
+        tail = np.asarray(tail_list, dtype=np.int64)
+    else:
+        tail = np.asarray([tok for tok in range(int(context_len)) if int(tok) not in selected_set], dtype=np.int64)
     if selected_cpu.size == 0 or tail.size == 0 or int(samples) <= 0:
         return 0.0, -float("inf"), 0, int(tail.size)
     count = min(int(samples), int(tail.size))
     rng = np.random.default_rng(int(seed) + 1000003 * int(qidx) + 65537 * int(head))
-    sample = rng.choice(tail, size=count, replace=False) if count < int(tail.size) else tail
+    if mode == "rank_prefix":
+        sample = tail[:count]
+    elif mode == "rank_stratified":
+        band_count = max(1, int(bands))
+        chunks = np.array_split(tail, band_count)
+        per_band = max(1, int(math.ceil(float(count) / float(band_count))))
+        picked: list[np.ndarray] = []
+        for chunk in chunks:
+            if chunk.size == 0:
+                continue
+            take = min(per_band, int(chunk.size))
+            if take >= int(chunk.size):
+                picked.append(chunk)
+            else:
+                # Systematic positions are deterministic and avoid adding a
+                # noisy seed dependency to the confidence rule.
+                idx = np.linspace(0, int(chunk.size) - 1, num=take, dtype=np.int64)
+                picked.append(chunk[idx])
+        sample = np.concatenate(picked)[:count] if picked else tail[:0]
+    elif mode == "uniform":
+        sample = rng.choice(tail, size=count, replace=False) if count < int(tail.size) else tail
+    else:
+        raise ValueError(f"unknown audit_tail_mode: {mode}")
     selected_scores = scores_np[selected_cpu].astype(np.float64, copy=False)
     sample_scores = scores_np[sample].astype(np.float64, copy=False)
     max_score = max(float(np.max(selected_scores)), float(np.max(sample_scores)))
@@ -627,7 +1025,14 @@ def run() -> None:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--decode_lengths", default="500,8000,32000,128000")
     parser.add_argument("--max_qidx_per_decode", type=int, default=1)
-    parser.add_argument("--selector_mode", choices=["fullscan", "routed"], default="routed")
+    parser.add_argument(
+        "--selector_mode",
+        choices=["fullscan", "routed", "sparq", "quest", "quest_pq", "oracle"],
+        default="routed",
+    )
+    parser.add_argument("--selector_sparq_rank", type=int, default=16)
+    parser.add_argument("--quest_rank", type=int, default=16)
+    parser.add_argument("--selector_index_bytes", type=int, default=4)
     parser.add_argument("--budgets", default="4096")
     parser.add_argument("--budget_by_head", default="", help="Optional comma map like 0:16384,1:24576 overriding --budgets per head.")
     parser.add_argument(
@@ -637,11 +1042,14 @@ def run() -> None:
             "proxy_mass_exact",
             "proxy_tail_delta",
             "proxy_mass_marginal_exact",
+            "pq_proxy_mass_budget",
+            "pq_ranked_mass_budget",
             "probe_tail_switch",
             "entropy_probe_tail_switch",
             "adaptive_entropy_probe_tail_switch",
             "geometric_probe_tail_switch",
             "geometric_stable_tail_switch",
+            "geometric_slope_stability",
             "geometric_exact_delta",
         ],
         default="none",
@@ -671,12 +1079,40 @@ def run() -> None:
     parser.add_argument("--entropy_tail_mass_max", type=float, default=0.01)
     parser.add_argument("--geometric_min_budget", type=int, default=4096)
     parser.add_argument("--geometric_max_budget", type=int, default=32768)
+    parser.add_argument(
+        "--geometric_max_budget_by_head",
+        default="",
+        help="Optional comma map like 0:120000,1:120000 overriding --geometric_max_budget per query head.",
+    )
+    parser.add_argument(
+        "--long_context_threshold",
+        type=int,
+        default=0,
+        help="If >0, enables long-context overrides when decode_length is at or above this threshold.",
+    )
+    parser.add_argument(
+        "--long_geometric_max_budget",
+        type=int,
+        default=0,
+        help="If >0 with long_context_threshold, overrides geometric_max_budget at/above threshold.",
+    )
+    parser.add_argument(
+        "--long_geometric_max_budget_by_head",
+        default="",
+        help="Optional long-context comma map like 0:120000,1:120000 overriding geometric max budget per head.",
+    )
     parser.add_argument("--geometric_growth", type=float, default=1.5)
     parser.add_argument("--geometric_probe_scale", type=float, default=1.125)
     parser.add_argument("--geometric_budget_granularity", type=int, default=1024)
     parser.add_argument("--stable_tail_probe_rel_l2_max", type=float, default=0.05)
+    parser.add_argument("--slope_forward_rel_l2_max", type=float, default=0.05)
+    parser.add_argument("--slope_backward_rel_l2_max", type=float, default=0.10)
+    parser.add_argument("--slope_ratio_max", type=float, default=1.0)
+    parser.add_argument("--slope_curvature_rel_l2_max", type=float, default=0.05)
     parser.add_argument("--exact_delta_rel_l2_max", type=float, default=0.01)
     parser.add_argument("--audit_tail_samples", type=int, default=0)
+    parser.add_argument("--audit_tail_mode", choices=["uniform", "rank_prefix", "rank_stratified"], default="uniform")
+    parser.add_argument("--audit_tail_bands", type=int, default=8)
     parser.add_argument("--audit_tail_mass_max", type=float, default=1.0)
     parser.add_argument("--audit_tail_logit_gap_max", type=float, default=float("inf"))
     parser.add_argument("--sparq_audit_rank", type=int, default=0)
@@ -694,7 +1130,7 @@ def run() -> None:
     parser.add_argument("--selected_value_mode", choices=["exact", "vpq_value"], default="exact")
     parser.add_argument(
         "--selected_value_exact_rule",
-        choices=["fixed", "selected_mass", "selected_risk_mass", "selected_mass_or_risk"],
+        choices=["fixed", "selector_rank", "selected_mass", "selected_risk_mass", "selected_mass_or_risk"],
         default="fixed",
     )
     parser.add_argument("--selected_value_exact_top", type=int, default=0)
@@ -702,8 +1138,62 @@ def run() -> None:
     parser.add_argument("--selected_value_exact_risk_mass", type=float, default=0.0)
     parser.add_argument("--selected_value_min_exact_top", type=int, default=0)
     parser.add_argument("--selected_value_max_exact_top", type=int, default=0)
+    parser.add_argument(
+        "--selected_value_max_exact_top_by_head",
+        default="",
+        help="Optional comma map like 0:0,1:0 overriding --selected_value_max_exact_top per query head.",
+    )
+    parser.add_argument(
+        "--selected_value_exact_all_context_max",
+        type=int,
+        default=0,
+        help="If >0, keep all selected V exact when context_len is at or below this threshold.",
+    )
+    parser.add_argument(
+        "--selected_value_exact_all_fraction_min",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0, keep all selected V exact when selected_tokens/context_len is at least this fraction. "
+            "This is a deployable compression-confidence rule; it uses only selected-set size."
+        ),
+    )
+    parser.add_argument(
+        "--long_selected_value_exact_mass",
+        type=float,
+        default=-1.0,
+        help="If >=0 with long_context_threshold, overrides selected_value_exact_mass at/above threshold.",
+    )
+    parser.add_argument(
+        "--long_selected_value_max_exact_top",
+        type=int,
+        default=-1,
+        help="If >=0 with long_context_threshold, overrides selected_value_max_exact_top at/above threshold.",
+    )
+    parser.add_argument(
+        "--long_selected_value_max_exact_top_by_head",
+        default="",
+        help="Optional long-context comma map like 0:0,1:0 overriding selected_value_max_exact_top per head.",
+    )
     parser.add_argument("--selected_value_residual_correction", choices=["none", "exact_mean"], default="none")
     parser.add_argument("--selected_value_residual_norm_bytes", type=int, default=2)
+    parser.add_argument("--selected_key_mode", choices=["exact", "band_calibrated_selector"], default="exact")
+    parser.add_argument("--selected_key_calibration_probes", type=int, default=0)
+    parser.add_argument("--selected_key_calibration_bands", type=int, default=8)
+    parser.add_argument(
+        "--selected_key_exact_selector_mass",
+        type=float,
+        default=0.0,
+        help="If >0 with compressed selected K, keep exact K for top selected tokens by selector-logit softmax mass.",
+    )
+    parser.add_argument("--selected_key_min_exact_top", type=int, default=0)
+    parser.add_argument("--selected_key_max_exact_top", type=int, default=0)
+    parser.add_argument(
+        "--selected_key_min_context",
+        type=int,
+        default=0,
+        help="If >0, use exact selected K below this context length even when selected_key_mode is compressed.",
+    )
     parser.add_argument("--tail_blend", type=float, default=1.0)
     parser.add_argument("--tail_blend_rule", choices=["fixed", "probe_optimal", "probe_extrapolated"], default="fixed")
     parser.add_argument("--tail_blend_extrap_max", type=float, default=4.0)
@@ -724,6 +1214,11 @@ def run() -> None:
     parser.add_argument("--router_merge_var", type=float, default=0.0)
     parser.add_argument("--router_max_groups", type=int, default=512)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--head_only",
+        action="store_true",
+        help="Skip o_proj/residual/MLP metrics and write only per-head attention diagnostics.",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available() and str(args.device).startswith("cuda"):
@@ -771,6 +1266,10 @@ def run() -> None:
         raise ValueError("layer eval expects exactly one budget for now")
     default_budget = int(budgets[0])
     budget_by_head = parse_head_budget_map(args.budget_by_head)
+    geometric_max_budget_by_head = parse_head_budget_map(args.geometric_max_budget_by_head)
+    long_geometric_max_budget_by_head = parse_head_budget_map(args.long_geometric_max_budget_by_head)
+    selected_value_max_exact_top_by_head = parse_head_budget_map(args.selected_value_max_exact_top_by_head)
+    long_selected_value_max_exact_top_by_head = parse_head_budget_map(args.long_selected_value_max_exact_top_by_head)
     confidence_budgets = (
         sorted(set(parse_csv_ints(args.confidence_budgets)))
         if str(args.confidence_budgets).strip()
@@ -823,7 +1322,7 @@ def run() -> None:
                 subvecs=int(args.subvecs),
                 subbits=int(args.subbits),
                 kmeans_iters=int(args.kmeans_iters),
-                seed=2025 + int(kv_head),
+                seed=2025 + 2027 * int(kv_head),
                 key_bytes=int(args.key_bytes),
                 router_enabled=str(args.selector_mode) == "routed",
                 router_prototypes=int(args.router_prototypes),
@@ -854,6 +1353,28 @@ def run() -> None:
             )
 
         for head in range(trace.num_heads):
+            long_context_active = (
+                int(args.long_context_threshold) > 0
+                and int(decode_tokens) >= int(args.long_context_threshold)
+            )
+            effective_selected_value_exact_mass = float(args.selected_value_exact_mass)
+            effective_selected_value_max_exact_top = int(
+                selected_value_max_exact_top_by_head.get(int(head), int(args.selected_value_max_exact_top))
+            )
+            effective_geometric_max_budget = int(
+                geometric_max_budget_by_head.get(int(head), int(args.geometric_max_budget))
+            )
+            if long_context_active:
+                if float(args.long_selected_value_exact_mass) >= 0.0:
+                    effective_selected_value_exact_mass = float(args.long_selected_value_exact_mass)
+                if int(args.long_selected_value_max_exact_top) >= 0:
+                    effective_selected_value_max_exact_top = int(args.long_selected_value_max_exact_top)
+                if int(head) in long_selected_value_max_exact_top_by_head:
+                    effective_selected_value_max_exact_top = int(long_selected_value_max_exact_top_by_head[int(head)])
+                if int(args.long_geometric_max_budget) > 0:
+                    effective_geometric_max_budget = int(args.long_geometric_max_budget)
+                if int(head) in long_geometric_max_budget_by_head:
+                    effective_geometric_max_budget = int(long_geometric_max_budget_by_head[int(head)])
             if str(args.online_confidence_rule) == "none":
                 budget = int(budget_by_head.get(int(head), default_budget))
                 rank_budget = budget
@@ -863,9 +1384,10 @@ def run() -> None:
             elif str(args.online_confidence_rule) in {
                 "geometric_probe_tail_switch",
                 "geometric_stable_tail_switch",
+                "geometric_slope_stability",
                 "geometric_exact_delta",
             }:
-                budget = int(args.geometric_max_budget)
+                budget = int(effective_geometric_max_budget)
                 rank_budget = budget
             else:
                 budget = int(max(confidence_budgets + [int(args.tail_confidence_budget)]))
@@ -895,15 +1417,27 @@ def run() -> None:
                     exact_value_mb = 0.0
                     compressed_v_mb = 0.0
                     fallback_v_mb = 0.0
-                    if str(args.selected_value_exact_rule) in {"selected_risk_mass", "selected_mass_or_risk"}:
-                        approx_values_all, compressed_v_mb, fallback_v_mb = _vpq_values_for_tokens(
+                    exact_all_by_context = (
+                        int(args.selected_value_exact_all_context_max) > 0
+                        and int(context_len) <= int(args.selected_value_exact_all_context_max)
+                    )
+                    selected_fraction = float(selected_arr.size) / max(1.0, float(context_len))
+                    exact_all_by_fraction = (
+                        float(args.selected_value_exact_all_fraction_min) > 0.0
+                        and selected_fraction >= float(args.selected_value_exact_all_fraction_min)
+                    )
+                    if exact_all_by_context or exact_all_by_fraction:
+                        selected_values[:] = values_np[selected_arr].astype(np.float32, copy=False)
+                        exact_count = int(selected_arr.size)
+                        exact_selected_mass = 1.0 if exact_count > 0 else 0.0
+                        exact_value_mb = float(exact_count * trace.head_dim * int(args.value_bytes)) / MB
+                    elif str(args.selected_value_exact_rule) in {"selected_risk_mass", "selected_mass_or_risk"}:
+                        residual_norm_all = _vpq_residual_norms_for_index(
                             index=index,
                             values_np=values_np,
-                            tokens=selected_arr.astype(np.int64, copy=False),
                             subbits=int(args.subbits),
                             value_subvecs=int(args.value_subvecs),
                             value_subbits=int(args.value_subbits),
-                            value_bytes=int(args.value_bytes),
                         )
                         residual_norm_mb = float(
                             selected_arr.size * max(0, int(args.selected_value_residual_norm_bytes))
@@ -913,11 +1447,7 @@ def run() -> None:
                         shifted = selected_scores - float(np.max(selected_scores))
                         probs = np.exp(shifted)
                         probs /= max(float(probs.sum()), 1e-20)
-                        residual_norm = np.linalg.norm(
-                            values_np[selected_arr].astype(np.float32, copy=False)
-                            - approx_values_all.astype(np.float32, copy=False),
-                            axis=1,
-                        ) / float(np.sqrt(float(trace.head_dim)))
+                        residual_norm = residual_norm_all[selected_arr].astype(np.float64, copy=False)
                         risk = probs * residual_norm.astype(np.float64, copy=False)
                         risk_order = np.argsort(-risk, kind="stable")
                         total_risk = float(risk.sum())
@@ -925,7 +1455,7 @@ def run() -> None:
                         risk_target = (
                             float(args.selected_value_exact_risk_mass)
                             if float(args.selected_value_exact_risk_mass) > 0.0
-                            else float(args.selected_value_exact_mass)
+                            else float(effective_selected_value_exact_mass)
                         )
                         if total_risk > 1e-20 and risk_target > 0.0:
                             cumulative = np.cumsum(risk[risk_order]) / total_risk
@@ -944,7 +1474,7 @@ def run() -> None:
                             exact_mask[risk_order[:risk_count]] = True
                         if str(args.selected_value_exact_rule) == "selected_mass_or_risk":
                             prob_order = np.argsort(-selected_scores, kind="stable")
-                            mass_target = float(max(0.0, min(1.0, args.selected_value_exact_mass)))
+                            mass_target = float(max(0.0, min(1.0, effective_selected_value_exact_mass)))
                             if mass_target > 0.0:
                                 prob_cumulative = np.cumsum(probs[prob_order])
                                 mass_count = int(np.searchsorted(prob_cumulative, mass_target, side="left") + 1)
@@ -959,8 +1489,8 @@ def run() -> None:
                             fill_order = np.argsort(-selected_scores, kind="stable")
                             exact_mask[fill_order[: min(int(selected_arr.size), min_top)]] = True
                             exact_count = int(np.sum(exact_mask))
-                        if int(args.selected_value_max_exact_top) > 0:
-                            max_top = int(args.selected_value_max_exact_top)
+                        if int(effective_selected_value_max_exact_top) > 0:
+                            max_top = int(effective_selected_value_max_exact_top)
                             if exact_count > max_top:
                                 keep_order = np.argsort(-(probs * (1.0 + residual_norm)), kind="stable")[:max_top]
                                 limited_mask = np.zeros((selected_arr.size,), dtype=bool)
@@ -968,19 +1498,32 @@ def run() -> None:
                                 exact_mask = limited_mask
                                 exact_count = int(np.sum(exact_mask))
                         exact_selected_mass = float(probs[exact_mask].sum()) if exact_count > 0 else 0.0
-                        selected_values[:] = approx_values_all.astype(np.float32, copy=False)
                         if exact_count > 0:
                             selected_values[exact_mask] = values_np[selected_arr[exact_mask]].astype(np.float32, copy=False)
                             exact_value_mb = float(np.sum(exact_mask) * trace.head_dim * int(args.value_bytes)) / MB
+                        compressed_mask = ~exact_mask
+                        if np.any(compressed_mask):
+                            approx_values, compressed_values_mb, fallback_values_mb = _vpq_values_for_tokens(
+                                index=index,
+                                values_np=values_np,
+                                tokens=selected_arr[compressed_mask].astype(np.int64, copy=False),
+                                subbits=int(args.subbits),
+                                value_subvecs=int(args.value_subvecs),
+                                value_subbits=int(args.value_subbits),
+                                value_bytes=int(args.value_bytes),
+                            )
+                            compressed_v_mb += float(compressed_values_mb)
+                            fallback_v_mb += float(fallback_values_mb)
+                            selected_values[compressed_mask] = approx_values
                     else:
                         exact_mask, exact_count, exact_selected_mass = _selected_value_exact_mask(
                             selected_arr=selected_arr,
                             selected_scores=scores_np[selected_arr],
                             rule=str(args.selected_value_exact_rule),
                             fixed_top=int(args.selected_value_exact_top),
-                            mass_target=float(args.selected_value_exact_mass),
+                            mass_target=float(effective_selected_value_exact_mass),
                             min_top=int(args.selected_value_min_exact_top),
-                            max_top=int(args.selected_value_max_exact_top),
+                            max_top=int(effective_selected_value_max_exact_top),
                         )
                         if exact_count > 0:
                             selected_values[exact_mask] = values_np[selected_arr[exact_mask]].astype(np.float32, copy=False)
@@ -1044,17 +1587,76 @@ def run() -> None:
                 return out_np, None
 
             query = torch.as_tensor(query_np, dtype=torch.float32, device=device)
-            ranked_t, ranked_scores_t, selector_seconds, selector_mb, chosen_nprobe = rank_paged_pq(
-                query,
-                index,
-                mode=str(args.selector_mode),
-                nprobes=nprobes,
-                budget=rank_budget,
-                key_bytes=int(args.key_bytes),
-                subbits=int(args.subbits),
-            )
-            ranked_cpu = ranked_t.detach().cpu().numpy().astype(np.int64, copy=False)
-            ranked_scores_cpu = ranked_scores_t.detach().cpu().numpy().astype(np.float32, copy=False)
+            selector_coverage = 0.0
+            if str(args.selector_mode) in {"fullscan", "routed"}:
+                ranked_t, ranked_scores_t, selector_seconds, selector_mb, chosen_nprobe = rank_paged_pq(
+                    query,
+                    index,
+                    mode=str(args.selector_mode),
+                    selector_backend="torch",
+                    nprobes=nprobes,
+                    budget=rank_budget,
+                    key_bytes=int(args.key_bytes),
+                    subbits=int(args.subbits),
+                )
+                ranked_cpu = ranked_t.detach().cpu().numpy().astype(np.int64, copy=False)
+                ranked_scores_cpu = ranked_scores_t.detach().cpu().numpy().astype(np.float32, copy=False)
+            elif str(args.selector_mode) == "sparq":
+                t0 = time.perf_counter()
+                ranked_cpu, ranked_scores_cpu, selector_mb, selector_coverage = _sparq_rank_tokens(
+                    keys_np=keys_np,
+                    query_np=query_np,
+                    index=index,
+                    rank=int(args.selector_sparq_rank),
+                    key_bytes=int(args.key_bytes),
+                    index_bytes=int(args.selector_index_bytes),
+                )
+                selector_seconds = time.perf_counter() - t0
+                chosen_nprobe = 0
+            elif str(args.selector_mode) == "quest":
+                t0 = time.perf_counter()
+                ranked_cpu, ranked_scores_cpu, selector_mb, chosen_nprobe, selector_coverage = _rank_quest_pages(
+                    keys_np=keys_np,
+                    query_np=query_np,
+                    index=index,
+                    rank=int(args.quest_rank),
+                    key_bytes=int(args.key_bytes),
+                    index_bytes=int(args.selector_index_bytes),
+                )
+                selector_seconds = time.perf_counter() - t0
+            elif str(args.selector_mode) == "quest_pq":
+                t0 = time.perf_counter()
+                ranked_cpu, ranked_scores_cpu, selector_mb, chosen_nprobe, selector_coverage = _rank_quest_pq(
+                    query=query,
+                    keys_np=keys_np,
+                    query_np=query_np,
+                    index=index,
+                    rank=int(args.quest_rank),
+                    nprobes=nprobes,
+                    budget=rank_budget,
+                    key_bytes=int(args.key_bytes),
+                    subbits=int(args.subbits),
+                    index_bytes=int(args.selector_index_bytes),
+                )
+                selector_seconds = time.perf_counter() - t0
+            elif str(args.selector_mode) == "oracle":
+                t0 = time.perf_counter()
+                base_set = set(int(tok) for tok in base)
+                order = np.argsort(-scores_np, kind="stable")
+                ranked_cpu = np.asarray(
+                    [int(tok) for tok in order.tolist() if int(tok) not in base_set],
+                    dtype=np.int64,
+                )
+                ranked_scores_cpu = (scores_np[ranked_cpu].astype(np.float32, copy=False) * np.sqrt(float(trace.head_dim))).astype(
+                    np.float32,
+                    copy=False,
+                )
+                selector_mb = float(context_len * trace.head_dim * int(args.key_bytes)) / MB
+                selector_coverage = 1.0
+                chosen_nprobe = 0
+                selector_seconds = time.perf_counter() - t0
+            else:
+                raise ValueError(f"unknown selector_mode: {args.selector_mode}")
             rerank_count = 0
             rerank_key_mb = 0.0
             sparq_rerank_count = 0
@@ -1123,6 +1725,14 @@ def run() -> None:
             marginal_exact_mass = 0.0
             marginal_score_gap = -float("inf")
             tail_probe_rel_l2 = float("inf")
+            stable_tail_probe_rel_l2 = float("inf")
+            slope_forward_rel_l2 = float("inf")
+            slope_backward_rel_l2 = float("inf")
+            slope_ratio = float("inf")
+            slope_curvature_rel_l2 = float("inf")
+            slope_minus_budget = 0
+            slope_center_budget = 0
+            slope_plus_budget = 0
             audit_tail_mass = 0.0
             audit_tail_logit_gap = -float("inf")
             audit_tail_count = 0
@@ -1988,8 +2598,55 @@ def run() -> None:
                         selected_only_np = _selected_only_output(keys_np, values_np, query_np, selected_cpu)
                         break
                     k = int(next_k)
-            elif online_rule in {"geometric_probe_tail_switch", "geometric_stable_tail_switch"}:
-                max_budget = int(args.geometric_max_budget)
+            elif online_rule in {"pq_proxy_mass_budget", "pq_ranked_mass_budget"}:
+                max_budget = int(effective_geometric_max_budget)
+                if max_budget <= 0:
+                    max_budget = int(rank_budget)
+                max_budget = max(0, min(max_budget, int(ranked_cpu.size)))
+                granularity = max(1, int(args.geometric_budget_granularity))
+                min_budget = _round_budget_up(
+                    int(args.geometric_min_budget),
+                    granularity=granularity,
+                    max_budget=max_budget,
+                )
+                proxy_target = max(float(args.tail_proxy_mass_min), 1.0 - float(args.tail_proxy_mass_max))
+                proxy_target = min(max(float(proxy_target), 0.0), 1.0 - 1.0e-7)
+                if max_budget > 0 and ranked_scores_cpu.size > 0:
+                    denom_scores = (
+                        ranked_scores_cpu[:max_budget]
+                        if online_rule == "pq_ranked_mass_budget"
+                        else ranked_scores_cpu
+                    )
+                    denom_scaled = denom_scores.astype(np.float64, copy=False) / math.sqrt(float(trace.head_dim))
+                    top_scaled = ranked_scores_cpu[:max_budget].astype(np.float64, copy=False) / math.sqrt(float(trace.head_dim))
+                    shift = float(np.max(denom_scaled))
+                    top_weights = np.exp(top_scaled - shift)
+                    denom = max(float(np.exp(denom_scaled - shift).sum()), 1e-20)
+                    cumulative = np.cumsum(top_weights) / denom
+                    if proxy_target > 0.0:
+                        hit = np.flatnonzero(cumulative >= proxy_target)
+                        chosen_budget = int(hit[0] + 1) if hit.size else int(max_budget)
+                    else:
+                        chosen_budget = int(min_budget)
+                    chosen_budget = max(int(min_budget), min(int(max_budget), int(chosen_budget)))
+                    chosen_budget = int(math.ceil(float(chosen_budget) / float(granularity)) * granularity)
+                    budget = min(int(max_budget), max(0, int(chosen_budget)))
+                    chosen_proxy_mass = float(cumulative[max(0, budget - 1)]) if budget > 0 else 0.0
+                    chosen_proxy_tail_mass = max(0.0, 1.0 - float(chosen_proxy_mass))
+                else:
+                    budget = 0
+                    chosen_proxy_mass = 0.0
+                    chosen_proxy_tail_mass = 1.0
+                selected_cpu = _selected_for_budget(
+                    base=base,
+                    ranked_cpu=ranked_cpu,
+                    budget=budget,
+                    context_len=context_len,
+                )
+                selected_only_np, _selected_values_np = selected_output(selected_cpu)
+                effective_tail_blend = 0.0 if int(head) in tail_off_heads else float(args.tail_blend)
+            elif online_rule in {"geometric_probe_tail_switch", "geometric_stable_tail_switch", "geometric_slope_stability"}:
+                max_budget = int(effective_geometric_max_budget)
                 granularity = max(1, int(args.geometric_budget_granularity))
                 growth = max(1.01, float(args.geometric_growth))
                 probe_scale = max(1.01, float(args.geometric_probe_scale))
@@ -2066,6 +2723,38 @@ def run() -> None:
                         context_len=context_len,
                     )
                     probe_selected_only = _selected_only_output(keys_np, values_np, query_np, probe_selected)
+                    if online_rule == "geometric_slope_stability":
+                        delta_budget = max(granularity, int(probe_budget) - int(tail_budget))
+                        minus_budget = max(0, int(tail_budget) - int(delta_budget))
+                        minus_selected = _selected_for_budget(
+                            base=base,
+                            ranked_cpu=ranked_cpu,
+                            budget=minus_budget,
+                            context_len=context_len,
+                        )
+                        minus_selected_only = _selected_only_output(keys_np, values_np, query_np, minus_selected)
+                        minus64 = minus_selected_only.astype(np.float64, copy=False)
+                        tail64 = tail_selected_only.astype(np.float64, copy=False)
+                        probe64 = probe_selected_only.astype(np.float64, copy=False)
+                        slope_forward_rel_l2 = float(np.linalg.norm(probe64 - tail64)) / max(
+                            float(np.linalg.norm(probe64)),
+                            1e-20,
+                        )
+                        slope_backward_rel_l2 = float(np.linalg.norm(tail64 - minus64)) / max(
+                            float(np.linalg.norm(tail64)),
+                            1e-20,
+                        )
+                        if slope_backward_rel_l2 <= 1e-20:
+                            slope_ratio = 0.0 if slope_forward_rel_l2 <= 1e-20 else float("inf")
+                        else:
+                            slope_ratio = float(slope_forward_rel_l2) / float(slope_backward_rel_l2)
+                        slope_curvature_rel_l2 = float(np.linalg.norm(probe64 - 2.0 * tail64 + minus64)) / max(
+                            float(np.linalg.norm(probe64)),
+                            1e-20,
+                        )
+                        slope_minus_budget = int(minus_budget)
+                        slope_center_budget = int(tail_budget)
+                        slope_plus_budget = int(probe_budget)
                     tail_probe_rel_l2 = float(
                         np.linalg.norm(
                             approx_tail_np.astype(np.float64, copy=False)
@@ -2080,12 +2769,15 @@ def run() -> None:
                     if int(args.audit_tail_samples) > 0:
                         audit_tail_mass, audit_tail_logit_gap, audit_tail_count, audit_tail_population = _sample_tail_audit(
                             selected_cpu=probe_selected,
+                            ranked_cpu=ranked_cpu,
                             scores_np=scores_np,
                             context_len=context_len,
                             samples=int(args.audit_tail_samples),
                             seed=int(args.tail_seed),
                             qidx=int(qidx),
                             head=int(head),
+                            mode=str(args.audit_tail_mode),
+                            bands=int(args.audit_tail_bands),
                         )
                         confidence_mb += float(audit_tail_count * trace.head_dim * int(args.key_bytes)) / MB
                     stable_tail_probe_rel_l2 = 0.0
@@ -2131,9 +2823,18 @@ def run() -> None:
                     selected_cpu = probe_selected
                     selected_only_np = probe_selected_only
                     budget = int(probe_budget)
+                    slope_stability_pass = True
+                    if online_rule == "geometric_slope_stability":
+                        slope_stability_pass = (
+                            slope_forward_rel_l2 <= float(args.slope_forward_rel_l2_max)
+                            and slope_backward_rel_l2 <= float(args.slope_backward_rel_l2_max)
+                            and slope_ratio <= float(args.slope_ratio_max)
+                            and slope_curvature_rel_l2 <= float(args.slope_curvature_rel_l2_max)
+                        )
                     tail_confidence_pass = (
                         tail_probe_rel_l2 <= float(args.tail_probe_rel_l2_max)
                         and stable_tail_probe_rel_l2 <= float(args.stable_tail_probe_rel_l2_max)
+                        and slope_stability_pass
                         and audit_tail_mass <= float(args.audit_tail_mass_max)
                         and audit_tail_logit_gap <= float(args.audit_tail_logit_gap_max)
                         and chosen_proxy_mass >= float(args.tail_proxy_mass_min)
@@ -2161,7 +2862,7 @@ def run() -> None:
                         break
                     k = int(next_k)
             elif online_rule == "geometric_exact_delta":
-                max_budget = int(args.geometric_max_budget)
+                max_budget = int(effective_geometric_max_budget)
                 granularity = max(1, int(args.geometric_budget_granularity))
                 growth = max(1.01, float(args.geometric_growth))
                 probe_scale = max(1.01, float(args.geometric_probe_scale))
@@ -2271,10 +2972,47 @@ def run() -> None:
             else:
                 raise ValueError(f"unknown online_confidence_rule: {online_rule}")
 
+            selected_key_scores_override = None
+            selected_key_exact_tokens = int(selected_cpu.size)
+            selected_key_compressed_tokens = 0
+            selected_key_calibration_probe_count = 0
+            selected_key_active = (
+                str(args.selected_key_mode) != "exact"
+                and (
+                    int(args.selected_key_min_context) <= 0
+                    or int(context_len) >= int(args.selected_key_min_context)
+                )
+            )
+            if selected_key_active:
+                _selected_output_np, final_selected_values_for_key = selected_output(selected_cpu)
+                (
+                    selected_key_scores_override,
+                    selected_key_exact_tokens,
+                    selected_key_compressed_tokens,
+                    selected_key_calibration_probe_count,
+                ) = _band_calibrated_selected_scores(
+                    selected_cpu=selected_cpu,
+                    ranked_cpu=ranked_cpu,
+                    ranked_scores_cpu=ranked_scores_cpu,
+                    exact_scores_np=scores_np,
+                    query_dim=int(trace.head_dim),
+                    probes=int(args.selected_key_calibration_probes),
+                    bands=int(args.selected_key_calibration_bands),
+                    exact_selector_mass=float(args.selected_key_exact_selector_mass),
+                    min_exact_top=int(args.selected_key_min_exact_top),
+                    max_exact_top=int(args.selected_key_max_exact_top),
+                )
+                selected_only_np = _selected_output_from_scores(
+                    values_np,
+                    selected_cpu,
+                    selected_key_scores_override,
+                    values_override=final_selected_values_for_key,
+                )
+
             selected = torch.as_tensor(selected_cpu, dtype=torch.long, device=device)
             if online_rule == "proxy_tail_delta" and tail_confidence_pass:
                 pass
-            elif precomputed_tail_np is not None and effective_tail_blend > 0.0:
+            elif precomputed_tail_np is not None and effective_tail_blend > 0.0 and selected_key_scores_override is None:
                 attn_seconds = 0.0
                 tail_count = int(precomputed_tail_count)
                 tail_population = int(precomputed_tail_population)
@@ -2308,6 +3046,7 @@ def run() -> None:
                     value_subvecs=int(args.value_subvecs),
                     value_subbits=int(args.value_subbits),
                     selected_values_np=final_selected_values_np,
+                    selected_scores_override=selected_key_scores_override,
                     tail_score_scale=tail_score_scale,
                     tail_score_bias=tail_score_bias,
                 )
@@ -2347,7 +3086,7 @@ def run() -> None:
             approx_heads.append(approx_head_np)
             head_metric = _output_error_metrics(dense_head, approx_head_np)
             mass = float(probs_np[selected_cpu].sum()) if selected_cpu.size else 0.0
-            exact_key_mb = float(selected_cpu.size * trace.head_dim * int(args.key_bytes)) / MB
+            exact_key_mb = float(selected_key_exact_tokens * trace.head_dim * int(args.key_bytes)) / MB
             if str(args.selected_value_mode) == "vpq_value":
                 final_key = selected_cpu.astype(np.int64, copy=False).tobytes()
                 final_cached = selected_value_cache.get(final_key)
@@ -2401,6 +3140,10 @@ def run() -> None:
                     "budget": int(budget),
                     "selected_tokens": int(selected_cpu.size),
                     "candidate_tokens": int(ranked_cpu.size),
+                    "selector_sparq_rank": int(args.selector_sparq_rank),
+                    "quest_rank": int(args.quest_rank),
+                    "selector_index_bytes": int(args.selector_index_bytes),
+                    "selector_coverage": float(selector_coverage),
                     "rerank_candidates": int(rerank_count),
                     "sparq_rerank_rank": int(args.sparq_rerank_rank),
                     "sparq_rerank_candidates": int(args.sparq_rerank_candidates),
@@ -2416,17 +3159,38 @@ def run() -> None:
                     "tail_samples": int(tail_count),
                     "tail_population": int(tail_population),
                     "tail_mode": str(args.tail_mode),
+                    "long_context_active": bool(long_context_active),
+                    "long_context_threshold": int(args.long_context_threshold),
                     "selected_value_mode": str(args.selected_value_mode),
                     "selected_value_exact_rule": str(args.selected_value_exact_rule),
                     "selected_value_exact_top": int(args.selected_value_exact_top),
                     "selected_value_exact_mass": float(args.selected_value_exact_mass),
+                    "selected_value_exact_mass_effective": float(effective_selected_value_exact_mass),
+                    "long_selected_value_exact_mass": float(args.long_selected_value_exact_mass),
                     "selected_value_exact_risk_mass": float(args.selected_value_exact_risk_mass),
                     "selected_value_min_exact_top": int(args.selected_value_min_exact_top),
                     "selected_value_max_exact_top": int(args.selected_value_max_exact_top),
+                    "selected_value_max_exact_top_effective": int(effective_selected_value_max_exact_top),
+                    "selected_value_max_exact_top_by_head": str(args.selected_value_max_exact_top_by_head),
+                    "long_selected_value_max_exact_top": int(args.long_selected_value_max_exact_top),
+                    "long_selected_value_max_exact_top_by_head": str(args.long_selected_value_max_exact_top_by_head),
+                    "selected_value_exact_all_context_max": int(args.selected_value_exact_all_context_max),
+                    "selected_value_exact_all_fraction_min": float(args.selected_value_exact_all_fraction_min),
                     "selected_value_residual_correction": str(args.selected_value_residual_correction),
                     "selected_value_residual_norm_bytes": int(args.selected_value_residual_norm_bytes),
                     "selected_value_exact_tokens": int(selected_value_exact_tokens),
                     "selected_value_exact_selected_mass": float(selected_value_exact_selected_mass),
+                    "selected_key_mode": str(args.selected_key_mode),
+                    "selected_key_active": bool(selected_key_active),
+                    "selected_key_calibration_probes": int(args.selected_key_calibration_probes),
+                    "selected_key_calibration_bands": int(args.selected_key_calibration_bands),
+                    "selected_key_exact_selector_mass": float(args.selected_key_exact_selector_mass),
+                    "selected_key_min_exact_top": int(args.selected_key_min_exact_top),
+                    "selected_key_max_exact_top": int(args.selected_key_max_exact_top),
+                    "selected_key_min_context": int(args.selected_key_min_context),
+                    "selected_key_exact_tokens": int(selected_key_exact_tokens),
+                    "selected_key_compressed_tokens": int(selected_key_compressed_tokens),
+                    "selected_key_calibration_probe_count": int(selected_key_calibration_probe_count),
                     "value_subvecs": int(args.value_subvecs),
                     "value_subbits": int(args.value_subbits),
                     "tail_estimator_reused": bool(tail_estimator_reused),
@@ -2454,6 +3218,16 @@ def run() -> None:
                     "marginal_score_gap": float(marginal_score_gap),
                     "tail_probe_budget": int(args.tail_probe_budget),
                     "tail_probe_rel_l2": float(tail_probe_rel_l2),
+                    "stable_tail_probe_rel_l2": float(stable_tail_probe_rel_l2),
+                    "slope_forward_rel_l2": float(slope_forward_rel_l2),
+                    "slope_backward_rel_l2": float(slope_backward_rel_l2),
+                    "slope_ratio": float(slope_ratio),
+                    "slope_curvature_rel_l2": float(slope_curvature_rel_l2),
+                    "slope_minus_budget": int(slope_minus_budget),
+                    "slope_center_budget": int(slope_center_budget),
+                    "slope_plus_budget": int(slope_plus_budget),
+                    "audit_tail_mode": str(args.audit_tail_mode),
+                    "audit_tail_bands": int(args.audit_tail_bands),
                     "audit_tail_mass": float(audit_tail_mass),
                     "audit_tail_logit_gap": float(audit_tail_logit_gap),
                     "audit_tail_count": int(audit_tail_count),
@@ -2466,9 +3240,17 @@ def run() -> None:
                     "entropy_required_budget": int(entropy_required_budget),
                     "geometric_min_budget": int(args.geometric_min_budget),
                     "geometric_max_budget": int(args.geometric_max_budget),
+                    "geometric_max_budget_effective": int(effective_geometric_max_budget),
+                    "geometric_max_budget_by_head": str(args.geometric_max_budget_by_head),
+                    "long_geometric_max_budget": int(args.long_geometric_max_budget),
+                    "long_geometric_max_budget_by_head": str(args.long_geometric_max_budget_by_head),
                     "geometric_growth": float(args.geometric_growth),
                     "geometric_probe_scale": float(args.geometric_probe_scale),
                     "stable_tail_probe_rel_l2_max": float(args.stable_tail_probe_rel_l2_max),
+                    "slope_forward_rel_l2_max": float(args.slope_forward_rel_l2_max),
+                    "slope_backward_rel_l2_max": float(args.slope_backward_rel_l2_max),
+                    "slope_ratio_max": float(args.slope_ratio_max),
+                    "slope_curvature_rel_l2_max": float(args.slope_curvature_rel_l2_max),
                     "exact_delta_rel_l2": float(exact_delta_rel_l2),
                     "exact_delta_rel_l2_max": float(args.exact_delta_rel_l2_max),
                     "attention_mass": mass,
@@ -2507,6 +3289,8 @@ def run() -> None:
             row["tail_sampling"] = str(args.tail_sampling)
             row["tail_mode"] = str(args.tail_mode)
             row["selector_mode"] = str(args.selector_mode)
+            if str(args.selected_key_mode) != "exact":
+                row["algorithm"] = f"{row['algorithm']}+{args.selected_key_mode}_k"
             row["budget"] = int(row.get("budget", default_budget))
             row["budget_by_head_enabled"] = bool(budget_by_head)
             row["tail_samples_requested"] = int(args.tail_samples)
@@ -2518,27 +3302,31 @@ def run() -> None:
         approx_concat = torch.as_tensor(approx_concat_np, dtype=torch.float32, device=device)
         layer_input = torch.as_tensor(np.asarray(layer_inputs[position], dtype=np.float32), dtype=torch.float32, device=device)
 
-        dense_attn_proj = F.linear(dense_concat, wo)
-        approx_attn_proj = F.linear(approx_concat, wo)
-        dense_post_attn = layer_input + dense_attn_proj
-        approx_post_attn = layer_input + approx_attn_proj
-        dense_layer_out = dense_post_attn + mlp(rmsnorm(dense_post_attn, post_ln, norm_eps), gate_proj, up_proj, down_proj)
-        approx_layer_out = approx_post_attn + mlp(rmsnorm(approx_post_attn, post_ln, norm_eps), gate_proj, up_proj, down_proj)
-        torch.cuda.synchronize() if device.type == "cuda" else None
-
         concat_metrics = _output_error_metrics(dense_concat_np, approx_concat_np)
-        proj_metrics = _output_error_metrics(
-            dense_attn_proj.detach().cpu().numpy().astype(np.float32, copy=False),
-            approx_attn_proj.detach().cpu().numpy().astype(np.float32, copy=False),
-        )
-        post_attn_metrics = _output_error_metrics(
-            dense_post_attn.detach().cpu().numpy().astype(np.float32, copy=False),
-            approx_post_attn.detach().cpu().numpy().astype(np.float32, copy=False),
-        )
-        layer_metrics = _output_error_metrics(
-            dense_layer_out.detach().cpu().numpy().astype(np.float32, copy=False),
-            approx_layer_out.detach().cpu().numpy().astype(np.float32, copy=False),
-        )
+        if bool(args.head_only):
+            proj_metrics = _nan_output_metrics()
+            post_attn_metrics = _nan_output_metrics()
+            layer_metrics = _nan_output_metrics()
+        else:
+            dense_attn_proj = F.linear(dense_concat, wo)
+            approx_attn_proj = F.linear(approx_concat, wo)
+            dense_post_attn = layer_input + dense_attn_proj
+            approx_post_attn = layer_input + approx_attn_proj
+            dense_layer_out = dense_post_attn + mlp(rmsnorm(dense_post_attn, post_ln, norm_eps), gate_proj, up_proj, down_proj)
+            approx_layer_out = approx_post_attn + mlp(rmsnorm(approx_post_attn, post_ln, norm_eps), gate_proj, up_proj, down_proj)
+            torch.cuda.synchronize() if device.type == "cuda" else None
+            proj_metrics = _output_error_metrics(
+                dense_attn_proj.detach().cpu().numpy().astype(np.float32, copy=False),
+                approx_attn_proj.detach().cpu().numpy().astype(np.float32, copy=False),
+            )
+            post_attn_metrics = _output_error_metrics(
+                dense_post_attn.detach().cpu().numpy().astype(np.float32, copy=False),
+                approx_post_attn.detach().cpu().numpy().astype(np.float32, copy=False),
+            )
+            layer_metrics = _output_error_metrics(
+                dense_layer_out.detach().cpu().numpy().astype(np.float32, copy=False),
+                approx_layer_out.detach().cpu().numpy().astype(np.float32, copy=False),
+            )
         elapsed = time.perf_counter() - q_start
         if str(args.online_confidence_rule) != "none":
             max_rank_budget = max([int(r.get("rank_budget", default_budget)) for r in head_rows] or [default_budget])
@@ -2547,6 +3335,8 @@ def run() -> None:
             algorithm = f"{args.selector_mode}_paged_pq_head_budget+{args.tail_mode}_tail"
         else:
             algorithm = f"{args.selector_mode}_paged_pq_k{default_budget}+{args.tail_mode}_tail"
+        if str(args.selected_key_mode) != "exact":
+            algorithm = f"{algorithm}+{args.selected_key_mode}_k"
         common = {
             "algorithm": algorithm,
             "decode_length": decode_tokens,
@@ -2581,12 +3371,21 @@ def run() -> None:
             "entropy_tail_mass_max": float(args.entropy_tail_mass_max),
             "geometric_min_budget": int(args.geometric_min_budget),
             "geometric_max_budget": int(args.geometric_max_budget),
+            "long_context_threshold": int(args.long_context_threshold),
+            "long_geometric_max_budget": int(args.long_geometric_max_budget),
+            "long_geometric_max_budget_by_head": str(args.long_geometric_max_budget_by_head),
             "geometric_growth": float(args.geometric_growth),
             "geometric_probe_scale": float(args.geometric_probe_scale),
             "geometric_budget_granularity": int(args.geometric_budget_granularity),
             "stable_tail_probe_rel_l2_max": float(args.stable_tail_probe_rel_l2_max),
+            "slope_forward_rel_l2_max": float(args.slope_forward_rel_l2_max),
+            "slope_backward_rel_l2_max": float(args.slope_backward_rel_l2_max),
+            "slope_ratio_max": float(args.slope_ratio_max),
+            "slope_curvature_rel_l2_max": float(args.slope_curvature_rel_l2_max),
             "exact_delta_rel_l2_max": float(args.exact_delta_rel_l2_max),
             "audit_tail_samples": int(args.audit_tail_samples),
+            "audit_tail_mode": str(args.audit_tail_mode),
+            "audit_tail_bands": int(args.audit_tail_bands),
             "audit_tail_mass_max": float(args.audit_tail_mass_max),
             "audit_tail_logit_gap_max": float(args.audit_tail_logit_gap_max),
             "tail_samples_requested": int(args.tail_samples),
@@ -2596,11 +3395,23 @@ def run() -> None:
             "selected_value_exact_rule": str(args.selected_value_exact_rule),
             "selected_value_exact_top": int(args.selected_value_exact_top),
             "selected_value_exact_mass": float(args.selected_value_exact_mass),
+            "long_selected_value_exact_mass": float(args.long_selected_value_exact_mass),
             "selected_value_exact_risk_mass": float(args.selected_value_exact_risk_mass),
             "selected_value_min_exact_top": int(args.selected_value_min_exact_top),
             "selected_value_max_exact_top": int(args.selected_value_max_exact_top),
+            "long_selected_value_max_exact_top": int(args.long_selected_value_max_exact_top),
+            "long_selected_value_max_exact_top_by_head": str(args.long_selected_value_max_exact_top_by_head),
+            "selected_value_exact_all_context_max": int(args.selected_value_exact_all_context_max),
+            "selected_value_exact_all_fraction_min": float(args.selected_value_exact_all_fraction_min),
             "selected_value_residual_correction": str(args.selected_value_residual_correction),
             "selected_value_residual_norm_bytes": int(args.selected_value_residual_norm_bytes),
+            "selected_key_mode": str(args.selected_key_mode),
+            "selected_key_calibration_probes": int(args.selected_key_calibration_probes),
+            "selected_key_calibration_bands": int(args.selected_key_calibration_bands),
+            "selected_key_exact_selector_mass": float(args.selected_key_exact_selector_mass),
+            "selected_key_min_exact_top": int(args.selected_key_min_exact_top),
+            "selected_key_max_exact_top": int(args.selected_key_max_exact_top),
+            "selected_key_min_context": int(args.selected_key_min_context),
             "value_subvecs": int(args.value_subvecs),
             "value_subbits": int(args.value_subbits),
             "tail_blend": float(max(0.0, min(1.0, float(args.tail_blend)))),
@@ -2608,6 +3419,9 @@ def run() -> None:
             "tail_blend_extrap_max": float(args.tail_blend_extrap_max),
             "tail_off_heads": str(args.tail_off_heads),
             "selector_mode": str(args.selector_mode),
+            "selector_sparq_rank": int(args.selector_sparq_rank),
+            "quest_rank": int(args.quest_rank),
+            "selector_index_bytes": int(args.selector_index_bytes),
             "rerank_candidates": int(args.rerank_candidates),
             "sparq_rerank_rank": int(args.sparq_rerank_rank),
             "sparq_rerank_candidates": int(args.sparq_rerank_candidates),
@@ -2619,6 +3433,7 @@ def run() -> None:
             "min_head_attention_mass": float(np.min([r["attention_mass"] for r in head_rows])),
             "mean_head_attention_relative_L2": float(np.mean([r["head_attention_relative_L2"] for r in head_rows])),
             "max_head_attention_relative_L2": float(np.max([r["head_attention_relative_L2"] for r in head_rows])),
+            "mean_selector_coverage": float(np.mean([r["selector_coverage"] for r in head_rows])),
             "mean_confidence_MB_per_head": float(np.mean([r["confidence_MB_per_query"] for r in head_rows])),
             "mean_sparq_rerank_MB_per_head": float(np.mean([r["sparq_rerank_MB_per_query"] for r in head_rows])),
             "mean_sparq_rerank_count": float(np.mean([r["sparq_rerank_count"] for r in head_rows])),
@@ -2632,6 +3447,11 @@ def run() -> None:
             "mean_selected_value_exact_tokens": float(np.mean([r["selected_value_exact_tokens"] for r in head_rows])),
             "mean_selected_value_exact_selected_mass": float(
                 np.mean([r["selected_value_exact_selected_mass"] for r in head_rows])
+            ),
+            "mean_selected_key_exact_tokens": float(np.mean([r["selected_key_exact_tokens"] for r in head_rows])),
+            "mean_selected_key_compressed_tokens": float(np.mean([r["selected_key_compressed_tokens"] for r in head_rows])),
+            "mean_selected_key_calibration_probe_count": float(
+                np.mean([r["selected_key_calibration_probe_count"] for r in head_rows])
             ),
             "mean_confidence_selected_value_MB_per_head": float(
                 np.mean([r["confidence_selected_value_MB_per_query"] for r in head_rows])
@@ -2654,6 +3474,15 @@ def run() -> None:
             "mean_marginal_exact_mass": float(np.mean([r["marginal_exact_mass"] for r in head_rows])),
             "max_marginal_exact_mass": float(np.max([r["marginal_exact_mass"] for r in head_rows])),
             "mean_tail_probe_rel_l2": float(np.mean([r["tail_probe_rel_l2"] for r in head_rows if np.isfinite(float(r["tail_probe_rel_l2"]))])) if any(np.isfinite(float(r["tail_probe_rel_l2"])) for r in head_rows) else float("inf"),
+            "mean_stable_tail_probe_rel_l2": float(np.mean([r["stable_tail_probe_rel_l2"] for r in head_rows if np.isfinite(float(r["stable_tail_probe_rel_l2"]))])) if any(np.isfinite(float(r["stable_tail_probe_rel_l2"])) for r in head_rows) else float("inf"),
+            "mean_slope_forward_rel_l2": float(np.mean([r["slope_forward_rel_l2"] for r in head_rows if np.isfinite(float(r["slope_forward_rel_l2"]))])) if any(np.isfinite(float(r["slope_forward_rel_l2"])) for r in head_rows) else float("inf"),
+            "max_slope_forward_rel_l2": float(np.max([r["slope_forward_rel_l2"] for r in head_rows if np.isfinite(float(r["slope_forward_rel_l2"]))])) if any(np.isfinite(float(r["slope_forward_rel_l2"])) for r in head_rows) else float("inf"),
+            "mean_slope_backward_rel_l2": float(np.mean([r["slope_backward_rel_l2"] for r in head_rows if np.isfinite(float(r["slope_backward_rel_l2"]))])) if any(np.isfinite(float(r["slope_backward_rel_l2"])) for r in head_rows) else float("inf"),
+            "mean_slope_ratio": float(np.mean([r["slope_ratio"] for r in head_rows if np.isfinite(float(r["slope_ratio"]))])) if any(np.isfinite(float(r["slope_ratio"])) for r in head_rows) else float("inf"),
+            "max_slope_ratio": float(np.max([r["slope_ratio"] for r in head_rows if np.isfinite(float(r["slope_ratio"]))])) if any(np.isfinite(float(r["slope_ratio"])) for r in head_rows) else float("inf"),
+            "mean_slope_curvature_rel_l2": float(np.mean([r["slope_curvature_rel_l2"] for r in head_rows if np.isfinite(float(r["slope_curvature_rel_l2"]))])) if any(np.isfinite(float(r["slope_curvature_rel_l2"])) for r in head_rows) else float("inf"),
+            "max_slope_curvature_rel_l2": float(np.max([r["slope_curvature_rel_l2"] for r in head_rows if np.isfinite(float(r["slope_curvature_rel_l2"]))])) if any(np.isfinite(float(r["slope_curvature_rel_l2"])) for r in head_rows) else float("inf"),
+            "mean_slope_plus_budget": float(np.mean([r["slope_plus_budget"] for r in head_rows])),
             "mean_audit_tail_mass": float(np.mean([r["audit_tail_mass"] for r in head_rows])),
             "max_audit_tail_mass": float(np.max([r["audit_tail_mass"] for r in head_rows])),
             "mean_audit_tail_count": float(np.mean([r["audit_tail_count"] for r in head_rows])),
@@ -2704,6 +3533,7 @@ def run() -> None:
                 "selected_value_mode",
                 "selected_value_exact_rule",
                 "selected_value_residual_correction",
+                "selected_key_mode",
             }:
                 summary[key] = rows[0][key]
         for metric in [
@@ -2729,6 +3559,9 @@ def run() -> None:
             "mean_selected_value_MB_per_head",
             "mean_selected_value_exact_tokens",
             "mean_selected_value_exact_selected_mass",
+            "mean_selected_key_exact_tokens",
+            "mean_selected_key_compressed_tokens",
+            "mean_selected_key_calibration_probe_count",
             "mean_confidence_selected_value_MB_per_head",
             "mean_tail_estimator_MB_per_head",
             "mean_online_update_MB_per_token_per_head",
@@ -2743,6 +3576,15 @@ def run() -> None:
             "mean_marginal_exact_mass",
             "max_marginal_exact_mass",
             "mean_tail_probe_rel_l2",
+            "mean_stable_tail_probe_rel_l2",
+            "mean_slope_forward_rel_l2",
+            "max_slope_forward_rel_l2",
+            "mean_slope_backward_rel_l2",
+            "mean_slope_ratio",
+            "max_slope_ratio",
+            "mean_slope_curvature_rel_l2",
+            "max_slope_curvature_rel_l2",
+            "mean_slope_plus_budget",
             "mean_audit_tail_mass",
             "max_audit_tail_mass",
             "mean_audit_tail_count",

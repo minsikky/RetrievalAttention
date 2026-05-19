@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd /scratch/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention
+
+CHUNK_ID="${CHUNK_ID:?CHUNK_ID is required}"
+CONFIG_NAME="${CONFIG_NAME:?CONFIG_NAME is required}"
+
+source attention_efficiency_result/validation_deployable_20260512_173454/q288_chunks.env
+chunk_var="chunk${CHUNK_ID}"
+export DECODE_LENGTHS="${!chunk_var}"
+
+export OUTPUT_ROOT="${OUTPUT_ROOT:-attention_efficiency_result/selected_key_compression_20260514_q288_potential}"
+export RUN_NAME="q288c${CHUNK_ID}_${CONFIG_NAME}"
+export ONLINE_CONFIDENCE_RULE="${ONLINE_CONFIDENCE_RULE:-geometric_probe_tail_switch}"
+
+case "${CONFIG_NAME}" in
+  sk_sched_exact)
+    export SELECTED_KEY_MODE=exact
+    export SELECTED_KEY_EXACT_SELECTOR_MASS=0.0
+    export SELECTED_KEY_CALIBRATION_PROBES=0
+    export GEOMETRIC_MIN_BUDGET=4096
+    export GEOMETRIC_MAX_BUDGET=65536
+    export GEOMETRIC_MAX_BUDGET_BY_HEAD=""
+    export SELECTED_VALUE_EXACT_MASS=0.99
+    export SELECTED_VALUE_MAX_EXACT_TOP=0
+    export SELECTED_VALUE_MAX_EXACT_TOP_BY_HEAD=""
+    export LONG_CONTEXT_THRESHOLD=90000
+    export LONG_GEOMETRIC_MAX_BUDGET=90000
+    export LONG_GEOMETRIC_MAX_BUDGET_BY_HEAD="0:120000,1:120000"
+    export LONG_SELECTED_VALUE_EXACT_MASS=0.98
+    export LONG_SELECTED_VALUE_MAX_EXACT_TOP=11264
+    export LONG_SELECTED_VALUE_MAX_EXACT_TOP_BY_HEAD="0:0,1:0"
+    ;;
+  sk_sched_m0999_k32k)
+    export SELECTED_KEY_MODE=band_calibrated_selector
+    export SELECTED_KEY_EXACT_SELECTOR_MASS=0.999
+    export SELECTED_KEY_CALIBRATION_PROBES=0
+    export SELECTED_KEY_MIN_CONTEXT=32000
+    export GEOMETRIC_MIN_BUDGET=4096
+    export GEOMETRIC_MAX_BUDGET=65536
+    export GEOMETRIC_MAX_BUDGET_BY_HEAD=""
+    export SELECTED_VALUE_EXACT_MASS=0.99
+    export SELECTED_VALUE_MAX_EXACT_TOP=0
+    export SELECTED_VALUE_MAX_EXACT_TOP_BY_HEAD=""
+    export LONG_CONTEXT_THRESHOLD=90000
+    export LONG_GEOMETRIC_MAX_BUDGET=90000
+    export LONG_GEOMETRIC_MAX_BUDGET_BY_HEAD="0:120000,1:120000"
+    export LONG_SELECTED_VALUE_EXACT_MASS=0.98
+    export LONG_SELECTED_VALUE_MAX_EXACT_TOP=11264
+    export LONG_SELECTED_VALUE_MAX_EXACT_TOP_BY_HEAD="0:0,1:0"
+    ;;
+  sk_sched_m09995_k32k)
+    export SELECTED_KEY_MODE=band_calibrated_selector
+    export SELECTED_KEY_EXACT_SELECTOR_MASS=0.9995
+    export SELECTED_KEY_CALIBRATION_PROBES=0
+    export SELECTED_KEY_MIN_CONTEXT=32000
+    export GEOMETRIC_MIN_BUDGET=4096
+    export GEOMETRIC_MAX_BUDGET=65536
+    export GEOMETRIC_MAX_BUDGET_BY_HEAD=""
+    export SELECTED_VALUE_EXACT_MASS=0.99
+    export SELECTED_VALUE_MAX_EXACT_TOP=0
+    export SELECTED_VALUE_MAX_EXACT_TOP_BY_HEAD=""
+    export LONG_CONTEXT_THRESHOLD=90000
+    export LONG_GEOMETRIC_MAX_BUDGET=90000
+    export LONG_GEOMETRIC_MAX_BUDGET_BY_HEAD="0:120000,1:120000"
+    export LONG_SELECTED_VALUE_EXACT_MASS=0.98
+    export LONG_SELECTED_VALUE_MAX_EXACT_TOP=11264
+    export LONG_SELECTED_VALUE_MAX_EXACT_TOP_BY_HEAD="0:0,1:0"
+    ;;
+  sk_exact)
+    export SELECTED_KEY_MODE=exact
+    export SELECTED_KEY_EXACT_SELECTOR_MASS=0.0
+    export SELECTED_KEY_CALIBRATION_PROBES=0
+    ;;
+  sk_m0998_p0)
+    export SELECTED_KEY_MODE=band_calibrated_selector
+    export SELECTED_KEY_EXACT_SELECTOR_MASS=0.998
+    export SELECTED_KEY_CALIBRATION_PROBES=0
+    ;;
+  sk_m0999_p0)
+    export SELECTED_KEY_MODE=band_calibrated_selector
+    export SELECTED_KEY_EXACT_SELECTOR_MASS=0.999
+    export SELECTED_KEY_CALIBRATION_PROBES=0
+    ;;
+  *)
+    echo "unknown CONFIG_NAME=${CONFIG_NAME}" >&2
+    exit 2
+    ;;
+esac
+
+bash scripts/run_selected_key_compression_smoke_one.sh
