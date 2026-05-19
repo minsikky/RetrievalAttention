@@ -1,0 +1,7 @@
+dense: 21/59 accuracy (35.59%)
+frontier: 24/59 accuracy (40.68%)
+comparison_ids: 59
+dense vs frontier: pred 56/59, response 9/59, judge 56/59
+  diff 66fa7f1dbb02136c067c6e6b: dense pred=None judge=False; frontier pred=D judge=True
+  diff 66ec3d1d821e116aacb1c622: dense pred=D judge=False; frontier pred=B judge=True
+  diff 66f58d6c821e116aacb33e76: dense pred=A judge=False; frontier pred=C judge=True

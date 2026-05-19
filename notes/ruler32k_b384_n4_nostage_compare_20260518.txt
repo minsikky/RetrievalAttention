@@ -1,0 +1,21 @@
+Task-level dense vs frontier comparison, RULER 32k, n=4, budget384.
+
+niah_single_1:
+  dense score: 100.0, nulls: 0/4
+  frontier score: 100.0, nulls: 0/4
+  exact prediction string match: 3/4
+
+niah_multikey_2:
+  dense score: 75.0, nulls: 0/4
+  frontier score: 50.0, nulls: 0/4
+  exact prediction string match: 1/4
+
+vt:
+  dense score: 95.0, nulls: 0/4
+  frontier score: 100.0, nulls: 0/4
+  exact prediction string match: 3/4
+
+fwe:
+  dense score: 100.0, nulls: 0/4
+  frontier score: 91.67, nulls: 0/4
+  exact prediction string match: 0/4

@@ -1,0 +1,4 @@
+dense: 27/59 accuracy (45.76%)
+frontier_b384: 27/59 accuracy (45.76%)
+comparison_ids: 59
+dense vs frontier_b384: pred 59/59, response 48/59, judge 59/59

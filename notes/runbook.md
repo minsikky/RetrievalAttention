@@ -1,5 +1,131 @@
 # Runbook
 
+## Frontier Benchmark Readiness Presets (2026-05-16)
+
+Use these wrappers for real dense-vs-frontier benchmark validation. They include `spgpu` / `zhengya98` Slurm headers. The HF LongBench-v2 and public long-decode wrappers accept `HF_MODEL_PRESET=qwen3_8b|llama31_8b|qwen3_5_9b`; default is `qwen3_8b`. Older RULER streaming wrappers are still Llama-specific unless explicitly updated.
+
+Frontier RULER, one task:
+```bash
+TASK_NAME=niah_single_1 CONTEXT_LEN=8192 NUM_SAMPLES=4 \
+OUTPUT_ROOT=ruler_eval_result/frontier_batched \
+sbatch scripts/run_frontier_ruler_batched_one.sh
+```
+
+Dense RULER, matching task:
+```bash
+TASK_NAME=niah_single_1 CONTEXT_LEN=8192 NUM_SAMPLES=4 \
+OUTPUT_ROOT=ruler_eval_result/dense_batched \
+sbatch scripts/run_dense_ruler_batched_one.sh
+```
+
+Frontier LongBench-v2, one slice:
+```bash
+MAX_EXAMPLES=64 LENGTH_FILTER=short DIFFICULTY_FILTER=easy MAX_INPUT_TOKENS=8192 \
+OUTPUT_DIR=longbench_v2_hf_result/frontier_batched_lbv2 \
+sbatch scripts/run_frontier_longbench_v2_one.sh
+```
+
+Dense LongBench-v2, matching slice:
+```bash
+MAX_EXAMPLES=64 LENGTH_FILTER=short DIFFICULTY_FILTER=easy MAX_INPUT_TOKENS=8192 \
+OUTPUT_DIR=longbench_v2_hf_result/dense_lbv2 \
+sbatch scripts/run_dense_longbench_v2_one.sh
+```
+
+Current frontier preset:
+
+- `MODE=pagedpq_batched` for RULER, `ATTENTION_MODE=pagedpq` for LongBench-v2.
+- `pq_ranked_mass_budget` confidence with conservative upper-bound selector-cost accounting.
+- `cuda_ext` decode selector, `torch_matmul` prefill selector, native selected/tail attention, GPU index build.
+- Selected V uses `vpq_value` with `selector_rank` exact top `256`; tail uses V-PQ blend `1.0`.
+- Profiling is off by default. Enable `PROFILE_NATIVE_OPS=1` only for diagnostic timing runs.
+
+Current pending validation manifests:
+
+- `notes/benchmark_readiness_checklist.md`
+- `notes/wrapper_config_audit_20260516.md`
+- `notes/benchmark_runtime_projection_20260516.md`
+- `notes/slurm_manifests/frontier_cuda_unit_tests_20260516.tsv`
+- `notes/cuda_unit_audit_20260516.md`
+- `notes/slurm_manifests/ruler_frontier_wrapper_smoke_20260516.tsv`
+- `notes/slurm_manifests/longbench_frontier_wrapper_smoke_20260516.tsv`
+- `notes/slurm_manifests/dense_wrapper_smoke_20260516.tsv`
+- `notes/slurm_manifests/frontier_benchmark_matrix_afterok_20260516.tsv`
+
+Audit wrapper defaults before submitting benchmark batches:
+```bash
+export LD_LIBRARY_PATH="/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
+.venv/bin/python benchmark/audit_benchmark_wrappers.py \
+  --output notes/wrapper_config_audit_20260516.md
+```
+
+Poll with:
+```bash
+scripts/poll_frontier_readiness_smokes.sh
+```
+
+Generate a compact readiness table from completed artifacts:
+```bash
+export LD_LIBRARY_PATH="/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
+.venv/bin/python benchmark/audit_benchmark_readiness.py \
+  --manifest notes/slurm_manifests/ruler_ctx8192_batched_success_20260516.tsv \
+  --manifest notes/slurm_manifests/longbench_v2_short_easy_n64_batched_20260516.tsv \
+  --output notes/readiness_audit_20260516.md
+```
+
+After wrapper smokes pass, submit a paired benchmark matrix:
+```bash
+TAG=ctx8k_short_easy_$(date +%Y%m%d_%H%M%S) \
+RULER_TASKS=niah_single_1,niah_multikey_2,vt,fwe \
+RULER_CONTEXT_LEN=8192 \
+RULER_NUM_SAMPLES=4 \
+LONGBENCH_MAX_EXAMPLES=64 \
+LONGBENCH_LENGTH_FILTER=short \
+LONGBENCH_DIFFICULTY_FILTER=easy \
+LONGBENCH_MAX_INPUT_TOKENS=8192 \
+scripts/submit_frontier_benchmark_matrix.sh
+```
+
+To queue the matrix behind smoke/unit gates, set `SBATCH_DEPENDENCY=afterok:<jobids>`.
+
+Use `DRY_RUN=1` first if changing task lists or output roots.
+
+Generate LongBench relL2/cosine-to-accuracy drift report from paired predictions plus diagnostic rows:
+```bash
+export LD_LIBRARY_PATH="/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
+.venv/bin/python benchmark/report_longbench_drift.py \
+  --dense longbench_v2_hf_result/dense_lbv2_short_easy_n64_temp0 \
+  --frontier longbench_v2_hf_result/frontier_lbv2_short_easy_n64_temp0 \
+  --diag-glob 'longbench_v2_hf_result/frontier_readiness_20260516_diag_fulltail64_temp0_*/summary.json' \
+  --changed-only \
+  --output notes/longbench_drift_report_20260516.md
+```
+
+Finalize the queued benchmark matrix after it completes:
+```bash
+bash scripts/finalize_frontier_benchmark_matrix.sh
+```
+
+Default outputs:
+
+- `notes/frontier_benchmark_matrix_afterok_20260516_audit.md`
+- `notes/frontier_benchmark_matrix_afterok_20260516_longbench_compare.txt`
+- `notes/frontier_benchmark_matrix_afterok_20260516_longbench_drift.md`
+
+If the final drift report has changed rows with missing diagnostics, submit row-level dense-reference diagnostics:
+```bash
+bash scripts/submit_longbench_changed_row_diagnostics.sh
+```
+
+Then rerun `bash scripts/finalize_frontier_benchmark_matrix.sh`.
+
+Run the strict completion gate before claiming benchmark readiness:
+```bash
+bash scripts/check_frontier_benchmark_readiness.sh
+```
+
+This gate reruns wrapper/default audits, CUDA unit-test artifact audit, wrapper-smoke artifact audit, benchmark-matrix artifact audit, and checks that the LongBench drift report is not a placeholder.
+
 ## Attention-Efficiency Proxy Sweep (2026-04-29)
 - Purpose: compare dense oracle, static/chunk, RetroInfer-style, and RetrievalAttention-style token selection by algorithmic efficiency, not wall-clock latency.
 - Main outputs:
