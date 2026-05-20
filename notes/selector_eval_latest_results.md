@@ -32,6 +32,7 @@ Canonical GPU smoke status, 2026-05-19:
 | RULER canonical GPU, 32k, all layers, n=1, 128 decode tokens, corrected accounting | `50481532` | completed | score `100.0`; mean selected `15209`; step `11.933 MB/head-query`; decode `255.13s` | Longer decode stress gives the same corrected per-query cost shape; runtime still scales with the current canonical attention kernel. |
 
 Fused-output runtime status, 2026-05-19: `gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds` reuses exact ranked logits and tail code-weight state in one CUDA final-output call, but the first implementation is slower than the existing canonical path on the 32k RULER smoke. Job `50481621` was canceled after `>6 min` without a prediction row, while the old path completed in `2:40`. The fused path is now opt-in via `ENABLE_FUSED_GEOMETRIC_OUTPUT=1`; default benchmark runs use the faster canonical path plus the corrected exact-K accounting.
+Follow-up correction attempt: moved selected-PQ tail subtraction out of the per-dimension final-output loop into a code-weight correction kernel. CUDA unit job `50483917` passed, but the 32k/32-token smoke `50484205` was still slower than canonical and was canceled after `>5 min` without a prediction row. Do not pursue this specific fused-output reuse design unless the final-output kernel is redesigned more deeply.
 
 ## Benchmark Readiness, 2026-05-18
 
