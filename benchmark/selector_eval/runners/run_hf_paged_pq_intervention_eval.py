@@ -1012,70 +1012,89 @@ def selected_mass_thresholds_from_logits_gpu(
     sorted_valid_all = torch.gather(valid_all, 1, sorted_order_all)
     prefix_lse_all = torch.logcumsumexp(logits_all, dim=-1)
     prefix_valid_counts = torch.cumsum(valid_all.to(torch.long), dim=-1)
-    for step, budget in enumerate(budgets):
-        budget_i = max(0, min(rank, int(budget)))
-        if budget_i <= 0:
-            thresholds[:, step] = float("inf")
-            threshold_sels[:, step] = -1
-            continue
-        in_budget_any = sorted_order_all < int(budget_i)
-        in_budget_sorted = in_budget_any & sorted_valid_all
-        sorted_logits = torch.where(
-            in_budget_sorted,
-            sorted_logits_all,
-            torch.full_like(sorted_logits_all, float("-inf")),
+    budgets_tensor = torch.tensor(
+        [max(0, min(rank, int(budget))) for budget in budgets],
+        dtype=torch.long,
+        device=device,
+    )
+    positive_steps = budgets_tensor > 0
+    if not bool(torch.any(positive_steps)):
+        thresholds.fill_(float("inf"))
+        threshold_sels.fill_(-1)
+        return thresholds.contiguous(), threshold_sels.contiguous()
+
+    lse_idx = torch.clamp(budgets_tensor - 1, min=0)
+    ranked_lse = prefix_lse_all.index_select(1, lse_idx)
+    total_lse = torch.logaddexp(base_lse.reshape(heads, 1), ranked_lse)
+    valid_count = prefix_valid_counts.index_select(1, lse_idx)
+    valid_count = torch.where(positive_steps.reshape(1, steps), valid_count, torch.zeros_like(valid_count))
+
+    budget_view = budgets_tensor.reshape(1, steps, 1)
+    in_budget_any = sorted_order_all.unsqueeze(1) < budget_view
+    in_budget_sorted = in_budget_any & sorted_valid_all.unsqueeze(1)
+    sorted_logits = sorted_logits_all.unsqueeze(1).expand(-1, steps, -1).masked_fill(
+        ~in_budget_sorted,
+        float("-inf"),
+    )
+    cum_selected_count = torch.cumsum(in_budget_sorted.to(torch.long), dim=-1)
+    if target <= 0.0:
+        counts = torch.zeros((heads, steps), dtype=torch.long, device=device)
+    else:
+        base_mass = torch.where(
+            torch.isfinite(total_lse),
+            torch.exp(base_lse.reshape(heads, 1) - total_lse),
+            torch.zeros_like(total_lse),
         )
-        ranked_lse = prefix_lse_all[:, budget_i - 1]
-        total_lse = torch.logaddexp(base_lse, ranked_lse)
-        valid_count = prefix_valid_counts[:, budget_i - 1]
-        if target <= 0.0:
-            counts = torch.zeros((heads,), dtype=torch.long, device=device)
-        else:
-            base_mass = torch.where(
-                torch.isfinite(total_lse),
-                torch.exp(base_lse - total_lse),
-                torch.zeros_like(total_lse),
-            )
-            cum_ranked_lse = torch.logcumsumexp(sorted_logits, dim=-1)
-            cum_selected_count = torch.cumsum(in_budget_sorted.to(torch.long), dim=-1)
-            cum_lse = torch.logaddexp(base_lse.unsqueeze(-1), cum_ranked_lse)
-            cum_mass = torch.where(
-                torch.isfinite(total_lse).unsqueeze(-1),
-                torch.exp(cum_lse - total_lse.unsqueeze(-1)),
-                torch.zeros_like(cum_lse),
-            )
-            hit = (cum_mass >= min(target, 1.0 - 1.0e-7)) & in_budget_sorted
-            has_hit = torch.any(hit, dim=-1)
-            first_hit_pos = torch.argmax(hit.to(torch.int32), dim=-1).to(torch.long)
-            first_hit_count = torch.gather(cum_selected_count, 1, first_hit_pos.reshape(heads, 1)).reshape(heads)
-            counts = torch.where(
-                base_mass >= target,
-                torch.zeros_like(first_hit_count),
-                torch.where(has_hit, first_hit_count, valid_count),
-            )
-        if int(min_top) > 0:
-            counts = torch.maximum(counts, torch.full_like(counts, min(budget_i, int(min_top))))
-        counts = torch.clamp(counts, min=0, max=budget_i)
-        has_exact = counts > 0
-        cum_selected_count = torch.cumsum(in_budget_sorted.to(torch.long), dim=-1)
-        cum_budget_count = torch.cumsum(in_budget_any.to(torch.long), dim=-1)
-        kth_valid_mask = in_budget_sorted & (cum_selected_count >= counts.reshape(heads, 1))
-        kth_any_mask = in_budget_any & (cum_budget_count >= counts.reshape(heads, 1))
-        kth_mask = torch.where((counts <= valid_count).reshape(heads, 1), kth_valid_mask, kth_any_mask)
-        kth_pos = torch.argmax(kth_mask.to(torch.int32), dim=-1).to(torch.long)
-        gather_idx = kth_pos.reshape(heads, 1)
-        threshold_vals = torch.gather(sorted_logits_all, 1, gather_idx).reshape(heads)
-        threshold_idx = torch.gather(sorted_order_all, 1, gather_idx).reshape(heads).to(torch.long)
-        thresholds[:, step] = torch.where(
-            has_exact,
-            threshold_vals,
-            torch.full_like(threshold_vals, float("inf")),
+        cum_ranked_lse = torch.logcumsumexp(sorted_logits, dim=-1)
+        cum_lse = torch.logaddexp(base_lse.reshape(heads, 1, 1), cum_ranked_lse)
+        cum_mass = torch.where(
+            torch.isfinite(total_lse).unsqueeze(-1),
+            torch.exp(cum_lse - total_lse.unsqueeze(-1)),
+            torch.zeros_like(cum_lse),
         )
-        threshold_sels[:, step] = torch.where(
-            has_exact,
-            threshold_idx,
-            torch.full_like(threshold_idx, -1),
+        hit = (cum_mass >= min(target, 1.0 - 1.0e-7)) & in_budget_sorted
+        has_hit = torch.any(hit, dim=-1)
+        first_hit_pos = torch.argmax(hit.to(torch.int32), dim=-1).to(torch.long)
+        first_hit_count = torch.gather(cum_selected_count, 2, first_hit_pos.unsqueeze(-1)).squeeze(-1)
+        counts = torch.where(
+            base_mass >= target,
+            torch.zeros_like(first_hit_count),
+            torch.where(has_hit, first_hit_count, valid_count),
         )
+    if int(min_top) > 0:
+        min_counts = torch.minimum(
+            budgets_tensor.reshape(1, steps),
+            torch.full((heads, steps), int(min_top), dtype=torch.long, device=device),
+        )
+        counts = torch.maximum(counts, min_counts)
+    counts = torch.minimum(torch.clamp(counts, min=0), budgets_tensor.reshape(1, steps))
+    counts = torch.where(positive_steps.reshape(1, steps), counts, torch.zeros_like(counts))
+    has_exact = counts > 0
+    cum_budget_count = torch.cumsum(in_budget_any.to(torch.long), dim=-1)
+    kth_valid_mask = in_budget_sorted & (cum_selected_count >= counts.unsqueeze(-1))
+    kth_any_mask = in_budget_any & (cum_budget_count >= counts.unsqueeze(-1))
+    kth_mask = torch.where((counts <= valid_count).unsqueeze(-1), kth_valid_mask, kth_any_mask)
+    kth_pos = torch.argmax(kth_mask.to(torch.int32), dim=-1).to(torch.long)
+    threshold_vals = torch.gather(
+        sorted_logits_all.unsqueeze(1).expand(-1, steps, -1),
+        2,
+        kth_pos.unsqueeze(-1),
+    ).squeeze(-1)
+    threshold_idx = torch.gather(
+        sorted_order_all.unsqueeze(1).expand(-1, steps, -1),
+        2,
+        kth_pos.unsqueeze(-1),
+    ).squeeze(-1).to(torch.long)
+    thresholds[:, :] = torch.where(
+        has_exact,
+        threshold_vals,
+        torch.full_like(threshold_vals, float("inf")),
+    )
+    threshold_sels[:, :] = torch.where(
+        has_exact,
+        threshold_idx,
+        torch.full_like(threshold_idx, -1),
+    )
     return thresholds.contiguous(), threshold_sels.contiguous()
 
 
@@ -1677,6 +1696,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
         raise ValueError(f"unsupported exact_logit_backend: {exact_logit_backend}")
     last_decode_base_key: tuple[int, int, int, int, int] | None = None
     last_decode_base_tensor: torch.Tensor | None = None
+    last_decode_rank_ids_tensors: dict[tuple[str, int, int], torch.Tensor] = {}
 
     def decode_base_tokens_tensor(query_context_len: int, sealed_end: int, indexed_end: int) -> torch.Tensor:
         nonlocal last_decode_base_key, last_decode_base_tensor
@@ -1697,6 +1717,23 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
         last_decode_base_key = cache_key
         last_decode_base_tensor = torch.as_tensor(np.asarray(base, dtype=np.int64), dtype=torch.long, device=device)
         return last_decode_base_tensor
+
+    def decode_rank_ids_tensor(rank_count: int, tensor_device: torch.device, *, dims: int = 2) -> torch.Tensor:
+        dims_i = int(dims)
+        if dims_i not in {2, 3}:
+            raise ValueError(f"unsupported rank id dims: {dims}")
+        cache_key = (str(tensor_device), int(rank_count), dims_i)
+        cached = last_decode_rank_ids_tensors.get(cache_key)
+        if cached is not None:
+            return cached
+        shape = (1, int(rank_count)) if dims_i == 2 else (1, 1, int(rank_count))
+        tensor = torch.arange(
+            int(rank_count),
+            dtype=torch.long,
+            device=tensor_device,
+        ).reshape(*shape)
+        last_decode_rank_ids_tensors[cache_key] = tensor
+        return tensor
 
     def decode_base_token_count(query_context_len: int, sealed_end: int) -> int:
         prefix_end = min(max(0, int(args.static_prefix)), int(query_context_len))
@@ -3383,7 +3420,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                         accepted_budget_mean_by_pos_cpu_chunk = (
                                             accepted_budget_counts.float().mean(dim=1).detach().cpu().tolist()
                                         )
-                                    rank_ids = torch.arange(rank_count, dtype=torch.long, device=device).reshape(1, 1, rank_count)
+                                    rank_ids = decode_rank_ids_tensor(rank_count, device, dims=3)
                                     ranked_scores_for_attention = ranked_scores.masked_fill(
                                         rank_ids >= accepted_budget_counts.unsqueeze(-1),
                                         float("-inf"),
@@ -5087,7 +5124,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                         rank_count = int(ranked_scores.shape[2])
                         if rank_count <= 0:
                             return None
-                        rank_ids = torch.arange(rank_count, dtype=torch.long, device=device).reshape(1, 1, rank_count)
+                        rank_ids = decode_rank_ids_tensor(rank_count, device, dims=3)
 
                         def mask_ranked_scores(keep: int) -> torch.Tensor:
                             keep_i = max(0, min(rank_count, int(keep)))
@@ -5874,7 +5911,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                     torch.div(accepted_budget_counts + granularity - 1, granularity, rounding_mode="floor")
                                     * granularity
                                 ).clamp(max=int(max_budget))
-                                rank_ids = torch.arange(rank_count, dtype=torch.long, device=device).reshape(1, rank_count)
+                                rank_ids = decode_rank_ids_tensor(rank_count, device, dims=2)
                                 proxy_ranked_scores = ranked_scores.masked_fill(
                                     rank_ids >= accepted_budget_counts.unsqueeze(-1),
                                     float("-inf"),
@@ -6077,7 +6114,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                 rank_count = int(ranked_scores.shape[1])
                                 if rank_count <= 0:
                                     raise RuntimeError("confidence decode requires rank_count > 0")
-                                rank_ids = torch.arange(rank_count, dtype=torch.long, device=device).reshape(1, rank_count)
+                                rank_ids = decode_rank_ids_tensor(rank_count, device, dims=2)
 
                                 def mask_decode_scores(keep: int) -> torch.Tensor:
                                     keep_i = max(0, min(rank_count, int(keep)))
@@ -7016,11 +7053,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                 cost_rank = int(exact_ranked_logits_for_conf.shape[-1])
                                 cost_ranked_scores = ranked_scores[:, :cost_rank]
                                 if accepted_budget_counts is not None:
-                                    cost_rank_ids = torch.arange(
-                                        cost_rank,
-                                        dtype=torch.long,
-                                        device=device,
-                                    ).reshape(1, cost_rank)
+                                    cost_rank_ids = decode_rank_ids_tensor(cost_rank, device, dims=2)
                                     cost_ranked_scores = cost_ranked_scores.masked_fill(
                                         cost_rank_ids >= accepted_budget_counts.unsqueeze(-1),
                                         float("-inf"),
@@ -7352,7 +7385,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                 torch.div(accepted_budget_counts + granularity - 1, granularity, rounding_mode="floor")
                                 * granularity
                             ).clamp(max=int(max_budget))
-                            rank_ids = torch.arange(rank_count, dtype=torch.long, device=device).reshape(1, rank_count)
+                            rank_ids = decode_rank_ids_tensor(rank_count, device, dims=2)
                             masked_scores = gqa_ranked_scores.masked_fill(
                                 rank_ids >= accepted_budget_counts.unsqueeze(-1),
                                 float("-inf"),

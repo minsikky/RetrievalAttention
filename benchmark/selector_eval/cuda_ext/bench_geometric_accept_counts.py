@@ -99,63 +99,103 @@ def selected_mass_thresholds_from_logits(
     device = ranked_logits.device
     thresholds = torch.empty((heads, steps), dtype=torch.float32, device=device)
     threshold_sels = torch.empty((heads, steps), dtype=torch.long, device=device)
+    if steps == 0:
+        return thresholds, threshold_sels
     rank = int(ranked_logits.shape[-1])
     target = float(max(0.0, min(1.0, float(exact_mass))))
-    for step, budget in enumerate(budgets):
-        budget_i = max(0, min(rank, int(budget)))
-        if budget_i <= 0:
-            thresholds[:, step] = float("inf")
-            threshold_sels[:, step] = -1
-            continue
-        valid = torch.isfinite(ranked_scores[:, :budget_i]) & torch.isfinite(ranked_logits[:, :budget_i])
-        logits = torch.where(
-            valid,
-            ranked_logits[:, :budget_i].float(),
-            torch.full((heads, budget_i), float("-inf"), dtype=torch.float32, device=device),
+    valid_all = torch.isfinite(ranked_scores[:, :rank]) & torch.isfinite(ranked_logits[:, :rank])
+    logits_all = torch.where(
+        valid_all,
+        ranked_logits[:, :rank].float(),
+        torch.full((heads, rank), float("-inf"), dtype=torch.float32, device=device),
+    )
+    sorted_logits_all, sorted_order_all = torch.sort(logits_all, dim=-1, descending=True, stable=True)
+    sorted_valid_all = torch.gather(valid_all, 1, sorted_order_all)
+    prefix_lse_all = torch.logcumsumexp(logits_all, dim=-1)
+    prefix_valid_counts = torch.cumsum(valid_all.to(torch.long), dim=-1)
+    budgets_tensor = torch.tensor(
+        [max(0, min(rank, int(budget))) for budget in budgets],
+        dtype=torch.long,
+        device=device,
+    )
+    positive_steps = budgets_tensor > 0
+    if not bool(torch.any(positive_steps)):
+        thresholds.fill_(float("inf"))
+        threshold_sels.fill_(-1)
+        return thresholds.contiguous(), threshold_sels.contiguous()
+
+    lse_idx = torch.clamp(budgets_tensor - 1, min=0)
+    ranked_lse = prefix_lse_all.index_select(1, lse_idx)
+    base_lse = base_logsumexp.float().reshape(heads, 1)
+    total_lse = torch.logaddexp(base_lse, ranked_lse)
+    valid_count = prefix_valid_counts.index_select(1, lse_idx)
+    valid_count = torch.where(positive_steps.reshape(1, steps), valid_count, torch.zeros_like(valid_count))
+    budget_view = budgets_tensor.reshape(1, steps, 1)
+    in_budget_any = sorted_order_all.unsqueeze(1) < budget_view
+    in_budget_sorted = in_budget_any & sorted_valid_all.unsqueeze(1)
+    sorted_logits = sorted_logits_all.unsqueeze(1).expand(-1, steps, -1).masked_fill(
+        ~in_budget_sorted,
+        float("-inf"),
+    )
+    cum_selected_count = torch.cumsum(in_budget_sorted.to(torch.long), dim=-1)
+    if target <= 0.0:
+        counts = torch.zeros((heads, steps), dtype=torch.long, device=device)
+    else:
+        base_mass = torch.where(
+            torch.isfinite(total_lse),
+            torch.exp(base_lse - total_lse),
+            torch.zeros_like(total_lse),
         )
-        sorted_logits, order = torch.sort(logits, dim=-1, descending=True, stable=True)
-        ranked_lse = torch.logsumexp(logits, dim=-1)
-        total_lse = torch.logaddexp(base_logsumexp.float(), ranked_lse)
-        if target <= 0.0:
-            counts = torch.zeros((heads,), dtype=torch.long, device=device)
-        else:
-            base_mass = torch.where(
-                torch.isfinite(total_lse),
-                torch.exp(base_logsumexp.float() - total_lse),
-                torch.zeros_like(total_lse),
-            )
-            cum_ranked_lse = torch.logcumsumexp(sorted_logits, dim=-1)
-            cum_lse = torch.logaddexp(base_logsumexp.float().unsqueeze(-1), cum_ranked_lse)
-            cum_mass = torch.where(
-                torch.isfinite(total_lse).unsqueeze(-1),
-                torch.exp(cum_lse - total_lse.unsqueeze(-1)),
-                torch.zeros_like(cum_lse),
-            )
-            hit = cum_mass >= min(target, 1.0 - 1.0e-7)
-            has_hit = torch.any(hit, dim=-1)
-            first_hit = torch.argmax(hit.to(torch.int32), dim=-1).to(torch.long) + 1
-            counts = torch.where(
-                base_mass >= target,
-                torch.zeros_like(first_hit),
-                torch.where(has_hit, first_hit, valid.sum(dim=-1).to(torch.long)),
-            )
-        if int(min_top) > 0:
-            counts = torch.maximum(counts, torch.full_like(counts, min(budget_i, int(min_top))))
-        counts = torch.clamp(counts, min=0, max=budget_i)
-        has_exact = counts > 0
-        gather_idx = torch.clamp(counts - 1, min=0).reshape(heads, 1)
-        threshold_vals = torch.gather(sorted_logits, 1, gather_idx).reshape(heads)
-        threshold_idx = torch.gather(order, 1, gather_idx).reshape(heads).to(torch.long)
-        thresholds[:, step] = torch.where(
-            has_exact,
-            threshold_vals,
-            torch.full_like(threshold_vals, float("inf")),
+        cum_ranked_lse = torch.logcumsumexp(sorted_logits, dim=-1)
+        cum_lse = torch.logaddexp(base_lse.unsqueeze(-1), cum_ranked_lse)
+        cum_mass = torch.where(
+            torch.isfinite(total_lse).unsqueeze(-1),
+            torch.exp(cum_lse - total_lse.unsqueeze(-1)),
+            torch.zeros_like(cum_lse),
         )
-        threshold_sels[:, step] = torch.where(
-            has_exact,
-            threshold_idx,
-            torch.full_like(threshold_idx, -1),
+        hit = (cum_mass >= min(target, 1.0 - 1.0e-7)) & in_budget_sorted
+        has_hit = torch.any(hit, dim=-1)
+        first_hit_pos = torch.argmax(hit.to(torch.int32), dim=-1).to(torch.long)
+        first_hit_count = torch.gather(cum_selected_count, 2, first_hit_pos.unsqueeze(-1)).squeeze(-1)
+        counts = torch.where(
+            base_mass >= target,
+            torch.zeros_like(first_hit_count),
+            torch.where(has_hit, first_hit_count, valid_count),
         )
+    if int(min_top) > 0:
+        min_counts = torch.minimum(
+            budgets_tensor.reshape(1, steps),
+            torch.full((heads, steps), int(min_top), dtype=torch.long, device=device),
+        )
+        counts = torch.maximum(counts, min_counts)
+    counts = torch.minimum(torch.clamp(counts, min=0), budgets_tensor.reshape(1, steps))
+    counts = torch.where(positive_steps.reshape(1, steps), counts, torch.zeros_like(counts))
+    has_exact = counts > 0
+    cum_budget_count = torch.cumsum(in_budget_any.to(torch.long), dim=-1)
+    kth_valid_mask = in_budget_sorted & (cum_selected_count >= counts.unsqueeze(-1))
+    kth_any_mask = in_budget_any & (cum_budget_count >= counts.unsqueeze(-1))
+    kth_mask = torch.where((counts <= valid_count).unsqueeze(-1), kth_valid_mask, kth_any_mask)
+    kth_pos = torch.argmax(kth_mask.to(torch.int32), dim=-1).to(torch.long)
+    threshold_vals = torch.gather(
+        sorted_logits_all.unsqueeze(1).expand(-1, steps, -1),
+        2,
+        kth_pos.unsqueeze(-1),
+    ).squeeze(-1)
+    threshold_idx = torch.gather(
+        sorted_order_all.unsqueeze(1).expand(-1, steps, -1),
+        2,
+        kth_pos.unsqueeze(-1),
+    ).squeeze(-1).to(torch.long)
+    thresholds[:, :] = torch.where(
+        has_exact,
+        threshold_vals,
+        torch.full_like(threshold_vals, float("inf")),
+    )
+    threshold_sels[:, :] = torch.where(
+        has_exact,
+        threshold_idx,
+        torch.full_like(threshold_idx, -1),
+    )
     return thresholds.contiguous(), threshold_sels.contiguous()
 
 
@@ -363,22 +403,30 @@ def main() -> None:
                 growth=float(args.growth),
                 probe_scale=float(args.probe_scale),
             )
-            approx_thresholds, approx_threshold_sels = selected_mass_thresholds_from_logits(
+            combined_budgets = sorted({int(v) for v in tail_budgets} | {int(v) for v in probe_budgets})
+            combined_thresholds, combined_threshold_sels = selected_mass_thresholds_from_logits(
                 ranked_logits=ranked_logits,
                 ranked_scores=ranked_scores,
                 base_logsumexp=base_lse,
-                budgets=tail_budgets,
+                budgets=combined_budgets,
                 exact_mass=float(args.exact_value_mass),
                 min_top=int(args.exact_value_min_top),
             )
-            probe_thresholds, probe_threshold_sels = selected_mass_thresholds_from_logits(
-                ranked_logits=ranked_logits,
-                ranked_scores=ranked_scores,
-                base_logsumexp=base_lse,
-                budgets=probe_budgets,
-                exact_mass=float(args.exact_value_mass),
-                min_top=int(args.exact_value_min_top),
+            budget_to_col = {int(budget): int(idx) for idx, budget in enumerate(combined_budgets)}
+            approx_cols = torch.tensor(
+                [budget_to_col[int(v)] for v in tail_budgets],
+                dtype=torch.long,
+                device=ranked_logits.device,
             )
+            probe_cols = torch.tensor(
+                [budget_to_col[int(v)] for v in probe_budgets],
+                dtype=torch.long,
+                device=ranked_logits.device,
+            )
+            approx_thresholds = combined_thresholds.index_select(1, approx_cols).contiguous()
+            approx_threshold_sels = combined_threshold_sels.index_select(1, approx_cols).contiguous()
+            probe_thresholds = combined_thresholds.index_select(1, probe_cols).contiguous()
+            probe_threshold_sels = combined_threshold_sels.index_select(1, probe_cols).contiguous()
             return native.gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_thresholds(
                 queries,
                 keys,
