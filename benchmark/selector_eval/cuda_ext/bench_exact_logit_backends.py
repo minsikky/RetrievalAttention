@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from benchmark.selector_eval.runners.run_hf_paged_pq_intervention_eval import (  # noqa: E402
     _gpu_gqa_dense_decode_ranked_logits_and_base_lse,
     _gpu_gqa_ranked_exact_logits,
+    load_selector_paged_pq_ext,
 )
 
 
@@ -64,7 +65,9 @@ def main() -> None:
     queries = torch.randn((heads, dim), device=device, dtype=torch.float32)
     keys = torch.randn((kv_heads, context, dim), device=device, dtype=torch.float16)
     ranked_tokens = torch.randint(0, context, (heads, rank), device=device, dtype=torch.long)
+    ranked_scores = torch.randn((heads, rank), device=device, dtype=torch.float32)
     keys_t_float = keys.float().transpose(1, 2).contiguous()
+    native = load_selector_paged_pq_ext()
 
     def ranked_gather():
         return _gpu_gqa_ranked_exact_logits(
@@ -110,9 +113,32 @@ def main() -> None:
         )
         return out
 
+    def native_ranked_with_base():
+        if not hasattr(native, "gqa_decode_ranked_exact_logits_with_base_lse"):
+            raise RuntimeError("native extension does not expose gqa_decode_ranked_exact_logits_with_base_lse")
+        out, _base_lse = native.gqa_decode_ranked_exact_logits_with_base_lse(
+            queries,
+            keys,
+            ranked_tokens,
+            ranked_scores,
+            int(group_size),
+            int(context),
+            int(args.static_prefix),
+            int(args.static_suffix),
+            int(args.page_size),
+            float(scale),
+        )
+        return out
+
     ranked_out, ranked_ms = _time_cuda(ranked_gather, warmup=int(args.warmup), iters=int(args.iters))
     dense_out, dense_ms = _time_cuda(dense_sim, warmup=int(args.warmup), iters=int(args.iters))
     cached_out, cached_dense_ms = _time_cuda(dense_sim_cached, warmup=int(args.warmup), iters=int(args.iters))
+    if hasattr(native, "gqa_decode_ranked_exact_logits_with_base_lse"):
+        native_out, native_ms = _time_cuda(native_ranked_with_base, warmup=int(args.warmup), iters=int(args.iters))
+        native_max_diff = float((ranked_out - native_out).abs().max().item())
+    else:
+        native_ms = None
+        native_max_diff = None
     max_diff = float((ranked_out - dense_out).abs().max().item())
     cached_max_diff = float((ranked_out - cached_out).abs().max().item())
     payload = {
@@ -125,11 +151,16 @@ def main() -> None:
         "ranked_gather_ms": ranked_ms,
         "dense_sim_ms": dense_ms,
         "dense_sim_cached_ms": cached_dense_ms,
+        "native_ranked_with_base_ms": native_ms,
         "speedup_dense_vs_ranked": float(ranked_ms / dense_ms) if dense_ms > 0.0 else float("inf"),
         "speedup_dense_cached_vs_ranked": float(ranked_ms / cached_dense_ms) if cached_dense_ms > 0.0 else float("inf"),
         "speedup_cached_vs_uncached_dense": float(dense_ms / cached_dense_ms) if cached_dense_ms > 0.0 else float("inf"),
+        "speedup_native_with_base_vs_ranked": (
+            float(ranked_ms / native_ms) if native_ms is not None and native_ms > 0.0 else None
+        ),
         "max_abs_diff": max_diff,
         "cached_max_abs_diff": cached_max_diff,
+        "native_max_abs_diff": native_max_diff,
     }
     text = json.dumps(payload, indent=2, sort_keys=True)
     print(text)

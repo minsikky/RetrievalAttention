@@ -6369,6 +6369,48 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                         confidence_calibration_key_mb += (
                                             float(num_heads * int(dense_key_tokens_for_conf) * int(self.head_dim) * key_bytes)
                                         ) / MB
+                                    elif (
+                                        need_base_lse_for_conf
+                                        and hasattr(native, "gqa_decode_ranked_exact_logits_with_base_lse")
+                                    ):
+                                        exact_ranked_logits_for_conf, base_lse_for_conf = (
+                                            native.gqa_decode_ranked_exact_logits_with_base_lse(
+                                                queries2,
+                                                keys_all,
+                                                ranked_t_prefix,
+                                                ranked_scores_prefix,
+                                                int(group_size),
+                                                int(query_context_len),
+                                                int(args.static_prefix),
+                                                int(args.static_suffix),
+                                                int(args.page_size),
+                                                float(self.head_dim) ** -0.5,
+                                            )
+                                        )
+                                        exact_ranked_logits_for_conf = exact_ranked_logits_for_conf.contiguous()
+                                        base_lse_for_conf = base_lse_for_conf.contiguous()
+                                        prefix_end_for_base = min(
+                                            max(0, int(args.static_prefix)),
+                                            int(query_context_len),
+                                        )
+                                        indexed_end_for_base = max(
+                                            int(prefix_end_for_base),
+                                            int(query_context_len) - max(0, int(args.static_suffix)),
+                                        )
+                                        sealed_end_for_base = int(prefix_end_for_base) + (
+                                            (
+                                                max(0, int(indexed_end_for_base) - int(prefix_end_for_base))
+                                                // max(1, int(args.page_size))
+                                            )
+                                            * max(1, int(args.page_size))
+                                        )
+                                        base_tokens_for_conf = decode_base_token_count(
+                                            int(query_context_len),
+                                            int(sealed_end_for_base),
+                                        )
+                                        confidence_calibration_key_mb += (
+                                            float(base_tokens_for_conf * num_heads * int(self.head_dim) * key_bytes)
+                                        ) / MB
                                     elif hasattr(native, "gqa_decode_ranked_exact_logits"):
                                         exact_ranked_logits_for_conf = native.gqa_decode_ranked_exact_logits(
                                             queries2,
@@ -6396,7 +6438,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                         if use_dense_exact_logit_sim
                                         else float(num_heads * int(max_budget) * int(self.head_dim) * key_bytes)
                                     ) / MB
-                                    if need_base_lse_for_conf and not use_dense_exact_logit_sim:
+                                    if need_base_lse_for_conf and base_lse_for_conf is None and not use_dense_exact_logit_sim:
                                         base_lse_for_conf, base_tokens_for_conf = _gpu_gqa_base_logsumexp_decode(
                                             queries=queries2,
                                             keys_all=keys_all,

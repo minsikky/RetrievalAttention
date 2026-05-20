@@ -378,6 +378,18 @@ torch::Tensor gqa_decode_ranked_exact_logits_cuda(
     int64_t page_size,
     double scale);
 
+std::vector<torch::Tensor> gqa_decode_ranked_exact_logits_with_base_lse_cuda(
+    torch::Tensor queries,
+    torch::Tensor keys,
+    torch::Tensor ranked_tokens,
+    torch::Tensor ranked_scores,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    int64_t page_size,
+    double scale);
+
 torch::Tensor gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_cuda(
     torch::Tensor queries,
     torch::Tensor keys,
@@ -2893,6 +2905,47 @@ torch::Tensor gqa_decode_ranked_exact_logits(
       scale);
 }
 
+std::vector<torch::Tensor> gqa_decode_ranked_exact_logits_with_base_lse(
+    torch::Tensor queries,
+    torch::Tensor keys,
+    torch::Tensor ranked_tokens,
+    torch::Tensor ranked_scores,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    int64_t page_size,
+    double scale) {
+  TORCH_CHECK(queries.is_cuda(), "queries must be CUDA");
+  TORCH_CHECK(keys.is_cuda(), "keys must be CUDA");
+  TORCH_CHECK(ranked_tokens.is_cuda(), "ranked_tokens must be CUDA");
+  TORCH_CHECK(ranked_scores.is_cuda(), "ranked_scores must be CUDA");
+  TORCH_CHECK(queries.scalar_type() == torch::kFloat32, "queries must be float32");
+  TORCH_CHECK(is_float_like(keys), "keys must be float32, float16, or bfloat16");
+  TORCH_CHECK(ranked_tokens.scalar_type() == torch::kLong, "ranked_tokens must be int64");
+  TORCH_CHECK(ranked_scores.scalar_type() == torch::kFloat32, "ranked_scores must be float32");
+  TORCH_CHECK(queries.dim() == 2, "queries shape must be [heads, dim]");
+  TORCH_CHECK(keys.dim() == 3, "keys shape must be [kv_heads, tokens, dim]");
+  TORCH_CHECK(ranked_tokens.dim() == 2, "ranked_tokens shape must be [heads, selected]");
+  TORCH_CHECK(ranked_scores.sizes() == ranked_tokens.sizes(), "ranked scores/tokens shape mismatch");
+  TORCH_CHECK(queries.size(0) == ranked_tokens.size(0), "ranked token head count mismatch");
+  TORCH_CHECK(queries.size(1) == keys.size(2), "query/key dim mismatch");
+  TORCH_CHECK(group_size > 0, "group_size must be positive");
+  TORCH_CHECK(page_size > 0, "page_size must be positive");
+  TORCH_CHECK(queries.size(0) <= keys.size(0) * group_size, "heads exceed kv_heads * group_size");
+  return gqa_decode_ranked_exact_logits_with_base_lse_cuda(
+      queries.contiguous(),
+      keys,
+      ranked_tokens.contiguous(),
+      ranked_scores.contiguous(),
+      group_size,
+      query_context_len,
+      static_prefix,
+      static_suffix,
+      page_size,
+      scale);
+}
+
 torch::Tensor gqa_decode_geometric_accept_counts_vpq_mass_min_proxy(
     torch::Tensor queries,
     torch::Tensor keys,
@@ -3693,6 +3746,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	      "gqa_decode_ranked_exact_logits",
 	      &gqa_decode_ranked_exact_logits,
 	      "Decode exact QK logits for ranked candidates only (CUDA)");
+	  m.def(
+	      "gqa_decode_ranked_exact_logits_with_base_lse",
+	      &gqa_decode_ranked_exact_logits_with_base_lse,
+	      "Decode exact QK logits for ranked candidates and base-window logsumexp (CUDA)");
 	  m.def(
 	      "gqa_decode_geometric_accept_counts_vpq_mass_min_proxy",
 	      &gqa_decode_geometric_accept_counts_vpq_mass_min_proxy,

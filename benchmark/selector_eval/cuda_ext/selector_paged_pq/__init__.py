@@ -27,6 +27,7 @@ _EXPORTED_NAMES = [
     "gqa_decode_geometric_accept_counts_vpq_tail_stability",
     "gqa_decode_geometric_accept_counts_vpq_proxy",
     "gqa_decode_ranked_exact_logits",
+    "gqa_decode_ranked_exact_logits_with_base_lse",
     "gqa_decode_geometric_accept_counts_vpq_mass_min_proxy",
     "gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits",
     "gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_thresholds",

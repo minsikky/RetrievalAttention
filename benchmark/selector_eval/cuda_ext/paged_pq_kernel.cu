@@ -9147,6 +9147,140 @@ torch::Tensor gqa_decode_ranked_exact_logits_cuda(
   return ranked_logits;
 }
 
+__global__ void gqa_decode_base_lse_from_logits_kernel(
+    const float* __restrict__ base_logits,
+    const int64_t* __restrict__ base_counts,
+    float* __restrict__ base_lse,
+    int64_t heads,
+    int64_t max_base) {
+  int64_t head = static_cast<int64_t>(blockIdx.x);
+  if (head >= heads) {
+    return;
+  }
+  extern __shared__ float shared[];
+  const int tid = threadIdx.x;
+  int64_t count = base_counts[head];
+  if (count < 0) {
+    count = 0;
+  }
+  if (count > max_base) {
+    count = max_base;
+  }
+  const float* row = base_logits + head * max_base;
+  float local_max = -INFINITY;
+  for (int64_t idx = tid; idx < count; idx += blockDim.x) {
+    local_max = fmaxf(local_max, row[idx]);
+  }
+  shared[tid] = local_max;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
+    }
+    __syncthreads();
+  }
+  float max_logit = shared[0];
+  float local_sum = 0.0f;
+  if (isfinite(max_logit)) {
+    for (int64_t idx = tid; idx < count; idx += blockDim.x) {
+      float logit = row[idx];
+      if (isfinite(logit)) {
+        local_sum += expf(logit - max_logit);
+      }
+    }
+  }
+  shared[tid] = local_sum;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      shared[tid] += shared[tid + stride];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    base_lse[head] = (isfinite(max_logit) && shared[0] > 0.0f) ? max_logit + logf(shared[0]) : -INFINITY;
+  }
+}
+
+std::vector<torch::Tensor> gqa_decode_ranked_exact_logits_with_base_lse_cuda(
+    torch::Tensor queries,
+    torch::Tensor keys,
+    torch::Tensor ranked_tokens,
+    torch::Tensor ranked_scores,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    int64_t page_size,
+    double scale) {
+  const auto heads = queries.size(0);
+  const auto dim = queries.size(1);
+  const auto kv_heads = keys.size(0);
+  const auto total_tokens = keys.size(1);
+  const auto ranked = ranked_tokens.size(1);
+  auto opts = queries.options().dtype(torch::kFloat32);
+  auto ranked_logits = torch::empty({heads, ranked}, opts);
+  auto base_lse = torch::empty({heads}, opts);
+  if (heads == 0 || ranked == 0) {
+    base_lse.fill_(-std::numeric_limits<float>::infinity());
+    return {ranked_logits, base_lse};
+  }
+  if (dim == 0 || kv_heads == 0 || total_tokens == 0) {
+    ranked_logits.fill_(-std::numeric_limits<float>::infinity());
+    base_lse.fill_(-std::numeric_limits<float>::infinity());
+    return {ranked_logits, base_lse};
+  }
+  const int threads = 256;
+  const int64_t max_base =
+      std::max<int64_t>(0, static_prefix) + std::max<int64_t>(0, static_suffix) +
+      std::max<int64_t>(1, page_size) + 4;
+  auto long_opts = queries.options().dtype(torch::kLong);
+  auto base_tokens = torch::empty({heads, max_base}, long_opts);
+  auto base_logits = torch::empty({heads, max_base}, opts);
+  auto base_counts = torch::zeros({heads}, long_opts);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      keys.scalar_type(),
+      "gqa_decode_ranked_exact_logits_with_base_lse_keys",
+      [&] {
+        gqa_decode_base_ranked_logits_kernel<scalar_t><<<static_cast<int>(heads), threads, 0, stream>>>(
+            queries.data_ptr<float>(),
+            keys.data_ptr<scalar_t>(),
+            ranked_tokens.data_ptr<int64_t>(),
+            ranked_scores.data_ptr<float>(),
+            base_tokens.data_ptr<int64_t>(),
+            base_logits.data_ptr<float>(),
+            base_counts.data_ptr<int64_t>(),
+            ranked_logits.data_ptr<float>(),
+            heads,
+            kv_heads,
+            ranked,
+            dim,
+            total_tokens,
+            keys.stride(0),
+            keys.stride(1),
+            keys.stride(2),
+            page_size,
+            max_base,
+            group_size,
+            query_context_len,
+            static_prefix,
+            static_suffix,
+            static_cast<float>(scale));
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  gqa_decode_base_lse_from_logits_kernel<<<static_cast<int>(heads), threads, threads * sizeof(float), stream>>>(
+      base_logits.data_ptr<float>(),
+      base_counts.data_ptr<int64_t>(),
+      base_lse.data_ptr<float>(),
+      heads,
+      max_base);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {ranked_logits, base_lse};
+}
+
 torch::Tensor gqa_decode_geometric_accept_counts_cuda(
     torch::Tensor queries,
     torch::Tensor keys,
