@@ -1720,6 +1720,13 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
     exact_logit_backend = str(getattr(args, "exact_logit_backend", "auto"))
     if exact_logit_backend not in {"auto", "ranked_gather", "dense_sim"}:
         raise ValueError(f"unsupported exact_logit_backend: {exact_logit_backend}")
+    try:
+        dense_sim_max_context_ratio = max(
+            0.0,
+            float(os.environ.get("FRONTIER_DENSE_SIM_MAX_CONTEXT_RATIO", "2.0")),
+        )
+    except ValueError:
+        dense_sim_max_context_ratio = 2.0
     last_decode_base_key: tuple[int, int, int, int, int] | None = None
     last_decode_base_tensor: torch.Tensor | None = None
     last_decode_rank_ids_tensors: dict[tuple[str, int, int], torch.Tensor] = {}
@@ -6336,7 +6343,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                             str(exact_logit_backend) == "auto"
                                             and device.type == "cuda"
                                             and min(int(query_context_len), int(keys_all.shape[1]))
-                                            <= max(1, int(max_budget)) * 2
+                                            <= int(max(1.0, float(max_budget) * float(dense_sim_max_context_ratio)))
                                         )
                                     )
                                     if bool(getattr(args, "profile_native_ops", False)):
