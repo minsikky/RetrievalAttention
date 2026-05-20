@@ -9221,8 +9221,7 @@ std::vector<torch::Tensor> gqa_decode_ranked_exact_logits_with_base_lse_cuda(
   auto opts = queries.options().dtype(torch::kFloat32);
   auto ranked_logits = torch::empty({heads, ranked}, opts);
   auto base_lse = torch::empty({heads}, opts);
-  if (heads == 0 || ranked == 0) {
-    base_lse.fill_(-std::numeric_limits<float>::infinity());
+  if (heads == 0) {
     return {ranked_logits, base_lse};
   }
   if (dim == 0 || kv_heads == 0 || total_tokens == 0) {
