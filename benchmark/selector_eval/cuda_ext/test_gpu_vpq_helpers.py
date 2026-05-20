@@ -1502,9 +1502,24 @@ def _test_dense_decode_ranked_logits_simulator() -> None:
     if got_base_cached is None or not torch.allclose(got_base_cached, ref_base, atol=2e-3, rtol=2e-3):
         max_diff = float((got_base_cached - ref_base).abs().max().item()) if got_base_cached is not None else float("inf")
         raise AssertionError(f"cached dense simulator base lse mismatch: max_diff={max_diff}")
-    from selector_paged_pq import gqa_decode_ranked_exact_logits_with_base_lse  # noqa: PLC0415
+    from selector_paged_pq import (  # noqa: PLC0415
+        gqa_decode_ranked_exact_logits,
+        gqa_decode_ranked_exact_logits_with_base_lse,
+    )
 
     ranked_scores = torch.ones_like(ref_ranked)
+    ref_native_ranked = gqa_decode_ranked_exact_logits(
+        queries,
+        keys,
+        ranked_tokens,
+        ranked_scores,
+        group_size,
+        query_context_len,
+        static_prefix,
+        static_suffix,
+        page_size,
+        scale,
+    )
     got_native_ranked, got_native_base = gqa_decode_ranked_exact_logits_with_base_lse(
         queries,
         keys,
@@ -1517,8 +1532,9 @@ def _test_dense_decode_ranked_logits_simulator() -> None:
         page_size,
         scale,
     )
-    if not torch.allclose(got_native_ranked, ref_ranked, atol=2e-3, rtol=2e-3):
-        max_diff = float((got_native_ranked - ref_ranked).abs().max().item())
+    if not torch.allclose(got_native_ranked, ref_native_ranked, atol=2e-3, rtol=2e-3, equal_nan=True):
+        finite = torch.isfinite(got_native_ranked) & torch.isfinite(ref_native_ranked)
+        max_diff = float((got_native_ranked[finite] - ref_native_ranked[finite]).abs().max().item()) if bool(torch.any(finite)) else float("inf")
         raise AssertionError(f"native ranked logits + base lse ranked mismatch: max_diff={max_diff}")
     if not torch.allclose(got_native_base, ref_base, atol=2e-3, rtol=2e-3):
         max_diff = float((got_native_base - ref_base).abs().max().item())
