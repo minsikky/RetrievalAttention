@@ -2830,3 +2830,29 @@ Current GPU conclusion:
 - Next algorithmic target is an adaptive tail-budget policy or stronger deployable tail estimator that gets the s12288/s16384 robustness without always paying that tail budget.
 
 Older summaries under `attention_efficiency_result/threeway_*`, `proxy_*`, and `online_ivfpq_*` are useful historical artifacts, but they use older proxy schemas and some pre-cleanup MB accounting. Do not mix them into the main comparison without regenerating under `benchmark/selector_eval`.
+
+### Frontier GPU Simulator Accounting / Exact-Logit Backend Update (2026-05-20)
+
+Current framing:
+
+- GPU benchmark runs are now treated as a simulator host for the frontier/custom-hardware algorithm.
+- Reported algorithmic cost should use `logical_frontier_*` fields.
+- GPU implementation diagnostics should use `physical_gpu_*` fields.
+- Existing unqualified fields such as `mean_step_MB_per_head_query` remain logical-frontier fields for backward compatibility.
+
+Implemented changes:
+
+- Split logical frontier MB from physical GPU emulation MB in RULER/LongBench/HF intervention summaries.
+- Logical frontier accounting charges accepted exact K once under exact K/V when GPU precomputes exact logits for confidence.
+- Physical GPU accounting still reports the dense/precomputed work that the GPU host paid to produce benchmark outputs.
+- Added `--exact_logit_backend {auto,ranked_gather,dense_sim}` / `FRONTIER_EXACT_LOGIT_BACKEND`.
+- `dense_sim` computes dense QK with GPU-friendly GEMMs and gathers ranked logits, preserving frontier output semantics while allowing physical GPU access to differ from custom hardware.
+- `auto` uses dense simulation only when context length is at most `2x` the ranked probe budget; otherwise it keeps ranked-gather exact logits to avoid overcomputing small-budget/very-long-context cases.
+- Added `benchmark/selector_eval/cuda_ext/bench_exact_logit_backends.py` and `scripts/run_exact_logit_backend_bench.sh` for ranked-gather vs dense-sim timing.
+
+Validation so far:
+
+- Python compile checks pass.
+- Shell syntax checks pass.
+- CPU tensor equivalence check passes for dense-sim ranked logits and base logsumexp against the previous ranked-gather helper.
+- Slurm validation is pending because `squeue`/`sbatch` currently time out contacting the Slurm controller.

@@ -15,6 +15,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import build_page_pq_gpu  # noqa: E402
 from benchmark.selector_eval.runners.run_hf_paged_pq_intervention_eval import (  # noqa: E402
     _gpu_gqa_base_logsumexp_decode,
+    _gpu_gqa_dense_decode_ranked_logits_and_base_lse,
+    _gpu_gqa_ranked_exact_logits,
     geometric_budget_pairs,
     reconstruct_all_vpq_values_gpu,
     select_thresholds_for_budget_counts_gpu,
@@ -1414,9 +1416,73 @@ def _test_native_exact_value_counts() -> None:
             )
 
 
+def _test_dense_decode_ranked_logits_simulator() -> None:
+    torch.manual_seed(20260520)
+    device = torch.device("cuda")
+    heads = 4
+    kv_heads = 2
+    group_size = 2
+    dim = 16
+    total_tokens = 48
+    query_context_len = 37
+    ranked = 13
+    static_prefix = 3
+    static_suffix = 5
+    page_size = 8
+    scale = float(dim) ** -0.5
+    queries = torch.randn((heads, dim), device=device, dtype=torch.float32)
+    keys = torch.randn((kv_heads, total_tokens, dim), device=device, dtype=torch.float16)
+    ranked_tokens = torch.randint(0, query_context_len, (heads, ranked), device=device, dtype=torch.long)
+
+    ref_ranked = _gpu_gqa_ranked_exact_logits(
+        queries=queries,
+        keys_all=keys,
+        ranked_tokens=ranked_tokens,
+        group_size=group_size,
+        scale=scale,
+        max_rank=ranked,
+    )
+    ref_base, ref_base_count = _gpu_gqa_base_logsumexp_decode(
+        queries=queries,
+        keys_all=keys,
+        group_size=group_size,
+        query_context_len=query_context_len,
+        static_prefix=static_prefix,
+        static_suffix=static_suffix,
+        page_size=page_size,
+        scale=scale,
+    )
+    got_ranked, got_base, got_base_count, got_key_count = _gpu_gqa_dense_decode_ranked_logits_and_base_lse(
+        queries=queries,
+        keys_all=keys,
+        ranked_tokens=ranked_tokens,
+        group_size=group_size,
+        scale=scale,
+        max_rank=ranked,
+        query_context_len=query_context_len,
+        static_prefix=static_prefix,
+        static_suffix=static_suffix,
+        page_size=page_size,
+        need_base_lse=True,
+    )
+    if int(got_key_count) != int(query_context_len):
+        raise AssertionError(f"dense simulator key_count mismatch: got={got_key_count} expected={query_context_len}")
+    if int(got_base_count) != int(ref_base_count):
+        raise AssertionError(f"dense simulator base_count mismatch: got={got_base_count} expected={ref_base_count}")
+    if got_base is None:
+        raise AssertionError("dense simulator did not return requested base logsumexp")
+    if not torch.allclose(got_ranked, ref_ranked, atol=2e-3, rtol=2e-3):
+        max_diff = float((got_ranked - ref_ranked).abs().max().item())
+        raise AssertionError(f"dense simulator ranked logits mismatch: max_diff={max_diff}")
+    if not torch.allclose(got_base, ref_base, atol=2e-3, rtol=2e-3):
+        max_diff = float((got_base - ref_base).abs().max().item())
+        raise AssertionError(f"dense simulator base lse mismatch: max_diff={max_diff}")
+
+
 def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    _test_dense_decode_ranked_logits_simulator()
     rng = np.random.default_rng(20260514)
     page_size = 32
     pages = 3

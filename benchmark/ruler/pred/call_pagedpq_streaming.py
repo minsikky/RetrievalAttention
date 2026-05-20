@@ -58,15 +58,27 @@ def stats_payload(stats: dict[int, ApproxStats]) -> dict[str, dict[str, float | 
             "mean_selected_tokens": float(s.mean_selected),
             "mean_tail_samples": float(s.mean_tail_samples),
             "mean_selector_MB_per_head_query": float(s.mean_selector_mb),
+            "mean_logical_frontier_selector_MB_per_head_query": float(s.mean_selector_mb),
             "mean_exact_KV_MB_per_head_query": float(s.mean_exact_kv_mb),
+            "mean_logical_frontier_exact_KV_MB_per_head_query": float(s.mean_exact_kv_mb),
             "mean_tail_estimator_MB_per_head_query": float(s.mean_tail_mb),
+            "mean_logical_frontier_tail_estimator_MB_per_head_query": float(s.mean_tail_mb),
             "mean_confidence_MB_per_head_query": float(s.mean_confidence_mb),
+            "mean_logical_frontier_confidence_MB_per_head_query": float(s.mean_confidence_mb),
             "mean_step_MB_per_head_query": float(s.mean_step_mb),
+            "mean_logical_frontier_step_MB_per_head_query": float(s.mean_step_mb),
+            "mean_physical_gpu_exact_KV_MB_per_head_query": float(s.mean_physical_gpu_exact_kv_mb),
+            "mean_physical_gpu_confidence_MB_per_head_query": float(s.mean_physical_gpu_confidence_mb),
+            "mean_physical_gpu_step_MB_per_head_query": float(s.mean_physical_gpu_step_mb),
             "selector_active_fraction": float(getattr(s, "selector_active_calls", 0)) / max(1, int(s.calls)),
             "tail_active_fraction": float(getattr(s, "tail_active_calls", 0)) / max(1, int(s.calls)),
             "confidence_active_fraction": float(getattr(s, "confidence_active_calls", 0)) / max(1, int(s.calls)),
             "mean_update_MB_per_head_query": float(update_mb_per_head_query),
             "mean_total_MB_per_head_query": float(s.mean_step_mb + update_mb_per_head_query),
+            "mean_logical_frontier_total_MB_per_head_query": float(s.mean_step_mb + update_mb_per_head_query),
+            "mean_physical_gpu_total_MB_per_head_query": float(
+                s.mean_physical_gpu_step_mb + update_mb_per_head_query
+            ),
             "index_build_calls": int(s.index_build_calls),
             "index_build_seconds": float(s.index_build_seconds),
             "index_build_read_MB": float(s.index_build_read_mb),
@@ -92,20 +104,39 @@ def aggregate_stats(stats: dict[int, ApproxStats]) -> dict[str, float | int]:
     update_mbs = [float(s.index_build_read_mb + s.index_build_write_mb) for s in layers]
     update_per_head_query = [mb / max(1, int(s.calls)) for mb, s in zip(update_mbs, layers, strict=True)]
     total_per_head_query = [float(s.mean_step_mb) + upd for s, upd in zip(layers, update_per_head_query, strict=True)]
+    physical_gpu_total_per_head_query = [
+        float(s.mean_physical_gpu_step_mb) + upd for s, upd in zip(layers, update_per_head_query, strict=True)
+    ]
     return {
         "layers": int(len(layers)),
         "head_query_calls_total": int(sum(s.calls for s in layers)),
         "approx_attention_calls_total": int(sum(s.approx_attention_calls for s in layers)),
         "passthrough_attention_calls_total": int(sum(s.passthrough_attention_calls for s in layers)),
         "mean_step_MB_per_head_query": float(np.mean([s.mean_step_mb for s in layers])),
+        "mean_logical_frontier_step_MB_per_head_query": float(np.mean([s.mean_step_mb for s in layers])),
         "mean_update_MB_per_head_query": float(np.mean(update_per_head_query)),
         "mean_total_MB_per_head_query": float(np.mean(total_per_head_query)),
+        "mean_logical_frontier_total_MB_per_head_query": float(np.mean(total_per_head_query)),
+        "mean_physical_gpu_total_MB_per_head_query": float(np.mean(physical_gpu_total_per_head_query)),
         "max_total_MB_per_head_query": float(np.max(total_per_head_query)),
+        "max_physical_gpu_total_MB_per_head_query": float(np.max(physical_gpu_total_per_head_query)),
         "max_step_MB_per_head_query": float(np.max([s.mean_step_mb for s in layers])),
+        "max_physical_gpu_step_MB_per_head_query": float(np.max([s.mean_physical_gpu_step_mb for s in layers])),
         "mean_selector_MB_per_head_query": float(np.mean([s.mean_selector_mb for s in layers])),
+        "mean_logical_frontier_selector_MB_per_head_query": float(np.mean([s.mean_selector_mb for s in layers])),
         "mean_exact_KV_MB_per_head_query": float(np.mean([s.mean_exact_kv_mb for s in layers])),
+        "mean_logical_frontier_exact_KV_MB_per_head_query": float(np.mean([s.mean_exact_kv_mb for s in layers])),
         "mean_tail_estimator_MB_per_head_query": float(np.mean([s.mean_tail_mb for s in layers])),
+        "mean_logical_frontier_tail_estimator_MB_per_head_query": float(np.mean([s.mean_tail_mb for s in layers])),
         "mean_confidence_MB_per_head_query": float(np.mean([s.mean_confidence_mb for s in layers])),
+        "mean_logical_frontier_confidence_MB_per_head_query": float(np.mean([s.mean_confidence_mb for s in layers])),
+        "mean_physical_gpu_exact_KV_MB_per_head_query": float(
+            np.mean([s.mean_physical_gpu_exact_kv_mb for s in layers])
+        ),
+        "mean_physical_gpu_confidence_MB_per_head_query": float(
+            np.mean([s.mean_physical_gpu_confidence_mb for s in layers])
+        ),
+        "mean_physical_gpu_step_MB_per_head_query": float(np.mean([s.mean_physical_gpu_step_mb for s in layers])),
         "mean_selected_tokens": float(np.mean([s.mean_selected for s in layers])),
         "selector_active_fraction": float(
             sum(int(getattr(s, "selector_active_calls", 0)) for s in layers)
@@ -299,6 +330,12 @@ def run() -> None:
             "Cost accounting for adaptive ranked/geometric confidence. exact reports accepted budgets; "
             "upper_bound avoids runtime syncs and reports conservative max-budget cost."
         ),
+    )
+    parser.add_argument(
+        "--exact_logit_backend",
+        choices=["auto", "ranked_gather", "dense_sim"],
+        default=os.environ.get("FRONTIER_EXACT_LOGIT_BACKEND", "auto"),
+        help="GPU simulator backend for exact logits used by frontier confidence checks.",
     )
     parser.add_argument("--geometric_min_budget", type=int, default=8192)
     parser.add_argument("--geometric_max_budget", type=int, default=65536)
@@ -500,6 +537,7 @@ def run() -> None:
             "tail_pq_corr_min": float(args.tail_pq_corr_min),
             "tail_pq_relrmse_max": float(args.tail_pq_relrmse_max),
             "ranked_confidence_cost_mode": str(args.ranked_confidence_cost_mode),
+            "exact_logit_backend": str(args.exact_logit_backend),
             "geometric_min_budget": int(args.geometric_min_budget),
             "geometric_max_budget": int(args.geometric_max_budget),
             "geometric_budget_granularity": int(args.geometric_budget_granularity),

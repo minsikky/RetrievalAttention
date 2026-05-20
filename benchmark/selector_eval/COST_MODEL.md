@@ -2,6 +2,13 @@
 
 This file defines the logical memory-traffic accounting used by `benchmark/selector_eval`.
 
+For GPU-hosted benchmark runs, distinguish two views:
+
+- `logical_frontier_*`: the memory traffic of the deployable frontier algorithm as it would run on the target custom-hardware model.
+- `physical_gpu_*`: the memory traffic implied by the GPU implementation used to emulate the algorithm and produce task-quality outputs.
+
+The GPU path may deliberately do extra dense/precomputed work to keep benchmark runs practical. Use `logical_frontier_*` for algorithmic-efficiency plots and `physical_gpu_*` only for GPU implementation/performance diagnostics.
+
 ## Phases
 
 - `selector`: query-time index/router/scoring reads needed to choose candidate tokens.
@@ -17,6 +24,8 @@ online_update_cumulative_MB    = cumulative update traffic up to this decode len
 online_update_MB_per_token     = online_update_cumulative_MB / decode_length
 step_MB_per_query              = selector_MB_per_query + exact_KV_MB_per_query + online_update_MB_per_token
 ```
+
+Unqualified benchmark fields such as `mean_step_MB_per_head_query` are logical-frontier fields for backward compatibility. New summaries also emit explicit `mean_logical_frontier_*` aliases and `mean_physical_gpu_*` diagnostics.
 
 Legacy compatibility aliases are still emitted:
 

@@ -308,6 +308,9 @@ class ApproxStats:
     mean_tail_mb: float = 0.0
     mean_confidence_mb: float = 0.0
     mean_step_mb: float = 0.0
+    mean_physical_gpu_exact_kv_mb: float = 0.0
+    mean_physical_gpu_confidence_mb: float = 0.0
+    mean_physical_gpu_step_mb: float = 0.0
     selector_active_calls: int = 0
     tail_active_calls: int = 0
     confidence_active_calls: int = 0
@@ -335,6 +338,8 @@ class ApproxStats:
         tail_mb_override: float | None = None,
         exact_kv_mb_override: float | None = None,
         confidence_mb_override: float = 0.0,
+        physical_gpu_exact_kv_mb_override: float | None = None,
+        physical_gpu_confidence_mb_override: float | None = None,
     ) -> None:
         self.add_count_repeated(
             1,
@@ -347,6 +352,8 @@ class ApproxStats:
             tail_mb_override=tail_mb_override,
             exact_kv_mb_override=exact_kv_mb_override,
             confidence_mb_override=confidence_mb_override,
+            physical_gpu_exact_kv_mb_override=physical_gpu_exact_kv_mb_override,
+            physical_gpu_confidence_mb_override=physical_gpu_confidence_mb_override,
         )
 
     def add_count_repeated(
@@ -361,6 +368,8 @@ class ApproxStats:
         tail_mb_override: float | None = None,
         exact_kv_mb_override: float | None = None,
         confidence_mb_override: float = 0.0,
+        physical_gpu_exact_kv_mb_override: float | None = None,
+        physical_gpu_confidence_mb_override: float | None = None,
     ) -> None:
         repeats = int(repeats)
         if repeats <= 0:
@@ -377,6 +386,17 @@ class ApproxStats:
         )
         confidence_mb = float(confidence_mb_override)
         step_mb = float(selector_mb) + exact_kv_mb + tail_mb + confidence_mb
+        physical_gpu_exact_kv_mb = (
+            float(physical_gpu_exact_kv_mb_override)
+            if physical_gpu_exact_kv_mb_override is not None
+            else exact_kv_mb
+        )
+        physical_gpu_confidence_mb = (
+            float(physical_gpu_confidence_mb_override)
+            if physical_gpu_confidence_mb_override is not None
+            else confidence_mb
+        )
+        physical_gpu_step_mb = float(selector_mb) + physical_gpu_exact_kv_mb + tail_mb + physical_gpu_confidence_mb
         next_calls = self.calls + repeats
         alpha = float(repeats) / float(next_calls)
         self.mean_selected += alpha * (float(selected_count) - self.mean_selected)
@@ -386,6 +406,13 @@ class ApproxStats:
         self.mean_tail_mb += alpha * (tail_mb - self.mean_tail_mb)
         self.mean_confidence_mb += alpha * (confidence_mb - self.mean_confidence_mb)
         self.mean_step_mb += alpha * (step_mb - self.mean_step_mb)
+        self.mean_physical_gpu_exact_kv_mb += alpha * (
+            physical_gpu_exact_kv_mb - self.mean_physical_gpu_exact_kv_mb
+        )
+        self.mean_physical_gpu_confidence_mb += alpha * (
+            physical_gpu_confidence_mb - self.mean_physical_gpu_confidence_mb
+        )
+        self.mean_physical_gpu_step_mb += alpha * (physical_gpu_step_mb - self.mean_physical_gpu_step_mb)
         if float(selector_mb) > 0.0:
             self.selector_active_calls += repeats
         if float(tail_mb) > 0.0:
@@ -405,6 +432,8 @@ class ApproxStats:
         tail_mb_override: float | None = None,
         exact_kv_mb_override: float | None = None,
         confidence_mb_override: float = 0.0,
+        physical_gpu_exact_kv_mb_override: float | None = None,
+        physical_gpu_confidence_mb_override: float | None = None,
     ) -> None:
         self.add_count(
             len(selected),
@@ -416,6 +445,8 @@ class ApproxStats:
             tail_mb_override=tail_mb_override,
             exact_kv_mb_override=exact_kv_mb_override,
             confidence_mb_override=confidence_mb_override,
+            physical_gpu_exact_kv_mb_override=physical_gpu_exact_kv_mb_override,
+            physical_gpu_confidence_mb_override=physical_gpu_confidence_mb_override,
         )
 
     def add_approx_attention_call(self) -> None:
@@ -967,21 +998,36 @@ def selected_mass_thresholds_from_logits_gpu(
         if base_logsumexp is not None
         else torch.full((heads,), float("-inf"), dtype=torch.float32, device=device)
     )
+    valid_all = torch.isfinite(ranked_scores[:, :rank]) & torch.isfinite(ranked_logits[:, :rank])
+    logits_all = torch.where(
+        valid_all,
+        ranked_logits[:, :rank].float(),
+        torch.full((heads, rank), float("-inf"), dtype=torch.float32, device=device),
+    )
+    # Sort once across the full ranked prefix. Per-budget exact-V thresholds are
+    # then computed by masking this sorted order to the active prefix. This keeps
+    # frontier semantics identical while avoiding one O(rank log rank) sort per
+    # geometric budget.
+    sorted_logits_all, sorted_order_all = torch.sort(logits_all, dim=-1, descending=True, stable=True)
+    sorted_valid_all = torch.gather(valid_all, 1, sorted_order_all)
+    prefix_lse_all = torch.logcumsumexp(logits_all, dim=-1)
+    prefix_valid_counts = torch.cumsum(valid_all.to(torch.long), dim=-1)
     for step, budget in enumerate(budgets):
         budget_i = max(0, min(rank, int(budget)))
         if budget_i <= 0:
             thresholds[:, step] = float("inf")
             threshold_sels[:, step] = -1
             continue
-        valid = torch.isfinite(ranked_scores[:, :budget_i]) & torch.isfinite(ranked_logits[:, :budget_i])
-        logits = torch.where(
-            valid,
-            ranked_logits[:, :budget_i].float(),
-            torch.full((heads, budget_i), float("-inf"), dtype=torch.float32, device=device),
+        in_budget_any = sorted_order_all < int(budget_i)
+        in_budget_sorted = in_budget_any & sorted_valid_all
+        sorted_logits = torch.where(
+            in_budget_sorted,
+            sorted_logits_all,
+            torch.full_like(sorted_logits_all, float("-inf")),
         )
-        sorted_logits, order = torch.sort(logits, dim=-1, descending=True, stable=True)
-        ranked_lse = torch.logsumexp(logits, dim=-1)
+        ranked_lse = prefix_lse_all[:, budget_i - 1]
         total_lse = torch.logaddexp(base_lse, ranked_lse)
+        valid_count = prefix_valid_counts[:, budget_i - 1]
         if target <= 0.0:
             counts = torch.zeros((heads,), dtype=torch.long, device=device)
         else:
@@ -991,27 +1037,35 @@ def selected_mass_thresholds_from_logits_gpu(
                 torch.zeros_like(total_lse),
             )
             cum_ranked_lse = torch.logcumsumexp(sorted_logits, dim=-1)
+            cum_selected_count = torch.cumsum(in_budget_sorted.to(torch.long), dim=-1)
             cum_lse = torch.logaddexp(base_lse.unsqueeze(-1), cum_ranked_lse)
             cum_mass = torch.where(
                 torch.isfinite(total_lse).unsqueeze(-1),
                 torch.exp(cum_lse - total_lse.unsqueeze(-1)),
                 torch.zeros_like(cum_lse),
             )
-            hit = cum_mass >= min(target, 1.0 - 1.0e-7)
+            hit = (cum_mass >= min(target, 1.0 - 1.0e-7)) & in_budget_sorted
             has_hit = torch.any(hit, dim=-1)
-            first_hit = torch.argmax(hit.to(torch.int32), dim=-1).to(torch.long) + 1
+            first_hit_pos = torch.argmax(hit.to(torch.int32), dim=-1).to(torch.long)
+            first_hit_count = torch.gather(cum_selected_count, 1, first_hit_pos.reshape(heads, 1)).reshape(heads)
             counts = torch.where(
                 base_mass >= target,
-                torch.zeros_like(first_hit),
-                torch.where(has_hit, first_hit, valid.sum(dim=-1).to(torch.long)),
+                torch.zeros_like(first_hit_count),
+                torch.where(has_hit, first_hit_count, valid_count),
             )
         if int(min_top) > 0:
             counts = torch.maximum(counts, torch.full_like(counts, min(budget_i, int(min_top))))
         counts = torch.clamp(counts, min=0, max=budget_i)
         has_exact = counts > 0
-        gather_idx = torch.clamp(counts - 1, min=0).reshape(heads, 1)
-        threshold_vals = torch.gather(sorted_logits, 1, gather_idx).reshape(heads)
-        threshold_idx = torch.gather(order, 1, gather_idx).reshape(heads).to(torch.long)
+        cum_selected_count = torch.cumsum(in_budget_sorted.to(torch.long), dim=-1)
+        cum_budget_count = torch.cumsum(in_budget_any.to(torch.long), dim=-1)
+        kth_valid_mask = in_budget_sorted & (cum_selected_count >= counts.reshape(heads, 1))
+        kth_any_mask = in_budget_any & (cum_budget_count >= counts.reshape(heads, 1))
+        kth_mask = torch.where((counts <= valid_count).reshape(heads, 1), kth_valid_mask, kth_any_mask)
+        kth_pos = torch.argmax(kth_mask.to(torch.int32), dim=-1).to(torch.long)
+        gather_idx = kth_pos.reshape(heads, 1)
+        threshold_vals = torch.gather(sorted_logits_all, 1, gather_idx).reshape(heads)
+        threshold_idx = torch.gather(sorted_order_all, 1, gather_idx).reshape(heads).to(torch.long)
         thresholds[:, step] = torch.where(
             has_exact,
             threshold_vals,
@@ -1119,6 +1173,108 @@ def _gpu_gqa_ranked_exact_logits(
                 logits = torch.sum(q.unsqueeze(1) * gathered.float(), dim=-1) * float(scale)
                 out[head_start:head_end, rank_start:rank_end] = logits
     return out
+
+
+def _gpu_gqa_dense_decode_ranked_logits_and_base_lse(
+    *,
+    queries: torch.Tensor,
+    keys_all: torch.Tensor,
+    ranked_tokens: torch.Tensor,
+    group_size: int,
+    scale: float,
+    max_rank: int,
+    query_context_len: int,
+    static_prefix: int,
+    static_suffix: int,
+    page_size: int,
+    need_base_lse: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None, int, int]:
+    """GPU simulator exact logits via dense QK then ranked gather.
+
+    This deliberately favors GPU throughput over physical access fidelity. The
+    output is still the exact ranked logits used by the frontier algorithm, but
+    the GPU host may read more K than the custom-hardware logical model.
+    """
+
+    if ranked_tokens.dim() != 2:
+        raise ValueError(f"dense decode exact logits expects [heads, rank], got {tuple(ranked_tokens.shape)}")
+    rank = min(max(0, int(max_rank)), int(ranked_tokens.shape[-1]))
+    heads = int(ranked_tokens.shape[0])
+    device = ranked_tokens.device
+    if rank <= 0:
+        empty = torch.empty((heads, 0), dtype=torch.float32, device=device)
+        base = torch.full((heads,), float("-inf"), dtype=torch.float32, device=device) if need_base_lse else None
+        return empty, base, 0, 0
+
+    key_count = min(max(0, int(query_context_len)), int(keys_all.shape[1]))
+    if key_count <= 0:
+        out = torch.full((heads, rank), float("-inf"), dtype=torch.float32, device=device)
+        base = torch.full((heads,), float("-inf"), dtype=torch.float32, device=device) if need_base_lse else None
+        return out, base, 0, 0
+
+    out = torch.empty((heads, rank), dtype=torch.float32, device=device)
+    base_out = (
+        torch.full((heads,), float("-inf"), dtype=torch.float32, device=device) if bool(need_base_lse) else None
+    )
+    base_toks: torch.Tensor | None = None
+    base_mask: torch.Tensor | None = None
+    total_base = 0
+    if bool(need_base_lse):
+        token_rows, mask_rows, total_base = _prefill_base_token_rows(
+            query_len=1,
+            query_start=int(query_context_len) - 1,
+            static_prefix=int(static_prefix),
+            static_suffix=int(static_suffix),
+            page_size=int(page_size),
+            device=device,
+        )
+        if token_rows.numel() > 0:
+            base_toks = token_rows[0].clamp(min=0, max=max(0, key_count - 1)).to(torch.long)
+            base_mask = mask_rows[0]
+
+    dim = int(queries.shape[-1])
+    kv_heads = int(keys_all.shape[0])
+    group = max(1, int(group_size))
+    covered_heads = min(heads, kv_heads * group)
+    aligned_heads = (covered_heads // group) * group
+    if aligned_heads > 0:
+        aligned_kv_heads = aligned_heads // group
+        q_grouped = queries[:aligned_heads, :].reshape(aligned_kv_heads, group, dim).float()
+        dense_grouped = torch.bmm(
+            q_grouped,
+            keys_all[:aligned_kv_heads, :key_count, :].float().transpose(1, 2).contiguous(),
+        ) * float(scale)
+        dense_logits = dense_grouped.reshape(aligned_heads, key_count)
+        toks = ranked_tokens[:aligned_heads, :rank].to(torch.long).clamp(min=0, max=max(0, key_count - 1))
+        out[:aligned_heads, :rank] = torch.gather(dense_logits, 1, toks)
+        if base_out is not None:
+            if base_toks is None or base_toks.numel() == 0:
+                base_out[:aligned_heads] = float("-inf")
+            else:
+                base_logits = dense_logits.index_select(1, base_toks)
+                if base_mask is not None:
+                    base_logits = base_logits.masked_fill(~base_mask.reshape(1, -1), float("-inf"))
+                base_out[:aligned_heads] = torch.logsumexp(base_logits, dim=-1)
+
+    for kv_head in range(aligned_heads // group, kv_heads):
+        head_start = int(kv_head * group)
+        head_end = min(heads, head_start + group)
+        if head_start >= head_end:
+            continue
+        q = queries[head_start:head_end, :].float()
+        # Dense GEMM is usually much faster on GPU than irregular ranked-K gathers.
+        dense_logits = torch.matmul(q, keys_all[int(kv_head), :key_count, :].float().t()) * float(scale)
+        toks = ranked_tokens[head_start:head_end, :rank].to(torch.long).clamp(min=0, max=max(0, key_count - 1))
+        out[head_start:head_end, :rank] = torch.gather(dense_logits, 1, toks)
+        if base_out is not None:
+            if base_toks is None or base_toks.numel() == 0:
+                base_out[head_start:head_end] = float("-inf")
+            else:
+                base_logits = dense_logits.index_select(1, base_toks)
+                if base_mask is not None:
+                    base_logits = base_logits.masked_fill(~base_mask.reshape(1, -1), float("-inf"))
+                base_out[head_start:head_end] = torch.logsumexp(base_logits, dim=-1)
+    return out.contiguous(), base_out.contiguous() if base_out is not None else None, int(total_base), int(key_count)
 
 
 def _prefill_base_token_rows(
@@ -1516,6 +1672,9 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
     ranked_confidence_cost_mode = str(getattr(args, "ranked_confidence_cost_mode", "exact"))
     if ranked_confidence_cost_mode not in {"exact", "upper_bound"}:
         raise ValueError(f"unsupported ranked_confidence_cost_mode: {ranked_confidence_cost_mode}")
+    exact_logit_backend = str(getattr(args, "exact_logit_backend", "auto"))
+    if exact_logit_backend not in {"auto", "ranked_gather", "dense_sim"}:
+        raise ValueError(f"unsupported exact_logit_backend: {exact_logit_backend}")
     last_decode_base_key: tuple[int, int, int, int, int] | None = None
     last_decode_base_tensor: torch.Tensor | None = None
 
@@ -5980,7 +6139,47 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                     )
                                     or (geometric_confidence_decode and selected_mass_in_kernel)
                                 ):
-                                    if hasattr(native, "gqa_decode_ranked_exact_logits"):
+                                    need_base_lse_for_conf = (
+                                        needs_proxy_gate
+                                        or native_selected_mass_threshold_proxy_possible
+                                        or (
+                                            str(args.selected_value_mode) == "vpq_value"
+                                            and str(args.selected_value_exact_rule) == "selected_mass"
+                                            and not selected_mass_in_kernel
+                                        )
+                                    )
+                                    use_dense_exact_logit_sim = (
+                                        str(exact_logit_backend) == "dense_sim"
+                                        or (
+                                            str(exact_logit_backend) == "auto"
+                                            and device.type == "cuda"
+                                            and min(int(query_context_len), int(keys_all.shape[1]))
+                                            <= max(1, int(max_budget)) * 2
+                                        )
+                                    )
+                                    if use_dense_exact_logit_sim:
+                                        (
+                                            exact_ranked_logits_for_conf,
+                                            base_lse_for_conf,
+                                            base_tokens_for_conf,
+                                            dense_key_tokens_for_conf,
+                                        ) = _gpu_gqa_dense_decode_ranked_logits_and_base_lse(
+                                            queries=queries2,
+                                            keys_all=keys_all,
+                                            ranked_tokens=ranked_t[:, :max_budget].contiguous(),
+                                            group_size=int(group_size),
+                                            scale=float(self.head_dim) ** -0.5,
+                                            max_rank=int(max_budget),
+                                            query_context_len=int(query_context_len),
+                                            static_prefix=int(args.static_prefix),
+                                            static_suffix=int(args.static_suffix),
+                                            page_size=int(args.page_size),
+                                            need_base_lse=bool(need_base_lse_for_conf),
+                                        )
+                                        confidence_calibration_key_mb += (
+                                            float(num_heads * int(dense_key_tokens_for_conf) * int(self.head_dim) * key_bytes)
+                                        ) / MB
+                                    elif hasattr(native, "gqa_decode_ranked_exact_logits"):
                                         exact_ranked_logits_for_conf = native.gqa_decode_ranked_exact_logits(
                                             queries2,
                                             keys_all,
@@ -6003,17 +6202,11 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                             max_rank=int(max_budget),
                                         )
                                     confidence_calibration_key_mb += (
-                                        float(num_heads * int(max_budget) * int(self.head_dim) * key_bytes)
+                                        0.0
+                                        if use_dense_exact_logit_sim
+                                        else float(num_heads * int(max_budget) * int(self.head_dim) * key_bytes)
                                     ) / MB
-                                    if (
-                                        needs_proxy_gate
-                                        or native_selected_mass_threshold_proxy_possible
-                                        or (
-                                        str(args.selected_value_mode) == "vpq_value"
-                                        and str(args.selected_value_exact_rule) == "selected_mass"
-                                        and not selected_mass_in_kernel
-                                        )
-                                    ):
+                                    if need_base_lse_for_conf and not use_dense_exact_logit_sim:
                                         base_lse_for_conf, base_tokens_for_conf = _gpu_gqa_base_logsumexp_decode(
                                             queries=queries2,
                                             keys_all=keys_all,
@@ -6229,22 +6422,34 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                             growth=float(growth),
                                             probe_scale=float(probe_scale),
                                         )
-                                        approx_thresholds, approx_threshold_sels = selected_mass_thresholds_from_logits_gpu(
+                                        combined_threshold_budgets = sorted(
+                                            {int(v) for v in tail_budgets} | {int(v) for v in probe_budgets}
+                                        )
+                                        combined_thresholds, combined_threshold_sels = selected_mass_thresholds_from_logits_gpu(
                                             ranked_logits=exact_ranked_logits_for_conf[:, :max_budget].contiguous(),
                                             ranked_scores=ranked_scores[:, :max_budget].contiguous(),
                                             base_logsumexp=base_lse_for_conf,
-                                            budgets=tail_budgets,
+                                            budgets=combined_threshold_budgets,
                                             exact_mass=float(args.selected_value_exact_mass),
                                             min_top=int(args.selected_value_min_exact_top),
                                         )
-                                        probe_thresholds, probe_threshold_sels = selected_mass_thresholds_from_logits_gpu(
-                                            ranked_logits=exact_ranked_logits_for_conf[:, :max_budget].contiguous(),
-                                            ranked_scores=ranked_scores[:, :max_budget].contiguous(),
-                                            base_logsumexp=base_lse_for_conf,
-                                            budgets=probe_budgets,
-                                            exact_mass=float(args.selected_value_exact_mass),
-                                            min_top=int(args.selected_value_min_exact_top),
+                                        combined_budget_to_col = {
+                                            int(budget): int(idx) for idx, budget in enumerate(combined_threshold_budgets)
+                                        }
+                                        approx_cols = torch.tensor(
+                                            [combined_budget_to_col[int(v)] for v in tail_budgets],
+                                            dtype=torch.long,
+                                            device=device,
                                         )
+                                        probe_cols = torch.tensor(
+                                            [combined_budget_to_col[int(v)] for v in probe_budgets],
+                                            dtype=torch.long,
+                                            device=device,
+                                        )
+                                        approx_thresholds = combined_thresholds.index_select(1, approx_cols).contiguous()
+                                        approx_threshold_sels = combined_threshold_sels.index_select(1, approx_cols).contiguous()
+                                        probe_thresholds = combined_thresholds.index_select(1, probe_cols).contiguous()
+                                        probe_threshold_sels = combined_threshold_sels.index_select(1, probe_cols).contiguous()
                                         # This fused final-output path is parity-tested, but the first
                                         # implementation is slower than the existing canonical path on
                                         # 32k decode. Keep it available for targeted optimization without
@@ -6876,21 +7081,38 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                 float(page_count * value_subvecs * value_centroids * value_subdim * value_bytes)
                                 + float((tail_count + compressed_selected_values) * value_subvecs * code_bytes)
                             ) / MB + dense_score_io_mb
-                            exact_key_mb = (
+                            physical_gpu_exact_key_mb = (
                                 0.0
                                 if final_k_logits_reused_for_cost
                                 else float(selected_count * int(self.head_dim) * key_bytes) / MB
                             )
                             exact_value_mb = float((base_count + exact_value_top) * int(self.head_dim) * value_bytes) / MB
-                            exact_kv_mb = exact_key_mb + exact_value_mb
-                            confidence_mb = (
-                                max(0, int(confidence_extra_attention_calls) - 1) * float(exact_kv_mb + tail_mb_for_cost)
+                            physical_gpu_exact_kv_mb = physical_gpu_exact_key_mb + exact_value_mb
+                            physical_gpu_confidence_mb = (
+                                max(0, int(confidence_extra_attention_calls) - 1)
+                                * float(physical_gpu_exact_kv_mb + tail_mb_for_cost)
                                 + float(confidence_calibration_key_mb) / float(max(1, num_heads))
                             )
                             if proxy_confidence_score_read_passes > 0:
-                                confidence_mb += (
+                                physical_gpu_confidence_mb += (
                                     float(proxy_confidence_score_read_passes) * float(page_count * page_size * 4) / MB
                                 )
+                            exact_key_mb = physical_gpu_exact_key_mb
+                            exact_kv_mb = physical_gpu_exact_kv_mb
+                            confidence_mb = physical_gpu_confidence_mb
+                            if final_k_logits_reused_for_cost:
+                                # The GPU host may precompute exact logits up to max_budget to emulate
+                                # the adaptive rule efficiently. The logical frontier/custom-hardware
+                                # cost is incremental: read each accepted K once, cache its logit, and
+                                # reuse it for the final attention. Therefore selected/probed K bytes
+                                # belong to exact_KV, not confidence overhead.
+                                exact_key_mb = float(selected_count * int(self.head_dim) * key_bytes) / MB
+                                exact_kv_mb = exact_key_mb + exact_value_mb
+                                confidence_mb = 0.0
+                                if proxy_confidence_score_read_passes > 0:
+                                    confidence_mb += (
+                                        float(proxy_confidence_score_read_passes) * float(page_count * page_size * 4) / MB
+                                    )
                             stats[layer_id].add_count_repeated(
                                 num_heads,
                                 selected_count,
@@ -6902,6 +7124,8 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                 tail_mb_override=tail_mb_for_cost,
                                 exact_kv_mb_override=exact_kv_mb,
                                 confidence_mb_override=confidence_mb,
+                                physical_gpu_exact_kv_mb_override=physical_gpu_exact_kv_mb,
+                                physical_gpu_confidence_mb_override=physical_gpu_confidence_mb,
                             )
                             return outputs_native.reshape(num_heads, int(self.head_dim))
                     except Exception:
@@ -8071,6 +8295,16 @@ def run() -> None:
             "upper_bound avoids runtime syncs and reports conservative max-budget cost."
         ),
     )
+    parser.add_argument(
+        "--exact_logit_backend",
+        choices=["auto", "ranked_gather", "dense_sim"],
+        default=os.environ.get("FRONTIER_EXACT_LOGIT_BACKEND", "auto"),
+        help=(
+            "GPU simulator backend for exact ranked logits used by confidence/selected-mass checks. "
+            "dense_sim computes dense QK and gathers ranked logits for speed, while logical MB still "
+            "uses the frontier/custom-hardware cost model."
+        ),
+    )
     parser.add_argument("--geometric_min_budget", type=int, default=8192)
     parser.add_argument("--geometric_max_budget", type=int, default=65536)
     parser.add_argument("--geometric_growth", type=float, default=1.5)
@@ -8262,15 +8496,25 @@ def run() -> None:
             "mean_selected_tokens": s.mean_selected,
             "mean_tail_samples": s.mean_tail_samples,
             "mean_selector_MB_per_head_query": s.mean_selector_mb,
+            "mean_logical_frontier_selector_MB_per_head_query": s.mean_selector_mb,
             "mean_exact_KV_MB_per_head_query": s.mean_exact_kv_mb,
+            "mean_logical_frontier_exact_KV_MB_per_head_query": s.mean_exact_kv_mb,
             "mean_tail_estimator_MB_per_head_query": s.mean_tail_mb,
+            "mean_logical_frontier_tail_estimator_MB_per_head_query": s.mean_tail_mb,
             "mean_confidence_MB_per_head_query": s.mean_confidence_mb,
+            "mean_logical_frontier_confidence_MB_per_head_query": s.mean_confidence_mb,
             "mean_step_MB_per_head_query": s.mean_step_mb,
+            "mean_logical_frontier_step_MB_per_head_query": s.mean_step_mb,
+            "mean_physical_gpu_exact_KV_MB_per_head_query": s.mean_physical_gpu_exact_kv_mb,
+            "mean_physical_gpu_confidence_MB_per_head_query": s.mean_physical_gpu_confidence_mb,
+            "mean_physical_gpu_step_MB_per_head_query": s.mean_physical_gpu_step_mb,
             "selector_active_fraction": float(s.selector_active_calls) / max(1, int(s.calls)),
             "tail_active_fraction": float(s.tail_active_calls) / max(1, int(s.calls)),
             "confidence_active_fraction": float(s.confidence_active_calls) / max(1, int(s.calls)),
             "mean_update_MB_per_head_query": update_mb_per_head_query,
             "mean_total_MB_per_head_query": s.mean_step_mb + update_mb_per_head_query,
+            "mean_logical_frontier_total_MB_per_head_query": s.mean_step_mb + update_mb_per_head_query,
+            "mean_physical_gpu_total_MB_per_head_query": s.mean_physical_gpu_step_mb + update_mb_per_head_query,
             "index_build_calls": s.index_build_calls,
             "index_build_seconds": s.index_build_seconds,
             "index_build_read_MB": s.index_build_read_mb,

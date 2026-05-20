@@ -83,6 +83,7 @@ fi
 echo "[pagedpq_stream_smoke] mode=${MODE} approx_prefill=${APPROX_PREFILL} task=${TASK_NAME} context=${CONTEXT_LEN} samples=${NUM_SAMPLES}"
 echo "[pagedpq_stream_smoke] out=${OUT_DIR}"
 echo "[pagedpq_stream_smoke] budget=${BUDGET:-4096} confidence=${ONLINE_CONFIDENCE_RULE:-none} target=${TAIL_PROXY_MASS_MIN:-0.0} geom_min=${GEOMETRIC_MIN_BUDGET:-8192} geom_max=${GEOMETRIC_MAX_BUDGET:-65536} page=${PAGE_SIZE:-5632} chunk=${PREFILL_CHUNK_SIZE:-0}"
+echo "[pagedpq_stream_smoke] exact_logit_backend=${FRONTIER_EXACT_LOGIT_BACKEND:-auto}"
 
 DATA_FILE="${DATA_FILE_OVERRIDE:-${DATA_DIR}/${TASK_NAME}/validation.jsonl}"
 if [ -n "${DATA_FILE_OVERRIDE:-}" ]; then
@@ -135,6 +136,7 @@ fi
   --tail_pq_corr_min "${TAIL_PQ_CORR_MIN:--1.0}" \
   --tail_pq_relrmse_max "${TAIL_PQ_RELRMSE_MAX:-inf}" \
   --ranked_confidence_cost_mode "${RANKED_CONFIDENCE_COST_MODE:-exact}" \
+  --exact_logit_backend "${FRONTIER_EXACT_LOGIT_BACKEND:-auto}" \
   --geometric_min_budget "${GEOMETRIC_MIN_BUDGET:-8192}" \
   --geometric_max_budget "${GEOMETRIC_MAX_BUDGET:-65536}" \
   --geometric_growth "${GEOMETRIC_GROWTH:-1.5}" \

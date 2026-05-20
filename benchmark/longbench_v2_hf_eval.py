@@ -136,6 +136,11 @@ def parse_args():
         choices=["exact", "upper_bound"],
         default="exact",
     )
+    parser.add_argument(
+        "--exact_logit_backend",
+        choices=["auto", "ranked_gather", "dense_sim"],
+        default=os.environ.get("FRONTIER_EXACT_LOGIT_BACKEND", "auto"),
+    )
     parser.add_argument("--geometric_min_budget", type=int, default=8)
     parser.add_argument("--geometric_max_budget", type=int, default=512)
     parser.add_argument("--geometric_growth", type=float, default=1.5)
@@ -486,6 +491,7 @@ def pagedpq_config(args):
         "tail_pq_corr_min": float(args.tail_pq_corr_min),
         "tail_pq_relrmse_max": float(args.tail_pq_relrmse_max),
         "ranked_confidence_cost_mode": str(args.ranked_confidence_cost_mode),
+        "exact_logit_backend": str(args.exact_logit_backend),
         "geometric_min_budget": int(args.geometric_min_budget),
         "geometric_max_budget": int(args.geometric_max_budget),
         "geometric_budget_granularity": int(args.geometric_budget_granularity),
@@ -722,15 +728,29 @@ def summarize_approx_stats(stats: dict[int, ApproxStats]) -> dict[str, dict[str,
             "mean_selected_tokens": float(s.mean_selected),
             "mean_tail_samples": float(s.mean_tail_samples),
             "mean_selector_MB_per_head_query": float(s.mean_selector_mb),
+            "mean_logical_frontier_selector_MB_per_head_query": float(s.mean_selector_mb),
             "mean_exact_KV_MB_per_head_query": float(s.mean_exact_kv_mb),
+            "mean_logical_frontier_exact_KV_MB_per_head_query": float(s.mean_exact_kv_mb),
             "mean_tail_estimator_MB_per_head_query": float(s.mean_tail_mb),
+            "mean_logical_frontier_tail_estimator_MB_per_head_query": float(s.mean_tail_mb),
             "mean_confidence_MB_per_head_query": float(s.mean_confidence_mb),
+            "mean_logical_frontier_confidence_MB_per_head_query": float(s.mean_confidence_mb),
             "mean_step_MB_per_head_query": float(s.mean_step_mb),
+            "mean_logical_frontier_step_MB_per_head_query": float(s.mean_step_mb),
+            "mean_physical_gpu_exact_KV_MB_per_head_query": float(s.mean_physical_gpu_exact_kv_mb),
+            "mean_physical_gpu_confidence_MB_per_head_query": float(s.mean_physical_gpu_confidence_mb),
+            "mean_physical_gpu_step_MB_per_head_query": float(s.mean_physical_gpu_step_mb),
             "selector_active_fraction": float(getattr(s, "selector_active_calls", 0)) / max(1, int(s.calls)),
             "tail_active_fraction": float(getattr(s, "tail_active_calls", 0)) / max(1, int(s.calls)),
             "confidence_active_fraction": float(getattr(s, "confidence_active_calls", 0)) / max(1, int(s.calls)),
             "mean_update_MB_per_head_query": float(update_mb / max(1, int(s.calls))),
             "mean_total_MB_per_head_query": float(s.mean_step_mb + update_mb / max(1, int(s.calls))),
+            "mean_logical_frontier_total_MB_per_head_query": float(
+                s.mean_step_mb + update_mb / max(1, int(s.calls))
+            ),
+            "mean_physical_gpu_total_MB_per_head_query": float(
+                s.mean_physical_gpu_step_mb + update_mb / max(1, int(s.calls))
+            ),
             "index_build_calls": int(s.index_build_calls),
             "index_build_seconds": float(s.index_build_seconds),
             "index_build_read_MB": float(s.index_build_read_mb),
@@ -768,10 +788,18 @@ def aggregate_approx_stats(stats: dict[int, ApproxStats]) -> dict[str, float | i
         "mean_selected_tokens": mean_attr("mean_selected"),
         "mean_tail_samples": mean_attr("mean_tail_samples"),
         "mean_selector_MB_per_head_query": mean_attr("mean_selector_mb"),
+        "mean_logical_frontier_selector_MB_per_head_query": mean_attr("mean_selector_mb"),
         "mean_exact_KV_MB_per_head_query": mean_attr("mean_exact_kv_mb"),
+        "mean_logical_frontier_exact_KV_MB_per_head_query": mean_attr("mean_exact_kv_mb"),
         "mean_tail_estimator_MB_per_head_query": mean_attr("mean_tail_mb"),
+        "mean_logical_frontier_tail_estimator_MB_per_head_query": mean_attr("mean_tail_mb"),
         "mean_confidence_MB_per_head_query": mean_attr("mean_confidence_mb"),
+        "mean_logical_frontier_confidence_MB_per_head_query": mean_attr("mean_confidence_mb"),
         "mean_step_MB_per_head_query": mean_attr("mean_step_mb"),
+        "mean_logical_frontier_step_MB_per_head_query": mean_attr("mean_step_mb"),
+        "mean_physical_gpu_exact_KV_MB_per_head_query": mean_attr("mean_physical_gpu_exact_kv_mb"),
+        "mean_physical_gpu_confidence_MB_per_head_query": mean_attr("mean_physical_gpu_confidence_mb"),
+        "mean_physical_gpu_step_MB_per_head_query": mean_attr("mean_physical_gpu_step_mb"),
         "selector_active_fraction": float(
             sum(int(getattr(s, "selector_active_calls", 0)) for s in rows) / max(1, total_calls)
         ),
@@ -785,6 +813,12 @@ def aggregate_approx_stats(stats: dict[int, ApproxStats]) -> dict[str, float | i
         "online_update_MB_per_head_query": float(total_update_mb / max(1, total_calls)),
         "online_update_MB_per_attention_call": float(total_update_mb / max(1, total_approx_calls)),
         "mean_total_MB_per_head_query": float(mean_attr("mean_step_mb") + total_update_mb / max(1, total_calls)),
+        "mean_logical_frontier_total_MB_per_head_query": float(
+            mean_attr("mean_step_mb") + total_update_mb / max(1, total_calls)
+        ),
+        "mean_physical_gpu_total_MB_per_head_query": float(
+            mean_attr("mean_physical_gpu_step_mb") + total_update_mb / max(1, total_calls)
+        ),
         "index_build_calls_total": int(sum(int(s.index_build_calls) for s in rows)),
         "index_build_seconds_total": float(sum(float(s.index_build_seconds) for s in rows)),
         "index_build_read_MB_total": float(sum(float(s.index_build_read_mb) for s in rows)),

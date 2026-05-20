@@ -152,6 +152,11 @@ def parse_args():
     parser.add_argument("--tail_pq_corr_min", type=float, default=-1.0)
     parser.add_argument("--tail_pq_relrmse_max", type=float, default=float("inf"))
     parser.add_argument("--ranked_confidence_cost_mode", choices=["exact", "upper_bound"], default="exact")
+    parser.add_argument(
+        "--exact_logit_backend",
+        choices=["auto", "ranked_gather", "dense_sim"],
+        default=os.environ.get("FRONTIER_EXACT_LOGIT_BACKEND", "auto"),
+    )
     parser.add_argument("--geometric_min_budget", type=int, default=8)
     parser.add_argument("--geometric_max_budget", type=int, default=512)
     parser.add_argument("--geometric_growth", type=float, default=1.5)
