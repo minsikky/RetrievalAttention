@@ -50,6 +50,7 @@ def _test_native_exact_value_counts() -> None:
         gqa_decode_geometric_accept_counts_vpq_proxy,
         gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_thresholds,
         gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds,
+        gqa_decode_ranked_exact_logits_with_base_lse,
         gqa_decode_vpq_selected_from_logits_mass_min,
         gqa_decode_vpq_selected_tail_agg_from_logits_mass_min,
         gqa_decode_vpq_selected_tail_agg_from_logits_mass_min_thresholds,
@@ -1455,6 +1456,7 @@ def _test_dense_decode_ranked_logits_simulator() -> None:
     got_ranked, got_base, got_base_count, got_key_count = _gpu_gqa_dense_decode_ranked_logits_and_base_lse(
         queries=queries,
         keys_all=keys,
+        keys_all_t_float=None,
         ranked_tokens=ranked_tokens,
         group_size=group_size,
         scale=scale,
@@ -1477,6 +1479,50 @@ def _test_dense_decode_ranked_logits_simulator() -> None:
     if not torch.allclose(got_base, ref_base, atol=2e-3, rtol=2e-3):
         max_diff = float((got_base - ref_base).abs().max().item())
         raise AssertionError(f"dense simulator base lse mismatch: max_diff={max_diff}")
+    keys_t_float = keys.float().transpose(1, 2).contiguous()
+    got_ranked_cached, got_base_cached, got_base_count_cached, _ = _gpu_gqa_dense_decode_ranked_logits_and_base_lse(
+        queries=queries,
+        keys_all=keys,
+        keys_all_t_float=keys_t_float,
+        ranked_tokens=ranked_tokens,
+        group_size=group_size,
+        scale=scale,
+        max_rank=ranked,
+        query_context_len=query_context_len,
+        static_prefix=static_prefix,
+        static_suffix=static_suffix,
+        page_size=page_size,
+        need_base_lse=True,
+    )
+    if int(got_base_count_cached) != int(ref_base_count):
+        raise AssertionError("cached dense simulator base_count mismatch")
+    if not torch.allclose(got_ranked_cached, ref_ranked, atol=2e-3, rtol=2e-3):
+        max_diff = float((got_ranked_cached - ref_ranked).abs().max().item())
+        raise AssertionError(f"cached dense simulator ranked logits mismatch: max_diff={max_diff}")
+    if got_base_cached is None or not torch.allclose(got_base_cached, ref_base, atol=2e-3, rtol=2e-3):
+        max_diff = float((got_base_cached - ref_base).abs().max().item()) if got_base_cached is not None else float("inf")
+        raise AssertionError(f"cached dense simulator base lse mismatch: max_diff={max_diff}")
+    from selector_paged_pq import gqa_decode_ranked_exact_logits_with_base_lse  # noqa: PLC0415
+
+    ranked_scores = torch.ones_like(ref_ranked)
+    got_native_ranked, got_native_base = gqa_decode_ranked_exact_logits_with_base_lse(
+        queries,
+        keys,
+        ranked_tokens,
+        ranked_scores,
+        group_size,
+        query_context_len,
+        static_prefix,
+        static_suffix,
+        page_size,
+        scale,
+    )
+    if not torch.allclose(got_native_ranked, ref_ranked, atol=2e-3, rtol=2e-3):
+        max_diff = float((got_native_ranked - ref_ranked).abs().max().item())
+        raise AssertionError(f"native ranked logits + base lse ranked mismatch: max_diff={max_diff}")
+    if not torch.allclose(got_native_base, ref_base, atol=2e-3, rtol=2e-3):
+        max_diff = float((got_native_base - ref_base).abs().max().item())
+        raise AssertionError(f"native ranked logits + base lse base mismatch: max_diff={max_diff}")
 
 
 def main() -> None:
