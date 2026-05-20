@@ -113,6 +113,22 @@ def main() -> None:
         )
         return out
 
+    def native_ranked_exact():
+        if not hasattr(native, "gqa_decode_ranked_exact_logits"):
+            raise RuntimeError("native extension does not expose gqa_decode_ranked_exact_logits")
+        return native.gqa_decode_ranked_exact_logits(
+            queries,
+            keys,
+            ranked_tokens,
+            ranked_scores,
+            int(group_size),
+            int(context),
+            int(args.static_prefix),
+            int(args.static_suffix),
+            int(args.page_size),
+            float(scale),
+        )
+
     def native_ranked_with_base():
         if not hasattr(native, "gqa_decode_ranked_exact_logits_with_base_lse"):
             raise RuntimeError("native extension does not expose gqa_decode_ranked_exact_logits_with_base_lse")
@@ -128,17 +144,26 @@ def main() -> None:
             int(args.page_size),
             float(scale),
         )
-        return out
+        return out, _base_lse
 
     ranked_out, ranked_ms = _time_cuda(ranked_gather, warmup=int(args.warmup), iters=int(args.iters))
     dense_out, dense_ms = _time_cuda(dense_sim, warmup=int(args.warmup), iters=int(args.iters))
     cached_out, cached_dense_ms = _time_cuda(dense_sim_cached, warmup=int(args.warmup), iters=int(args.iters))
     if hasattr(native, "gqa_decode_ranked_exact_logits_with_base_lse"):
-        native_out, native_ms = _time_cuda(native_ranked_with_base, warmup=int(args.warmup), iters=int(args.iters))
-        native_max_diff = float((ranked_out - native_out).abs().max().item())
+        native_ref, native_ref_ms = _time_cuda(native_ranked_exact, warmup=int(args.warmup), iters=int(args.iters))
+        native_result, native_ms = _time_cuda(native_ranked_with_base, warmup=int(args.warmup), iters=int(args.iters))
+        native_out, _native_base_lse = native_result
+        finite = torch.isfinite(native_ref) & torch.isfinite(native_out)
+        if bool(torch.any(finite)):
+            native_max_diff = float((native_ref[finite] - native_out[finite]).abs().max().item())
+        else:
+            native_max_diff = 0.0
+        native_inf_mask_mismatch = int((torch.isfinite(native_ref) != torch.isfinite(native_out)).sum().item())
     else:
+        native_ref_ms = None
         native_ms = None
         native_max_diff = None
+        native_inf_mask_mismatch = None
     max_diff = float((ranked_out - dense_out).abs().max().item())
     cached_max_diff = float((ranked_out - cached_out).abs().max().item())
     payload = {
@@ -151,6 +176,7 @@ def main() -> None:
         "ranked_gather_ms": ranked_ms,
         "dense_sim_ms": dense_ms,
         "dense_sim_cached_ms": cached_dense_ms,
+        "native_ranked_exact_ms": native_ref_ms,
         "native_ranked_with_base_ms": native_ms,
         "speedup_dense_vs_ranked": float(ranked_ms / dense_ms) if dense_ms > 0.0 else float("inf"),
         "speedup_dense_cached_vs_ranked": float(ranked_ms / cached_dense_ms) if cached_dense_ms > 0.0 else float("inf"),
@@ -161,6 +187,7 @@ def main() -> None:
         "max_abs_diff": max_diff,
         "cached_max_abs_diff": cached_max_diff,
         "native_max_abs_diff": native_max_diff,
+        "native_inf_mask_mismatch": native_inf_mask_mismatch,
     }
     text = json.dumps(payload, indent=2, sort_keys=True)
     print(text)
