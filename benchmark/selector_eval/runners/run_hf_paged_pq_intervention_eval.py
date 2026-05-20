@@ -1215,6 +1215,7 @@ def _gpu_gqa_dense_decode_ranked_logits_and_base_lse(
     *,
     queries: torch.Tensor,
     keys_all: torch.Tensor,
+    keys_all_t_float: torch.Tensor | None,
     ranked_tokens: torch.Tensor,
     group_size: int,
     scale: float,
@@ -1276,9 +1277,13 @@ def _gpu_gqa_dense_decode_ranked_logits_and_base_lse(
     if aligned_heads > 0:
         aligned_kv_heads = aligned_heads // group
         q_grouped = queries[:aligned_heads, :].reshape(aligned_kv_heads, group, dim).float()
+        if keys_all_t_float is not None:
+            key_t_grouped = keys_all_t_float[:aligned_kv_heads, :, :key_count]
+        else:
+            key_t_grouped = keys_all[:aligned_kv_heads, :key_count, :].float().transpose(1, 2).contiguous()
         dense_grouped = torch.bmm(
             q_grouped,
-            keys_all[:aligned_kv_heads, :key_count, :].float().transpose(1, 2).contiguous(),
+            key_t_grouped,
         ) * float(scale)
         dense_logits = dense_grouped.reshape(aligned_heads, key_count)
         toks = ranked_tokens[:aligned_heads, :rank].to(torch.long).clamp(min=0, max=max(0, key_count - 1))
@@ -1299,7 +1304,11 @@ def _gpu_gqa_dense_decode_ranked_logits_and_base_lse(
             continue
         q = queries[head_start:head_end, :].float()
         # Dense GEMM is usually much faster on GPU than irregular ranked-K gathers.
-        dense_logits = torch.matmul(q, keys_all[int(kv_head), :key_count, :].float().t()) * float(scale)
+        if keys_all_t_float is not None:
+            key_t = keys_all_t_float[int(kv_head), :, :key_count]
+        else:
+            key_t = keys_all[int(kv_head), :key_count, :].float().t()
+        dense_logits = torch.matmul(q, key_t) * float(scale)
         toks = ranked_tokens[head_start:head_end, :rank].to(torch.long).clamp(min=0, max=max(0, key_count - 1))
         out[head_start:head_end, :rank] = torch.gather(dense_logits, 1, toks)
         if base_out is not None:
@@ -1718,6 +1727,72 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
         tuple[str, int, int, int, float, float],
         tuple[list[int], list[int], list[int], torch.Tensor, torch.Tensor],
     ] = {}
+    dense_decode_key_t_cache: dict[int, dict[str, object]] = {}
+    try:
+        dense_decode_key_t_cache_max_bytes = int(
+            max(0.0, float(os.environ.get("FRONTIER_DENSE_KEY_T_CACHE_MAX_GB", "12.0")))
+            * 1024.0
+            * 1024.0
+            * 1024.0
+        )
+    except ValueError:
+        dense_decode_key_t_cache_max_bytes = 12 * 1024 * 1024 * 1024
+    dense_decode_key_t_cache_enabled = _env_truthy("FRONTIER_DENSE_KEY_T_CACHE", "1")
+
+    def dense_decode_key_t_float_cache(
+        *,
+        layer_id: int,
+        keys_all: torch.Tensor,
+        key_count: int,
+    ) -> torch.Tensor | None:
+        if (
+            not dense_decode_key_t_cache_enabled
+            or dense_decode_key_t_cache_max_bytes <= 0
+            or keys_all.device.type != "cuda"
+        ):
+            return None
+        kv_heads = int(keys_all.shape[0])
+        capacity = int(keys_all.shape[1])
+        dim = int(keys_all.shape[2])
+        key_count_i = min(max(0, int(key_count)), capacity)
+        if kv_heads <= 0 or capacity <= 0 or dim <= 0 or key_count_i <= 0:
+            return None
+        # This cache is a GPU-simulator optimization only. Keep a conservative
+        # cap so long-context task runs do not OOM by caching every layer's
+        # float-transposed K unless the user explicitly raises the limit.
+        all_layers_bytes = int(max(1, len(layer_ids))) * kv_heads * capacity * dim * 4
+        if all_layers_bytes > dense_decode_key_t_cache_max_bytes:
+            return None
+        entry = dense_decode_key_t_cache.get(int(layer_id))
+        data_ptr = int(keys_all.data_ptr())
+        shape = (kv_heads, capacity, dim)
+        if (
+            entry is None
+            or int(entry.get("data_ptr", -1)) != data_ptr
+            or tuple(entry.get("shape", ())) != shape
+            or str(entry.get("device", "")) != str(keys_all.device)
+        ):
+            entry = {
+                "data_ptr": data_ptr,
+                "shape": shape,
+                "device": str(keys_all.device),
+                "filled": 0,
+                "tensor": torch.empty((kv_heads, dim, capacity), dtype=torch.float32, device=keys_all.device),
+            }
+            dense_decode_key_t_cache[int(layer_id)] = entry
+        filled = int(entry.get("filled", 0))
+        if key_count_i < filled:
+            filled = 0
+        if key_count_i > filled:
+            cached = entry["tensor"]
+            assert isinstance(cached, torch.Tensor)
+            cached[:, :, filled:key_count_i].copy_(
+                keys_all[:, filled:key_count_i, :].float().transpose(1, 2).contiguous()
+            )
+            entry["filled"] = key_count_i
+        cached = entry["tensor"]
+        assert isinstance(cached, torch.Tensor)
+        return cached
 
     def decode_base_tokens_tensor(query_context_len: int, sealed_end: int, indexed_end: int) -> torch.Tensor:
         nonlocal last_decode_base_key, last_decode_base_tensor
@@ -6276,6 +6351,11 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                         ) = _gpu_gqa_dense_decode_ranked_logits_and_base_lse(
                                             queries=queries2,
                                             keys_all=keys_all,
+                                            keys_all_t_float=dense_decode_key_t_float_cache(
+                                                layer_id=int(layer_id),
+                                                keys_all=keys_all,
+                                                key_count=int(query_context_len),
+                                            ),
                                             ranked_tokens=ranked_t_prefix,
                                             group_size=int(group_size),
                                             scale=float(self.head_dim) ** -0.5,
