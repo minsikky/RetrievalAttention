@@ -1714,6 +1714,10 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
     last_decode_base_key: tuple[int, int, int, int, int] | None = None
     last_decode_base_tensor: torch.Tensor | None = None
     last_decode_rank_ids_tensors: dict[tuple[str, int, int], torch.Tensor] = {}
+    geometric_budget_column_tensors: dict[
+        tuple[str, int, int, int, float, float],
+        tuple[list[int], list[int], list[int], torch.Tensor, torch.Tensor],
+    ] = {}
 
     def decode_base_tokens_tensor(query_context_len: int, sealed_end: int, indexed_end: int) -> torch.Tensor:
         nonlocal last_decode_base_key, last_decode_base_tensor
@@ -1751,6 +1755,49 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
         ).reshape(*shape)
         last_decode_rank_ids_tensors[cache_key] = tensor
         return tensor
+
+    def geometric_threshold_budget_columns(
+        *,
+        min_budget: int,
+        max_budget: int,
+        granularity: int,
+        growth: float,
+        probe_scale: float,
+        tensor_device: torch.device,
+    ) -> tuple[list[int], list[int], list[int], torch.Tensor, torch.Tensor]:
+        cache_key = (
+            str(tensor_device),
+            int(min_budget),
+            int(max_budget),
+            int(granularity),
+            float(growth),
+            float(probe_scale),
+        )
+        cached = geometric_budget_column_tensors.get(cache_key)
+        if cached is not None:
+            return cached
+        tail_budgets, probe_budgets = geometric_budget_pairs(
+            min_budget=int(min_budget),
+            max_budget=int(max_budget),
+            granularity=int(granularity),
+            growth=float(growth),
+            probe_scale=float(probe_scale),
+        )
+        combined_budgets = sorted({int(v) for v in tail_budgets} | {int(v) for v in probe_budgets})
+        budget_to_col = {int(budget): int(idx) for idx, budget in enumerate(combined_budgets)}
+        approx_cols = torch.tensor(
+            [budget_to_col[int(v)] for v in tail_budgets],
+            dtype=torch.long,
+            device=tensor_device,
+        )
+        probe_cols = torch.tensor(
+            [budget_to_col[int(v)] for v in probe_budgets],
+            dtype=torch.long,
+            device=tensor_device,
+        )
+        cached = (tail_budgets, probe_budgets, combined_budgets, approx_cols, probe_cols)
+        geometric_budget_column_tensors[cache_key] = cached
+        return cached
 
     def decode_base_token_count(query_context_len: int, sealed_end: int) -> int:
         prefix_end = min(max(0, int(args.static_prefix)), int(query_context_len))
@@ -6484,15 +6531,19 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                         if bool(getattr(args, "profile_native_ops", False)):
                                             _sync_if_cuda(device)
                                             native_threshold_t0 = time.perf_counter()
-                                        tail_budgets, probe_budgets = geometric_budget_pairs(
+                                        (
+                                            tail_budgets,
+                                            probe_budgets,
+                                            combined_threshold_budgets,
+                                            approx_cols,
+                                            probe_cols,
+                                        ) = geometric_threshold_budget_columns(
                                             min_budget=int(k),
                                             max_budget=int(max_budget),
                                             granularity=int(granularity),
                                             growth=float(growth),
                                             probe_scale=float(probe_scale),
-                                        )
-                                        combined_threshold_budgets = sorted(
-                                            {int(v) for v in tail_budgets} | {int(v) for v in probe_budgets}
+                                            tensor_device=device,
                                         )
                                         combined_thresholds, combined_threshold_sels = selected_mass_thresholds_from_logits_gpu(
                                             ranked_logits=exact_ranked_logits_for_conf[:, :max_budget].contiguous(),
@@ -6501,19 +6552,6 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                             budgets=combined_threshold_budgets,
                                             exact_mass=float(args.selected_value_exact_mass),
                                             min_top=int(args.selected_value_min_exact_top),
-                                        )
-                                        combined_budget_to_col = {
-                                            int(budget): int(idx) for idx, budget in enumerate(combined_threshold_budgets)
-                                        }
-                                        approx_cols = torch.tensor(
-                                            [combined_budget_to_col[int(v)] for v in tail_budgets],
-                                            dtype=torch.long,
-                                            device=device,
-                                        )
-                                        probe_cols = torch.tensor(
-                                            [combined_budget_to_col[int(v)] for v in probe_budgets],
-                                            dtype=torch.long,
-                                            device=device,
                                         )
                                         approx_thresholds = combined_thresholds.index_select(1, approx_cols).contiguous()
                                         approx_threshold_sels = combined_threshold_sels.index_select(1, approx_cols).contiguous()
