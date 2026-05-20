@@ -6144,6 +6144,8 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                 max_budget = max(0, min(rank_count, int(args.geometric_max_budget)))
                                 if max_budget <= 0:
                                     max_budget = rank_count
+                                ranked_t_prefix = ranked_t[:, :max_budget].contiguous()
+                                ranked_scores_prefix = ranked_scores[:, :max_budget].contiguous()
                                 granularity = max(1, int(args.geometric_budget_granularity))
                                 growth = max(1.01, float(args.geometric_growth))
                                 probe_scale = max(1.01, float(args.geometric_probe_scale))
@@ -6227,7 +6229,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                         ) = _gpu_gqa_dense_decode_ranked_logits_and_base_lse(
                                             queries=queries2,
                                             keys_all=keys_all,
-                                            ranked_tokens=ranked_t[:, :max_budget].contiguous(),
+                                            ranked_tokens=ranked_t_prefix,
                                             group_size=int(group_size),
                                             scale=float(self.head_dim) ** -0.5,
                                             max_rank=int(max_budget),
@@ -6244,8 +6246,8 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                         exact_ranked_logits_for_conf = native.gqa_decode_ranked_exact_logits(
                                             queries2,
                                             keys_all,
-                                            ranked_t[:, :max_budget].contiguous(),
-                                            ranked_scores[:, :max_budget].contiguous(),
+                                            ranked_t_prefix,
+                                            ranked_scores_prefix,
                                             int(group_size),
                                             int(query_context_len),
                                             int(args.static_prefix),
@@ -6310,7 +6312,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                                     value_codebooks,
                                                     value_codes,
                                                     page_starts,
-                                                    ranked_t[:, :max_budget].contiguous(),
+                                                    ranked_t_prefix,
                                                     masked_prefix,
                                                     exact_ranked_logits_for_conf[:, :max_budget].contiguous(),
                                                     selected_mass_output_thresholds.contiguous(),
@@ -6338,7 +6340,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                                     value_codebooks,
                                                     value_codes,
                                                     page_starts,
-                                                    ranked_t[:, :max_budget].contiguous(),
+                                                    ranked_t_prefix,
                                                     masked_prefix,
                                                     exact_ranked_logits_for_conf[:, :max_budget].contiguous(),
                                                     float(args.selected_value_exact_mass),
@@ -6364,7 +6366,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                                 value_codebooks,
                                                 value_codes,
                                                 page_starts,
-                                                ranked_t[:, :max_budget].contiguous(),
+                                                ranked_t_prefix,
                                                 masked_prefix,
                                                 float(args.selected_value_exact_mass),
                                             )
@@ -6399,7 +6401,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                             value_codebooks,
                                             value_codes,
                                             page_starts,
-                                            ranked_t[:, :max_budget].contiguous(),
+                                            ranked_t_prefix,
                                             masked_prefix,
                                             exact_value_counts,
                                             int(group_size),
@@ -6494,7 +6496,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                         )
                                         combined_thresholds, combined_threshold_sels = selected_mass_thresholds_from_logits_gpu(
                                             ranked_logits=exact_ranked_logits_for_conf[:, :max_budget].contiguous(),
-                                            ranked_scores=ranked_scores[:, :max_budget].contiguous(),
+                                            ranked_scores=ranked_scores_prefix,
                                             base_logsumexp=base_lse_for_conf,
                                             budgets=combined_threshold_budgets,
                                             exact_mass=float(args.selected_value_exact_mass),
@@ -6546,8 +6548,8 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                                 value_codebooks,
                                                 value_codes,
                                                 page_starts,
-                                                ranked_t[:, :max_budget].contiguous(),
-                                                ranked_scores[:, :max_budget].contiguous(),
+                                                ranked_t_prefix,
+                                                ranked_scores_prefix,
                                                 exact_ranked_logits_for_conf[:, :max_budget].contiguous(),
                                                 approx_thresholds,
                                                 approx_threshold_sels,
@@ -6589,8 +6591,8 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                                     value_codebooks,
                                                     value_codes,
                                                     page_starts,
-                                                    ranked_t[:, :max_budget].contiguous(),
-                                                    ranked_scores[:, :max_budget].contiguous(),
+                                                    ranked_t_prefix,
+                                                    ranked_scores_prefix,
                                                     exact_ranked_logits_for_conf[:, :max_budget].contiguous(),
                                                     approx_thresholds,
                                                     approx_threshold_sels,
@@ -6644,8 +6646,8 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                                 value_codebooks,
                                                 value_codes,
                                                 page_starts,
-                                                ranked_t[:, :max_budget].contiguous(),
-                                                ranked_scores[:, :max_budget].contiguous(),
+                                                ranked_t_prefix,
+                                                ranked_scores_prefix,
                                                 exact_ranked_logits_for_conf[:, :max_budget].contiguous(),
                                                 int(group_size),
                                                 int(query_context_len),
