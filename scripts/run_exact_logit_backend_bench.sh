@@ -17,10 +17,19 @@ mkdir -p "${OUTPUT_DIR}"
 
 module purge
 module load python/3.10.4
+module load cuda/12.8.1
 source .venv/bin/activate
 
 export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.10/site-packages/torch/lib:/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
+export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0;8.6;9.0}"
 export PYTHONPATH="$PWD/benchmark/selector_eval/cuda_ext:${PYTHONPATH:-}"
+export MAX_JOBS="${MAX_JOBS:-4}"
+
+if [[ "${BUILD_CUDA_EXT:-1}" == "1" ]]; then
+  cd benchmark/selector_eval/cuda_ext
+  python setup.py build_ext --inplace
+  cd ../../..
+fi
 
 CONTEXT="${CONTEXT:-32768}"
 RANK="${RANK:-32768}"
