@@ -6,6 +6,20 @@
 - Target model for iteration: `meta-llama/Llama-3.1-8B-Instruct`.
 - Primary benchmark flow now: `test.sh` first, then RULER subset/full.
 
+## 2026-05-20 update (frontier GPU simulator optimization)
+- Current target: make the canonical GPU-hosted frontier simulator fast enough for RULER/LongBench-style decode benchmarks while preserving CPU-frontier algorithm semantics.
+- Latest source changes:
+  - logical frontier MB accounting is separated from physical GPU simulator MB
+  - dense exact-logit simulation can cache float-transposed K incrementally with `FRONTIER_DENSE_KEY_T_CACHE`
+  - native extension now exposes ranked exact logits plus base-window logsumexp in one call for the long-context ranked-gather path
+  - native timing summaries include exact-logit, threshold, geometric-confidence, and output slices when `PROFILE_NATIVE_OPS=1`
+- Pending validation once Slurm recovers:
+  - build/run `scripts/run_frontier_cuda_unit_tests.sh`
+  - run `scripts/run_exact_logit_backend_bench.sh` at 32k/64k/128k to choose dense-sim vs ranked-gather cutoff
+  - run a profiled RULER smoke with `PROFILE_NATIVE_OPS=1`
+  - run a small LongBench-v2 smoke with `PROFILE_NATIVE_OPS=1`
+- Cluster status at `2026-05-20 02:44 EDT`: `scontrol ping` reports `Slurmctld(primary) at glctld is DOWN`, so no GPU Slurm validation has been submitted yet.
+
 ## 2026-04-27 update (Qwen3.5 LongBench v2 reproduction attempt)
 - Public target checked from the Qwen3.5-9B model card:
   - `LongBench v2=55.2`
