@@ -477,6 +477,43 @@ torch::Tensor gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_
     bool calibrate_proxy,
     bool probe_includes_tail);
 
+std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds_cuda(
+    torch::Tensor queries,
+    torch::Tensor keys,
+    torch::Tensor values,
+    torch::Tensor dense_pq_scores,
+    torch::Tensor value_codebooks,
+    torch::Tensor value_codes,
+    torch::Tensor page_starts,
+    torch::Tensor ranked_tokens,
+    torch::Tensor ranked_scores,
+    torch::Tensor ranked_logits,
+    torch::Tensor approx_exact_thresholds,
+    torch::Tensor approx_exact_threshold_sels,
+    torch::Tensor probe_exact_thresholds,
+    torch::Tensor probe_exact_threshold_sels,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    int64_t page_size,
+    int64_t min_budget,
+    int64_t max_budget,
+    int64_t granularity,
+    double growth,
+    double probe_scale,
+    double rel_l2_max,
+    double exact_value_mass,
+    int64_t exact_value_min_top,
+    double scale,
+    double proxy_mass_min,
+    double proxy_tail_mass_max,
+    double pq_corr_min,
+    double pq_relrmse_max,
+    bool calibrate_proxy,
+    bool probe_includes_tail,
+    double tail_blend);
+
 torch::Tensor gqa_causal_geometric_accept_counts_cuda(
     torch::Tensor queries,
     torch::Tensor keys,
@@ -3194,6 +3231,121 @@ torch::Tensor gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_
       probe_includes_tail);
 }
 
+std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds(
+    torch::Tensor queries,
+    torch::Tensor keys,
+    torch::Tensor values,
+    torch::Tensor dense_pq_scores,
+    torch::Tensor value_codebooks,
+    torch::Tensor value_codes,
+    torch::Tensor page_starts,
+    torch::Tensor ranked_tokens,
+    torch::Tensor ranked_scores,
+    torch::Tensor ranked_logits,
+    torch::Tensor approx_exact_thresholds,
+    torch::Tensor approx_exact_threshold_sels,
+    torch::Tensor probe_exact_thresholds,
+    torch::Tensor probe_exact_threshold_sels,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    int64_t page_size,
+    int64_t min_budget,
+    int64_t max_budget,
+    int64_t granularity,
+    double growth,
+    double probe_scale,
+    double rel_l2_max,
+    double exact_value_mass,
+    int64_t exact_value_min_top,
+    double scale,
+    double proxy_mass_min,
+    double proxy_tail_mass_max,
+    double pq_corr_min,
+    double pq_relrmse_max,
+    bool calibrate_proxy,
+    bool probe_includes_tail,
+    double tail_blend) {
+  TORCH_CHECK(queries.is_cuda(), "queries must be CUDA");
+  TORCH_CHECK(keys.is_cuda(), "keys must be CUDA");
+  TORCH_CHECK(values.is_cuda(), "values must be CUDA");
+  TORCH_CHECK(dense_pq_scores.is_cuda(), "dense_pq_scores must be CUDA");
+  TORCH_CHECK(value_codebooks.is_cuda(), "value_codebooks must be CUDA");
+  TORCH_CHECK(value_codes.is_cuda(), "value_codes must be CUDA");
+  TORCH_CHECK(page_starts.is_cuda(), "page_starts must be CUDA");
+  TORCH_CHECK(ranked_tokens.is_cuda(), "ranked_tokens must be CUDA");
+  TORCH_CHECK(ranked_scores.is_cuda(), "ranked_scores must be CUDA");
+  TORCH_CHECK(ranked_logits.is_cuda(), "ranked_logits must be CUDA");
+  TORCH_CHECK(approx_exact_thresholds.is_cuda(), "approx_exact_thresholds must be CUDA");
+  TORCH_CHECK(approx_exact_threshold_sels.is_cuda(), "approx_exact_threshold_sels must be CUDA");
+  TORCH_CHECK(probe_exact_thresholds.is_cuda(), "probe_exact_thresholds must be CUDA");
+  TORCH_CHECK(probe_exact_threshold_sels.is_cuda(), "probe_exact_threshold_sels must be CUDA");
+  TORCH_CHECK(queries.scalar_type() == torch::kFloat32, "queries must be float32");
+  TORCH_CHECK(is_float_like(keys), "keys must be float-like");
+  TORCH_CHECK(is_float_like(values), "values must be float-like");
+  TORCH_CHECK(dense_pq_scores.scalar_type() == torch::kFloat32, "dense_pq_scores must be float32");
+  TORCH_CHECK(value_codebooks.scalar_type() == torch::kFloat32, "value_codebooks must be float32");
+  TORCH_CHECK(
+      value_codes.scalar_type() == torch::kLong || value_codes.scalar_type() == torch::kUInt8,
+      "value_codes must be int64 or uint8");
+  TORCH_CHECK(page_starts.scalar_type() == torch::kLong, "page_starts must be int64");
+  TORCH_CHECK(ranked_tokens.scalar_type() == torch::kLong, "ranked_tokens must be int64");
+  TORCH_CHECK(ranked_scores.scalar_type() == torch::kFloat32, "ranked_scores must be float32");
+  TORCH_CHECK(ranked_logits.scalar_type() == torch::kFloat32, "ranked_logits must be float32");
+  TORCH_CHECK(approx_exact_thresholds.scalar_type() == torch::kFloat32, "approx thresholds must be float32");
+  TORCH_CHECK(probe_exact_thresholds.scalar_type() == torch::kFloat32, "probe thresholds must be float32");
+  TORCH_CHECK(approx_exact_threshold_sels.scalar_type() == torch::kLong, "approx threshold sels must be int64");
+  TORCH_CHECK(probe_exact_threshold_sels.scalar_type() == torch::kLong, "probe threshold sels must be int64");
+  TORCH_CHECK(ranked_tokens.dim() == 2, "ranked_tokens shape must be [heads, selected]");
+  TORCH_CHECK(ranked_scores.sizes() == ranked_tokens.sizes(), "ranked scores/tokens shape mismatch");
+  TORCH_CHECK(ranked_logits.sizes() == ranked_tokens.sizes(), "ranked logits/tokens shape mismatch");
+  TORCH_CHECK(approx_exact_thresholds.dim() == 2, "approx thresholds shape must be [heads, steps]");
+  TORCH_CHECK(approx_exact_threshold_sels.sizes() == approx_exact_thresholds.sizes(), "approx threshold shape mismatch");
+  TORCH_CHECK(probe_exact_thresholds.sizes() == approx_exact_thresholds.sizes(), "probe threshold shape mismatch");
+  TORCH_CHECK(probe_exact_threshold_sels.sizes() == approx_exact_thresholds.sizes(), "probe threshold sel shape mismatch");
+  TORCH_CHECK(approx_exact_thresholds.size(0) == queries.size(0), "threshold head count mismatch");
+  TORCH_CHECK(group_size > 0, "group_size must be positive");
+  TORCH_CHECK(page_size > 0, "page_size must be positive");
+  TORCH_CHECK(granularity > 0, "granularity must be positive");
+  return gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds_cuda(
+      queries.contiguous(),
+      keys,
+      values,
+      dense_pq_scores.contiguous(),
+      value_codebooks.contiguous(),
+      value_codes.contiguous(),
+      page_starts.contiguous(),
+      ranked_tokens.contiguous(),
+      ranked_scores.contiguous(),
+      ranked_logits.contiguous(),
+      approx_exact_thresholds.contiguous(),
+      approx_exact_threshold_sels.contiguous(),
+      probe_exact_thresholds.contiguous(),
+      probe_exact_threshold_sels.contiguous(),
+      group_size,
+      query_context_len,
+      static_prefix,
+      static_suffix,
+      page_size,
+      min_budget,
+      max_budget,
+      granularity,
+      growth,
+      probe_scale,
+      rel_l2_max,
+      exact_value_mass,
+      exact_value_min_top,
+      scale,
+      proxy_mass_min,
+      proxy_tail_mass_max,
+      pq_corr_min,
+      pq_relrmse_max,
+      calibrate_proxy,
+      probe_includes_tail,
+      tail_blend);
+}
+
 torch::Tensor gqa_causal_geometric_accept_counts(
     torch::Tensor queries,
     torch::Tensor keys,
@@ -3553,6 +3705,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	      "gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_thresholds",
 	      &gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_thresholds,
 	      "Decode geometric confidence counts with selected-mass V-PQ exactness, proxy gating, precomputed exact logits, and per-budget thresholds (CUDA)");
+	  m.def(
+	      "gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds",
+	      &gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds,
+	      "Decode geometric confidence and final selected/tail output with selected-mass V-PQ exactness, proxy gating, precomputed exact logits, and per-budget thresholds (CUDA)");
 	  m.def(
 	      "gqa_causal_geometric_accept_counts",
 	      &gqa_causal_geometric_accept_counts,

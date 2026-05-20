@@ -30,6 +30,7 @@ _EXPORTED_NAMES = [
     "gqa_decode_geometric_accept_counts_vpq_mass_min_proxy",
     "gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits",
     "gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_thresholds",
+    "gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds",
     "gqa_decode_fullscan_vpq_selected_tail_agg",
     "gqa_decode_fullscan_vpq_selected_tail_agg_mass_min",
     "gqa_decode_scoreless_fullscan_vpq_tail",

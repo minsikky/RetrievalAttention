@@ -15,7 +15,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import build_page_pq_gpu  # noqa: E402
 from benchmark.selector_eval.runners.run_hf_paged_pq_intervention_eval import (  # noqa: E402
     _gpu_gqa_base_logsumexp_decode,
+    geometric_budget_pairs,
     reconstruct_all_vpq_values_gpu,
+    select_thresholds_for_budget_counts_gpu,
     selected_mass_thresholds_from_logits_gpu,
     vpq_values_for_tokens_gpu,
 )
@@ -44,6 +46,8 @@ def _test_native_exact_value_counts() -> None:
         gqa_decode_geometric_accept_counts_vpq,
         gqa_decode_geometric_accept_counts_vpq_tail_stability,
         gqa_decode_geometric_accept_counts_vpq_proxy,
+        gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_thresholds,
+        gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds,
         gqa_decode_vpq_selected_from_logits_mass_min,
         gqa_decode_vpq_selected_tail_agg_from_logits_mass_min,
         gqa_decode_vpq_selected_tail_agg_from_logits_mass_min_thresholds,
@@ -634,6 +638,142 @@ def _test_native_exact_value_counts() -> None:
     if not torch.allclose(ref_decode_tail_mass, got_decode_tail_from_thresholds, atol=2e-3, rtol=2e-3):
         raise AssertionError("decode from-logits threshold path mismatches mass+min path")
 
+    geo_tail_budgets, geo_probe_budgets = geometric_budget_pairs(
+        min_budget=1,
+        max_budget=ranked,
+        granularity=1,
+        growth=1.5,
+        probe_scale=1.5,
+    )
+    geo_approx_thresholds, geo_approx_threshold_sels = selected_mass_thresholds_from_logits_gpu(
+        ranked_logits=ranked_logits_decode_dynamic,
+        ranked_scores=ranked_scores_decode,
+        base_logsumexp=base_lse_decode,
+        budgets=geo_tail_budgets,
+        exact_mass=threshold_mass,
+        min_top=1,
+    )
+    geo_probe_thresholds, geo_probe_threshold_sels = selected_mass_thresholds_from_logits_gpu(
+        ranked_logits=ranked_logits_decode_dynamic,
+        ranked_scores=ranked_scores_decode,
+        base_logsumexp=base_lse_decode,
+        budgets=geo_probe_budgets,
+        exact_mass=threshold_mass,
+        min_top=1,
+    )
+    fused_counts, fused_output = gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds(
+        q_decode,
+        keys,
+        values,
+        dense_decode,
+        value_codebooks,
+        value_codes,
+        page_starts,
+        ranked_decode,
+        ranked_scores_decode,
+        ranked_logits_decode,
+        geo_approx_thresholds,
+        geo_approx_threshold_sels,
+        geo_probe_thresholds,
+        geo_probe_threshold_sels,
+        2,
+        query_context_len,
+        static_prefix,
+        static_suffix,
+        page_size,
+        1,
+        ranked,
+        1,
+        1.5,
+        1.5,
+        0.35,
+        threshold_mass,
+        1,
+        scale,
+        0.0,
+        1.0,
+        -1.0,
+        float("inf"),
+        True,
+        False,
+        1.0,
+    )
+    ref_fused_counts = gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_thresholds(
+        q_decode,
+        keys,
+        values,
+        dense_decode,
+        value_codebooks,
+        value_codes,
+        page_starts,
+        ranked_decode,
+        ranked_scores_decode,
+        ranked_logits_decode,
+        geo_approx_thresholds,
+        geo_approx_threshold_sels,
+        geo_probe_thresholds,
+        geo_probe_threshold_sels,
+        2,
+        query_context_len,
+        static_prefix,
+        static_suffix,
+        page_size,
+        1,
+        ranked,
+        1,
+        1.5,
+        1.5,
+        0.35,
+        threshold_mass,
+        1,
+        scale,
+        0.0,
+        1.0,
+        -1.0,
+        float("inf"),
+        True,
+        False,
+    )
+    if fused_counts.detach().cpu().tolist() != ref_fused_counts.detach().cpu().tolist():
+        raise AssertionError(
+            f"fused geometric output counts mismatch: got={fused_counts.detach().cpu().tolist()} "
+            f"expected={ref_fused_counts.detach().cpu().tolist()}"
+        )
+    fused_thresholds, fused_threshold_sels = select_thresholds_for_budget_counts_gpu(
+        thresholds=geo_probe_thresholds,
+        threshold_sels=geo_probe_threshold_sels,
+        budgets=geo_probe_budgets,
+        counts=fused_counts,
+    )
+    rank_ids = torch.arange(ranked, dtype=torch.long, device=device).reshape(1, ranked)
+    fused_rank_mask = rank_ids >= fused_counts.unsqueeze(-1)
+    ref_fused_output = gqa_decode_vpq_selected_tail_agg_from_logits_mass_min_thresholds(
+        q_decode,
+        keys,
+        values,
+        dense_decode,
+        value_codebooks,
+        value_codes,
+        page_starts,
+        ranked_decode,
+        ranked_scores_decode.masked_fill(fused_rank_mask, float("-inf")).contiguous(),
+        ranked_logits_decode,
+        fused_thresholds,
+        fused_threshold_sels,
+        threshold_mass,
+        1,
+        2,
+        query_context_len,
+        static_prefix,
+        static_suffix,
+        page_size,
+        scale,
+        1.0,
+    )
+    if not torch.allclose(ref_fused_output, fused_output, atol=3e-3, rtol=3e-3):
+        max_diff = float(torch.max(torch.abs(ref_fused_output - fused_output)).detach().cpu().item())
+        raise AssertionError(f"fused geometric output mismatch: max_diff={max_diff}")
+
     keys_pad = torch.empty((kv_heads, total_tokens, dim + 1), device=device, dtype=keys.dtype)
     values_pad = torch.empty((kv_heads, total_tokens, dim + 1), device=device, dtype=values.dtype)
     keys_strided = keys_pad[..., :dim]
@@ -691,8 +831,6 @@ def _test_native_exact_value_counts() -> None:
         if granularity <= 1:
             return min(value, max_budget)
         return min(((value + granularity - 1) // granularity) * granularity, max_budget)
-
-    rank_ids = torch.arange(ranked, dtype=torch.long, device=device).reshape(1, ranked)
 
     def mask_scores(keep: int) -> torch.Tensor:
         keep_i = max(0, min(ranked, int(keep)))

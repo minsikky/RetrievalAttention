@@ -5671,6 +5671,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                             accepted_budget_counts: torch.Tensor | None = None
                             selected_mass_exact_value_counts_for_cost: torch.Tensor | None = None
                             selected_mass_cost_upper_bound = False
+                            final_k_logits_reused_for_cost = False
                             exact_ranked_logits_for_conf: torch.Tensor | None = None
                             base_lse_for_conf: torch.Tensor | None = None
                             if proxy_confidence_decode or ranked_confidence_decode:
@@ -6193,6 +6194,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                         float(blend),
                                     )
                                 outputs_native = None
+                                fused_geometric_output = False
                                 native_vpq_geometric_exact_top: int | None = None
                                 if (
                                     str(args.selected_value_mode) == "vpq_value"
@@ -6243,8 +6245,22 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                             exact_mass=float(args.selected_value_exact_mass),
                                             min_top=int(args.selected_value_min_exact_top),
                                         )
-                                        accepted_budget_counts = (
-                                            native.gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_thresholds(
+                                        # This fused final-output path is parity-tested, but the first
+                                        # implementation is slower than the existing canonical path on
+                                        # 32k decode. Keep it available for targeted optimization without
+                                        # making benchmark runs pay the regression by default.
+                                        output_from_logits_fn = (
+                                            getattr(
+                                                native,
+                                                "gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds",
+                                                None,
+                                            )
+                                            if _env_truthy("ENABLE_FUSED_GEOMETRIC_OUTPUT")
+                                            and not _env_truthy("DISABLE_FUSED_GEOMETRIC_OUTPUT")
+                                            else None
+                                        )
+                                        if output_from_logits_fn is not None:
+                                            accepted_budget_counts, outputs_native = output_from_logits_fn(
                                                 queries2,
                                                 keys_all,
                                                 values_all,
@@ -6279,9 +6295,53 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                                 float(args.tail_pq_relrmse_max),
                                                 str(args.tail_score_calibration) == "affine_selected",
                                                 bool(tail_stability_confidence_decode),
-                                            ).contiguous()
-                                        )
-                                        if probe_budgets:
+                                                float(tail_blend_value),
+                                            )
+                                            accepted_budget_counts = accepted_budget_counts.contiguous()
+                                            outputs_native = outputs_native.contiguous()
+                                            fused_geometric_output = True
+                                            final_k_logits_reused_for_cost = True
+                                        else:
+                                            accepted_budget_counts = (
+                                                native.gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_thresholds(
+                                                    queries2,
+                                                    keys_all,
+                                                    values_all,
+                                                    dense_pq_scores.contiguous(),
+                                                    value_codebooks,
+                                                    value_codes,
+                                                    page_starts,
+                                                    ranked_t[:, :max_budget].contiguous(),
+                                                    ranked_scores[:, :max_budget].contiguous(),
+                                                    exact_ranked_logits_for_conf[:, :max_budget].contiguous(),
+                                                    approx_thresholds,
+                                                    approx_threshold_sels,
+                                                    probe_thresholds,
+                                                    probe_threshold_sels,
+                                                    int(group_size),
+                                                    int(query_context_len),
+                                                    int(args.static_prefix),
+                                                    int(args.static_suffix),
+                                                    int(args.page_size),
+                                                    int(k),
+                                                    int(max_budget),
+                                                    int(granularity),
+                                                    float(growth),
+                                                    float(probe_scale),
+                                                    float(args.tail_probe_rel_l2_max),
+                                                    float(args.selected_value_exact_mass),
+                                                    int(args.selected_value_min_exact_top),
+                                                    float(self.head_dim) ** -0.5,
+                                                    float(args.tail_proxy_mass_min),
+                                                    float(args.tail_proxy_mass_max),
+                                                    float(args.tail_pq_corr_min),
+                                                    float(args.tail_pq_relrmse_max),
+                                                    str(args.tail_score_calibration) == "affine_selected",
+                                                    bool(tail_stability_confidence_decode),
+                                                ).contiguous()
+                                            )
+                                            final_k_logits_reused_for_cost = True
+                                        if probe_budgets and not fused_geometric_output:
                                             selected_mass_output_thresholds, selected_mass_output_threshold_sels = (
                                                 select_thresholds_for_budget_counts_gpu(
                                                     thresholds=probe_thresholds,
@@ -6360,14 +6420,15 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                             str(args.tail_score_calibration) == "affine_selected",
                                             bool(tail_stability_confidence_decode),
                                         ).contiguous()
-                                    proxy_ranked_scores = ranked_scores.masked_fill(
-                                        rank_ids >= accepted_budget_counts.unsqueeze(-1),
-                                        float("-inf"),
-                                    ).contiguous()
-                                    outputs_native = decode_selected_tail(
-                                        proxy_ranked_scores,
-                                        float(tail_blend_value),
-                                    )
+                                    if outputs_native is None:
+                                        proxy_ranked_scores = ranked_scores.masked_fill(
+                                            rank_ids >= accepted_budget_counts.unsqueeze(-1),
+                                            float("-inf"),
+                                        ).contiguous()
+                                        outputs_native = decode_selected_tail(
+                                            proxy_ranked_scores,
+                                            float(tail_blend_value),
+                                        )
                                     # One native confidence pass plus one final canonical output.
                                     confidence_extra_attention_calls += 2
                                 elif (
@@ -6815,10 +6876,13 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                 float(page_count * value_subvecs * value_centroids * value_subdim * value_bytes)
                                 + float((tail_count + compressed_selected_values) * value_subvecs * code_bytes)
                             ) / MB + dense_score_io_mb
-                            exact_kv_mb = (
-                                float(selected_count * int(self.head_dim) * key_bytes)
-                                + float((base_count + exact_value_top) * int(self.head_dim) * value_bytes)
-                            ) / MB
+                            exact_key_mb = (
+                                0.0
+                                if final_k_logits_reused_for_cost
+                                else float(selected_count * int(self.head_dim) * key_bytes) / MB
+                            )
+                            exact_value_mb = float((base_count + exact_value_top) * int(self.head_dim) * value_bytes) / MB
+                            exact_kv_mb = exact_key_mb + exact_value_mb
                             confidence_mb = (
                                 max(0, int(confidence_extra_attention_calls) - 1) * float(exact_kv_mb + tail_mb_for_cost)
                                 + float(confidence_calibration_key_mb) / float(max(1, num_heads))

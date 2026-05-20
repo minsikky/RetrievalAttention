@@ -5666,6 +5666,234 @@ __global__ void gqa_decode_geometric_accept_counts_codeweights_kernel(
   }
 }
 
+template <typename value_t, typename vcode_t>
+__global__ void gqa_decode_geometric_final_output_codeweights_kernel(
+    const value_t* __restrict__ values,
+    const float* __restrict__ dense_pq_scores,
+    const float* __restrict__ value_codebooks,
+    const vcode_t* __restrict__ value_codes,
+    const int64_t* __restrict__ page_starts,
+    const int64_t* __restrict__ base_tokens,
+    const float* __restrict__ base_logits,
+    const int64_t* __restrict__ base_counts,
+    const int64_t* __restrict__ ranked_tokens,
+    const float* __restrict__ ranked_logits,
+    const float* __restrict__ tail_partial_max,
+    const float* __restrict__ confidence_max_logits,
+    const float* __restrict__ tail_denoms,
+    const float* __restrict__ code_weight_sums,
+    const int64_t* __restrict__ accepted_counts,
+    float* __restrict__ outputs,
+    int64_t heads,
+    int64_t kv_heads,
+    int64_t ranked,
+    int64_t dim,
+    int64_t total_tokens,
+    int64_t value_stride_head,
+    int64_t value_stride_token,
+    int64_t value_stride_dim,
+    int64_t pages,
+    int64_t page_size,
+    int64_t max_base,
+    int64_t value_subvecs,
+    int64_t value_centroids,
+    int64_t value_subdim,
+    int64_t tail_blocks,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    float exact_value_mass,
+    int64_t exact_value_min_top,
+    float scale,
+    float tail_blend) {
+  int64_t head = blockIdx.x;
+  if (head >= heads) {
+    return;
+  }
+  int64_t prefix_end = 0;
+  int64_t base_tail_start = 0;
+  token_in_base_window(
+      0,
+      query_context_len,
+      static_prefix,
+      static_suffix,
+      page_size,
+      &prefix_end,
+      &base_tail_start);
+  int64_t kv_head = min(head / group_size, kv_heads - 1);
+  const int64_t* base_tokens_row = base_tokens + head * max_base;
+  const float* base_logits_row = base_logits + head * max_base;
+  int64_t base_count = base_counts[head];
+  const int64_t* ranked_row = ranked_tokens + head * ranked;
+  const float* ranked_logit_row = ranked_logits + head * ranked;
+  const float* dense_row = dense_pq_scores + head * (pages * page_size);
+
+  __shared__ int64_t accepted_shared;
+  __shared__ float final_max_shared;
+  __shared__ float threshold_logit_shared;
+  __shared__ int64_t threshold_sel_shared;
+  if (threadIdx.x == 0) {
+    int64_t accepted = accepted_counts[head];
+    if (accepted < 0) {
+      accepted = 0;
+    }
+    if (accepted > ranked) {
+      accepted = ranked;
+    }
+    accepted_shared = accepted;
+    float final_max = -INFINITY;
+    for (int64_t idx = 0; idx < base_count; ++idx) {
+      final_max = fmaxf(final_max, base_logits_row[idx]);
+    }
+    for (int64_t sel = 0; sel < accepted; ++sel) {
+      final_max = fmaxf(final_max, ranked_logit_row[sel]);
+    }
+    for (int64_t block = 0; block < tail_blocks; ++block) {
+      final_max = fmaxf(final_max, tail_partial_max[head * tail_blocks + block]);
+    }
+    final_max_shared = final_max;
+    selected_mass_exact_threshold_device(
+        base_logits_row,
+        base_count,
+        ranked_logit_row,
+        accepted,
+        exact_value_mass,
+        exact_value_min_top,
+        &threshold_logit_shared,
+        &threshold_sel_shared);
+  }
+  __syncthreads();
+
+  int64_t d = threadIdx.x;
+  if (d >= dim) {
+    return;
+  }
+  int64_t accepted = accepted_shared;
+  float final_max = final_max_shared;
+  if (!isfinite(final_max)) {
+    outputs[head * dim + d] = 0.0f;
+    return;
+  }
+  float threshold_logit = threshold_logit_shared;
+  int64_t threshold_sel = threshold_sel_shared;
+
+  float denom = 0.0f;
+  float selected_denom = 0.0f;
+  float numer = 0.0f;
+  float selected_numer = 0.0f;
+  for (int64_t idx = 0; idx < base_count; ++idx) {
+    int64_t token = base_tokens_row[idx];
+    float logit = base_logits_row[idx];
+    if (token < 0 || token >= total_tokens || !isfinite(logit)) {
+      continue;
+    }
+    float w = expf(logit - final_max);
+    float v = load_strided3_as_float(
+        values,
+        kv_head,
+        token,
+        d,
+        value_stride_head,
+        value_stride_token,
+        value_stride_dim);
+    denom += w;
+    selected_denom += w;
+    numer += w * v;
+    selected_numer += w * v;
+  }
+
+  float tail_scale = expf(confidence_max_logits[head] - final_max);
+  denom += tail_denoms[head] * tail_scale;
+  if (value_subdim > 0) {
+    int64_t sub = d / value_subdim;
+    int64_t sub_d = d - sub * value_subdim;
+    if (sub >= 0 && sub < value_subvecs) {
+      for (int64_t page = 0; page < pages; ++page) {
+        for (int64_t code = 0; code < value_centroids; ++code) {
+          float w = code_weight_sums[(((head * pages + page) * value_subvecs + sub) * value_centroids + code)];
+          if (w == 0.0f) {
+            continue;
+          }
+          float value = value_codebooks
+              [((((kv_head * pages + page) * value_subvecs + sub) * value_centroids + code) * value_subdim) +
+               sub_d];
+          numer += (w * tail_scale) * value;
+        }
+      }
+    }
+  }
+
+  for (int64_t sel = 0; sel < accepted; ++sel) {
+    float logit = ranked_logit_row[sel];
+    int64_t token = ranked_row[sel];
+    if (!isfinite(logit) || token < 0 || token >= query_context_len || token >= total_tokens) {
+      continue;
+    }
+    float w = expf(logit - final_max);
+    bool exact_value = selected_mass_exact_value_for_rank(logit, sel, threshold_logit, threshold_sel);
+    float selected_v = selected_value_for_rank_dim_explicit(
+        values,
+        value_codebooks,
+        value_codes,
+        page_starts,
+        token,
+        exact_value,
+        kv_head,
+        d,
+        total_tokens,
+        value_stride_head,
+        value_stride_token,
+        value_stride_dim,
+        pages,
+        page_size,
+        value_subvecs,
+        value_centroids,
+        value_subdim);
+    denom += w;
+    selected_denom += w;
+    numer += w * selected_v;
+    selected_numer += w * selected_v;
+
+    int64_t page = -1;
+    int64_t row = -1;
+    if (complete_page_for_token(
+            page_starts,
+            pages,
+            page_size,
+            token,
+            query_context_len,
+            prefix_end,
+            base_tail_start,
+            &page,
+            &row)) {
+      float pq_w = expf(dense_row[page * page_size + row] * scale - final_max);
+      float pq_v = load_vpq_value_for_dim(
+          value_codebooks,
+          value_codes,
+          kv_head,
+          page,
+          row,
+          d,
+          pages,
+          page_size,
+          value_subvecs,
+          value_centroids,
+          value_subdim);
+      denom -= pq_w;
+      numer -= pq_w * pq_v;
+    }
+  }
+
+  float full = numer / fmaxf(denom, 1.0e-20f);
+  if (tail_blend > 0.0f && tail_blend < 1.0f) {
+    float selected_only = selected_numer / fmaxf(selected_denom, 1.0e-20f);
+    outputs[head * dim + d] = selected_only + tail_blend * (full - selected_only);
+  } else {
+    outputs[head * dim + d] = full;
+  }
+}
+
 __global__ void gqa_decode_proxy_gate_counts_kernel(
     const float* __restrict__ base_logits,
     const int64_t* __restrict__ base_counts,
@@ -9390,6 +9618,446 @@ torch::Tensor gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_
       pq_corr_min,
       pq_relrmse_max,
       calibrate_proxy);
+}
+
+std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds_cuda(
+    torch::Tensor queries,
+    torch::Tensor keys,
+    torch::Tensor values,
+    torch::Tensor dense_pq_scores,
+    torch::Tensor value_codebooks,
+    torch::Tensor value_codes,
+    torch::Tensor page_starts,
+    torch::Tensor ranked_tokens,
+    torch::Tensor ranked_scores,
+    torch::Tensor ranked_logits,
+    torch::Tensor approx_exact_thresholds,
+    torch::Tensor approx_exact_threshold_sels,
+    torch::Tensor probe_exact_thresholds,
+    torch::Tensor probe_exact_threshold_sels,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    int64_t page_size,
+    int64_t min_budget,
+    int64_t max_budget,
+    int64_t granularity,
+    double growth,
+    double probe_scale,
+    double rel_l2_max,
+    double exact_value_mass,
+    int64_t exact_value_min_top,
+    double scale,
+    double proxy_mass_min,
+    double proxy_tail_mass_max,
+    double pq_corr_min,
+    double pq_relrmse_max,
+    bool calibrate_proxy,
+    bool probe_includes_tail,
+    double tail_blend) {
+  const auto heads = queries.size(0);
+  const auto dim = queries.size(1);
+  const auto kv_heads = keys.size(0);
+  const auto total_tokens = keys.size(1);
+  const auto ranked = ranked_tokens.size(1);
+  const auto pages = value_codebooks.size(1);
+  const auto value_subvecs = value_codebooks.size(2);
+  const auto value_centroids = value_codebooks.size(3);
+  const auto value_subdim = value_codebooks.size(4);
+  auto counts = torch::empty({heads}, queries.options().dtype(torch::kLong));
+  auto outputs = torch::empty({heads, dim}, queries.options().dtype(torch::kFloat32));
+  if (heads == 0) {
+    return {counts, outputs};
+  }
+  if (dim == 0 || kv_heads == 0 || total_tokens == 0 || pages == 0 || page_size <= 0) {
+    counts.zero_();
+    outputs.zero_();
+    return {counts, outputs};
+  }
+
+  const int threads = 256;
+  const int shared_bytes = threads * 2 * sizeof(float);
+  const int64_t pages_per_block = decode_tail_pages_per_block();
+  const int64_t tail_blocks = std::max<int64_t>(1, (pages + pages_per_block - 1) / pages_per_block);
+  const int64_t max_base =
+      std::max<int64_t>(0, static_prefix) + std::max<int64_t>(0, static_suffix) +
+      std::max<int64_t>(1, page_size) + 4;
+  auto opts = queries.options().dtype(torch::kFloat32);
+  auto long_opts = queries.options().dtype(torch::kLong);
+  auto base_tokens = torch::empty({heads, max_base}, long_opts);
+  auto base_logits = torch::empty({heads, max_base}, opts);
+  auto base_counts = torch::zeros({heads}, long_opts);
+  auto filtered_ranked_logits = torch::empty({heads, ranked}, opts);
+  auto partial_max = torch::empty({heads, tail_blocks}, opts);
+  auto max_logits = torch::empty({heads}, opts);
+  auto partial_sum = torch::empty({heads, tail_blocks}, opts);
+  auto tail_denoms = torch::empty({heads}, opts);
+  auto code_weight_sums = torch::zeros({heads, pages, value_subvecs, value_centroids}, opts);
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      keys.scalar_type(),
+      "gqa_decode_geometric_output_base_keys",
+      [&] {
+        gqa_decode_base_logits_kernel<scalar_t><<<static_cast<int>(heads), threads, 0, stream>>>(
+            queries.data_ptr<float>(),
+            keys.data_ptr<scalar_t>(),
+            base_tokens.data_ptr<int64_t>(),
+            base_logits.data_ptr<float>(),
+            base_counts.data_ptr<int64_t>(),
+            heads,
+            kv_heads,
+            dim,
+            total_tokens,
+            keys.stride(0),
+            keys.stride(1),
+            keys.stride(2),
+            page_size,
+            max_base,
+            group_size,
+            query_context_len,
+            static_prefix,
+            static_suffix,
+            static_cast<float>(scale));
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  const int filter_threads = 256;
+  const int64_t filter_total = heads * ranked;
+  const int filter_blocks = static_cast<int>((filter_total + filter_threads - 1) / filter_threads);
+  gqa_decode_filter_ranked_logits_input_kernel<<<filter_blocks, filter_threads, 0, stream>>>(
+      ranked_tokens.data_ptr<int64_t>(),
+      ranked_scores.data_ptr<float>(),
+      ranked_logits.data_ptr<float>(),
+      filtered_ranked_logits.data_ptr<float>(),
+      heads,
+      ranked,
+      query_context_len,
+      static_prefix,
+      static_suffix,
+      page_size);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  dim3 tail_grid(static_cast<unsigned int>(heads), static_cast<unsigned int>(tail_blocks));
+  gqa_decode_tail_partial_max_nomask_kernel<<<tail_grid, threads, threads * sizeof(float), stream>>>(
+      dense_pq_scores.data_ptr<float>(),
+      page_starts.data_ptr<int64_t>(),
+      partial_max.data_ptr<float>(),
+      heads,
+      pages,
+      page_size,
+      tail_blocks,
+      pages_per_block,
+      query_context_len,
+      static_prefix,
+      static_suffix,
+      static_cast<float>(scale));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  gqa_decode_final_max_kernel<<<static_cast<int>(heads), threads, threads * sizeof(float), stream>>>(
+      partial_max.data_ptr<float>(),
+      base_logits.data_ptr<float>(),
+      base_counts.data_ptr<int64_t>(),
+      filtered_ranked_logits.data_ptr<float>(),
+      max_logits.data_ptr<float>(),
+      heads,
+      ranked,
+      max_base,
+      tail_blocks);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  if (value_codes.scalar_type() == torch::kUInt8) {
+    gqa_decode_tail_sum_codeweights_nomask_kernel<uint8_t><<<tail_grid, threads, threads * sizeof(float), stream>>>(
+        dense_pq_scores.data_ptr<float>(),
+        max_logits.data_ptr<float>(),
+        value_codes.data_ptr<uint8_t>(),
+        page_starts.data_ptr<int64_t>(),
+        partial_sum.data_ptr<float>(),
+        code_weight_sums.data_ptr<float>(),
+        heads,
+        kv_heads,
+        pages,
+        page_size,
+        value_subvecs,
+        value_centroids,
+        tail_blocks,
+        pages_per_block,
+        group_size,
+        query_context_len,
+        static_prefix,
+        static_suffix,
+        static_cast<float>(scale));
+  } else {
+    gqa_decode_tail_sum_codeweights_nomask_kernel<int64_t><<<tail_grid, threads, threads * sizeof(float), stream>>>(
+        dense_pq_scores.data_ptr<float>(),
+        max_logits.data_ptr<float>(),
+        value_codes.data_ptr<int64_t>(),
+        page_starts.data_ptr<int64_t>(),
+        partial_sum.data_ptr<float>(),
+        code_weight_sums.data_ptr<float>(),
+        heads,
+        kv_heads,
+        pages,
+        page_size,
+        value_subvecs,
+        value_centroids,
+        tail_blocks,
+        pages_per_block,
+        group_size,
+        query_context_len,
+        static_prefix,
+        static_suffix,
+        static_cast<float>(scale));
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  gqa_decode_tail_denom_from_partials_kernel<<<static_cast<int>(heads), threads, threads * sizeof(float), stream>>>(
+      partial_sum.data_ptr<float>(),
+      tail_denoms.data_ptr<float>(),
+      heads,
+      tail_blocks);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  const int64_t threshold_steps =
+      (approx_exact_thresholds.defined() && approx_exact_thresholds.numel() > 0) ? approx_exact_thresholds.size(1) : 0;
+  const float* approx_exact_thresholds_ptr =
+      threshold_steps > 0 ? approx_exact_thresholds.data_ptr<float>() : nullptr;
+  const int64_t* approx_exact_threshold_sels_ptr =
+      threshold_steps > 0 ? approx_exact_threshold_sels.data_ptr<int64_t>() : nullptr;
+  const float* probe_exact_thresholds_ptr =
+      threshold_steps > 0 ? probe_exact_thresholds.data_ptr<float>() : nullptr;
+  const int64_t* probe_exact_threshold_sels_ptr =
+      threshold_steps > 0 ? probe_exact_threshold_sels.data_ptr<int64_t>() : nullptr;
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      values.scalar_type(),
+      "gqa_decode_geometric_output_counts_values",
+      [&] {
+        using value_scalar_t = scalar_t;
+        if (value_codes.scalar_type() == torch::kUInt8) {
+          gqa_decode_geometric_accept_counts_codeweights_kernel<value_scalar_t, uint8_t>
+              <<<static_cast<int>(heads), threads, shared_bytes, stream>>>(
+                  values.data_ptr<value_scalar_t>(),
+                  dense_pq_scores.data_ptr<float>(),
+                  value_codebooks.data_ptr<float>(),
+                  value_codes.data_ptr<uint8_t>(),
+                  page_starts.data_ptr<int64_t>(),
+                  base_tokens.data_ptr<int64_t>(),
+                  base_logits.data_ptr<float>(),
+                  base_counts.data_ptr<int64_t>(),
+                  ranked_tokens.data_ptr<int64_t>(),
+                  filtered_ranked_logits.data_ptr<float>(),
+                  max_logits.data_ptr<float>(),
+                  tail_denoms.data_ptr<float>(),
+                  code_weight_sums.data_ptr<float>(),
+                  approx_exact_thresholds_ptr,
+                  approx_exact_threshold_sels_ptr,
+                  probe_exact_thresholds_ptr,
+                  probe_exact_threshold_sels_ptr,
+                  counts.data_ptr<int64_t>(),
+                  heads,
+                  kv_heads,
+                  ranked,
+                  dim,
+                  total_tokens,
+                  values.stride(0),
+                  values.stride(1),
+                  values.stride(2),
+                  pages,
+                  page_size,
+                  max_base,
+                  value_subvecs,
+                  value_centroids,
+                  value_subdim,
+                  group_size,
+                  query_context_len,
+                  static_prefix,
+                  static_suffix,
+                  min_budget,
+                  max_budget,
+                  granularity,
+                  static_cast<float>(growth),
+                  static_cast<float>(probe_scale),
+                  static_cast<float>(rel_l2_max),
+                  0,
+                  static_cast<float>(exact_value_mass),
+                  exact_value_min_top,
+                  static_cast<float>(scale),
+                  probe_includes_tail,
+                  threshold_steps);
+        } else {
+          gqa_decode_geometric_accept_counts_codeweights_kernel<value_scalar_t, int64_t>
+              <<<static_cast<int>(heads), threads, shared_bytes, stream>>>(
+                  values.data_ptr<value_scalar_t>(),
+                  dense_pq_scores.data_ptr<float>(),
+                  value_codebooks.data_ptr<float>(),
+                  value_codes.data_ptr<int64_t>(),
+                  page_starts.data_ptr<int64_t>(),
+                  base_tokens.data_ptr<int64_t>(),
+                  base_logits.data_ptr<float>(),
+                  base_counts.data_ptr<int64_t>(),
+                  ranked_tokens.data_ptr<int64_t>(),
+                  filtered_ranked_logits.data_ptr<float>(),
+                  max_logits.data_ptr<float>(),
+                  tail_denoms.data_ptr<float>(),
+                  code_weight_sums.data_ptr<float>(),
+                  approx_exact_thresholds_ptr,
+                  approx_exact_threshold_sels_ptr,
+                  probe_exact_thresholds_ptr,
+                  probe_exact_threshold_sels_ptr,
+                  counts.data_ptr<int64_t>(),
+                  heads,
+                  kv_heads,
+                  ranked,
+                  dim,
+                  total_tokens,
+                  values.stride(0),
+                  values.stride(1),
+                  values.stride(2),
+                  pages,
+                  page_size,
+                  max_base,
+                  value_subvecs,
+                  value_centroids,
+                  value_subdim,
+                  group_size,
+                  query_context_len,
+                  static_prefix,
+                  static_suffix,
+                  min_budget,
+                  max_budget,
+                  granularity,
+                  static_cast<float>(growth),
+                  static_cast<float>(probe_scale),
+                  static_cast<float>(rel_l2_max),
+                  0,
+                  static_cast<float>(exact_value_mass),
+                  exact_value_min_top,
+                  static_cast<float>(scale),
+                  probe_includes_tail,
+                  threshold_steps);
+        }
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  gqa_decode_proxy_gate_counts_kernel<<<static_cast<int>(heads), threads, threads * sizeof(float), stream>>>(
+      base_logits.data_ptr<float>(),
+      base_counts.data_ptr<int64_t>(),
+      filtered_ranked_logits.data_ptr<float>(),
+      ranked_scores.data_ptr<float>(),
+      counts.data_ptr<int64_t>(),
+      heads,
+      ranked,
+      max_base,
+      max_budget,
+      static_cast<float>(scale),
+      static_cast<float>(proxy_mass_min),
+      static_cast<float>(proxy_tail_mass_max),
+      static_cast<float>(pq_corr_min),
+      static_cast<float>(pq_relrmse_max),
+      calibrate_proxy);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half,
+      at::ScalarType::BFloat16,
+      values.scalar_type(),
+      "gqa_decode_geometric_output_final_values",
+      [&] {
+        using value_scalar_t = scalar_t;
+        if (value_codes.scalar_type() == torch::kUInt8) {
+          gqa_decode_geometric_final_output_codeweights_kernel<value_scalar_t, uint8_t>
+              <<<static_cast<int>(heads), threads, 0, stream>>>(
+                  values.data_ptr<value_scalar_t>(),
+                  dense_pq_scores.data_ptr<float>(),
+                  value_codebooks.data_ptr<float>(),
+                  value_codes.data_ptr<uint8_t>(),
+                  page_starts.data_ptr<int64_t>(),
+                  base_tokens.data_ptr<int64_t>(),
+                  base_logits.data_ptr<float>(),
+                  base_counts.data_ptr<int64_t>(),
+                  ranked_tokens.data_ptr<int64_t>(),
+                  filtered_ranked_logits.data_ptr<float>(),
+                  partial_max.data_ptr<float>(),
+                  max_logits.data_ptr<float>(),
+                  tail_denoms.data_ptr<float>(),
+                  code_weight_sums.data_ptr<float>(),
+                  counts.data_ptr<int64_t>(),
+                  outputs.data_ptr<float>(),
+                  heads,
+                  kv_heads,
+                  ranked,
+                  dim,
+                  total_tokens,
+                  values.stride(0),
+                  values.stride(1),
+                  values.stride(2),
+                  pages,
+                  page_size,
+                  max_base,
+                  value_subvecs,
+                  value_centroids,
+                  value_subdim,
+                  tail_blocks,
+                  group_size,
+                  query_context_len,
+                  static_prefix,
+                  static_suffix,
+                  static_cast<float>(exact_value_mass),
+                  exact_value_min_top,
+                  static_cast<float>(scale),
+                  static_cast<float>(tail_blend));
+        } else {
+          gqa_decode_geometric_final_output_codeweights_kernel<value_scalar_t, int64_t>
+              <<<static_cast<int>(heads), threads, 0, stream>>>(
+                  values.data_ptr<value_scalar_t>(),
+                  dense_pq_scores.data_ptr<float>(),
+                  value_codebooks.data_ptr<float>(),
+                  value_codes.data_ptr<int64_t>(),
+                  page_starts.data_ptr<int64_t>(),
+                  base_tokens.data_ptr<int64_t>(),
+                  base_logits.data_ptr<float>(),
+                  base_counts.data_ptr<int64_t>(),
+                  ranked_tokens.data_ptr<int64_t>(),
+                  filtered_ranked_logits.data_ptr<float>(),
+                  partial_max.data_ptr<float>(),
+                  max_logits.data_ptr<float>(),
+                  tail_denoms.data_ptr<float>(),
+                  code_weight_sums.data_ptr<float>(),
+                  counts.data_ptr<int64_t>(),
+                  outputs.data_ptr<float>(),
+                  heads,
+                  kv_heads,
+                  ranked,
+                  dim,
+                  total_tokens,
+                  values.stride(0),
+                  values.stride(1),
+                  values.stride(2),
+                  pages,
+                  page_size,
+                  max_base,
+                  value_subvecs,
+                  value_centroids,
+                  value_subdim,
+                  tail_blocks,
+                  group_size,
+                  query_context_len,
+                  static_prefix,
+                  static_suffix,
+                  static_cast<float>(exact_value_mass),
+                  exact_value_min_top,
+                  static_cast<float>(scale),
+                  static_cast<float>(tail_blend));
+        }
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {counts, outputs};
 }
 
 torch::Tensor gqa_causal_geometric_accept_counts_cuda_impl(
