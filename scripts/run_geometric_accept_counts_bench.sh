@@ -12,8 +12,8 @@ set -euo pipefail
 
 cd /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention
 
-OUTPUT_DIR="${OUTPUT_DIR:-cuda_unit_result/geometric_accept_counts_bench_20260518}"
-mkdir -p "${OUTPUT_DIR}" slurm_out/geometric_accept_counts_bench_20260518
+OUTPUT_DIR="${OUTPUT_DIR:-cuda_unit_result/geometric_accept_counts_bench_20260520}"
+mkdir -p "${OUTPUT_DIR}" slurm_out/geometric_accept_counts_bench_20260520
 
 module purge
 module load python/3.10.4
@@ -55,12 +55,12 @@ python benchmark/selector_eval/cuda_ext/bench_geometric_accept_counts.py \
   --growth "${BENCH_GROWTH:-1.5}" \
   --probe-scale "${BENCH_PROBE_SCALE:-1.5}" \
   --rel-l2-max "${BENCH_REL_L2_MAX:-0.04}" \
-  --exact-value-top "${BENCH_EXACT_VALUE_TOP:-256}" \
-  --exact-value-mass "${BENCH_EXACT_VALUE_MASS:-0.0}" \
-  --exact-value-min-top "${BENCH_EXACT_VALUE_MIN_TOP:-0}" \
+  --exact-value-top "${BENCH_EXACT_VALUE_TOP:-0}" \
+  --exact-value-mass "${BENCH_EXACT_VALUE_MASS:-0.99}" \
+  --exact-value-min-top "${BENCH_EXACT_VALUE_MIN_TOP:-1024}" \
   --warmup "${BENCH_WARMUP:-3}" \
   --iters "${BENCH_ITERS:-10}" \
-  $( [ "${BENCH_SKIP_OLD_LOOP:-0}" = "1" ] && printf '%s' "--skip-old-loop" ) \
+  $( [ "${BENCH_SKIP_OLD_LOOP:-1}" = "1" ] && printf '%s' "--skip-old-loop" ) \
   --output "${OUTPUT_DIR}/summary.json"
 
 echo "[geom_accept_bench] finished=$(date --iso-8601=seconds)"
