@@ -64,6 +64,7 @@ def main() -> None:
     queries = torch.randn((heads, dim), device=device, dtype=torch.float32)
     keys = torch.randn((kv_heads, context, dim), device=device, dtype=torch.float16)
     ranked_tokens = torch.randint(0, context, (heads, rank), device=device, dtype=torch.long)
+    keys_t_float = keys.float().transpose(1, 2).contiguous()
 
     def ranked_gather():
         return _gpu_gqa_ranked_exact_logits(
@@ -79,6 +80,24 @@ def main() -> None:
         out, _base, _base_count, _key_count = _gpu_gqa_dense_decode_ranked_logits_and_base_lse(
             queries=queries,
             keys_all=keys,
+            keys_all_t_float=None,
+            ranked_tokens=ranked_tokens,
+            group_size=group_size,
+            scale=scale,
+            max_rank=rank,
+            query_context_len=context,
+            static_prefix=int(args.static_prefix),
+            static_suffix=int(args.static_suffix),
+            page_size=int(args.page_size),
+            need_base_lse=False,
+        )
+        return out
+
+    def dense_sim_cached():
+        out, _base, _base_count, _key_count = _gpu_gqa_dense_decode_ranked_logits_and_base_lse(
+            queries=queries,
+            keys_all=keys,
+            keys_all_t_float=keys_t_float,
             ranked_tokens=ranked_tokens,
             group_size=group_size,
             scale=scale,
@@ -93,7 +112,9 @@ def main() -> None:
 
     ranked_out, ranked_ms = _time_cuda(ranked_gather, warmup=int(args.warmup), iters=int(args.iters))
     dense_out, dense_ms = _time_cuda(dense_sim, warmup=int(args.warmup), iters=int(args.iters))
+    cached_out, cached_dense_ms = _time_cuda(dense_sim_cached, warmup=int(args.warmup), iters=int(args.iters))
     max_diff = float((ranked_out - dense_out).abs().max().item())
+    cached_max_diff = float((ranked_out - cached_out).abs().max().item())
     payload = {
         "context": context,
         "rank": rank,
@@ -103,8 +124,12 @@ def main() -> None:
         "dim": dim,
         "ranked_gather_ms": ranked_ms,
         "dense_sim_ms": dense_ms,
+        "dense_sim_cached_ms": cached_dense_ms,
         "speedup_dense_vs_ranked": float(ranked_ms / dense_ms) if dense_ms > 0.0 else float("inf"),
+        "speedup_dense_cached_vs_ranked": float(ranked_ms / cached_dense_ms) if cached_dense_ms > 0.0 else float("inf"),
+        "speedup_cached_vs_uncached_dense": float(dense_ms / cached_dense_ms) if cached_dense_ms > 0.0 else float("inf"),
         "max_abs_diff": max_diff,
+        "cached_max_abs_diff": cached_max_diff,
     }
     text = json.dumps(payload, indent=2, sort_keys=True)
     print(text)
