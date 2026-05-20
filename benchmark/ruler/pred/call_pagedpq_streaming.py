@@ -92,6 +92,10 @@ def stats_payload(stats: dict[int, ApproxStats]) -> dict[str, dict[str, float | 
             "native_pack_seconds": float(s.native_pack_seconds),
             "native_selector_seconds": float(s.native_selector_seconds),
             "native_attention_seconds": float(s.native_attention_seconds),
+            "native_exact_logit_seconds": float(getattr(s, "native_exact_logit_seconds", 0.0)),
+            "native_threshold_seconds": float(getattr(s, "native_threshold_seconds", 0.0)),
+            "native_geometric_seconds": float(getattr(s, "native_geometric_seconds", 0.0)),
+            "native_output_seconds": float(getattr(s, "native_output_seconds", 0.0)),
             "output_projection_seconds": float(s.output_projection_seconds),
         }
     return payload
@@ -163,6 +167,10 @@ def aggregate_stats(stats: dict[int, ApproxStats]) -> dict[str, float | int]:
         "native_pack_seconds_total": float(sum(s.native_pack_seconds for s in layers)),
         "native_selector_seconds_total": float(sum(s.native_selector_seconds for s in layers)),
         "native_attention_seconds_total": float(sum(s.native_attention_seconds for s in layers)),
+        "native_exact_logit_seconds_total": float(sum(float(getattr(s, "native_exact_logit_seconds", 0.0)) for s in layers)),
+        "native_threshold_seconds_total": float(sum(float(getattr(s, "native_threshold_seconds", 0.0)) for s in layers)),
+        "native_geometric_seconds_total": float(sum(float(getattr(s, "native_geometric_seconds", 0.0)) for s in layers)),
+        "native_output_seconds_total": float(sum(float(getattr(s, "native_output_seconds", 0.0)) for s in layers)),
         "output_projection_seconds_total": float(sum(s.output_projection_seconds for s in layers)),
     }
 

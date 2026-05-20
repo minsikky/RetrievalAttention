@@ -764,6 +764,10 @@ def summarize_approx_stats(stats: dict[int, ApproxStats]) -> dict[str, dict[str,
             "native_pack_seconds": float(s.native_pack_seconds),
             "native_selector_seconds": float(s.native_selector_seconds),
             "native_attention_seconds": float(s.native_attention_seconds),
+            "native_exact_logit_seconds": float(getattr(s, "native_exact_logit_seconds", 0.0)),
+            "native_threshold_seconds": float(getattr(s, "native_threshold_seconds", 0.0)),
+            "native_geometric_seconds": float(getattr(s, "native_geometric_seconds", 0.0)),
+            "native_output_seconds": float(getattr(s, "native_output_seconds", 0.0)),
             "output_projection_seconds": float(s.output_projection_seconds),
         }
     return payload
@@ -831,6 +835,16 @@ def aggregate_approx_stats(stats: dict[int, ApproxStats]) -> dict[str, float | i
         "native_pack_seconds_total": float(sum(float(s.native_pack_seconds) for s in rows)),
         "native_selector_seconds_total": float(sum(float(s.native_selector_seconds) for s in rows)),
         "native_attention_seconds_total": float(sum(float(s.native_attention_seconds) for s in rows)),
+        "native_exact_logit_seconds_total": float(
+            sum(float(getattr(s, "native_exact_logit_seconds", 0.0)) for s in rows)
+        ),
+        "native_threshold_seconds_total": float(
+            sum(float(getattr(s, "native_threshold_seconds", 0.0)) for s in rows)
+        ),
+        "native_geometric_seconds_total": float(
+            sum(float(getattr(s, "native_geometric_seconds", 0.0)) for s in rows)
+        ),
+        "native_output_seconds_total": float(sum(float(getattr(s, "native_output_seconds", 0.0)) for s in rows)),
         "output_projection_seconds_total": float(sum(float(s.output_projection_seconds) for s in rows)),
     }
 

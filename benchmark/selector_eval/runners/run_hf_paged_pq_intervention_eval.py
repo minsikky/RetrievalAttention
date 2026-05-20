@@ -325,6 +325,10 @@ class ApproxStats:
     native_pack_seconds: float = 0.0
     native_selector_seconds: float = 0.0
     native_attention_seconds: float = 0.0
+    native_exact_logit_seconds: float = 0.0
+    native_threshold_seconds: float = 0.0
+    native_geometric_seconds: float = 0.0
+    native_output_seconds: float = 0.0
     output_projection_seconds: float = 0.0
 
     def add_count(
@@ -479,6 +483,19 @@ class ApproxStats:
     def add_native_timing(self, selector_seconds: float = 0.0, attention_seconds: float = 0.0) -> None:
         self.native_selector_seconds += float(selector_seconds)
         self.native_attention_seconds += float(attention_seconds)
+
+    def add_native_detail_timing(
+        self,
+        *,
+        exact_logit_seconds: float = 0.0,
+        threshold_seconds: float = 0.0,
+        geometric_seconds: float = 0.0,
+        output_seconds: float = 0.0,
+    ) -> None:
+        self.native_exact_logit_seconds += float(exact_logit_seconds)
+        self.native_threshold_seconds += float(threshold_seconds)
+        self.native_geometric_seconds += float(geometric_seconds)
+        self.native_output_seconds += float(output_seconds)
 
     def add_output_projection_timing(self, seconds: float) -> None:
         self.output_projection_seconds += float(seconds)
@@ -5864,6 +5881,10 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                             confidence_extra_attention_calls = 0
                             confidence_calibration_key_mb = 0.0
                             proxy_confidence_score_read_passes = 0
+                            native_exact_logit_seconds = 0.0
+                            native_threshold_seconds = 0.0
+                            native_geometric_seconds = 0.0
+                            native_output_seconds = 0.0
                             accepted_budget_counts: torch.Tensor | None = None
                             selected_mass_exact_value_counts_for_cost: torch.Tensor | None = None
                             selected_mass_cost_upper_bound = False
@@ -6194,6 +6215,9 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                             <= max(1, int(max_budget)) * 2
                                         )
                                     )
+                                    if bool(getattr(args, "profile_native_ops", False)):
+                                        _sync_if_cuda(device)
+                                        native_exact_logit_t0 = time.perf_counter()
                                     if use_dense_exact_logit_sim:
                                         (
                                             exact_ranked_logits_for_conf,
@@ -6257,6 +6281,9 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                         confidence_calibration_key_mb += (
                                             float(base_tokens_for_conf * num_heads * int(self.head_dim) * key_bytes)
                                         ) / MB
+                                    if bool(getattr(args, "profile_native_ops", False)):
+                                        _sync_if_cuda(device)
+                                        native_exact_logit_seconds += float(time.perf_counter() - native_exact_logit_t0)
                                 if selected_mass_in_kernel:
                                     selected_mass_cost_upper_bound = True
                                 selected_mass_output_thresholds = None
@@ -6452,6 +6479,9 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                         and base_lse_for_conf is not None
                                         and native_selected_mass_threshold_proxy_possible
                                     ):
+                                        if bool(getattr(args, "profile_native_ops", False)):
+                                            _sync_if_cuda(device)
+                                            native_threshold_t0 = time.perf_counter()
                                         tail_budgets, probe_budgets = geometric_budget_pairs(
                                             min_budget=int(k),
                                             max_budget=int(max_budget),
@@ -6487,6 +6517,9 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                         approx_threshold_sels = combined_threshold_sels.index_select(1, approx_cols).contiguous()
                                         probe_thresholds = combined_thresholds.index_select(1, probe_cols).contiguous()
                                         probe_threshold_sels = combined_threshold_sels.index_select(1, probe_cols).contiguous()
+                                        if bool(getattr(args, "profile_native_ops", False)):
+                                            _sync_if_cuda(device)
+                                            native_threshold_seconds += float(time.perf_counter() - native_threshold_t0)
                                         # This fused final-output path is parity-tested, but the first
                                         # implementation is slower than the existing canonical path on
                                         # 32k decode. Keep it available for targeted optimization without
@@ -6501,6 +6534,9 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                             and not _env_truthy("DISABLE_FUSED_GEOMETRIC_OUTPUT")
                                             else None
                                         )
+                                        if bool(getattr(args, "profile_native_ops", False)):
+                                            _sync_if_cuda(device)
+                                            native_geometric_t0 = time.perf_counter()
                                         if output_from_logits_fn is not None:
                                             accepted_budget_counts, outputs_native = output_from_logits_fn(
                                                 queries2,
@@ -6583,6 +6619,9 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                                 ).contiguous()
                                             )
                                             final_k_logits_reused_for_cost = True
+                                        if bool(getattr(args, "profile_native_ops", False)):
+                                            _sync_if_cuda(device)
+                                            native_geometric_seconds += float(time.perf_counter() - native_geometric_t0)
                                         if probe_budgets and not fused_geometric_output:
                                             selected_mass_output_thresholds, selected_mass_output_threshold_sels = (
                                                 select_thresholds_for_budget_counts_gpu(
@@ -6667,10 +6706,16 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                             rank_ids >= accepted_budget_counts.unsqueeze(-1),
                                             float("-inf"),
                                         ).contiguous()
+                                        if bool(getattr(args, "profile_native_ops", False)):
+                                            _sync_if_cuda(device)
+                                            native_output_t0 = time.perf_counter()
                                         outputs_native = decode_selected_tail(
                                             proxy_ranked_scores,
                                             float(tail_blend_value),
                                         )
+                                        if bool(getattr(args, "profile_native_ops", False)):
+                                            _sync_if_cuda(device)
+                                            native_output_seconds += float(time.perf_counter() - native_output_t0)
                                     # One native confidence pass plus one final canonical output.
                                     confidence_extra_attention_calls += 2
                                 elif (
@@ -7040,6 +7085,12 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                 stats[layer_id].add_native_timing(
                                     selector_seconds=selector_seconds,
                                     attention_seconds=float(time.perf_counter() - attention_t0),
+                                )
+                                stats[layer_id].add_native_detail_timing(
+                                    exact_logit_seconds=native_exact_logit_seconds,
+                                    threshold_seconds=native_threshold_seconds,
+                                    geometric_seconds=native_geometric_seconds,
+                                    output_seconds=native_output_seconds,
                                 )
 
                             if bool(getattr(args, "disable_cost_stats", False)):
@@ -8561,6 +8612,10 @@ def run() -> None:
             "native_pack_seconds": s.native_pack_seconds,
             "native_selector_seconds": s.native_selector_seconds,
             "native_attention_seconds": s.native_attention_seconds,
+            "native_exact_logit_seconds": s.native_exact_logit_seconds,
+            "native_threshold_seconds": s.native_threshold_seconds,
+            "native_geometric_seconds": s.native_geometric_seconds,
+            "native_output_seconds": s.native_output_seconds,
             "output_projection_seconds": s.output_projection_seconds,
         }
     task = {
