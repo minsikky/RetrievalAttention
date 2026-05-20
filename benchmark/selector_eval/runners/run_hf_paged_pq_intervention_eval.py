@@ -6822,8 +6822,9 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                             bool(tail_stability_confidence_decode),
                                         ).contiguous()
                                     if outputs_native is None:
-                                        proxy_ranked_scores = ranked_scores.masked_fill(
-                                            rank_ids >= accepted_budget_counts.unsqueeze(-1),
+                                        proxy_rank_ids = decode_rank_ids_tensor(max_budget, device, dims=2)
+                                        proxy_ranked_scores = ranked_scores_prefix.masked_fill(
+                                            proxy_rank_ids >= accepted_budget_counts.unsqueeze(-1),
                                             float("-inf"),
                                         ).contiguous()
                                         if bool(getattr(args, "profile_native_ops", False)):
