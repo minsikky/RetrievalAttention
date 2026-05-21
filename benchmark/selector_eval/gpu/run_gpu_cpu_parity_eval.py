@@ -38,6 +38,12 @@ from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import (
     rank_paged_pq_batched_with_scores,
     selector_bytes_fullscan,
 )
+from benchmark.selector_eval.runners.run_hf_paged_pq_intervention_eval import (
+    _gpu_gqa_dense_decode_ranked_logits_and_base_lse,
+    geometric_budget_pairs,
+    selected_mass_thresholds_from_logits_gpu,
+    value_vpq_pack_torch,
+)
 
 
 def _sync_if_cuda(device: torch.device | str) -> None:
@@ -315,6 +321,397 @@ def _vpq_value_for_token_cpu(
     return torch.cat(pieces, dim=0)
 
 
+def _selected_mass_exact_by_threshold(logit: float, sel: int, threshold: float, threshold_sel: int) -> bool:
+    if int(threshold_sel) < 0 or not math.isfinite(float(logit)) or not math.isfinite(float(threshold)):
+        return False
+    return float(logit) > float(threshold) or (float(logit) == float(threshold) and int(sel) <= int(threshold_sel))
+
+
+def _fit_selected_pq_logit_uncertainty_local(
+    *,
+    selected_cpu: np.ndarray,
+    ranked_cpu: np.ndarray,
+    ranked_scores_cpu: np.ndarray,
+    scores_np: np.ndarray,
+    query_dim: int,
+) -> tuple[float, float, int, float, float, float]:
+    """NumPy-reduction-free copy of the CPU frontier proxy calibration."""
+
+    if selected_cpu.size == 0 or ranked_cpu.size == 0:
+        return 1.0, 0.0, 0, float("inf"), 0.0, 0.0
+    selected_set = set(int(tok) for tok in selected_cpu.tolist())
+    score_scale = float(math.sqrt(float(query_dim)))
+    pq_vals: list[float] = []
+    exact_vals: list[float] = []
+    for tok, score in zip(ranked_cpu.tolist(), ranked_scores_cpu.tolist(), strict=False):
+        tok_i = int(tok)
+        if tok_i not in selected_set:
+            continue
+        pq_vals.append(float(score) / score_scale)
+        exact_vals.append(float(scores_np[tok_i]))
+    if len(pq_vals) < 2:
+        return 1.0, 0.0, len(pq_vals), float("inf"), 0.0, 0.0
+    x = torch.tensor(pq_vals, dtype=torch.float64)
+    y = torch.tensor(exact_vals, dtype=torch.float64)
+    x_mean = torch.mean(x)
+    y_mean = torch.mean(y)
+    x_centered = x - x_mean
+    y_centered = y - y_mean
+    x_var = float(torch.mean(x_centered * x_centered))
+    y_std = float(torch.sqrt(torch.mean(y_centered * y_centered)))
+    if x_var <= 1e-20:
+        pred = torch.full_like(y, float(y_mean))
+        rmse = float(torch.sqrt(torch.mean((pred - y) ** 2)))
+        rel_rmse = rmse / max(y_std, 1e-6)
+        return 0.0, float(y_mean), int(x.numel()), float(rel_rmse), 0.0, float(y_std)
+    cov = float(torch.mean(x_centered * y_centered))
+    fitted_scale = cov / x_var
+    fitted_bias = float(y_mean) - fitted_scale * float(x_mean)
+    if fitted_scale <= 0.0 or not math.isfinite(fitted_scale):
+        fitted_scale = 1.0
+        fitted_bias = 0.0
+    pred = fitted_scale * x + fitted_bias
+    residual = y - pred
+    rmse = float(torch.sqrt(torch.mean(residual * residual)))
+    rel_rmse = rmse / max(y_std, 1e-6)
+    x_std = float(torch.sqrt(torch.mean(x_centered * x_centered)))
+    corr = cov / max(x_std * y_std, 1e-20)
+    if not math.isfinite(corr):
+        corr = 0.0
+    residual_std = float(torch.sqrt(torch.mean((residual - torch.mean(residual)) ** 2)))
+    if not math.isfinite(residual_std):
+        residual_std = 0.0
+    return float(fitted_scale), float(fitted_bias), int(x.numel()), float(rel_rmse), float(corr), float(residual_std)
+
+
+def _proxy_selected_mass_local(
+    *,
+    selected_cpu: np.ndarray,
+    ranked_cpu: np.ndarray,
+    ranked_scores_cpu: np.ndarray,
+    scores_np: np.ndarray,
+    query_dim: int,
+    tail_score_scale: float = 1.0,
+    tail_score_bias: float = 0.0,
+) -> tuple[float, float]:
+    """Selector-only mass proxy without NumPy reductions."""
+
+    selected_set = set(int(tok) for tok in selected_cpu.tolist())
+    exact_scores = [float(scores_np[int(tok)]) for tok in selected_cpu.tolist()]
+    score_scale = float(math.sqrt(float(query_dim)))
+    tail_scores = [
+        float(tail_score_scale) * (float(score) / score_scale) + float(tail_score_bias)
+        for tok, score in zip(ranked_cpu.tolist(), ranked_scores_cpu.tolist(), strict=False)
+        if int(tok) not in selected_set
+    ]
+    if not exact_scores and not tail_scores:
+        return 0.0, 0.0
+    max_score = max(exact_scores + tail_scores)
+    exact_w = sum(math.exp(score - max_score) for score in exact_scores)
+    tail_w = sum(math.exp(score - max_score) for score in tail_scores)
+    total = max(exact_w + tail_w, 1e-20)
+    return float(exact_w / total), float(tail_w / total)
+
+
+def _decode_vpq_selected_tail_ref_threshold(
+    *,
+    query: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    dense_pq_scores: torch.Tensor,
+    value_codebooks: torch.Tensor,
+    value_codes: torch.Tensor,
+    page_starts: torch.Tensor,
+    ranked_tokens: torch.Tensor,
+    ranked_scores: torch.Tensor,
+    ranked_logits: torch.Tensor,
+    selected_count: int,
+    exact_value_threshold: float,
+    exact_value_threshold_sel: int,
+    query_context_len: int,
+    static_prefix: int,
+    static_suffix: int,
+    page_size: int,
+    scale: float,
+    tail_blend: float,
+) -> tuple[torch.Tensor, dict[str, int]]:
+    """CPU reference for the native decode selected-mass V-PQ tail output.
+
+    This mirrors the benchmark GPU simulator semantics, including exact static
+    prefix/suffix, selected exact-K logits, selected-mass exact/compressed V,
+    and optional V-PQ residual tail. It consumes the same V-PQ packs as the
+    GPU path, so differences isolate execution/backend parity rather than
+    different codebook training.
+    """
+
+    query_cpu = query.detach().to(device="cpu", dtype=torch.float32)
+    keys_cpu = keys.detach().to(device="cpu", dtype=torch.float32)
+    values_cpu = values.detach().to(device="cpu", dtype=torch.float32)
+    dense_cpu = dense_pq_scores.detach().to(device="cpu", dtype=torch.float32)
+    ranked_tokens_cpu = ranked_tokens.detach().to(device="cpu", dtype=torch.long)
+    ranked_scores_cpu = ranked_scores.detach().to(device="cpu", dtype=torch.float32)
+    ranked_logits_cpu = ranked_logits.detach().to(device="cpu", dtype=torch.float32)
+    page_starts_cpu = page_starts.detach().to(device="cpu", dtype=torch.long)
+    prefix_end, base_tail_start = _decode_base_bounds(query_context_len, static_prefix, static_suffix, page_size)
+
+    logits: list[torch.Tensor] = []
+    vals: list[torch.Tensor] = []
+    selected_set: set[int] = set()
+    exact_selected = 0
+    compressed_selected = 0
+
+    for tok in list(range(0, prefix_end)) + list(range(base_tail_start, int(query_context_len))):
+        selected_set.add(int(tok))
+        logits.append((keys_cpu[int(tok)] @ query_cpu) * float(scale))
+        vals.append(values_cpu[int(tok)])
+
+    ranked_limit = min(max(0, int(selected_count)), int(ranked_tokens_cpu.numel()))
+    for sel in range(ranked_limit):
+        tok = int(ranked_tokens_cpu[sel].item())
+        selector_score = float(ranked_scores_cpu[sel].item())
+        logit = float(ranked_logits_cpu[sel].item())
+        if not math.isfinite(selector_score) or not math.isfinite(logit) or tok < 0 or tok >= int(query_context_len):
+            continue
+        if _decode_token_in_base(tok, query_context_len, static_prefix, static_suffix, page_size):
+            continue
+        if tok in selected_set:
+            continue
+        selected_set.add(tok)
+        logits.append(torch.tensor(logit, dtype=torch.float32))
+        if _selected_mass_exact_by_threshold(logit, sel, exact_value_threshold, exact_value_threshold_sel):
+            vals.append(values_cpu[tok])
+            exact_selected += 1
+            continue
+        approx = _vpq_value_for_token_cpu(
+            tok,
+            value_codebooks=value_codebooks,
+            value_codes=value_codes,
+            page_starts=page_starts_cpu,
+            page_size=int(page_size),
+        )
+        if approx is None:
+            vals.append(values_cpu[tok])
+            exact_selected += 1
+        else:
+            vals.append(approx)
+            compressed_selected += 1
+
+    tail_count = 0
+    if float(tail_blend) > 0.0 and int(page_starts_cpu.numel()) > 0:
+        for page in range(int(page_starts_cpu.numel())):
+            page_start = int(page_starts_cpu[page].item())
+            if page_start < prefix_end or page_start + int(page_size) > base_tail_start:
+                continue
+            for row in range(int(page_size)):
+                tok = page_start + row
+                if tok >= int(query_context_len) or tok in selected_set:
+                    continue
+                approx = _vpq_value_for_token_cpu(
+                    tok,
+                    value_codebooks=value_codebooks,
+                    value_codes=value_codes,
+                    page_starts=page_starts_cpu,
+                    page_size=int(page_size),
+                )
+                if approx is None:
+                    continue
+                logits.append(dense_cpu[page * int(page_size) + row] * float(scale))
+                vals.append(approx)
+                tail_count += 1
+
+    if not logits:
+        return torch.zeros((values_cpu.shape[-1],), dtype=torch.float32), {
+            "base_count": 0,
+            "ranked_count": 0,
+            "tail_count": 0,
+            "exact_selected_v": 0,
+            "compressed_selected_v": 0,
+        }
+    weights = torch.softmax(torch.stack(logits, dim=0), dim=0)
+    out = weights @ torch.stack(vals, dim=0)
+    return out.float(), {
+        "base_count": len(list(range(0, prefix_end)) + list(range(base_tail_start, int(query_context_len)))),
+        "ranked_count": int(ranked_limit),
+        "tail_count": int(tail_count),
+        "exact_selected_v": int(exact_selected),
+        "compressed_selected_v": int(compressed_selected),
+    }
+
+
+def _cpu_canonical_geometric_from_gpu_packs(
+    *,
+    query: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    scores_np: np.ndarray,
+    dense_pq_scores: torch.Tensor,
+    value_codebooks: torch.Tensor,
+    value_codes: torch.Tensor,
+    page_starts: torch.Tensor,
+    ranked_tokens: torch.Tensor,
+    ranked_scores: torch.Tensor,
+    ranked_logits: torch.Tensor,
+    approx_thresholds: torch.Tensor,
+    approx_threshold_sels: torch.Tensor,
+    probe_thresholds: torch.Tensor,
+    probe_threshold_sels: torch.Tensor,
+    tail_budgets: list[int],
+    probe_budgets: list[int],
+    base_tokens: list[int],
+    query_context_len: int,
+    static_prefix: int,
+    static_suffix: int,
+    page_size: int,
+    min_budget: int,
+    max_budget: int,
+    granularity: int,
+    growth: float,
+    probe_scale: float,
+    rel_l2_max: float,
+    selected_value_exact_mass: float,
+    selected_value_min_exact_top: int,
+    scale: float,
+    proxy_mass_min: float,
+    proxy_tail_mass_max: float,
+    pq_corr_min: float,
+    pq_relrmse_max: float,
+    tail_blend: float,
+) -> tuple[int, torch.Tensor, dict[str, float | int]]:
+    """Sequential CPU reference for the benchmark canonical GPU kernel."""
+
+    ranked_tokens_cpu = ranked_tokens.detach().to(device="cpu", dtype=torch.long).numpy().astype(np.int64, copy=False)
+    ranked_scores_cpu = ranked_scores.detach().to(device="cpu", dtype=torch.float32).numpy().astype(np.float32, copy=False)
+    base = unique_tokens(
+        list(base_tokens),
+        context_len=int(query_context_len),
+    )
+
+    accepted = int(max_budget)
+    accepted_step = max(0, len(probe_budgets) - 1)
+    last_rel = float("inf")
+    last_proxy_mass = 0.0
+    last_proxy_tail_mass = 0.0
+    last_pq_corr = 0.0
+    last_pq_relrmse = float("inf")
+
+    for step, (tail_budget, probe_budget) in enumerate(zip(tail_budgets, probe_budgets, strict=True)):
+        approx_out, _approx_counts = _decode_vpq_selected_tail_ref_threshold(
+            query=query,
+            keys=keys,
+            values=values,
+            dense_pq_scores=dense_pq_scores,
+            value_codebooks=value_codebooks,
+            value_codes=value_codes,
+            page_starts=page_starts,
+            ranked_tokens=ranked_tokens,
+            ranked_scores=ranked_scores,
+            ranked_logits=ranked_logits,
+            selected_count=int(tail_budget),
+            exact_value_threshold=float(approx_thresholds[int(step)].detach().cpu().item()),
+            exact_value_threshold_sel=int(approx_threshold_sels[int(step)].detach().cpu().item()),
+            query_context_len=int(query_context_len),
+            static_prefix=int(static_prefix),
+            static_suffix=int(static_suffix),
+            page_size=int(page_size),
+            scale=float(scale),
+            tail_blend=float(tail_blend),
+        )
+        probe_out, _probe_counts = _decode_vpq_selected_tail_ref_threshold(
+            query=query,
+            keys=keys,
+            values=values,
+            dense_pq_scores=dense_pq_scores,
+            value_codebooks=value_codebooks,
+            value_codes=value_codes,
+            page_starts=page_starts,
+            ranked_tokens=ranked_tokens,
+            ranked_scores=ranked_scores,
+            ranked_logits=ranked_logits,
+            selected_count=int(probe_budget),
+            exact_value_threshold=float(probe_thresholds[int(step)].detach().cpu().item()),
+            exact_value_threshold_sel=int(probe_threshold_sels[int(step)].detach().cpu().item()),
+            query_context_len=int(query_context_len),
+            static_prefix=int(static_prefix),
+            static_suffix=int(static_suffix),
+            page_size=int(page_size),
+            scale=float(scale),
+            tail_blend=0.0,
+        )
+        last_rel = float(torch.linalg.norm((approx_out - probe_out).double()) / torch.linalg.norm(probe_out.double()).clamp_min(1e-20))
+
+        tail_selected = _selected_tokens(base, ranked_tokens_cpu, context_len=int(query_context_len), budget=int(tail_budget))
+        (
+            tail_score_scale,
+            tail_score_bias,
+            _tail_calibration_tokens,
+            last_pq_relrmse,
+            last_pq_corr,
+            _tail_pq_residual_std,
+        ) = _fit_selected_pq_logit_uncertainty_local(
+            selected_cpu=tail_selected,
+            ranked_cpu=ranked_tokens_cpu,
+            ranked_scores_cpu=ranked_scores_cpu,
+            scores_np=scores_np,
+            query_dim=int(query.numel()),
+        )
+        last_proxy_mass, last_proxy_tail_mass = _proxy_selected_mass_local(
+            selected_cpu=tail_selected,
+            ranked_cpu=ranked_tokens_cpu,
+            ranked_scores_cpu=ranked_scores_cpu,
+            scores_np=scores_np,
+            query_dim=int(query.numel()),
+            tail_score_scale=tail_score_scale,
+            tail_score_bias=tail_score_bias,
+        )
+        passed = (
+            last_rel <= float(rel_l2_max)
+            and last_proxy_mass >= float(proxy_mass_min)
+            and last_proxy_tail_mass <= float(proxy_tail_mass_max)
+            and last_pq_corr >= float(pq_corr_min)
+            and last_pq_relrmse <= float(pq_relrmse_max)
+        )
+        if passed:
+            accepted = int(probe_budget)
+            accepted_step = int(step)
+            break
+        if int(probe_budget) >= int(max_budget):
+            accepted = int(max_budget)
+            accepted_step = int(step)
+            break
+
+    final_out, final_counts = _decode_vpq_selected_tail_ref_threshold(
+        query=query,
+        keys=keys,
+        values=values,
+        dense_pq_scores=dense_pq_scores,
+        value_codebooks=value_codebooks,
+        value_codes=value_codes,
+        page_starts=page_starts,
+        ranked_tokens=ranked_tokens,
+        ranked_scores=ranked_scores,
+        ranked_logits=ranked_logits,
+        selected_count=int(accepted),
+        exact_value_threshold=float(probe_thresholds[int(accepted_step)].detach().cpu().item()) if probe_thresholds.numel() else float("inf"),
+        exact_value_threshold_sel=int(probe_threshold_sels[int(accepted_step)].detach().cpu().item()) if probe_threshold_sels.numel() else -1,
+        query_context_len=int(query_context_len),
+        static_prefix=int(static_prefix),
+        static_suffix=int(static_suffix),
+        page_size=int(page_size),
+        scale=float(scale),
+        tail_blend=float(tail_blend),
+    )
+    diagnostics: dict[str, float | int] = {
+        "accepted_step": int(accepted_step),
+        "last_tail_probe_rel_l2": float(last_rel),
+        "last_proxy_mass": float(last_proxy_mass),
+        "last_proxy_tail_mass": float(last_proxy_tail_mass),
+        "last_pq_corr": float(last_pq_corr),
+        "last_pq_relrmse": float(last_pq_relrmse),
+        **{f"final_{k}": int(v) for k, v in final_counts.items()},
+    }
+    return int(accepted), final_out, diagnostics
+
+
 def _decode_vpq_selected_tail_ref(
     *,
     query: torch.Tensor,
@@ -518,6 +915,276 @@ def _order_equal(left: np.ndarray, right: np.ndarray) -> bool:
     return int(left.size) == int(right.size) and [int(x) for x in left.tolist()] == [int(x) for x in right.tolist()]
 
 
+def _run_canonical_geometric_parity_one(
+    *,
+    args: argparse.Namespace,
+    trace,
+    qidx: int,
+    decode_tokens: int,
+    head: int,
+    kv_head: int,
+    context_len: int,
+    index: GPUIndex,
+    base: list[int],
+    keys_t: torch.Tensor,
+    values_t: torch.Tensor,
+    query_t: torch.Tensor,
+    scores_cpu_t: torch.Tensor,
+    device: torch.device,
+) -> dict[str, float | int | str | bool]:
+    """Compare live canonical GPU geometric V-PQ output against a CPU reference.
+
+    This validates the simulator boundary used by the benchmark path. The CPU
+    reference consumes the same page-local K-PQ scores, exact ranked logits,
+    selected-mass thresholds, and V-PQ packs as the GPU path.
+    """
+
+    native = load_selector_paged_pq_ext()
+    sealed_tokens = int(sum(int(page.size) for page in index.pages))
+    max_rank = min(max(0, int(args.geometric_max_budget)), int(sealed_tokens))
+    if max_rank <= 0:
+        return {
+            "status": "skipped",
+            "failure_reason": "empty-sealed-index",
+            "decode_length": int(decode_tokens),
+            "qidx": int(qidx),
+            "head": int(head),
+            "kv_head": int(kv_head),
+            "context_len": int(context_len),
+            "accepted_count_gpu": 0,
+            "accepted_count_cpu": 0,
+            "accepted_count_abs_diff": 0,
+            "canonical_output_gpu_vs_cpu_relL2": 0.0,
+        }
+
+    rank_budget = int(max_rank)
+    ranked_t, ranked_scores, dense_pq_scores, _rank_seconds, _selector_mb, _ = rank_paged_pq_batched_with_scores(
+        query_t.reshape(1, -1).contiguous(),
+        index,
+        mode="fullscan",
+        selector_backend="cuda_ext",
+        nprobes=[],
+        budget=rank_budget,
+        key_bytes=int(args.score_key_bytes),
+        subbits=int(args.subbits),
+    )
+    value_pack = value_vpq_pack_torch(
+        index=index,
+        values=values_t,
+        value_subvecs=int(args.value_subvecs),
+        value_subbits=int(args.value_subbits),
+        key_bytes=int(args.value_bytes),
+        device=device,
+        value_group_pages=1,
+    )
+    if value_pack is None:
+        return {
+            "status": "skipped",
+            "failure_reason": "empty-value-vpq-pack",
+            "decode_length": int(decode_tokens),
+            "qidx": int(qidx),
+            "head": int(head),
+            "kv_head": int(kv_head),
+            "context_len": int(context_len),
+            "accepted_count_gpu": 0,
+            "accepted_count_cpu": 0,
+            "accepted_count_abs_diff": 0,
+            "canonical_output_gpu_vs_cpu_relL2": 0.0,
+        }
+    value_codebooks, value_codes, value_page_starts, value_page_size, actual_value_subbits = value_pack
+    if int(value_page_size) != int(args.page_size):
+        raise ValueError(
+            f"canonical parity currently expects value_group_pages=1; got value_page_size={value_page_size}"
+        )
+
+    queries_gqa = query_t.reshape(1, int(trace.head_dim)).contiguous()
+    keys_gqa = keys_t.reshape(1, int(context_len), int(trace.head_dim)).contiguous()
+    values_gqa = values_t.reshape(1, int(context_len), int(trace.head_dim)).contiguous()
+    scale = float(trace.head_dim) ** -0.5
+    exact_ranked_logits, base_lse, _base_count, _dense_key_count = _gpu_gqa_dense_decode_ranked_logits_and_base_lse(
+        queries=queries_gqa,
+        keys_all=keys_gqa,
+        keys_all_t_float=None,
+        ranked_tokens=ranked_t,
+        group_size=1,
+        scale=float(scale),
+        max_rank=rank_budget,
+        query_context_len=int(context_len),
+        static_prefix=int(args.static_prefix),
+        static_suffix=int(args.static_suffix),
+        page_size=int(args.page_size),
+        need_base_lse=True,
+    )
+    min_budget = min(max(1, int(args.geometric_min_budget)), rank_budget)
+    granularity = max(1, int(args.geometric_budget_granularity))
+    tail_budgets, probe_budgets = geometric_budget_pairs(
+        min_budget=int(min_budget),
+        max_budget=int(rank_budget),
+        granularity=int(granularity),
+        growth=float(args.geometric_growth),
+        probe_scale=float(args.geometric_probe_scale),
+    )
+    if not tail_budgets:
+        tail_budgets = [int(rank_budget)]
+        probe_budgets = [int(rank_budget)]
+    approx_thresholds, approx_threshold_sels = selected_mass_thresholds_from_logits_gpu(
+        ranked_logits=exact_ranked_logits[:, :rank_budget].contiguous(),
+        ranked_scores=ranked_scores[:, :rank_budget].contiguous(),
+        base_logsumexp=base_lse,
+        budgets=tail_budgets,
+        exact_mass=float(args.selected_value_exact_mass),
+        min_top=int(args.selected_value_min_exact_top),
+    )
+    probe_thresholds, probe_threshold_sels = selected_mass_thresholds_from_logits_gpu(
+        ranked_logits=exact_ranked_logits[:, :rank_budget].contiguous(),
+        ranked_scores=ranked_scores[:, :rank_budget].contiguous(),
+        base_logsumexp=base_lse,
+        budgets=probe_budgets,
+        exact_mass=float(args.selected_value_exact_mass),
+        min_top=int(args.selected_value_min_exact_top),
+    )
+
+    gpu_counts, gpu_output = native.gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds(
+        queries_gqa,
+        keys_gqa,
+        values_gqa,
+        dense_pq_scores.contiguous(),
+        value_codebooks.reshape(
+            1,
+            int(value_codebooks.shape[0]),
+            int(value_codebooks.shape[1]),
+            int(value_codebooks.shape[2]),
+            int(value_codebooks.shape[3]),
+        ).contiguous(),
+        value_codes.reshape(
+            1,
+            int(value_codes.shape[0]),
+            int(value_codes.shape[1]),
+            int(value_codes.shape[2]),
+        ).contiguous(),
+        value_page_starts.contiguous(),
+        ranked_t[:, :rank_budget].contiguous(),
+        ranked_scores[:, :rank_budget].contiguous(),
+        exact_ranked_logits[:, :rank_budget].contiguous(),
+        approx_thresholds.contiguous(),
+        approx_threshold_sels.contiguous(),
+        probe_thresholds.contiguous(),
+        probe_threshold_sels.contiguous(),
+        1,
+        int(context_len),
+        int(args.static_prefix),
+        int(args.static_suffix),
+        int(args.page_size),
+        int(min_budget),
+        int(rank_budget),
+        int(granularity),
+        float(args.geometric_growth),
+        float(args.geometric_probe_scale),
+        float(args.tail_probe_rel_l2_max),
+        float(args.selected_value_exact_mass),
+        int(args.selected_value_min_exact_top),
+        float(scale),
+        float(args.tail_proxy_mass_min),
+        float(args.tail_proxy_mass_max),
+        float(args.tail_pq_corr_min),
+        float(args.tail_pq_relrmse_max),
+        True,
+        False,
+        float(args.tail_blend),
+    )
+    _sync_if_cuda(device)
+    cpu_count, cpu_output, diagnostics = _cpu_canonical_geometric_from_gpu_packs(
+        query=query_t,
+        keys=keys_t,
+        values=values_t,
+        scores_np=scores_cpu_t.detach().to(device="cpu", dtype=torch.float32).numpy(),
+        dense_pq_scores=dense_pq_scores[0],
+        value_codebooks=value_codebooks,
+        value_codes=value_codes,
+        page_starts=value_page_starts,
+        ranked_tokens=ranked_t[0, :rank_budget],
+        ranked_scores=ranked_scores[0, :rank_budget],
+        ranked_logits=exact_ranked_logits[0, :rank_budget],
+        approx_thresholds=approx_thresholds[0],
+        approx_threshold_sels=approx_threshold_sels[0],
+        probe_thresholds=probe_thresholds[0],
+        probe_threshold_sels=probe_threshold_sels[0],
+        tail_budgets=tail_budgets,
+        probe_budgets=probe_budgets,
+        base_tokens=base,
+        query_context_len=int(context_len),
+        static_prefix=int(args.static_prefix),
+        static_suffix=int(args.static_suffix),
+        page_size=int(args.page_size),
+        min_budget=int(min_budget),
+        max_budget=int(rank_budget),
+        granularity=int(granularity),
+        growth=float(args.geometric_growth),
+        probe_scale=float(args.geometric_probe_scale),
+        rel_l2_max=float(args.tail_probe_rel_l2_max),
+        selected_value_exact_mass=float(args.selected_value_exact_mass),
+        selected_value_min_exact_top=int(args.selected_value_min_exact_top),
+        scale=float(scale),
+        proxy_mass_min=float(args.tail_proxy_mass_min),
+        proxy_tail_mass_max=float(args.tail_proxy_mass_max),
+        pq_corr_min=float(args.tail_pq_corr_min),
+        pq_relrmse_max=float(args.tail_pq_relrmse_max),
+        tail_blend=float(args.tail_blend),
+    )
+    gpu_count = int(gpu_counts[0].detach().cpu().item())
+    gpu_output_cpu = gpu_output[0].detach().to(device="cpu", dtype=torch.float32)
+    diff = gpu_output_cpu.double() - cpu_output.double()
+    rel_l2 = float(torch.linalg.norm(diff) / torch.linalg.norm(cpu_output.double()).clamp_min(1e-20))
+    linf = float(torch.max(torch.abs(diff))) if diff.numel() else 0.0
+    count_diff = abs(int(gpu_count) - int(cpu_count))
+    row_status = "passed"
+    reason = ""
+    if count_diff != 0:
+        row_status = "failed"
+        reason = "canonical-accepted-count-mismatch"
+    elif rel_l2 > float(args.canonical_output_atol):
+        row_status = "failed"
+        reason = f"canonical-output-diff>{float(args.canonical_output_atol):g}"
+
+    code_bytes = 1 if int(actual_value_subbits) <= 8 else 2
+    return {
+        "status": row_status,
+        "failure_reason": reason,
+        "decode_length": int(decode_tokens),
+        "qidx": int(qidx),
+        "head": int(head),
+        "kv_head": int(kv_head),
+        "context_len": int(context_len),
+        "page_size": int(args.page_size),
+        "sealed_tokens": int(sealed_tokens),
+        "base_tokens": int(len(base)),
+        "geometric_min_budget": int(min_budget),
+        "geometric_max_budget": int(rank_budget),
+        "geometric_steps": int(len(tail_budgets)),
+        "accepted_count_gpu": int(gpu_count),
+        "accepted_count_cpu": int(cpu_count),
+        "accepted_count_abs_diff": int(count_diff),
+        "canonical_output_gpu_vs_cpu_relL2": float(rel_l2),
+        "canonical_output_gpu_vs_cpu_linf": float(linf),
+        "canonical_tail_probe_rel_l2": float(diagnostics.get("last_tail_probe_rel_l2", float("nan"))),
+        "canonical_proxy_mass": float(diagnostics.get("last_proxy_mass", float("nan"))),
+        "canonical_proxy_tail_mass": float(diagnostics.get("last_proxy_tail_mass", float("nan"))),
+        "canonical_pq_corr": float(diagnostics.get("last_pq_corr", float("nan"))),
+        "canonical_pq_relrmse": float(diagnostics.get("last_pq_relrmse", float("nan"))),
+        "canonical_final_tail_tokens": int(diagnostics.get("final_tail_count", 0)),
+        "canonical_final_exact_selected_v": int(diagnostics.get("final_exact_selected_v", 0)),
+        "canonical_final_compressed_selected_v": int(diagnostics.get("final_compressed_selected_v", 0)),
+        "value_vpq_codebook_MB": float(int(value_codebooks.numel()) * int(args.value_bytes)) / MB,
+        "value_vpq_code_MB_for_tail_and_compressed_selected": float(
+            int(diagnostics.get("final_tail_count", 0) + diagnostics.get("final_compressed_selected_v", 0))
+            * int(value_codebooks.shape[1])
+            * int(code_bytes)
+        )
+        / MB,
+        "value_vpq_seed_scheme": "live_gpu_value_vpq_pack_torch",
+    }
+
+
 def run() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace", required=True)
@@ -542,6 +1209,20 @@ def run() -> None:
     parser.add_argument("--exact_value_top", type=int, default=-64)
     parser.add_argument("--tail_blend", type=float, default=1.0)
     parser.add_argument("--vpq_tail_atol", type=float, default=3e-3)
+    parser.add_argument("--check_canonical_geometric", action="store_true")
+    parser.add_argument("--geometric_min_budget", type=int, default=4096)
+    parser.add_argument("--geometric_max_budget", type=int, default=32768)
+    parser.add_argument("--geometric_budget_granularity", type=int, default=1024)
+    parser.add_argument("--geometric_growth", type=float, default=1.5)
+    parser.add_argument("--geometric_probe_scale", type=float, default=1.5)
+    parser.add_argument("--tail_probe_rel_l2_max", type=float, default=0.020)
+    parser.add_argument("--selected_value_exact_mass", type=float, default=0.99)
+    parser.add_argument("--selected_value_min_exact_top", type=int, default=1024)
+    parser.add_argument("--tail_proxy_mass_min", type=float, default=0.99)
+    parser.add_argument("--tail_proxy_mass_max", type=float, default=1.0)
+    parser.add_argument("--tail_pq_corr_min", type=float, default=0.70)
+    parser.add_argument("--tail_pq_relrmse_max", type=float, default=float("inf"))
+    parser.add_argument("--canonical_output_atol", type=float, default=5e-3)
     parser.add_argument("--max_qidx_per_decode", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
@@ -580,6 +1261,7 @@ def run() -> None:
         raise SystemExit(f"no q_indices found for decode_lengths={decode_lengths}")
 
     rows: list[dict] = []
+    canonical_rows: list[dict] = []
     status = "passed"
     failures: list[str] = []
 
@@ -946,6 +1628,33 @@ def run() -> None:
                     }
                 )
 
+            if bool(args.check_canonical_geometric):
+                canonical_row = _run_canonical_geometric_parity_one(
+                    args=args,
+                    trace=trace,
+                    qidx=int(qidx),
+                    decode_tokens=int(decode_tokens),
+                    head=int(head),
+                    kv_head=int(kv_head),
+                    context_len=int(context_len),
+                    index=index,
+                    base=base,
+                    keys_t=keys_t,
+                    values_t=values_t,
+                    query_t=query_t,
+                    scores_cpu_t=scores_cpu_t,
+                    device=device,
+                )
+                canonical_rows.append(canonical_row)
+                if canonical_row.get("status") == "failed":
+                    status = "failed"
+                    failures.append(
+                        f"canonical decode={decode_tokens} head={head}: {canonical_row.get('failure_reason', '')} "
+                        f"count_gpu={canonical_row.get('accepted_count_gpu', 0)} "
+                        f"count_cpu={canonical_row.get('accepted_count_cpu', 0)} "
+                        f"output_rel={canonical_row.get('canonical_output_gpu_vs_cpu_relL2', 0.0):.6g}"
+                    )
+
     samples_path = out_dir / "samples.csv"
     with samples_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [])
@@ -953,12 +1662,24 @@ def run() -> None:
             writer.writeheader()
             writer.writerows(rows)
     (out_dir / "samples.json").write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    canonical_samples_path = out_dir / "canonical_geometric_samples.csv"
+    with canonical_samples_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(canonical_rows[0].keys()) if canonical_rows else [])
+        if canonical_rows:
+            writer.writeheader()
+            writer.writerows(canonical_rows)
+    (out_dir / "canonical_geometric_samples.json").write_text(
+        json.dumps(canonical_rows, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
     summary = {
         "kind": "gpu_cpu_paged_pq_parity",
         "status": status,
         "failures": failures,
         "rows": int(len(rows)),
+        "canonical_geometric_checked": bool(any(row.get("status") != "skipped" for row in canonical_rows)),
+        "canonical_geometric_rows": int(len(canonical_rows)),
         "trace": str(args.trace),
         "decode_lengths": decode_lengths,
         "heads": heads,
@@ -975,6 +1696,19 @@ def run() -> None:
         "max_vpq_tail_output_relL2": float(max((row.get("vpq_tail_output_relL2", 0.0) for row in rows), default=0.0)),
         "max_vpq_tail_output_linf": float(max((row.get("vpq_tail_output_linf", 0.0) for row in rows), default=0.0)),
         "max_vpq_tail_MB_per_query": float(max((row.get("vpq_tail_MB_per_query", 0.0) for row in rows), default=0.0)),
+        "max_canonical_output_gpu_vs_cpu_relL2": float(
+            max((row.get("canonical_output_gpu_vs_cpu_relL2", 0.0) for row in canonical_rows), default=0.0)
+        ),
+        "max_canonical_output_gpu_vs_cpu_linf": float(
+            max((row.get("canonical_output_gpu_vs_cpu_linf", 0.0) for row in canonical_rows), default=0.0)
+        ),
+        "max_canonical_accepted_count_abs_diff": int(
+            max((int(row.get("accepted_count_abs_diff", 0)) for row in canonical_rows), default=0)
+        ),
+        "all_canonical_accept_counts_equal": bool(
+            all(int(row.get("accepted_count_abs_diff", 0)) == 0 for row in canonical_rows)
+        ),
+        "canonical_statuses": sorted(set(str(row.get("status", "unknown")) for row in canonical_rows)),
         "min_cpu_cuda_topk_overlap": float(min((row["cpu_cuda_topk_overlap"] for row in rows), default=1.0)),
         "all_cpu_cuda_selected_sets_equal": bool(all(row["cpu_cuda_selected_set_equal"] for row in rows)),
         "all_page_counts_equal": bool(all(row["page_count_equal"] for row in rows)),
@@ -995,6 +1729,7 @@ def run() -> None:
         else 0.0,
         "selector_speedup_vs_cpu_mean": _mean([float(row["selector_speedup_vs_cpu_mean"]) for row in rows]) if rows else 0.0,
         "samples_csv": str(samples_path),
+        "canonical_geometric_samples_csv": str(canonical_samples_path),
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2, sort_keys=True))
