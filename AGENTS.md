@@ -1,123 +1,98 @@
 # AGENTS.md
+Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
 
-## Project context
-RetroInfer (Microsoft) long-context attention repo with CPU-GPU co-execution.
-Current active experiment is RetrievalAttention-style ANN retrieval for `Llama-3.1-8B`.
-High-level research framing: prove dynamic/unstructured sparse attention's algorithmic efficiency first, then use the GPU mismatch to motivate hardware support for long decode. See `notes/research_flow.md`.
+**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
-## Environment constraints
-- GPU server with Slurm (`sbatch`).
-- CPU RAM and ANN index size are primary bottlenecks, not GPU VRAM.
-- Standard job entry for fast iteration: `test.sh`.
+## 1. Think Before Coding
 
-## Quick start
-- Submit simple test: `sbatch test.sh`
-- Submit RULER wrapper: `sbatch benchmark/ruler/ruler_run_wrapper.sh`
-- Do not tail/wait after submit; inspect slurm output after completion.
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
 
-## Current active branch/work
-- Branch used for GPU-topk exploration: `gpu_top_k`
-- Focus area: `cache_hub/retrievalattention_cache.py`
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
 
-## Current decisions
-- ANN backend: `faiss-cpu` (baseline + decode seed index in GPU-topk mode).
-- Graph build: full prefill queries (no subsampling yet).
-- Retrieval budget fairness: token budget derived from RetroInfer settings.
-- RetrievalAttention static pattern is now paper-style:
-  - `static_pattern_start=128`
-  - `static_pattern_end=512`
-- Runtime token budget is now override-first for fast iteration:
-  - `TOKEN_BUDGET_OVERRIDE=100` is default in `test.sh` and `benchmark/ruler/ruler_run_wrapper.sh`.
-  - Ratio-based budget path is still available as fallback.
-- Roar-style graph builder is implemented and selectable:
-  - `RETRIEVALATTN_GRAPH_BUILDER=roar|legacy`
-  - default in `test.sh`: `roar`.
-- Roar graph-build backend now supports C++ acceleration via local extension:
-  - `RETRIEVALATTN_ROAR_BACKEND=cpp|python|auto`
-  - default in run scripts: `cpp` (fails fast if extension is missing).
-  - extension source/build path: `third_party/RoarGraph/python_ext`.
-  - build command:
-    - `module load python/3.10.4`
-    - `source .venv/bin/activate`
-    - `python third_party/RoarGraph/python_ext/setup.py build_ext --inplace`
-- Decode traversal now supports the same C++ extension path:
-  - `RETRIEVALATTN_DECODE_BACKEND=auto|python|roar_cpp` (`auto` default),
-  - C++ decode search runs only for CSR graphs and falls back to Python traversal in `auto` mode if C++ fails,
-  - `roar_cpp` mode is strict and fails fast if the extension is missing/unusable.
-- Decode C++ search controls:
-  - `RETRIEVALATTN_ROAR_DECODE_INIT` (seed count passed to C++ queue, default `64`),
-  - `RETRIEVALATTN_ROAR_DECODE_LPQ` (queue capacity override, `0` => candidate-target driven),
-  - `RETRIEVALATTN_ROAR_DECODE_MAX_CMPS` (`0` => uncapped),
-  - `RETRIEVALATTN_ROAR_DECODE_MAX_HOPS` (`0` => uses `RETRIEVALATTN_MAX_VISITS`),
-  - `RETRIEVALATTN_ROAR_DECODE_THREADS` (OpenMP thread override in decode C++ call).
+## 2. Simplicity First
 
-## Important caution (quality)
-- Decode seeding now defaults to `RETRIEVALATTN_SEED_MODE=graph_only`:
-  - warm-start from previous step retrieved tokens,
-  - add per-head high-degree hub seeds from the built K-K graph,
-  - add dynamic-tail anchors for cold-start robustness.
-- `RETRIEVALATTN_SEED_MODE=faiss` remains available for debug/reference and uses full-scan `IndexFlatIP` seed search.
-- If decode index is missing while running faiss seed mode, output quality can collapse (e.g., repeated `[INST]` patterns).
+**Minimum code that solves the problem. Nothing speculative.**
 
-## Important caution (latency)
-- Decode traversal now has two backends:
-  - C++ Roar-style bounded queue traversal (`RETRIEVALATTN_DECODE_BACKEND=auto|roar_cpp`),
-  - Python adaptive best-first traversal fallback (`RETRIEVALATTN_DECODE_BACKEND=python` or auto fallback).
-- Default behavior (`auto`) prefers C++ on CSR graphs and avoids hard failures by falling back to Python if the call fails.
-- Python adaptive traversal remains available and still uses:
-  - `RETRIEVALATTN_EXPAND_WIDTH`, `RETRIEVALATTN_MIN_VISITS`, `RETRIEVALATTN_MAX_VISITS`,
-  - `RETRIEVALATTN_STOP_PATIENCE`, `RETRIEVALATTN_STOP_MARGIN`, `RETRIEVALATTN_FRONTIER_TOPN`.
-- Default adaptive limits can still be expensive if fanout is high.
-- Tune `RETRIEVALATTN_MIN_VISITS` / `RETRIEVALATTN_MAX_VISITS` / `RETRIEVALATTN_EXPAND_WIDTH` first when decode is too slow.
-- `test.sh` now uses latency-safe defaults for adaptive decode:
-  - `RETRIEVALATTN_EXPAND_WIDTH=48`
-  - `RETRIEVALATTN_MIN_VISITS=96`
-  - `RETRIEVALATTN_MAX_VISITS=2048`
-  - `RETRIEVALATTN_STOP_PATIENCE=1`
-  - `RETRIEVALATTN_STOP_MARGIN=0.001`
-- Decode critical-path profiling can be enabled with `RETRIEVALATTN_DECODE_PROFILE=1` (enabled by default in `test.sh`).
-- Latest decode seed change:
-  - default seed path is now `RETRIEVALATTN_SEED_MODE=graph_only` (no full-scan `IndexFlatIP` at decode seed stage).
-  - expected effect: reduce `seed` time in decode profile.
-  - status: needs fresh run measurement to confirm reduction.
-- Current priority after seed-mode change:
-  - accelerate graph traversal (`graph` slice in decode profile), since retrieval traversal remains the expected bottleneck.
-- Latest measured A/B (same adaptive traversal settings):
-  - `slurm-42275514.out` (legacy faiss seed): decode `1268.31 s`; retrieve `[seed=308.814s, graph=896.496s]`.
-  - `slurm-42277995.out` (graph_only seed): decode `945.12 s`; retrieve `[seed=10.546s, graph=880.674s]`.
-  - interpretation: seed optimization worked (large drop), graph remained dominant.
-- Candidate expansion efficiency signal:
-  - `visited_total` stayed around `24.87M`,
-  - `candidates_total` stayed around `78-80M`,
-  - only ~31% of candidate evaluations become visited nodes, so decode bottleneck is now traversal fanout/candidate processing.
-- Current priority:
-  - measure C++ decode traversal (`RETRIEVALATTN_DECODE_BACKEND=auto`) vs Python fallback on the same seed/budget settings.
-  - if `graph` time is still dominant, tune `RETRIEVALATTN_ROAR_DECODE_LPQ` / `MAX_HOPS` / `MAX_CMPS` first before changing retrieval budget.
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
 
-## Key code locations
-- Retrieval prototype cache: `cache_hub/retrievalattention_cache.py`
-- Retrieval attention kernels: `attn_hub/retrievalattention_attn.py`
-- Model routing: `model_hub/llama.py`, `model_hub/qwen.py`
-- Baseline RetroInfer cache: `cache_hub/retroinfer_cache.py`
-- Run harness: `test.sh`, `benchmark/ruler/ruler_run_wrapper.sh`
-- Decode latency reporting: `model_hub/LLM.py`
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
 
-## Notes index
-- High-level research flow: `notes/research_flow.md`
-- Current status snapshot: `notes/current_status.md`
-- Debug and verification playbook: `notes/debug_playbook.md`
-- Performance and quality findings log: `notes/findings_log.md`
-- Runbook and env flags: `notes/runbook.md`
-- Latest compact handoff checkpoint: `notes/context_checkpoint_2026-02-12.md`
-- Previous compact checkpoints:
-  - `notes/context_checkpoint_2026-02-06.md`
-  - `notes/context_checkpoint_2026-02-05.md`
+## 3. Surgical Changes
 
-## Open design questions
-- Token-level gather vs mapping token hits back to cluster/wave abstractions.
-- Graph format and degree cap under CPU RAM constraints.
-- Per-layer/per-head indexing vs sharing across heads.
-- Decode beam-search traversal design:
-  - beam width / ef-search style controls,
-  - reverse-edge usage during traversal,
-  - stop rule to hit target token budget with bounded latency.
+**Touch only what you must. Clean up only your own mess.**
+
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
+
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
+
+The test: Every changed line should trace directly to the user's request.
+
+## 4. Goal-Driven Execution
+
+**Define success criteria. Loop until verified.**
+
+Transform tasks into verifiable goals:
+- "Add validation" → "Write tests for invalid inputs, then make them pass"
+- "Fix the bug" → "Write a test that reproduces it, then make it pass"
+- "Refactor X" → "Ensure tests pass before and after"
+
+For multi-step tasks, state a brief plan:
+```
+1. [Step] → verify: [check]
+2. [Step] → verify: [check]
+3. [Step] → verify: [check]
+```
+
+Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+
+---
+
+**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+## Project Context
+
+RetrievalAttention is a long-context attention research repo built around RetroInfer-style infrastructure, sparse/approximate attention baselines, and GPU benchmark validation. Active experiments change quickly; do not infer current targets from this file.
+
+Before starting project work, read:
+- `notes/current_status.md` for the current active objective and latest results.
+- `notes/runbook.md` for current Slurm wrappers, presets, and environment flags.
+- `notes/research_flow.md` for the high-level research framing.
+- `notes/selector_eval_latest_results.md` for the latest selector/frontier results.
+
+## Environment Rules
+
+- Use Slurm for heavy builds, GPU tests, and benchmark runs.
+- Prefer `spgpu` with account `zhengya98`.
+- Do not run long GPU jobs, large compiles, or benchmark suites on login nodes.
+- Use the repo `.venv` for Python commands when practical; load the cluster Python module first when the venv requires it.
+- Treat dated job IDs, benchmark outputs, and active experiment settings as notes content, not stable agent instructions.
+
+## Stable Code Map
+
+- Retrieval cache prototypes: `cache_hub/`
+- Attention kernels and wrappers: `attn_hub/`
+- Model routing: `model_hub/`
+- Selector/frontier evaluation: `benchmark/selector_eval/`
+- RULER and LongBench wrappers: `benchmark/`, `scripts/`
+- Research notes and handoffs: `notes/`
+
+## Where Volatile Details Belong
+
+- Current branch, active experiment, pending jobs, and latest conclusions: `notes/current_status.md`.
+- Run commands, Slurm flags, wrapper defaults, and environment variables: `notes/runbook.md`.
+- Performance measurements, failed ideas, and quality findings: `notes/findings_log.md` or a dated note.
+- Design questions and research direction: `notes/research_flow.md`.

@@ -25,6 +25,7 @@ slurm-c90-*.out
 slurm-cmp64-*.out
 slurm-kvab_*.out
 slurm-kvqh-*.out
+.slurm-*.json
 simple_test.out
 ruler_sampled*.out
 roargraph_builder_ext*.so
@@ -33,6 +34,10 @@ notes/*.tsv
 notes/*.npz
 notes/*.png
 notes/slurm_manifests/
+notes/archive/**/*.csv
+notes/archive/**/*.tsv
+notes/archive/**/*.npz
+notes/archive/**/*.png
 /third_party/
 
 ## Native extension build products
