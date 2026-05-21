@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -42,6 +43,22 @@ def parse_args() -> argparse.Namespace:
         "--skip-old-loop",
         action="store_true",
         help="skip the repeated-output reference loop; useful for large 32k/128k-sized timing runs",
+    )
+    parser.add_argument(
+        "--bench-fused-output",
+        action="store_true",
+        help="also time the fused geometric-counts plus final-output native entry point",
+    )
+    parser.add_argument(
+        "--bench-final-output",
+        action="store_true",
+        help="also time the canonical final selected/tail output native entry point at --output-budget",
+    )
+    parser.add_argument(
+        "--output-budget",
+        type=int,
+        default=0,
+        help="selected budget used by --bench-final-output; 0 means max-budget",
     )
     return parser.parse_args()
 
@@ -391,42 +408,76 @@ def main() -> None:
             k = next_k
         return expected
 
+    threshold_cache: tuple[
+        list[int],
+        list[int],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ] | None = None
+
+    def threshold_inputs() -> tuple[
+        list[int],
+        list[int],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        nonlocal threshold_cache
+        if threshold_cache is not None:
+            return threshold_cache
+        tail_budgets, probe_budgets = geometric_budget_pairs(
+            min_budget=min_budget,
+            max_budget=max_budget,
+            granularity=granularity,
+            growth=float(args.growth),
+            probe_scale=float(args.probe_scale),
+        )
+        combined_budgets = sorted({int(v) for v in tail_budgets} | {int(v) for v in probe_budgets})
+        combined_thresholds, combined_threshold_sels = selected_mass_thresholds_from_logits(
+            ranked_logits=ranked_logits,
+            ranked_scores=ranked_scores,
+            base_logsumexp=base_lse,
+            budgets=combined_budgets,
+            exact_mass=float(args.exact_value_mass),
+            min_top=int(args.exact_value_min_top),
+        )
+        budget_to_col = {int(budget): int(idx) for idx, budget in enumerate(combined_budgets)}
+        approx_cols = torch.tensor(
+            [budget_to_col[int(v)] for v in tail_budgets],
+            dtype=torch.long,
+            device=ranked_logits.device,
+        )
+        probe_cols = torch.tensor(
+            [budget_to_col[int(v)] for v in probe_budgets],
+            dtype=torch.long,
+            device=ranked_logits.device,
+        )
+        threshold_cache = (
+            tail_budgets,
+            probe_budgets,
+            combined_thresholds.index_select(1, approx_cols).contiguous(),
+            combined_threshold_sels.index_select(1, approx_cols).contiguous(),
+            combined_thresholds.index_select(1, probe_cols).contiguous(),
+            combined_threshold_sels.index_select(1, probe_cols).contiguous(),
+        )
+        return threshold_cache
+
     def native_counts() -> torch.Tensor:
         if (
             use_selected_mass
             and hasattr(native, "gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_thresholds")
         ):
-            tail_budgets, probe_budgets = geometric_budget_pairs(
-                min_budget=min_budget,
-                max_budget=max_budget,
-                granularity=granularity,
-                growth=float(args.growth),
-                probe_scale=float(args.probe_scale),
-            )
-            combined_budgets = sorted({int(v) for v in tail_budgets} | {int(v) for v in probe_budgets})
-            combined_thresholds, combined_threshold_sels = selected_mass_thresholds_from_logits(
-                ranked_logits=ranked_logits,
-                ranked_scores=ranked_scores,
-                base_logsumexp=base_lse,
-                budgets=combined_budgets,
-                exact_mass=float(args.exact_value_mass),
-                min_top=int(args.exact_value_min_top),
-            )
-            budget_to_col = {int(budget): int(idx) for idx, budget in enumerate(combined_budgets)}
-            approx_cols = torch.tensor(
-                [budget_to_col[int(v)] for v in tail_budgets],
-                dtype=torch.long,
-                device=ranked_logits.device,
-            )
-            probe_cols = torch.tensor(
-                [budget_to_col[int(v)] for v in probe_budgets],
-                dtype=torch.long,
-                device=ranked_logits.device,
-            )
-            approx_thresholds = combined_thresholds.index_select(1, approx_cols).contiguous()
-            approx_threshold_sels = combined_threshold_sels.index_select(1, approx_cols).contiguous()
-            probe_thresholds = combined_thresholds.index_select(1, probe_cols).contiguous()
-            probe_threshold_sels = combined_threshold_sels.index_select(1, probe_cols).contiguous()
+            (
+                _tail_budgets,
+                _probe_budgets,
+                approx_thresholds,
+                approx_threshold_sels,
+                probe_thresholds,
+                probe_threshold_sels,
+            ) = threshold_inputs()
             return native.gqa_decode_geometric_accept_counts_vpq_mass_min_proxy_from_logits_thresholds(
                 queries,
                 keys,
@@ -558,11 +609,129 @@ def main() -> None:
             scale,
         )
 
+    def native_fused_output() -> torch.Tensor:
+        if not (
+            use_selected_mass
+            and hasattr(native, "gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds")
+        ):
+            raise RuntimeError("fused geometric output path is unavailable for this configuration")
+        (
+            _tail_budgets,
+            _probe_budgets,
+            approx_thresholds,
+            approx_threshold_sels,
+            probe_thresholds,
+            probe_threshold_sels,
+        ) = threshold_inputs()
+        _counts, outputs = native.gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds(
+            queries,
+            keys,
+            values,
+            dense_pq_scores,
+            value_codebooks,
+            value_codes,
+            page_starts,
+            ranked_tokens,
+            ranked_scores,
+            ranked_logits,
+            approx_thresholds,
+            approx_threshold_sels,
+            probe_thresholds,
+            probe_threshold_sels,
+            group_size,
+            total_tokens,
+            128,
+            512,
+            page_size,
+            min_budget,
+            max_budget,
+            granularity,
+            float(args.growth),
+            float(args.probe_scale),
+            float(args.rel_l2_max),
+            float(args.exact_value_mass),
+            int(args.exact_value_min_top),
+            scale,
+            0.0,
+            1.0,
+            -1.0,
+            float("inf"),
+            False,
+            str(args.mode) == "tail_stability",
+            1.0,
+        )
+        return outputs
+
+    final_output_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+
+    def final_output_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        nonlocal final_output_cache
+        if final_output_cache is not None:
+            return final_output_cache
+        output_budget = int(args.output_budget) if int(args.output_budget) > 0 else max_budget
+        output_budget = max(0, min(int(output_budget), max_budget))
+        final_scores = ranked_scores.masked_fill(rank_ids >= int(output_budget), float("-inf")).contiguous()
+        thresholds, threshold_sels = selected_mass_thresholds_from_logits(
+            ranked_logits=ranked_logits,
+            ranked_scores=ranked_scores,
+            base_logsumexp=base_lse,
+            budgets=[output_budget],
+            exact_mass=float(args.exact_value_mass),
+            min_top=int(args.exact_value_min_top),
+        )
+        final_output_cache = (final_scores, thresholds[:, 0].contiguous(), threshold_sels[:, 0].contiguous())
+        return final_output_cache
+
+    def native_final_output() -> torch.Tensor:
+        if not (
+            use_selected_mass
+            and hasattr(native, "gqa_decode_vpq_selected_tail_agg_from_logits_mass_min_thresholds")
+        ):
+            raise RuntimeError("final output threshold path is unavailable for this configuration")
+        final_scores, thresholds, threshold_sels = final_output_inputs()
+        return native.gqa_decode_vpq_selected_tail_agg_from_logits_mass_min_thresholds(
+            queries,
+            keys,
+            values,
+            dense_pq_scores,
+            value_codebooks,
+            value_codes,
+            page_starts,
+            ranked_tokens,
+            final_scores,
+            ranked_logits,
+            thresholds,
+            threshold_sels,
+            float(args.exact_value_mass),
+            int(args.exact_value_min_top),
+            group_size,
+            total_tokens,
+            128,
+            512,
+            page_size,
+            scale,
+            1.0,
+        )
+
     old_ms = None
     old_result = None
     if not bool(args.skip_old_loop):
         old_ms, old_result = elapsed_ms(old_loop, warmup=int(args.warmup), iters=int(args.iters))
     native_ms, native_result = elapsed_ms(native_counts, warmup=int(args.warmup), iters=int(args.iters))
+    fused_output_ms = None
+    if bool(args.bench_fused_output):
+        fused_output_ms, _fused_output = elapsed_ms(
+            native_fused_output,
+            warmup=int(args.warmup),
+            iters=int(args.iters),
+        )
+    final_output_ms = None
+    if bool(args.bench_final_output):
+        final_output_ms, _final_output = elapsed_ms(
+            native_final_output,
+            warmup=int(args.warmup),
+            iters=int(args.iters),
+        )
     native_cpu = native_result.detach().cpu()
     old_cpu = old_result.detach().cpu() if old_result is not None else None
     counts_match = bool(torch.equal(old_cpu, native_cpu)) if old_cpu is not None else None
@@ -583,6 +752,9 @@ def main() -> None:
         "mode": str(args.mode),
         "old_loop_ms": old_ms,
         "native_ms": native_ms,
+        "fused_output_ms": fused_output_ms,
+        "final_output_ms": final_output_ms,
+        "output_budget": int(args.output_budget) if int(args.output_budget) > 0 else max_budget,
         "speedup": old_ms / native_ms if old_ms is not None and native_ms > 0.0 else None,
         "native_path": (
             "mass_min_proxy_from_logits_thresholds"
@@ -593,6 +765,8 @@ def main() -> None:
             if use_selected_mass
             else "vpq"
         ),
+        "step_parallel": os.environ.get("SELECTOR_PQ_GEOMETRIC_STEP_PARALLEL", ""),
+        "tail_output_parallel": os.environ.get("SELECTOR_PQ_TAIL_OUTPUT_PARALLEL", ""),
         "counts_match": counts_match,
         "old_counts": old_cpu.tolist() if old_cpu is not None else None,
         "native_counts": native_cpu.tolist(),

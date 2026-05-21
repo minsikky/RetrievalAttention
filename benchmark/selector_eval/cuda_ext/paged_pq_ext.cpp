@@ -526,6 +526,16 @@ std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_l
     bool probe_includes_tail,
     double tail_blend);
 
+std::vector<torch::Tensor> selected_mass_thresholds_from_topk_cuda(
+    torch::Tensor top_logits,
+    torch::Tensor top_order,
+    torch::Tensor prefix_lse,
+    torch::Tensor prefix_valid_counts,
+    torch::Tensor base_lse,
+    torch::Tensor budgets,
+    double exact_mass,
+    int64_t min_top);
+
 torch::Tensor gqa_causal_geometric_accept_counts_cuda(
     torch::Tensor queries,
     torch::Tensor keys,
@@ -3399,6 +3409,46 @@ std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_l
       tail_blend);
 }
 
+std::vector<torch::Tensor> selected_mass_thresholds_from_topk(
+    torch::Tensor top_logits,
+    torch::Tensor top_order,
+    torch::Tensor prefix_lse,
+    torch::Tensor prefix_valid_counts,
+    torch::Tensor base_lse,
+    torch::Tensor budgets,
+    double exact_mass,
+    int64_t min_top) {
+  TORCH_CHECK(top_logits.is_cuda(), "top_logits must be CUDA");
+  TORCH_CHECK(top_order.is_cuda(), "top_order must be CUDA");
+  TORCH_CHECK(prefix_lse.is_cuda(), "prefix_lse must be CUDA");
+  TORCH_CHECK(prefix_valid_counts.is_cuda(), "prefix_valid_counts must be CUDA");
+  TORCH_CHECK(base_lse.is_cuda(), "base_lse must be CUDA");
+  TORCH_CHECK(budgets.is_cuda(), "budgets must be CUDA");
+  TORCH_CHECK(top_logits.scalar_type() == torch::kFloat32, "top_logits must be float32");
+  TORCH_CHECK(top_order.scalar_type() == torch::kLong, "top_order must be int64");
+  TORCH_CHECK(prefix_lse.scalar_type() == torch::kFloat32, "prefix_lse must be float32");
+  TORCH_CHECK(prefix_valid_counts.scalar_type() == torch::kLong, "prefix_valid_counts must be int64");
+  TORCH_CHECK(base_lse.scalar_type() == torch::kFloat32, "base_lse must be float32");
+  TORCH_CHECK(budgets.scalar_type() == torch::kLong, "budgets must be int64");
+  TORCH_CHECK(top_logits.dim() == 2, "top_logits shape must be [heads, topk]");
+  TORCH_CHECK(top_order.sizes() == top_logits.sizes(), "top_order/top_logits shape mismatch");
+  TORCH_CHECK(prefix_lse.dim() == 2, "prefix_lse shape must be [heads, rank]");
+  TORCH_CHECK(prefix_valid_counts.sizes() == prefix_lse.sizes(), "prefix valid/lse shape mismatch");
+  TORCH_CHECK(base_lse.dim() == 1, "base_lse shape must be [heads]");
+  TORCH_CHECK(budgets.dim() == 1, "budgets shape must be [steps]");
+  TORCH_CHECK(prefix_lse.size(0) == top_logits.size(0), "prefix/topk head count mismatch");
+  TORCH_CHECK(base_lse.size(0) == top_logits.size(0), "base_lse head count mismatch");
+  return selected_mass_thresholds_from_topk_cuda(
+      top_logits.contiguous(),
+      top_order.contiguous(),
+      prefix_lse.contiguous(),
+      prefix_valid_counts.contiguous(),
+      base_lse.contiguous(),
+      budgets.contiguous(),
+      exact_mass,
+      min_top);
+}
+
 torch::Tensor gqa_causal_geometric_accept_counts(
     torch::Tensor queries,
     torch::Tensor keys,
@@ -3766,6 +3816,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	      "gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds",
 	      &gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds,
 	      "Decode geometric confidence and final selected/tail output with selected-mass V-PQ exactness, proxy gating, precomputed exact logits, and per-budget thresholds (CUDA)");
+	  m.def(
+	      "selected_mass_thresholds_from_topk",
+	      &selected_mass_thresholds_from_topk,
+	      "Build selected-mass exact-V thresholds from sorted top-k exact logits (CUDA)");
 	  m.def(
 	      "gqa_causal_geometric_accept_counts",
 	      &gqa_causal_geometric_accept_counts,

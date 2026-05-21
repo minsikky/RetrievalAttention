@@ -48,6 +48,7 @@ _EXPORTED_NAMES = [
     "gqa_exact_selected_attention",
     "gqa_fullscan_pq_topk",
     "gqa_fullscan_pq_topk_scores",
+    "selected_mass_thresholds_from_topk",
 ]
 
 __all__ = []

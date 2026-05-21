@@ -61,6 +61,8 @@ python benchmark/selector_eval/cuda_ext/bench_geometric_accept_counts.py \
   --warmup "${BENCH_WARMUP:-3}" \
   --iters "${BENCH_ITERS:-10}" \
   $( [ "${BENCH_SKIP_OLD_LOOP:-1}" = "1" ] && printf '%s' "--skip-old-loop" ) \
+  $( [ "${BENCH_FUSED_OUTPUT:-0}" = "1" ] && printf '%s' "--bench-fused-output" ) \
+  $( [ "${BENCH_FINAL_OUTPUT:-0}" = "1" ] && printf '%s %s' "--bench-final-output --output-budget" "${BENCH_OUTPUT_BUDGET:-0}" ) \
   --output "${OUTPUT_DIR}/summary.json"
 
 echo "[geom_accept_bench] finished=$(date --iso-8601=seconds)"

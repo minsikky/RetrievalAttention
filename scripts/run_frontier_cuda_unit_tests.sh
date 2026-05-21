@@ -26,6 +26,8 @@ export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.10/site-packages/torch/lib:/sw/pk
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.0;8.6;9.0}"
 export PYTHONPATH="$PWD/benchmark/selector_eval/cuda_ext:${PYTHONPATH:-}"
 export MAX_JOBS="${MAX_JOBS:-4}"
+LOCK_FILE="${CUDA_EXT_BUILD_LOCK:-${PWD}/.codex/selector_pq_build.lock}"
+mkdir -p "$(dirname "${LOCK_FILE}")"
 
 start_ts="$(date +%s)"
 status="passed"
@@ -40,9 +42,11 @@ set +e
   python -V
   nvidia-smi || true
 
-  cd benchmark/selector_eval/cuda_ext
-  python setup.py build_ext --inplace
-  cd ../../..
+  (
+    flock 200
+    cd benchmark/selector_eval/cuda_ext
+    python setup.py build_ext --inplace
+  ) 200>"${LOCK_FILE}"
 
   .venv/bin/python benchmark/selector_eval/cuda_ext/test_fullscan_pq_topk.py
   .venv/bin/python benchmark/selector_eval/cuda_ext/test_gpu_vpq_helpers.py

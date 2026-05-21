@@ -23,6 +23,28 @@ int64_t decode_tail_pages_per_block() {
   return std::min<int64_t>(64, std::max<int64_t>(1, static_cast<int64_t>(parsed)));
 }
 
+int decode_geometric_threads() {
+  const char* value = std::getenv("SELECTOR_PQ_GEOMETRIC_THREADS");
+  if (value == nullptr || value[0] == '\0') {
+    return 256;
+  }
+  char* end = nullptr;
+  long parsed = std::strtol(value, &end, 10);
+  if (end == value) {
+    return 256;
+  }
+  if (parsed <= 64) {
+    return 64;
+  }
+  if (parsed <= 128) {
+    return 128;
+  }
+  if (parsed <= 256) {
+    return 256;
+  }
+  return 512;
+}
+
 template <typename scalar_t>
 __device__ __forceinline__ float load_as_float(const scalar_t* __restrict__ ptr, int64_t index) {
   return static_cast<float>(ptr[index]);
@@ -4310,6 +4332,307 @@ __global__ void gqa_decode_tail_agg_output_kernel(
   }
 }
 
+template <typename value_t, typename vcode_t>
+__device__ __forceinline__ float selected_value_for_rank_dim_explicit(
+    const value_t* __restrict__ values,
+    const float* __restrict__ value_codebooks,
+    const vcode_t* __restrict__ value_codes,
+    const int64_t* __restrict__ page_starts,
+    int64_t token,
+    bool exact_value,
+    int64_t kv_head,
+    int64_t dim_idx,
+    int64_t total_tokens,
+    int64_t value_stride_head,
+    int64_t value_stride_token,
+    int64_t value_stride_dim,
+    int64_t pages,
+    int64_t page_size,
+    int64_t value_subvecs,
+    int64_t value_centroids,
+    int64_t value_subdim);
+
+template <typename value_t, typename vcode_t>
+__global__ void gqa_decode_tail_agg_output_parallel_kernel(
+    const value_t* __restrict__ values,
+    const float* __restrict__ value_codebooks,
+    const vcode_t* __restrict__ value_codes,
+    const int64_t* __restrict__ page_starts,
+    const int64_t* __restrict__ base_tokens,
+    const float* __restrict__ base_logits,
+    const int64_t* __restrict__ base_counts,
+    const int64_t* __restrict__ ranked_tokens,
+    const float* __restrict__ ranked_logits,
+    const unsigned char* __restrict__ ranked_exact,
+    const float* __restrict__ max_logits,
+    const float* __restrict__ denoms,
+    const float* __restrict__ selected_denoms,
+    const float* __restrict__ code_weight_sums,
+    float* __restrict__ outputs,
+    int64_t heads,
+    int64_t kv_heads,
+    int64_t ranked,
+    int64_t dim,
+    int64_t total_tokens,
+    int64_t value_stride_head,
+    int64_t value_stride_token,
+    int64_t value_stride_dim,
+    int64_t pages,
+    int64_t page_size,
+    int64_t max_base,
+    int64_t value_subvecs,
+    int64_t value_centroids,
+    int64_t value_subdim,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    float tail_blend) {
+  int64_t head = blockIdx.x;
+  int64_t d = blockIdx.y;
+  if (head >= heads || d >= dim) {
+    return;
+  }
+  extern __shared__ float shared[];
+  float* selected_parts = shared;
+  float* tail_parts = selected_parts + blockDim.x;
+
+  int64_t kv_head = min(head / group_size, kv_heads - 1);
+  int64_t prefix_end = 0;
+  int64_t base_tail_start = 0;
+  token_in_base_window(
+      0,
+      query_context_len,
+      static_prefix,
+      static_suffix,
+      page_size,
+      &prefix_end,
+      &base_tail_start);
+  const int64_t* base_tokens_row = base_tokens + head * max_base;
+  const float* base_logits_row = base_logits + head * max_base;
+  int64_t base_count = base_counts[head];
+  const int64_t* ranked_row = ranked_tokens + head * ranked;
+  const float* ranked_logits_row = ranked_logits + head * ranked;
+  const unsigned char* ranked_exact_row = ranked_exact + head * ranked;
+  float max_logit = max_logits[head];
+
+  float selected_local = 0.0f;
+  float tail_local = 0.0f;
+  if (isfinite(max_logit)) {
+    for (int64_t idx = threadIdx.x; idx < base_count; idx += blockDim.x) {
+      int64_t token = base_tokens_row[idx];
+      if (token < 0 || token >= total_tokens) {
+        continue;
+      }
+      float logit = base_logits_row[idx];
+      if (!isfinite(logit)) {
+        continue;
+      }
+      float weight = expf(logit - max_logit);
+      selected_local += weight *
+          load_strided3_as_float(values, kv_head, token, d, value_stride_head, value_stride_token, value_stride_dim);
+    }
+    for (int64_t sel = threadIdx.x; sel < ranked; sel += blockDim.x) {
+      float logit = ranked_logits_row[sel];
+      if (!isfinite(logit)) {
+        continue;
+      }
+      int64_t token = ranked_row[sel];
+      if (token < 0 || token >= total_tokens) {
+        continue;
+      }
+      float weight = expf(logit - max_logit);
+      bool exact_value = ranked_exact_row[sel] != 0;
+      float value = selected_value_for_rank_dim_explicit(
+          values,
+          value_codebooks,
+          value_codes,
+          page_starts,
+          token,
+          exact_value,
+          kv_head,
+          d,
+          total_tokens,
+          value_stride_head,
+          value_stride_token,
+          value_stride_dim,
+          pages,
+          page_size,
+          value_subvecs,
+          value_centroids,
+          value_subdim);
+      selected_local += weight * value;
+    }
+    if (tail_blend > 0.0f && pages > 0 && value_subvecs > 0 && value_subdim > 0) {
+      int64_t sub = d / value_subdim;
+      int64_t sub_d = d - sub * value_subdim;
+      if (sub >= 0 && sub < value_subvecs) {
+        int64_t total_codes = pages * value_centroids;
+        for (int64_t idx = threadIdx.x; idx < total_codes; idx += blockDim.x) {
+          int64_t page = idx / value_centroids;
+          int64_t code = idx - page * value_centroids;
+          int64_t page_start = page_starts[page];
+          bool valid_page = page_start >= prefix_end && page_start + page_size <= base_tail_start;
+          if (!valid_page) {
+            continue;
+          }
+          float weight_sum =
+              code_weight_sums[(((head * pages + page) * value_subvecs + sub) * value_centroids + code)];
+          if (weight_sum == 0.0f) {
+            continue;
+          }
+          float value = value_codebooks
+              [((((kv_head * pages + page) * value_subvecs + sub) * value_centroids + code) * value_subdim) +
+               sub_d];
+          tail_local += weight_sum * value;
+        }
+      }
+    }
+  }
+  selected_parts[threadIdx.x] = selected_local;
+  tail_parts[threadIdx.x] = tail_local;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      selected_parts[threadIdx.x] += selected_parts[threadIdx.x + stride];
+      tail_parts[threadIdx.x] += tail_parts[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    float full = (selected_parts[0] + tail_parts[0]) / denoms[head];
+    if (tail_blend > 0.0f && tail_blend < 1.0f) {
+      float selected_only = selected_parts[0] / selected_denoms[head];
+      outputs[head * dim + d] = selected_only + tail_blend * (full - selected_only);
+    } else {
+      outputs[head * dim + d] = full;
+    }
+  }
+}
+
+template <typename value_t, typename vcode_t>
+void launch_gqa_decode_tail_agg_output(
+    const value_t* values,
+    const float* value_codebooks,
+    const vcode_t* value_codes,
+    const int64_t* page_starts,
+    const int64_t* base_tokens,
+    const float* base_logits,
+    const int64_t* base_counts,
+    const int64_t* ranked_tokens,
+    const float* ranked_logits,
+    const unsigned char* ranked_exact,
+    const float* max_logits,
+    const float* denoms,
+    const float* selected_denoms,
+    const float* code_weight_sums,
+    float* outputs,
+    int64_t heads,
+    int64_t kv_heads,
+    int64_t ranked,
+    int64_t dim,
+    int64_t total_tokens,
+    int64_t value_stride_head,
+    int64_t value_stride_token,
+    int64_t value_stride_dim,
+    int64_t pages,
+    int64_t page_size,
+    int64_t max_base,
+    int64_t value_subvecs,
+    int64_t value_centroids,
+    int64_t value_subdim,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    float scale,
+    float tail_blend,
+    cudaStream_t stream) {
+  const int threads = 256;
+  const char* parallel_env = std::getenv("SELECTOR_PQ_TAIL_OUTPUT_PARALLEL");
+  const bool use_parallel =
+      parallel_env != nullptr && parallel_env[0] != '\0' && parallel_env[0] != '0';
+  if (use_parallel) {
+    dim3 output_grid(static_cast<unsigned int>(heads), static_cast<unsigned int>(dim));
+    gqa_decode_tail_agg_output_parallel_kernel<value_t, vcode_t>
+        <<<output_grid, threads, threads * 2 * sizeof(float), stream>>>(
+            values,
+            value_codebooks,
+            value_codes,
+            page_starts,
+            base_tokens,
+            base_logits,
+            base_counts,
+            ranked_tokens,
+            ranked_logits,
+            ranked_exact,
+            max_logits,
+            denoms,
+            selected_denoms,
+            code_weight_sums,
+            outputs,
+            heads,
+            kv_heads,
+            ranked,
+            dim,
+            total_tokens,
+            value_stride_head,
+            value_stride_token,
+            value_stride_dim,
+            pages,
+            page_size,
+            max_base,
+            value_subvecs,
+            value_centroids,
+            value_subdim,
+            group_size,
+            query_context_len,
+            static_prefix,
+            static_suffix,
+            tail_blend);
+    return;
+  }
+  const int64_t output_total = heads * dim;
+  const int output_blocks = static_cast<int>((output_total + threads - 1) / threads);
+  gqa_decode_tail_agg_output_kernel<value_t, vcode_t>
+      <<<output_blocks, threads, 0, stream>>>(
+          values,
+          value_codebooks,
+          value_codes,
+          page_starts,
+          base_tokens,
+          base_logits,
+          base_counts,
+          ranked_tokens,
+          ranked_logits,
+          ranked_exact,
+          max_logits,
+          denoms,
+          selected_denoms,
+          code_weight_sums,
+          outputs,
+          heads,
+          kv_heads,
+          ranked,
+          dim,
+          total_tokens,
+          value_stride_head,
+          value_stride_token,
+          value_stride_dim,
+          pages,
+          page_size,
+          max_base,
+          value_subvecs,
+          value_centroids,
+          value_subdim,
+          group_size,
+          query_context_len,
+          static_prefix,
+          static_suffix,
+          scale,
+          tail_blend);
+}
+
 __device__ __forceinline__ int64_t round_budget_up_device(
     int64_t budget,
     int64_t granularity,
@@ -4611,6 +4934,129 @@ __device__ __forceinline__ void selected_mass_exact_threshold_device(
   if (exact_count > 0) {
     *threshold_logit_out = prev_logit;
     *threshold_sel_out = prev_sel;
+  }
+}
+
+__global__ void selected_mass_thresholds_from_topk_kernel(
+    const float* __restrict__ top_logits,
+    const int64_t* __restrict__ top_order,
+    const float* __restrict__ prefix_lse,
+    const int64_t* __restrict__ prefix_valid_counts,
+    const float* __restrict__ base_lse,
+    const int64_t* __restrict__ budgets,
+    float* __restrict__ thresholds,
+    int64_t* __restrict__ threshold_sels,
+    unsigned char* __restrict__ sufficient,
+    int64_t heads,
+    int64_t k_top,
+    int64_t rank,
+    int64_t steps,
+    float exact_mass,
+    int64_t min_top) {
+  int64_t head = static_cast<int64_t>(blockIdx.x);
+  int64_t step = static_cast<int64_t>(blockIdx.y);
+  if (head >= heads || step >= steps) {
+    return;
+  }
+  constexpr int kThreads = 256;
+  __shared__ float scan_weights[kThreads];
+  __shared__ int scan_counts[kThreads];
+  __shared__ int hit_pos;
+
+  int64_t budget = budgets[step];
+  budget = max(static_cast<int64_t>(0), min(rank, budget));
+  int64_t out_idx = head * steps + step;
+  if (threadIdx.x == 0) {
+    thresholds[out_idx] = INFINITY;
+    threshold_sels[out_idx] = -1;
+    sufficient[out_idx] = 1;
+  }
+  __syncthreads();
+  if (budget <= 0 || rank <= 0 || k_top <= 0 || (exact_mass <= 0.0f && min_top <= 0)) {
+    return;
+  }
+
+  int64_t lse_idx = head * rank + budget - 1;
+  float ranked_lse = prefix_lse[lse_idx];
+  int64_t valid_count = prefix_valid_counts[lse_idx];
+  valid_count = max(static_cast<int64_t>(0), min(budget, valid_count));
+  int64_t min_count = min(budget, max(static_cast<int64_t>(0), min_top));
+  if (valid_count <= 0 && min_count <= 0) {
+    return;
+  }
+  float total_lse = logaddexp_device(base_lse[head], ranked_lse);
+  if (!isfinite(total_lse)) {
+    return;
+  }
+  float target = fminf(fmaxf(exact_mass, 0.0f), 1.0f - 1.0e-7f);
+  float base_mass = isfinite(base_lse[head]) ? expf(base_lse[head] - total_lse) : 0.0f;
+  bool mass_already_met = target <= 0.0f || base_mass >= target;
+
+  float running_weight = 0.0f;
+  int running_count = 0;
+  bool found = false;
+  int64_t top_base = head * k_top;
+  for (int64_t chunk = 0; chunk < k_top; chunk += kThreads) {
+    int64_t j = chunk + threadIdx.x;
+    float weight = 0.0f;
+    int count = 0;
+    if (j < k_top) {
+      int64_t sel = top_order[top_base + j];
+      float logit = top_logits[top_base + j];
+      if (sel >= 0 && sel < budget && isfinite(logit)) {
+        weight = expf(logit - total_lse);
+        count = 1;
+      }
+    }
+    scan_weights[threadIdx.x] = weight;
+    scan_counts[threadIdx.x] = count;
+    __syncthreads();
+    for (int offset = 1; offset < kThreads; offset <<= 1) {
+      float add_weight = 0.0f;
+      int add_count = 0;
+      if (threadIdx.x >= offset) {
+        add_weight = scan_weights[threadIdx.x - offset];
+        add_count = scan_counts[threadIdx.x - offset];
+      }
+      __syncthreads();
+      scan_weights[threadIdx.x] += add_weight;
+      scan_counts[threadIdx.x] += add_count;
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      hit_pos = kThreads;
+    }
+    __syncthreads();
+    if (count > 0) {
+      int cumulative_count = running_count + scan_counts[threadIdx.x];
+      float cumulative_mass = base_mass + running_weight + scan_weights[threadIdx.x];
+      bool enough_by_mass = mass_already_met || cumulative_mass >= target;
+      bool enough_by_count = cumulative_count >= min_count;
+      bool last_valid_fallback = valid_count > 0 && cumulative_count >= valid_count;
+      if ((enough_by_mass && enough_by_count) || last_valid_fallback) {
+        atomicMin(&hit_pos, static_cast<int>(threadIdx.x));
+      }
+    }
+    __syncthreads();
+    if (hit_pos < kThreads) {
+      if (threadIdx.x == 0) {
+        int64_t hit_j = chunk + static_cast<int64_t>(hit_pos);
+        thresholds[out_idx] = top_logits[top_base + hit_j];
+        threshold_sels[out_idx] = top_order[top_base + hit_j];
+      }
+      found = true;
+    }
+    float chunk_weight = scan_weights[kThreads - 1];
+    int chunk_count = scan_counts[kThreads - 1];
+    running_weight += chunk_weight;
+    running_count += chunk_count;
+    __syncthreads();
+    if (found) {
+      break;
+    }
+  }
+  if (!found && threadIdx.x == 0) {
+    sufficient[out_idx] = 0;
   }
 }
 
@@ -5666,6 +6112,1833 @@ __global__ void gqa_decode_geometric_accept_counts_codeweights_kernel(
   }
 }
 
+__global__ void gqa_decode_rank_weight_metadata_kernel(
+    const int64_t* __restrict__ ranked_tokens,
+    const float* __restrict__ ranked_logits,
+    const float* __restrict__ dense_pq_scores,
+    const int64_t* __restrict__ page_starts,
+    const float* __restrict__ max_logits,
+    float* __restrict__ ranked_weights,
+    float* __restrict__ ranked_pq_weights,
+    int32_t* __restrict__ ranked_pages,
+    int32_t* __restrict__ ranked_rows,
+    int64_t heads,
+    int64_t ranked,
+    int64_t pages,
+    int64_t page_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    float scale) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = heads * ranked;
+  if (idx >= total) {
+    return;
+  }
+  int64_t head = idx / ranked;
+  int64_t sel = idx - head * ranked;
+  int64_t token = ranked_tokens[idx];
+  float logit = ranked_logits[idx];
+  float global_max = max_logits[head];
+  float selected_w = 0.0f;
+  float pq_w = 0.0f;
+  int32_t page_i32 = -1;
+  int32_t row_i32 = -1;
+  if (isfinite(global_max) && isfinite(logit) && token >= 0 && token < query_context_len) {
+    selected_w = expf(logit - global_max);
+    int64_t prefix_end = 0;
+    int64_t base_tail_start = 0;
+    token_in_base_window(
+        0,
+        query_context_len,
+        static_prefix,
+        static_suffix,
+        page_size,
+        &prefix_end,
+        &base_tail_start);
+    int64_t page = -1;
+    int64_t row = -1;
+    if (complete_page_for_token(
+            page_starts,
+            pages,
+            page_size,
+            token,
+            query_context_len,
+            prefix_end,
+            base_tail_start,
+            &page,
+            &row)) {
+      pq_w = expf(dense_pq_scores[head * (pages * page_size) + page * page_size + row] * scale - global_max);
+      page_i32 = static_cast<int32_t>(page);
+      row_i32 = static_cast<int32_t>(row);
+    }
+  }
+  ranked_weights[idx] = selected_w;
+  ranked_pq_weights[idx] = pq_w;
+  ranked_pages[idx] = page_i32;
+  ranked_rows[idx] = row_i32;
+}
+
+__device__ __forceinline__ void geometric_budget_pair_for_step_device(
+    int64_t step,
+    int64_t min_budget,
+    int64_t max_budget,
+    int64_t granularity,
+    float growth,
+    float probe_scale,
+    int64_t* __restrict__ tail_budget_out,
+    int64_t* __restrict__ probe_budget_out);
+
+template <typename vcode_t>
+__global__ void gqa_decode_geometric_selected_code_delta_kernel(
+    const int64_t* __restrict__ ranked_tokens,
+    const float* __restrict__ ranked_logits,
+    const float* __restrict__ ranked_weights,
+    const float* __restrict__ ranked_pq_weights,
+    const int32_t* __restrict__ ranked_pages,
+    const int32_t* __restrict__ ranked_rows,
+    const vcode_t* __restrict__ value_codes,
+    const float* __restrict__ approx_exact_thresholds,
+    const int64_t* __restrict__ approx_exact_threshold_sels,
+    const float* __restrict__ probe_exact_thresholds,
+    const int64_t* __restrict__ probe_exact_threshold_sels,
+    float* __restrict__ approx_den_incs,
+    float* __restrict__ probe_den_incs,
+    float* __restrict__ final_den_incs,
+    float* __restrict__ approx_code_incs,
+    float* __restrict__ probe_code_incs,
+    float* __restrict__ final_code_incs,
+    int64_t heads,
+    int64_t kv_heads,
+    int64_t ranked,
+    int64_t pages,
+    int64_t page_size,
+    int64_t value_subvecs,
+    int64_t value_centroids,
+    int64_t group_size,
+    int64_t min_budget,
+    int64_t max_budget_arg,
+    int64_t granularity,
+    float growth,
+    float probe_scale,
+    bool probe_includes_tail,
+    int64_t threshold_steps) {
+  int64_t head = blockIdx.x;
+  int64_t step = blockIdx.y;
+  if (head >= heads || step >= threshold_steps || value_subvecs <= 0 || value_centroids <= 0) {
+    return;
+  }
+  extern __shared__ float shared[];
+  float* approx_den_parts = shared;
+  float* probe_den_parts = approx_den_parts + blockDim.x;
+  float* final_den_parts = probe_den_parts + blockDim.x;
+
+  int64_t max_budget = max_budget_arg;
+  if (max_budget <= 0 || max_budget > ranked) {
+    max_budget = ranked;
+  }
+  int64_t tail_budget = 0;
+  int64_t probe_budget = 0;
+  geometric_budget_pair_for_step_device(
+      step,
+      min_budget,
+      max_budget,
+      granularity,
+      growth,
+      probe_scale,
+      &tail_budget,
+      &probe_budget);
+  int64_t approx_keep = 0;
+  int64_t probe_keep = 0;
+  if (step > 0) {
+    int64_t prev_tail = 0;
+    int64_t prev_probe = 0;
+    geometric_budget_pair_for_step_device(
+        step - 1,
+        min_budget,
+        max_budget,
+        granularity,
+        growth,
+        probe_scale,
+        &prev_tail,
+        &prev_probe);
+    approx_keep = prev_tail;
+    probe_keep = prev_probe;
+  }
+
+  int64_t threshold_idx = head * threshold_steps + step;
+  float approx_threshold = approx_exact_thresholds[threshold_idx];
+  int64_t approx_threshold_sel = approx_exact_threshold_sels[threshold_idx];
+  float probe_threshold = probe_exact_thresholds[threshold_idx];
+  int64_t probe_threshold_sel = probe_exact_threshold_sels[threshold_idx];
+  int64_t kv_head = min(head / group_size, kv_heads - 1);
+  const int64_t* ranked_row_tokens = ranked_tokens + head * ranked;
+  const float* ranked_row_logits = ranked_logits + head * ranked;
+  const float* ranked_row_weights = ranked_weights + head * ranked;
+  const float* ranked_row_pq_weights = ranked_pq_weights + head * ranked;
+  const int32_t* ranked_row_pages = ranked_pages + head * ranked;
+  const int32_t* ranked_row_rows = ranked_rows + head * ranked;
+
+  float approx_den_local = 0.0f;
+  float probe_den_local = 0.0f;
+  float final_den_local = 0.0f;
+  for (int64_t sel = approx_keep + threadIdx.x; sel < tail_budget; sel += blockDim.x) {
+    float selected_w = ranked_row_weights[sel];
+    if (selected_w == 0.0f) {
+      continue;
+    }
+    int64_t page = static_cast<int64_t>(ranked_row_pages[sel]);
+    int64_t row = static_cast<int64_t>(ranked_row_rows[sel]);
+    bool has_tail_page = page >= 0 && row >= 0 && page < pages && row < page_size;
+    float pq_w = has_tail_page ? ranked_row_pq_weights[sel] : 0.0f;
+    approx_den_local += selected_w - pq_w;
+    if (!has_tail_page) {
+      continue;
+    }
+    float logit = ranked_row_logits[sel];
+    bool exact_value = selected_mass_exact_value_for_rank(logit, sel, approx_threshold, approx_threshold_sel);
+    float selected_delta = exact_value ? 0.0f : selected_w;
+    float code_delta = selected_delta - pq_w;
+    if (code_delta == 0.0f) {
+      continue;
+    }
+    for (int64_t sub = 0; sub < value_subvecs; ++sub) {
+      int64_t code = static_cast<int64_t>(
+          value_codes[((kv_head * pages + page) * page_size + row) * value_subvecs + sub]);
+      code = max(static_cast<int64_t>(0), min(code, value_centroids - 1));
+      int64_t out_idx = (((head * threshold_steps + step) * pages + page) * value_subvecs + sub) *
+                            value_centroids +
+                        code;
+      atomicAdd(approx_code_incs + out_idx, code_delta);
+    }
+  }
+
+  for (int64_t sel = probe_keep + threadIdx.x; sel < probe_budget; sel += blockDim.x) {
+    float selected_w = ranked_row_weights[sel];
+    if (selected_w == 0.0f) {
+      continue;
+    }
+    int64_t page = static_cast<int64_t>(ranked_row_pages[sel]);
+    int64_t row = static_cast<int64_t>(ranked_row_rows[sel]);
+    bool has_tail_page = page >= 0 && row >= 0 && page < pages && row < page_size;
+    float pq_w = has_tail_page ? ranked_row_pq_weights[sel] : 0.0f;
+    probe_den_local += selected_w - (probe_includes_tail ? pq_w : 0.0f);
+    final_den_local += selected_w - (!probe_includes_tail ? pq_w : 0.0f);
+    if (!has_tail_page) {
+      continue;
+    }
+    float logit = ranked_row_logits[sel];
+    bool exact_value = selected_mass_exact_value_for_rank(logit, sel, probe_threshold, probe_threshold_sel);
+    float selected_delta = exact_value ? 0.0f : selected_w;
+    float probe_code_delta = selected_delta - (probe_includes_tail ? pq_w : 0.0f);
+    float final_code_delta = selected_delta - (!probe_includes_tail ? pq_w : 0.0f);
+    for (int64_t sub = 0; sub < value_subvecs; ++sub) {
+      int64_t code = static_cast<int64_t>(
+          value_codes[((kv_head * pages + page) * page_size + row) * value_subvecs + sub]);
+      code = max(static_cast<int64_t>(0), min(code, value_centroids - 1));
+      int64_t out_idx = (((head * threshold_steps + step) * pages + page) * value_subvecs + sub) *
+                            value_centroids +
+                        code;
+      if (probe_code_delta != 0.0f) {
+        atomicAdd(probe_code_incs + out_idx, probe_code_delta);
+      }
+      if (final_code_delta != 0.0f) {
+        atomicAdd(final_code_incs + out_idx, final_code_delta);
+      }
+    }
+  }
+
+  approx_den_parts[threadIdx.x] = approx_den_local;
+  probe_den_parts[threadIdx.x] = probe_den_local;
+  final_den_parts[threadIdx.x] = final_den_local;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      approx_den_parts[threadIdx.x] += approx_den_parts[threadIdx.x + stride];
+      probe_den_parts[threadIdx.x] += probe_den_parts[threadIdx.x + stride];
+      final_den_parts[threadIdx.x] += final_den_parts[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    int64_t idx = head * threshold_steps + step;
+    approx_den_incs[idx] = approx_den_parts[0];
+    probe_den_incs[idx] = probe_den_parts[0];
+    final_den_incs[idx] = final_den_parts[0];
+  }
+}
+
+template <typename value_t>
+__global__ void gqa_decode_geometric_selected_exact_delta_kernel(
+    const value_t* __restrict__ values,
+    const int64_t* __restrict__ ranked_tokens,
+    const float* __restrict__ ranked_logits,
+    const float* __restrict__ ranked_weights,
+    const int32_t* __restrict__ ranked_pages,
+    const int32_t* __restrict__ ranked_rows,
+    const float* __restrict__ approx_exact_thresholds,
+    const int64_t* __restrict__ approx_exact_threshold_sels,
+    const float* __restrict__ probe_exact_thresholds,
+    const int64_t* __restrict__ probe_exact_threshold_sels,
+    float* __restrict__ approx_exact_num_incs,
+    float* __restrict__ probe_exact_num_incs,
+    float* __restrict__ final_exact_num_incs,
+    int64_t heads,
+    int64_t kv_heads,
+    int64_t ranked,
+    int64_t dim,
+    int64_t total_tokens,
+    int64_t value_stride_head,
+    int64_t value_stride_token,
+    int64_t value_stride_dim,
+    int64_t pages,
+    int64_t page_size,
+    int64_t group_size,
+    int64_t min_budget,
+    int64_t max_budget_arg,
+    int64_t granularity,
+    float growth,
+    float probe_scale,
+    int64_t threshold_steps) {
+  int64_t head = blockIdx.x;
+  int64_t step = blockIdx.y;
+  if (head >= heads || step >= threshold_steps || dim <= 0) {
+    return;
+  }
+  extern __shared__ float shared[];
+  float* approx_num = shared;
+  float* probe_num = approx_num + dim;
+  float* final_num = probe_num + dim;
+  for (int64_t d = threadIdx.x; d < 3 * dim; d += blockDim.x) {
+    shared[d] = 0.0f;
+  }
+  __syncthreads();
+
+  int64_t max_budget = max_budget_arg;
+  if (max_budget <= 0 || max_budget > ranked) {
+    max_budget = ranked;
+  }
+  int64_t tail_budget = 0;
+  int64_t probe_budget = 0;
+  geometric_budget_pair_for_step_device(
+      step,
+      min_budget,
+      max_budget,
+      granularity,
+      growth,
+      probe_scale,
+      &tail_budget,
+      &probe_budget);
+  int64_t approx_keep = 0;
+  int64_t probe_keep = 0;
+  if (step > 0) {
+    int64_t prev_tail = 0;
+    int64_t prev_probe = 0;
+    geometric_budget_pair_for_step_device(
+        step - 1,
+        min_budget,
+        max_budget,
+        granularity,
+        growth,
+        probe_scale,
+        &prev_tail,
+        &prev_probe);
+    approx_keep = prev_tail;
+    probe_keep = prev_probe;
+  }
+
+  int64_t threshold_idx = head * threshold_steps + step;
+  float approx_threshold = approx_exact_thresholds[threshold_idx];
+  int64_t approx_threshold_sel = approx_exact_threshold_sels[threshold_idx];
+  float probe_threshold = probe_exact_thresholds[threshold_idx];
+  int64_t probe_threshold_sel = probe_exact_threshold_sels[threshold_idx];
+  int64_t kv_head = min(head / group_size, kv_heads - 1);
+  const int64_t* ranked_row_tokens = ranked_tokens + head * ranked;
+  const float* ranked_row_logits = ranked_logits + head * ranked;
+  const float* ranked_row_weights = ranked_weights + head * ranked;
+  const int32_t* ranked_row_pages = ranked_pages + head * ranked;
+  const int32_t* ranked_row_rows = ranked_rows + head * ranked;
+
+  for (int64_t sel = approx_keep + threadIdx.x; sel < tail_budget; sel += blockDim.x) {
+    float selected_w = ranked_row_weights[sel];
+    int64_t token = ranked_row_tokens[sel];
+    if (selected_w == 0.0f || token < 0 || token >= total_tokens) {
+      continue;
+    }
+    int64_t page = static_cast<int64_t>(ranked_row_pages[sel]);
+    int64_t row = static_cast<int64_t>(ranked_row_rows[sel]);
+    bool has_tail_page = page >= 0 && row >= 0 && page < pages && row < page_size;
+    float logit = ranked_row_logits[sel];
+    bool exact_value =
+        selected_mass_exact_value_for_rank(logit, sel, approx_threshold, approx_threshold_sel);
+    if (!exact_value && has_tail_page) {
+      continue;
+    }
+    for (int64_t d = 0; d < dim; ++d) {
+      float value = load_strided3_as_float(
+          values,
+          kv_head,
+          token,
+          d,
+          value_stride_head,
+          value_stride_token,
+          value_stride_dim);
+      atomicAdd(approx_num + d, selected_w * value);
+    }
+  }
+
+  for (int64_t sel = probe_keep + threadIdx.x; sel < probe_budget; sel += blockDim.x) {
+    float selected_w = ranked_row_weights[sel];
+    int64_t token = ranked_row_tokens[sel];
+    if (selected_w == 0.0f || token < 0 || token >= total_tokens) {
+      continue;
+    }
+    int64_t page = static_cast<int64_t>(ranked_row_pages[sel]);
+    int64_t row = static_cast<int64_t>(ranked_row_rows[sel]);
+    bool has_tail_page = page >= 0 && row >= 0 && page < pages && row < page_size;
+    float logit = ranked_row_logits[sel];
+    bool exact_value =
+        selected_mass_exact_value_for_rank(logit, sel, probe_threshold, probe_threshold_sel);
+    if (!exact_value && has_tail_page) {
+      continue;
+    }
+    for (int64_t d = 0; d < dim; ++d) {
+      float value = load_strided3_as_float(
+          values,
+          kv_head,
+          token,
+          d,
+          value_stride_head,
+          value_stride_token,
+          value_stride_dim);
+      float weighted = selected_w * value;
+      atomicAdd(probe_num + d, weighted);
+      atomicAdd(final_num + d, weighted);
+    }
+  }
+  __syncthreads();
+
+  for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+    int64_t out_idx = (head * threshold_steps + step) * dim + d;
+    approx_exact_num_incs[out_idx] = approx_num[d];
+    probe_exact_num_incs[out_idx] = probe_num[d];
+    final_exact_num_incs[out_idx] = final_num[d];
+  }
+}
+
+__global__ void gqa_decode_geometric_selected_exact_list_kernel(
+    const int64_t* __restrict__ ranked_tokens,
+    const float* __restrict__ ranked_logits,
+    const float* __restrict__ ranked_weights,
+    const int32_t* __restrict__ ranked_pages,
+    const int32_t* __restrict__ ranked_rows,
+    const float* __restrict__ approx_exact_thresholds,
+    const int64_t* __restrict__ approx_exact_threshold_sels,
+    const float* __restrict__ probe_exact_thresholds,
+    const int64_t* __restrict__ probe_exact_threshold_sels,
+    int32_t* __restrict__ approx_exact_counts,
+    int32_t* __restrict__ probe_exact_counts,
+    int32_t* __restrict__ approx_exact_tokens,
+    int32_t* __restrict__ probe_exact_tokens,
+    float* __restrict__ approx_exact_weights,
+    float* __restrict__ probe_exact_weights,
+    int64_t heads,
+    int64_t ranked,
+    int64_t total_tokens,
+    int64_t pages,
+    int64_t page_size,
+    int64_t min_budget,
+    int64_t max_budget_arg,
+    int64_t granularity,
+    float growth,
+    float probe_scale,
+    int64_t exact_list_capacity,
+    int64_t threshold_steps) {
+  int64_t head = blockIdx.x;
+  int64_t step = blockIdx.y;
+  if (head >= heads || step >= threshold_steps) {
+    return;
+  }
+  int64_t max_budget = max_budget_arg;
+  if (max_budget <= 0 || max_budget > ranked) {
+    max_budget = ranked;
+  }
+  int64_t tail_budget = 0;
+  int64_t probe_budget = 0;
+  geometric_budget_pair_for_step_device(
+      step,
+      min_budget,
+      max_budget,
+      granularity,
+      growth,
+      probe_scale,
+      &tail_budget,
+      &probe_budget);
+  int64_t approx_keep = 0;
+  int64_t probe_keep = 0;
+  if (step > 0) {
+    int64_t prev_tail = 0;
+    int64_t prev_probe = 0;
+    geometric_budget_pair_for_step_device(
+        step - 1,
+        min_budget,
+        max_budget,
+        granularity,
+        growth,
+        probe_scale,
+        &prev_tail,
+        &prev_probe);
+    approx_keep = prev_tail;
+    probe_keep = prev_probe;
+  }
+
+  int64_t count_idx = head * threshold_steps + step;
+  if (threadIdx.x == 0) {
+    approx_exact_counts[count_idx] = 0;
+    probe_exact_counts[count_idx] = 0;
+  }
+  __syncthreads();
+
+  float approx_threshold = approx_exact_thresholds[count_idx];
+  int64_t approx_threshold_sel = approx_exact_threshold_sels[count_idx];
+  float probe_threshold = probe_exact_thresholds[count_idx];
+  int64_t probe_threshold_sel = probe_exact_threshold_sels[count_idx];
+  const int64_t* ranked_row_tokens = ranked_tokens + head * ranked;
+  const float* ranked_row_logits = ranked_logits + head * ranked;
+  const float* ranked_row_weights = ranked_weights + head * ranked;
+  const int32_t* ranked_row_pages = ranked_pages + head * ranked;
+  const int32_t* ranked_row_rows = ranked_rows + head * ranked;
+  int64_t capacity = exact_list_capacity;
+  if (capacity <= 0 || capacity > max_budget) {
+    capacity = max_budget;
+  }
+  int64_t list_base = (head * threshold_steps + step) * capacity;
+
+  for (int64_t sel = approx_keep + threadIdx.x; sel < tail_budget; sel += blockDim.x) {
+    float selected_w = ranked_row_weights[sel];
+    int64_t token = ranked_row_tokens[sel];
+    if (selected_w == 0.0f || token < 0 || token >= total_tokens) {
+      continue;
+    }
+    int64_t page = static_cast<int64_t>(ranked_row_pages[sel]);
+    int64_t row = static_cast<int64_t>(ranked_row_rows[sel]);
+    bool has_tail_page = page >= 0 && row >= 0 && page < pages && row < page_size;
+    float logit = ranked_row_logits[sel];
+    bool exact_value =
+        selected_mass_exact_value_for_rank(logit, sel, approx_threshold, approx_threshold_sel);
+    if (!exact_value && has_tail_page) {
+      continue;
+    }
+    int64_t out = static_cast<int64_t>(atomicAdd(approx_exact_counts + count_idx, 1));
+    if (out < capacity) {
+      approx_exact_tokens[list_base + out] = static_cast<int32_t>(token);
+      approx_exact_weights[list_base + out] = selected_w;
+    }
+  }
+
+  for (int64_t sel = probe_keep + threadIdx.x; sel < probe_budget; sel += blockDim.x) {
+    float selected_w = ranked_row_weights[sel];
+    int64_t token = ranked_row_tokens[sel];
+    if (selected_w == 0.0f || token < 0 || token >= total_tokens) {
+      continue;
+    }
+    int64_t page = static_cast<int64_t>(ranked_row_pages[sel]);
+    int64_t row = static_cast<int64_t>(ranked_row_rows[sel]);
+    bool has_tail_page = page >= 0 && row >= 0 && page < pages && row < page_size;
+    float logit = ranked_row_logits[sel];
+    bool exact_value =
+        selected_mass_exact_value_for_rank(logit, sel, probe_threshold, probe_threshold_sel);
+    if (!exact_value && has_tail_page) {
+      continue;
+    }
+    int64_t out = static_cast<int64_t>(atomicAdd(probe_exact_counts + count_idx, 1));
+    if (out < capacity) {
+      probe_exact_tokens[list_base + out] = static_cast<int32_t>(token);
+      probe_exact_weights[list_base + out] = selected_w;
+    }
+  }
+}
+
+__device__ __forceinline__ void geometric_budget_pair_for_step_device(
+    int64_t step,
+    int64_t min_budget,
+    int64_t max_budget,
+    int64_t granularity,
+    float growth,
+    float probe_scale,
+    int64_t* __restrict__ tail_budget_out,
+    int64_t* __restrict__ probe_budget_out) {
+  int64_t tail_budget = min_budget;
+  if (tail_budget < 0) {
+    tail_budget = 0;
+  }
+  if (tail_budget > max_budget) {
+    tail_budget = max_budget;
+  }
+  tail_budget = round_budget_up_device(tail_budget, granularity, max_budget);
+  int64_t probe_budget = tail_budget;
+  for (int64_t idx = 0; idx <= step; ++idx) {
+    float target = fmaxf(static_cast<float>(tail_budget + granularity), probe_scale * static_cast<float>(tail_budget));
+    probe_budget = round_budget_up_device(static_cast<int64_t>(ceilf(target)), granularity, max_budget);
+    if (probe_budget < tail_budget) {
+      probe_budget = tail_budget;
+    }
+    if (idx == step || probe_budget >= max_budget) {
+      break;
+    }
+    float next_target = fmaxf(static_cast<float>(probe_budget + granularity), growth * static_cast<float>(probe_budget));
+    int64_t next_budget = round_budget_up_device(static_cast<int64_t>(ceilf(next_target)), granularity, max_budget);
+    if (next_budget <= probe_budget) {
+      tail_budget = probe_budget;
+      break;
+    }
+    tail_budget = next_budget;
+  }
+  *tail_budget_out = tail_budget;
+  *probe_budget_out = probe_budget;
+}
+
+template <typename value_t, typename vcode_t>
+__global__ void gqa_decode_geometric_step_diff_codeweights_kernel(
+    const value_t* __restrict__ values,
+    const float* __restrict__ dense_pq_scores,
+    const float* __restrict__ value_codebooks,
+    const vcode_t* __restrict__ value_codes,
+    const int64_t* __restrict__ page_starts,
+    const int64_t* __restrict__ base_tokens,
+    const float* __restrict__ base_logits,
+    const int64_t* __restrict__ base_counts,
+    const int64_t* __restrict__ ranked_tokens,
+    const float* __restrict__ ranked_logits,
+    const float* __restrict__ max_logits,
+    const float* __restrict__ tail_denoms,
+    const float* __restrict__ code_weight_sums,
+    const float* __restrict__ approx_exact_thresholds,
+    const int64_t* __restrict__ approx_exact_threshold_sels,
+    const float* __restrict__ probe_exact_thresholds,
+    const int64_t* __restrict__ probe_exact_threshold_sels,
+    float* __restrict__ diff_squares,
+    float* __restrict__ probe_squares,
+    int64_t heads,
+    int64_t kv_heads,
+    int64_t ranked,
+    int64_t dim,
+    int64_t total_tokens,
+    int64_t value_stride_head,
+    int64_t value_stride_token,
+    int64_t value_stride_dim,
+    int64_t pages,
+    int64_t page_size,
+    int64_t max_base,
+    int64_t value_subvecs,
+    int64_t value_centroids,
+    int64_t value_subdim,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    int64_t min_budget,
+    int64_t max_budget_arg,
+    int64_t granularity,
+    float growth,
+    float probe_scale,
+    float scale,
+    bool probe_includes_tail,
+    int64_t threshold_steps) {
+  int64_t head = blockIdx.x;
+  int64_t step = blockIdx.y;
+  int64_t d = blockIdx.z;
+  if (head >= heads || step >= threshold_steps || d >= dim) {
+    return;
+  }
+  extern __shared__ float shared[];
+  float* approx_den_parts = shared;
+  float* approx_num_parts = approx_den_parts + blockDim.x;
+  float* probe_den_parts = approx_num_parts + blockDim.x;
+  float* probe_num_parts = probe_den_parts + blockDim.x;
+  __shared__ float base_den_shared;
+  __shared__ float base_num_shared;
+  __shared__ float tail_den_shared;
+  __shared__ float tail_num_shared;
+
+  int64_t max_budget = max_budget_arg;
+  if (max_budget <= 0 || max_budget > ranked) {
+    max_budget = ranked;
+  }
+  int64_t tail_budget = 0;
+  int64_t probe_budget = 0;
+  geometric_budget_pair_for_step_device(
+      step,
+      min_budget,
+      max_budget,
+      granularity,
+      growth,
+      probe_scale,
+      &tail_budget,
+      &probe_budget);
+
+  int64_t prefix_end = 0;
+  int64_t base_tail_start = 0;
+  token_in_base_window(
+      0,
+      query_context_len,
+      static_prefix,
+      static_suffix,
+      page_size,
+      &prefix_end,
+      &base_tail_start);
+  int64_t kv_head = min(head / group_size, kv_heads - 1);
+  const int64_t* base_tokens_row = base_tokens + head * max_base;
+  const float* base_logits_row = base_logits + head * max_base;
+  int64_t base_count = base_counts[head];
+  const int64_t* ranked_row = ranked_tokens + head * ranked;
+  const float* ranked_logit_row = ranked_logits + head * ranked;
+  const float* dense_row = dense_pq_scores + head * (pages * page_size);
+  float global_max = max_logits[head];
+  int64_t threshold_idx = head * threshold_steps + step;
+  float approx_threshold = approx_exact_thresholds[threshold_idx];
+  int64_t approx_threshold_sel = approx_exact_threshold_sels[threshold_idx];
+  float probe_threshold = probe_exact_thresholds[threshold_idx];
+  int64_t probe_threshold_sel = probe_exact_threshold_sels[threshold_idx];
+
+  if (threadIdx.x == 0) {
+    float base_den = 0.0f;
+    float base_num = 0.0f;
+    if (isfinite(global_max)) {
+      for (int64_t idx = 0; idx < base_count; ++idx) {
+        int64_t token = base_tokens_row[idx];
+        float logit = base_logits_row[idx];
+        if (token < 0 || token >= total_tokens || !isfinite(logit)) {
+          continue;
+        }
+        float w = expf(logit - global_max);
+        base_den += w;
+        base_num += w * load_strided3_as_float(
+                            values,
+                            kv_head,
+                            token,
+                            d,
+                            value_stride_head,
+                            value_stride_token,
+                            value_stride_dim);
+      }
+    }
+    float tail_num = 0.0f;
+    if (isfinite(global_max) && value_subdim > 0) {
+      int64_t sub = d / value_subdim;
+      int64_t sub_d = d - sub * value_subdim;
+      if (sub >= 0 && sub < value_subvecs) {
+        for (int64_t page = 0; page < pages; ++page) {
+          for (int64_t code = 0; code < value_centroids; ++code) {
+            float w = code_weight_sums[(((head * pages + page) * value_subvecs + sub) * value_centroids + code)];
+            if (w == 0.0f) {
+              continue;
+            }
+            float value = value_codebooks
+                [((((kv_head * pages + page) * value_subvecs + sub) * value_centroids + code) * value_subdim) +
+                 sub_d];
+            tail_num += w * value;
+          }
+        }
+      }
+    }
+    base_den_shared = base_den;
+    base_num_shared = base_num;
+    tail_den_shared = isfinite(global_max) ? tail_denoms[head] : 0.0f;
+    tail_num_shared = tail_num;
+  }
+  __syncthreads();
+
+  float approx_den_local = 0.0f;
+  float approx_num_local = 0.0f;
+  float probe_den_local = 0.0f;
+  float probe_num_local = 0.0f;
+  if (isfinite(global_max)) {
+    for (int64_t sel = threadIdx.x; sel < tail_budget; sel += blockDim.x) {
+      float logit = ranked_logit_row[sel];
+      int64_t token = ranked_row[sel];
+      if (!isfinite(logit) || token < 0 || token >= query_context_len || token >= total_tokens) {
+        continue;
+      }
+      float selected_w = expf(logit - global_max);
+      bool exact_value = selected_mass_exact_value_for_rank(logit, sel, approx_threshold, approx_threshold_sel);
+      float selected_v = selected_value_for_rank_dim_explicit(
+          values,
+          value_codebooks,
+          value_codes,
+          page_starts,
+          token,
+          exact_value,
+          kv_head,
+          d,
+          total_tokens,
+          value_stride_head,
+          value_stride_token,
+          value_stride_dim,
+          pages,
+          page_size,
+          value_subvecs,
+          value_centroids,
+          value_subdim);
+      approx_den_local += selected_w;
+      approx_num_local += selected_w * selected_v;
+      int64_t page = -1;
+      int64_t row = -1;
+      if (complete_page_for_token(
+              page_starts,
+              pages,
+              page_size,
+              token,
+              query_context_len,
+              prefix_end,
+              base_tail_start,
+              &page,
+              &row)) {
+        float pq_w = expf(dense_row[page * page_size + row] * scale - global_max);
+        float pq_v = load_vpq_value_for_dim(
+            value_codebooks,
+            value_codes,
+            kv_head,
+            page,
+            row,
+            d,
+            pages,
+            page_size,
+            value_subvecs,
+            value_centroids,
+            value_subdim);
+        approx_den_local -= pq_w;
+        approx_num_local -= pq_w * pq_v;
+      }
+    }
+    for (int64_t sel = threadIdx.x; sel < probe_budget; sel += blockDim.x) {
+      float logit = ranked_logit_row[sel];
+      int64_t token = ranked_row[sel];
+      if (!isfinite(logit) || token < 0 || token >= query_context_len || token >= total_tokens) {
+        continue;
+      }
+      float selected_w = expf(logit - global_max);
+      bool exact_value = selected_mass_exact_value_for_rank(logit, sel, probe_threshold, probe_threshold_sel);
+      float selected_v = selected_value_for_rank_dim_explicit(
+          values,
+          value_codebooks,
+          value_codes,
+          page_starts,
+          token,
+          exact_value,
+          kv_head,
+          d,
+          total_tokens,
+          value_stride_head,
+          value_stride_token,
+          value_stride_dim,
+          pages,
+          page_size,
+          value_subvecs,
+          value_centroids,
+          value_subdim);
+      probe_den_local += selected_w;
+      probe_num_local += selected_w * selected_v;
+      if (probe_includes_tail) {
+        int64_t page = -1;
+        int64_t row = -1;
+        if (complete_page_for_token(
+                page_starts,
+                pages,
+                page_size,
+                token,
+                query_context_len,
+                prefix_end,
+                base_tail_start,
+                &page,
+                &row)) {
+          float pq_w = expf(dense_row[page * page_size + row] * scale - global_max);
+          float pq_v = load_vpq_value_for_dim(
+              value_codebooks,
+              value_codes,
+              kv_head,
+              page,
+              row,
+              d,
+              pages,
+              page_size,
+              value_subvecs,
+              value_centroids,
+              value_subdim);
+          probe_den_local -= pq_w;
+          probe_num_local -= pq_w * pq_v;
+        }
+      }
+    }
+  }
+
+  approx_den_parts[threadIdx.x] = approx_den_local;
+  approx_num_parts[threadIdx.x] = approx_num_local;
+  probe_den_parts[threadIdx.x] = probe_den_local;
+  probe_num_parts[threadIdx.x] = probe_num_local;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      approx_den_parts[threadIdx.x] += approx_den_parts[threadIdx.x + stride];
+      approx_num_parts[threadIdx.x] += approx_num_parts[threadIdx.x + stride];
+      probe_den_parts[threadIdx.x] += probe_den_parts[threadIdx.x + stride];
+      probe_num_parts[threadIdx.x] += probe_num_parts[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    float approx_den = base_den_shared + tail_den_shared + approx_den_parts[0];
+    float approx_num = base_num_shared + tail_num_shared + approx_num_parts[0];
+    float probe_den = base_den_shared + (probe_includes_tail ? tail_den_shared : 0.0f) + probe_den_parts[0];
+    float probe_num = base_num_shared + (probe_includes_tail ? tail_num_shared : 0.0f) + probe_num_parts[0];
+    float approx_tail = approx_num / fmaxf(approx_den, 1.0e-20f);
+    float probe_only = probe_num / fmaxf(probe_den, 1.0e-20f);
+    float delta = approx_tail - probe_only;
+    int64_t out_idx = (head * threshold_steps + step) * dim + d;
+    diff_squares[out_idx] = delta * delta;
+    probe_squares[out_idx] = probe_only * probe_only;
+  }
+}
+
+template <typename value_t, typename vcode_t>
+__global__ void gqa_decode_geometric_dim_scan_codeweights_kernel(
+    const value_t* __restrict__ values,
+    const float* __restrict__ dense_pq_scores,
+    const float* __restrict__ value_codebooks,
+    const vcode_t* __restrict__ value_codes,
+    const int64_t* __restrict__ page_starts,
+    const int64_t* __restrict__ base_tokens,
+    const float* __restrict__ base_logits,
+    const int64_t* __restrict__ base_counts,
+    const int64_t* __restrict__ ranked_tokens,
+    const float* __restrict__ ranked_logits,
+    const float* __restrict__ ranked_weights,
+    const float* __restrict__ ranked_pq_weights,
+    const int32_t* __restrict__ ranked_pages,
+    const int32_t* __restrict__ ranked_rows,
+    const float* __restrict__ approx_den_incs,
+    const float* __restrict__ probe_den_incs,
+    const float* __restrict__ final_den_incs,
+    const float* __restrict__ approx_code_incs,
+    const float* __restrict__ probe_code_incs,
+    const float* __restrict__ final_code_incs,
+    const float* __restrict__ approx_exact_num_incs,
+    const float* __restrict__ probe_exact_num_incs,
+    const float* __restrict__ final_exact_num_incs,
+    const int32_t* __restrict__ approx_exact_counts,
+    const int32_t* __restrict__ probe_exact_counts,
+    const int32_t* __restrict__ approx_exact_tokens,
+    const int32_t* __restrict__ probe_exact_tokens,
+    const float* __restrict__ approx_exact_weights,
+    const float* __restrict__ probe_exact_weights,
+    const float* __restrict__ max_logits,
+    const float* __restrict__ tail_denoms,
+    const float* __restrict__ code_weight_sums,
+    const float* __restrict__ approx_exact_thresholds,
+    const int64_t* __restrict__ approx_exact_threshold_sels,
+    const float* __restrict__ probe_exact_thresholds,
+    const int64_t* __restrict__ probe_exact_threshold_sels,
+    float* __restrict__ diff_squares,
+    float* __restrict__ probe_squares,
+    float* __restrict__ candidate_outputs,
+    int64_t heads,
+    int64_t kv_heads,
+    int64_t ranked,
+    int64_t dim,
+    int64_t total_tokens,
+    int64_t value_stride_head,
+    int64_t value_stride_token,
+    int64_t value_stride_dim,
+    int64_t pages,
+    int64_t page_size,
+    int64_t max_base,
+    int64_t value_subvecs,
+    int64_t value_centroids,
+    int64_t value_subdim,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    int64_t min_budget,
+    int64_t max_budget_arg,
+    int64_t granularity,
+    float growth,
+    float probe_scale,
+    float scale,
+    bool probe_includes_tail,
+    bool write_candidate_outputs,
+    bool use_selected_code_incs,
+    bool use_selected_exact_num_incs,
+    bool use_selected_exact_lists,
+    int64_t exact_list_capacity,
+    int64_t threshold_steps) {
+  int64_t head = blockIdx.x;
+  int64_t d = blockIdx.y;
+  if (head >= heads || d >= dim || threshold_steps <= 0) {
+    return;
+  }
+  extern __shared__ float shared[];
+  float* den0 = shared;
+  float* num0 = den0 + blockDim.x;
+  float* den1 = num0 + blockDim.x;
+  float* num1 = den1 + blockDim.x;
+  float* den2 = num1 + blockDim.x;
+  float* num2 = den2 + blockDim.x;
+
+  int64_t max_budget = max_budget_arg;
+  if (max_budget <= 0 || max_budget > ranked) {
+    max_budget = ranked;
+  }
+  int64_t prefix_end = 0;
+  int64_t base_tail_start = 0;
+  token_in_base_window(
+      0,
+      query_context_len,
+      static_prefix,
+      static_suffix,
+      page_size,
+      &prefix_end,
+      &base_tail_start);
+  int64_t kv_head = min(head / group_size, kv_heads - 1);
+  const int64_t* base_tokens_row = base_tokens + head * max_base;
+  const float* base_logits_row = base_logits + head * max_base;
+  int64_t base_count = max(static_cast<int64_t>(0), min(base_counts[head], max_base));
+  const int64_t* ranked_row = ranked_tokens + head * ranked;
+  const float* ranked_logit_row = ranked_logits + head * ranked;
+  const float* ranked_weight_row = ranked_weights != nullptr ? ranked_weights + head * ranked : nullptr;
+  const float* ranked_pq_weight_row = ranked_pq_weights != nullptr ? ranked_pq_weights + head * ranked : nullptr;
+  const int32_t* ranked_page_row = ranked_pages != nullptr ? ranked_pages + head * ranked : nullptr;
+  const int32_t* ranked_row_row = ranked_rows != nullptr ? ranked_rows + head * ranked : nullptr;
+  const float* dense_row = dense_pq_scores + head * (pages * page_size);
+  bool use_code_incs =
+      use_selected_code_incs && approx_den_incs != nullptr && probe_den_incs != nullptr &&
+      final_den_incs != nullptr && approx_code_incs != nullptr && probe_code_incs != nullptr &&
+      final_code_incs != nullptr && ranked_weight_row != nullptr && ranked_pq_weight_row != nullptr &&
+      ranked_page_row != nullptr && ranked_row_row != nullptr && value_subdim > 0 && value_subvecs > 0 &&
+      value_centroids > 0;
+  bool use_exact_num_incs =
+      use_code_incs && use_selected_exact_num_incs && approx_exact_num_incs != nullptr &&
+      probe_exact_num_incs != nullptr && final_exact_num_incs != nullptr;
+  bool use_exact_lists =
+      use_code_incs && use_selected_exact_lists && approx_exact_counts != nullptr &&
+      probe_exact_counts != nullptr && approx_exact_tokens != nullptr && probe_exact_tokens != nullptr &&
+      approx_exact_weights != nullptr && probe_exact_weights != nullptr;
+  int64_t list_capacity = exact_list_capacity;
+  if (list_capacity <= 0 || list_capacity > max_budget) {
+    list_capacity = max_budget;
+  }
+  float global_max = max_logits[head];
+  if (!isfinite(global_max)) {
+    return;
+  }
+
+  float local_base_den = 0.0f;
+  float local_base_num = 0.0f;
+  for (int64_t idx = threadIdx.x; idx < base_count; idx += blockDim.x) {
+    int64_t token = base_tokens_row[idx];
+    float logit = base_logits_row[idx];
+    if (token < 0 || token >= total_tokens || !isfinite(logit)) {
+      continue;
+    }
+    float w = expf(logit - global_max);
+    local_base_den += w;
+    local_base_num += w * load_strided3_as_float(
+                            values,
+                            kv_head,
+                            token,
+                            d,
+                            value_stride_head,
+                            value_stride_token,
+                            value_stride_dim);
+  }
+
+  float local_tail_num = 0.0f;
+  if (value_subdim > 0) {
+    int64_t sub = d / value_subdim;
+    int64_t sub_d = d - sub * value_subdim;
+    if (sub >= 0 && sub < value_subvecs) {
+      int64_t total_codes = pages * value_centroids;
+      for (int64_t idx = threadIdx.x; idx < total_codes; idx += blockDim.x) {
+        int64_t page = idx / value_centroids;
+        int64_t code = idx - page * value_centroids;
+        float w = code_weight_sums[(((head * pages + page) * value_subvecs + sub) * value_centroids + code)];
+        if (w == 0.0f) {
+          continue;
+        }
+        float value = value_codebooks
+            [((((kv_head * pages + page) * value_subvecs + sub) * value_centroids + code) * value_subdim) +
+             sub_d];
+        local_tail_num += w * value;
+      }
+    }
+  }
+
+  den0[threadIdx.x] = local_base_den;
+  num0[threadIdx.x] = local_base_num;
+  den1[threadIdx.x] = local_tail_num;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      den0[threadIdx.x] += den0[threadIdx.x + stride];
+      num0[threadIdx.x] += num0[threadIdx.x + stride];
+      den1[threadIdx.x] += den1[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  __shared__ float approx_den_shared;
+  __shared__ float approx_num_shared;
+  __shared__ float probe_den_shared;
+  __shared__ float probe_num_shared;
+  __shared__ float final_den_shared;
+  __shared__ float final_num_shared;
+  if (threadIdx.x == 0) {
+    float base_den = den0[0];
+    float base_num = num0[0];
+    float tail_den = tail_denoms[head];
+    float tail_num = den1[0];
+    approx_den_shared = base_den + tail_den;
+    approx_num_shared = base_num + tail_num;
+    probe_den_shared = probe_includes_tail ? (base_den + tail_den) : base_den;
+    probe_num_shared = probe_includes_tail ? (base_num + tail_num) : base_num;
+    final_den_shared = base_den + tail_den;
+    final_num_shared = base_num + tail_num;
+  }
+  __syncthreads();
+
+  int64_t approx_keep = 0;
+  int64_t probe_keep = 0;
+  for (int64_t step = 0; step < threshold_steps; ++step) {
+    int64_t tail_budget = 0;
+    int64_t probe_budget = 0;
+    geometric_budget_pair_for_step_device(
+        step,
+        min_budget,
+        max_budget,
+        granularity,
+        growth,
+        probe_scale,
+        &tail_budget,
+        &probe_budget);
+    int64_t thresh_idx = head * threshold_steps + step;
+    float approx_threshold = approx_exact_thresholds[thresh_idx];
+    int64_t approx_threshold_sel = approx_exact_threshold_sels[thresh_idx];
+    float probe_threshold = probe_exact_thresholds[thresh_idx];
+    int64_t probe_threshold_sel = probe_exact_threshold_sels[thresh_idx];
+    float local_approx_code_num = 0.0f;
+    float local_probe_code_num = 0.0f;
+    float local_final_code_num = 0.0f;
+    if (use_code_incs && value_subdim > 0) {
+      int64_t sub = d / value_subdim;
+      int64_t sub_d = d - sub * value_subdim;
+      if (sub >= 0 && sub < value_subvecs) {
+        int64_t total_codes = pages * value_centroids;
+        int64_t code_base = (((head * threshold_steps + step) * pages) * value_subvecs + sub) * value_centroids;
+        for (int64_t idx = threadIdx.x; idx < total_codes; idx += blockDim.x) {
+          int64_t page = idx / value_centroids;
+          int64_t code = idx - page * value_centroids;
+          float value = value_codebooks
+              [((((kv_head * pages + page) * value_subvecs + sub) * value_centroids + code) * value_subdim) +
+               sub_d];
+          int64_t weight_idx = code_base + page * value_subvecs * value_centroids + code;
+          local_approx_code_num += approx_code_incs[weight_idx] * value;
+          local_probe_code_num += probe_code_incs[weight_idx] * value;
+          if (write_candidate_outputs) {
+            local_final_code_num += final_code_incs[weight_idx] * value;
+          }
+        }
+      }
+    }
+
+    float local_approx_den = 0.0f;
+    float local_approx_num = local_approx_code_num;
+    int64_t approx_exact_count = use_exact_lists ? static_cast<int64_t>(approx_exact_counts[thresh_idx]) : 0;
+    bool use_approx_exact_list = use_exact_lists && approx_exact_count <= list_capacity;
+    if (use_approx_exact_list) {
+      int64_t list_base = (head * threshold_steps + step) * list_capacity;
+      int64_t exact_count = min(approx_exact_count, list_capacity);
+      for (int64_t idx = threadIdx.x; idx < exact_count; idx += blockDim.x) {
+        int64_t token = approx_exact_tokens[list_base + idx];
+        float selected_w = approx_exact_weights[list_base + idx];
+        if (selected_w == 0.0f || token < 0 || token >= total_tokens) {
+          continue;
+        }
+        local_approx_num += selected_w * load_strided3_as_float(
+                                          values,
+                                          kv_head,
+                                          token,
+                                          d,
+                                          value_stride_head,
+                                          value_stride_token,
+                                          value_stride_dim);
+      }
+    } else if (!use_exact_num_incs) {
+    for (int64_t sel = approx_keep + threadIdx.x; sel < tail_budget; sel += blockDim.x) {
+      float logit = ranked_logit_row[sel];
+      int64_t token = ranked_row[sel];
+      if (!isfinite(logit) || token < 0 || token >= query_context_len || token >= total_tokens) {
+        continue;
+	      }
+	      float selected_w = ranked_weight_row != nullptr ? ranked_weight_row[sel] : expf(logit - global_max);
+	      bool exact_value = selected_mass_exact_value_for_rank(logit, sel, approx_threshold, approx_threshold_sel);
+	      int64_t page = -1;
+	      int64_t row = -1;
+	      bool has_tail_page = false;
+	      if (ranked_page_row != nullptr && ranked_row_row != nullptr) {
+	        page = static_cast<int64_t>(ranked_page_row[sel]);
+	        row = static_cast<int64_t>(ranked_row_row[sel]);
+	        has_tail_page = page >= 0 && row >= 0;
+	      } else {
+	        has_tail_page = complete_page_for_token(
+	            page_starts,
+	            pages,
+	            page_size,
+	            token,
+	            query_context_len,
+	            prefix_end,
+	            base_tail_start,
+	            &page,
+	            &row);
+	      }
+	      if (use_code_incs) {
+	        if (exact_value || !has_tail_page) {
+	          float selected_v = exact_value
+	              ? load_strided3_as_float(
+	                    values,
+	                    kv_head,
+	                    token,
+	                    d,
+	                    value_stride_head,
+	                    value_stride_token,
+	                    value_stride_dim)
+	              : selected_value_for_rank_dim_explicit(
+	                    values,
+	                    value_codebooks,
+	                    value_codes,
+	                    page_starts,
+	                    token,
+	                    false,
+	                    kv_head,
+	                    d,
+	                    total_tokens,
+	                    value_stride_head,
+	                    value_stride_token,
+	                    value_stride_dim,
+	                    pages,
+	                    page_size,
+	                    value_subvecs,
+	                    value_centroids,
+	                    value_subdim);
+	          local_approx_num += selected_w * selected_v;
+	        }
+	        continue;
+	      }
+	      float pq_w = 0.0f;
+	      float pq_v = 0.0f;
+	      if (has_tail_page) {
+	        pq_w = ranked_pq_weight_row != nullptr
+	            ? ranked_pq_weight_row[sel]
+	            : expf(dense_row[page * page_size + row] * scale - global_max);
+	        pq_v = load_vpq_value_for_dim(
+	            value_codebooks,
+	            value_codes,
+	            kv_head,
+	            page,
+	            row,
+	            d,
+	            pages,
+	            page_size,
+	            value_subvecs,
+	            value_centroids,
+	            value_subdim);
+	      }
+	      float selected_v = 0.0f;
+	      if (exact_value) {
+	        selected_v = load_strided3_as_float(
+	            values,
+	            kv_head,
+	            token,
+	            d,
+	            value_stride_head,
+	            value_stride_token,
+	            value_stride_dim);
+	      } else if (has_tail_page) {
+	        selected_v = pq_v;
+	      } else {
+	        selected_v = selected_value_for_rank_dim_explicit(
+	            values,
+	            value_codebooks,
+	            value_codes,
+	            page_starts,
+	            token,
+	            false,
+	            kv_head,
+	            d,
+	            total_tokens,
+	            value_stride_head,
+	            value_stride_token,
+	            value_stride_dim,
+	            pages,
+	            page_size,
+	            value_subvecs,
+	            value_centroids,
+	            value_subdim);
+	      }
+	      local_approx_den += selected_w;
+	      local_approx_num += selected_w * selected_v;
+	      if (has_tail_page) {
+	        local_approx_den -= pq_w;
+	        local_approx_num -= pq_w * pq_v;
+	      }
+    }
+    }
+
+    float local_probe_den = 0.0f;
+    float local_probe_num = local_probe_code_num;
+    float local_final_den = 0.0f;
+    float local_final_num = local_final_code_num;
+    int64_t probe_exact_count = use_exact_lists ? static_cast<int64_t>(probe_exact_counts[thresh_idx]) : 0;
+    bool use_probe_exact_list = use_exact_lists && probe_exact_count <= list_capacity;
+    if (use_probe_exact_list) {
+      int64_t list_base = (head * threshold_steps + step) * list_capacity;
+      int64_t exact_count = min(probe_exact_count, list_capacity);
+      for (int64_t idx = threadIdx.x; idx < exact_count; idx += blockDim.x) {
+        int64_t token = probe_exact_tokens[list_base + idx];
+        float selected_w = probe_exact_weights[list_base + idx];
+        if (selected_w == 0.0f || token < 0 || token >= total_tokens) {
+          continue;
+        }
+        float selected_v = load_strided3_as_float(
+            values,
+            kv_head,
+            token,
+            d,
+            value_stride_head,
+            value_stride_token,
+            value_stride_dim);
+        local_probe_num += selected_w * selected_v;
+        if (write_candidate_outputs) {
+          local_final_num += selected_w * selected_v;
+        }
+      }
+    } else if (!use_exact_num_incs) {
+    for (int64_t sel = probe_keep + threadIdx.x; sel < probe_budget; sel += blockDim.x) {
+      float logit = ranked_logit_row[sel];
+      int64_t token = ranked_row[sel];
+      if (!isfinite(logit) || token < 0 || token >= query_context_len || token >= total_tokens) {
+        continue;
+	      }
+	      float selected_w = ranked_weight_row != nullptr ? ranked_weight_row[sel] : expf(logit - global_max);
+	      bool exact_value = selected_mass_exact_value_for_rank(logit, sel, probe_threshold, probe_threshold_sel);
+	      int64_t page = -1;
+	      int64_t row = -1;
+	      bool has_tail_page = false;
+	      if (ranked_page_row != nullptr && ranked_row_row != nullptr) {
+	        page = static_cast<int64_t>(ranked_page_row[sel]);
+	        row = static_cast<int64_t>(ranked_row_row[sel]);
+	        has_tail_page = page >= 0 && row >= 0;
+	      } else {
+	        has_tail_page = complete_page_for_token(
+	            page_starts,
+	            pages,
+	            page_size,
+	            token,
+	            query_context_len,
+	            prefix_end,
+	            base_tail_start,
+	            &page,
+	            &row);
+	      }
+	      if (use_code_incs) {
+	        if (exact_value || !has_tail_page) {
+	          float selected_v = exact_value
+	              ? load_strided3_as_float(
+	                    values,
+	                    kv_head,
+	                    token,
+	                    d,
+	                    value_stride_head,
+	                    value_stride_token,
+	                    value_stride_dim)
+	              : selected_value_for_rank_dim_explicit(
+	                    values,
+	                    value_codebooks,
+	                    value_codes,
+	                    page_starts,
+	                    token,
+	                    false,
+	                    kv_head,
+	                    d,
+	                    total_tokens,
+	                    value_stride_head,
+	                    value_stride_token,
+	                    value_stride_dim,
+	                    pages,
+	                    page_size,
+	                    value_subvecs,
+	                    value_centroids,
+	                    value_subdim);
+	          local_probe_num += selected_w * selected_v;
+	          if (write_candidate_outputs) {
+	            local_final_num += selected_w * selected_v;
+	          }
+	        }
+	        continue;
+	      }
+	      float pq_w = 0.0f;
+	      float pq_v = 0.0f;
+	      if (has_tail_page) {
+	        pq_w = ranked_pq_weight_row != nullptr
+	            ? ranked_pq_weight_row[sel]
+	            : expf(dense_row[page * page_size + row] * scale - global_max);
+	        pq_v = load_vpq_value_for_dim(
+	            value_codebooks,
+	            value_codes,
+	            kv_head,
+	            page,
+	            row,
+	            d,
+	            pages,
+	            page_size,
+	            value_subvecs,
+	            value_centroids,
+	            value_subdim);
+	      }
+	      float selected_v = 0.0f;
+	      if (exact_value) {
+	        selected_v = load_strided3_as_float(
+	            values,
+	            kv_head,
+	            token,
+	            d,
+	            value_stride_head,
+	            value_stride_token,
+	            value_stride_dim);
+	      } else if (has_tail_page) {
+	        selected_v = pq_v;
+	      } else {
+	        selected_v = selected_value_for_rank_dim_explicit(
+	            values,
+	            value_codebooks,
+	            value_codes,
+	            page_starts,
+	            token,
+	            false,
+	            kv_head,
+	            d,
+	            total_tokens,
+	            value_stride_head,
+	            value_stride_token,
+	            value_stride_dim,
+	            pages,
+	            page_size,
+	            value_subvecs,
+	            value_centroids,
+	            value_subdim);
+	      }
+	      local_probe_den += selected_w;
+	      local_probe_num += selected_w * selected_v;
+	      if (write_candidate_outputs) {
+	        local_final_den += selected_w;
+	        local_final_num += selected_w * selected_v;
+	      }
+	      if (probe_includes_tail && has_tail_page) {
+	          local_probe_den -= pq_w;
+	          local_probe_num -= pq_w * pq_v;
+	      }
+	      if (write_candidate_outputs && !probe_includes_tail && has_tail_page) {
+	          local_final_den -= pq_w;
+	          local_final_num -= pq_w * pq_v;
+	      }
+	    }
+    }
+
+    den0[threadIdx.x] = local_approx_den;
+    num0[threadIdx.x] = local_approx_num;
+    den1[threadIdx.x] = local_probe_den;
+    num1[threadIdx.x] = local_probe_num;
+    den2[threadIdx.x] = local_final_den;
+    num2[threadIdx.x] = local_final_num;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        den0[threadIdx.x] += den0[threadIdx.x + stride];
+        num0[threadIdx.x] += num0[threadIdx.x + stride];
+        den1[threadIdx.x] += den1[threadIdx.x + stride];
+        num1[threadIdx.x] += num1[threadIdx.x + stride];
+        den2[threadIdx.x] += den2[threadIdx.x + stride];
+        num2[threadIdx.x] += num2[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      if (use_code_incs) {
+        int64_t inc_idx = head * threshold_steps + step;
+        approx_den_shared += approx_den_incs[inc_idx];
+        probe_den_shared += probe_den_incs[inc_idx];
+        if (write_candidate_outputs) {
+          final_den_shared += final_den_incs[inc_idx];
+        }
+      } else {
+        approx_den_shared += den0[0];
+        probe_den_shared += den1[0];
+        if (write_candidate_outputs) {
+          final_den_shared += probe_includes_tail ? den1[0] : den2[0];
+        }
+      }
+      float approx_num_add = num0[0];
+      float probe_num_add = num1[0];
+      float final_num_add = write_candidate_outputs ? (probe_includes_tail ? num1[0] : num2[0]) : 0.0f;
+      if (use_exact_num_incs) {
+        int64_t num_idx = (head * threshold_steps + step) * dim + d;
+        approx_num_add += approx_exact_num_incs[num_idx];
+        probe_num_add += probe_exact_num_incs[num_idx];
+        if (write_candidate_outputs) {
+          final_num_add += final_exact_num_incs[num_idx];
+        }
+      }
+      approx_num_shared += approx_num_add;
+      probe_num_shared += probe_num_add;
+      if (write_candidate_outputs) {
+        final_num_shared += final_num_add;
+      }
+      float approx_tail = approx_num_shared / fmaxf(approx_den_shared, 1.0e-20f);
+      float probe_only = probe_num_shared / fmaxf(probe_den_shared, 1.0e-20f);
+      float delta = approx_tail - probe_only;
+      int64_t out_idx = (head * threshold_steps + step) * dim + d;
+      diff_squares[out_idx] = delta * delta;
+      probe_squares[out_idx] = probe_only * probe_only;
+      if (write_candidate_outputs && candidate_outputs != nullptr) {
+        candidate_outputs[out_idx] = final_num_shared / fmaxf(final_den_shared, 1.0e-20f);
+      }
+    }
+    __syncthreads();
+    approx_keep = tail_budget;
+    probe_keep = probe_budget;
+  }
+}
+
+__global__ void gqa_decode_geometric_pick_counts_from_step_diffs_kernel(
+    const float* __restrict__ diff_squares,
+    const float* __restrict__ probe_squares,
+    const float* __restrict__ max_logits,
+    int64_t* __restrict__ accepted_counts,
+    int64_t heads,
+    int64_t threshold_steps,
+    int64_t dim,
+    int64_t min_budget,
+    int64_t max_budget_arg,
+    int64_t ranked,
+    int64_t granularity,
+    float growth,
+    float probe_scale,
+    float rel_l2_max) {
+  int64_t head = blockIdx.x;
+  if (head >= heads) {
+    return;
+  }
+  extern __shared__ float shared[];
+  float* diff_shared = shared;
+  float* probe_shared = shared + blockDim.x;
+  int64_t max_budget = max_budget_arg;
+  if (max_budget <= 0 || max_budget > ranked) {
+    max_budget = ranked;
+  }
+  if (!isfinite(max_logits[head])) {
+    if (threadIdx.x == 0) {
+      accepted_counts[head] = max_budget;
+    }
+    return;
+  }
+  __shared__ int done_shared;
+  __shared__ int64_t accepted_shared;
+  if (threadIdx.x == 0) {
+    done_shared = 0;
+    accepted_shared = max_budget;
+  }
+  __syncthreads();
+
+  for (int64_t step = 0; step < threshold_steps; ++step) {
+    float local_diff = 0.0f;
+    float local_probe = 0.0f;
+    int64_t row_offset = (head * threshold_steps + step) * dim;
+    for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+      local_diff += diff_squares[row_offset + d];
+      local_probe += probe_squares[row_offset + d];
+    }
+    diff_shared[threadIdx.x] = local_diff;
+    probe_shared[threadIdx.x] = local_probe;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        diff_shared[threadIdx.x] += diff_shared[threadIdx.x + stride];
+        probe_shared[threadIdx.x] += probe_shared[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      int64_t tail_budget = 0;
+      int64_t probe_budget = 0;
+      geometric_budget_pair_for_step_device(
+          step,
+          min_budget,
+          max_budget,
+          granularity,
+          growth,
+          probe_scale,
+          &tail_budget,
+          &probe_budget);
+      float denom = sqrtf(fmaxf(probe_shared[0], 1.0e-40f));
+      float rel = sqrtf(fmaxf(diff_shared[0], 0.0f)) / denom;
+      if (rel <= rel_l2_max) {
+        accepted_shared = probe_budget;
+        done_shared = 1;
+      }
+    }
+    __syncthreads();
+    if (done_shared != 0) {
+      break;
+    }
+  }
+  if (threadIdx.x == 0) {
+    accepted_counts[head] = accepted_shared;
+  }
+}
+
+__global__ void gqa_decode_geometric_pick_candidate_outputs_kernel(
+    const float* __restrict__ candidate_outputs,
+    const int64_t* __restrict__ accepted_counts,
+    float* __restrict__ outputs,
+    int64_t heads,
+    int64_t threshold_steps,
+    int64_t dim,
+    int64_t min_budget,
+    int64_t max_budget_arg,
+    int64_t ranked,
+    int64_t granularity,
+    float growth,
+    float probe_scale) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = heads * dim;
+  if (linear >= total || threshold_steps <= 0) {
+    return;
+  }
+  int64_t head = linear / dim;
+  int64_t d = linear - head * dim;
+  int64_t max_budget = max_budget_arg;
+  if (max_budget <= 0 || max_budget > ranked) {
+    max_budget = ranked;
+  }
+  int64_t accepted = accepted_counts[head];
+  accepted = max(static_cast<int64_t>(0), min(accepted, max_budget));
+  int64_t chosen_step = threshold_steps - 1;
+  for (int64_t step = 0; step < threshold_steps; ++step) {
+    int64_t tail_budget = 0;
+    int64_t probe_budget = 0;
+    geometric_budget_pair_for_step_device(
+        step,
+        min_budget,
+        max_budget,
+        granularity,
+        growth,
+        probe_scale,
+        &tail_budget,
+        &probe_budget);
+    if (probe_budget >= accepted) {
+      chosen_step = step;
+      break;
+    }
+  }
+  outputs[head * dim + d] = candidate_outputs[(head * threshold_steps + chosen_step) * dim + d];
+}
+
+template <typename value_t>
+__global__ void gqa_decode_geometric_pick_output_from_deltas_kernel(
+    const value_t* __restrict__ values,
+    const float* __restrict__ value_codebooks,
+    const int64_t* __restrict__ base_tokens,
+    const float* __restrict__ base_logits,
+    const int64_t* __restrict__ base_counts,
+    const float* __restrict__ final_den_incs,
+    const float* __restrict__ final_code_incs,
+    const int32_t* __restrict__ probe_exact_counts,
+    const int32_t* __restrict__ probe_exact_tokens,
+    const float* __restrict__ probe_exact_weights,
+    const float* __restrict__ max_logits,
+    const float* __restrict__ tail_denoms,
+    const float* __restrict__ code_weight_sums,
+    const int64_t* __restrict__ accepted_counts,
+    float* __restrict__ outputs,
+    int64_t heads,
+    int64_t kv_heads,
+    int64_t ranked,
+    int64_t dim,
+    int64_t total_tokens,
+    int64_t value_stride_head,
+    int64_t value_stride_token,
+    int64_t value_stride_dim,
+    int64_t pages,
+    int64_t max_base,
+    int64_t value_subvecs,
+    int64_t value_centroids,
+    int64_t value_subdim,
+    int64_t group_size,
+    int64_t min_budget,
+    int64_t max_budget_arg,
+    int64_t granularity,
+    float growth,
+    float probe_scale,
+    int64_t exact_list_capacity,
+    int64_t threshold_steps) {
+  int64_t head = blockIdx.x;
+  int64_t d = blockIdx.y;
+  if (head >= heads || d >= dim || threshold_steps <= 0) {
+    return;
+  }
+  extern __shared__ float shared[];
+  float* den_parts = shared;
+  float* num_parts = den_parts + blockDim.x;
+
+  int64_t max_budget = max_budget_arg;
+  if (max_budget <= 0 || max_budget > ranked) {
+    max_budget = ranked;
+  }
+  int64_t accepted = accepted_counts[head];
+  accepted = max(static_cast<int64_t>(0), min(accepted, max_budget));
+  int64_t chosen_step = threshold_steps - 1;
+  for (int64_t step = 0; step < threshold_steps; ++step) {
+    int64_t tail_budget = 0;
+    int64_t probe_budget = 0;
+    geometric_budget_pair_for_step_device(
+        step,
+        min_budget,
+        max_budget,
+        granularity,
+        growth,
+        probe_scale,
+        &tail_budget,
+        &probe_budget);
+    if (probe_budget >= accepted) {
+      chosen_step = step;
+      break;
+    }
+  }
+
+  float global_max = max_logits[head];
+  if (!isfinite(global_max)) {
+    if (threadIdx.x == 0) {
+      outputs[head * dim + d] = 0.0f;
+    }
+    return;
+  }
+  int64_t kv_head = min(head / group_size, kv_heads - 1);
+  const int64_t* base_tokens_row = base_tokens + head * max_base;
+  const float* base_logits_row = base_logits + head * max_base;
+  int64_t base_count = max(static_cast<int64_t>(0), min(base_counts[head], max_base));
+
+  float den_local = 0.0f;
+  float num_local = 0.0f;
+  for (int64_t idx = threadIdx.x; idx < base_count; idx += blockDim.x) {
+    int64_t token = base_tokens_row[idx];
+    float logit = base_logits_row[idx];
+    if (token < 0 || token >= total_tokens || !isfinite(logit)) {
+      continue;
+    }
+    float w = expf(logit - global_max);
+    den_local += w;
+    num_local += w * load_strided3_as_float(
+                            values,
+                            kv_head,
+                            token,
+                            d,
+                            value_stride_head,
+                            value_stride_token,
+                            value_stride_dim);
+  }
+
+  if (threadIdx.x == 0) {
+    den_local += tail_denoms[head];
+  }
+  if (value_subdim > 0) {
+    int64_t sub = d / value_subdim;
+    int64_t sub_d = d - sub * value_subdim;
+    if (sub >= 0 && sub < value_subvecs) {
+      int64_t total_codes = pages * value_centroids;
+      for (int64_t idx = threadIdx.x; idx < total_codes; idx += blockDim.x) {
+        int64_t page = idx / value_centroids;
+        int64_t code = idx - page * value_centroids;
+        float w = code_weight_sums[(((head * pages + page) * value_subvecs + sub) * value_centroids + code)];
+        float value = value_codebooks
+            [((((kv_head * pages + page) * value_subvecs + sub) * value_centroids + code) * value_subdim) +
+             sub_d];
+        num_local += w * value;
+      }
+    }
+  }
+
+  for (int64_t step = threadIdx.x; step <= chosen_step; step += blockDim.x) {
+    den_local += final_den_incs[head * threshold_steps + step];
+  }
+  if (value_subdim > 0) {
+    int64_t sub = d / value_subdim;
+    int64_t sub_d = d - sub * value_subdim;
+    if (sub >= 0 && sub < value_subvecs) {
+      int64_t total_codes = pages * value_centroids;
+      for (int64_t step = 0; step <= chosen_step; ++step) {
+        int64_t code_base = (((head * threshold_steps + step) * pages) * value_subvecs + sub) * value_centroids;
+        for (int64_t idx = threadIdx.x; idx < total_codes; idx += blockDim.x) {
+          int64_t page = idx / value_centroids;
+          int64_t code = idx - page * value_centroids;
+          float value = value_codebooks
+              [((((kv_head * pages + page) * value_subvecs + sub) * value_centroids + code) * value_subdim) +
+               sub_d];
+          num_local += final_code_incs[code_base + page * value_subvecs * value_centroids + code] * value;
+        }
+      }
+    }
+  }
+
+  int64_t capacity = exact_list_capacity;
+  if (capacity <= 0 || capacity > max_budget) {
+    capacity = max_budget;
+  }
+  for (int64_t step = 0; step <= chosen_step; ++step) {
+    int64_t count_idx = head * threshold_steps + step;
+    int64_t exact_count = static_cast<int64_t>(probe_exact_counts[count_idx]);
+    exact_count = max(static_cast<int64_t>(0), min(exact_count, capacity));
+    int64_t list_base = (head * threshold_steps + step) * capacity;
+    for (int64_t idx = threadIdx.x; idx < exact_count; idx += blockDim.x) {
+      int64_t token = static_cast<int64_t>(probe_exact_tokens[list_base + idx]);
+      float w = probe_exact_weights[list_base + idx];
+      if (w == 0.0f || token < 0 || token >= total_tokens) {
+        continue;
+      }
+      num_local += w * load_strided3_as_float(
+                         values,
+                         kv_head,
+                         token,
+                         d,
+                         value_stride_head,
+                         value_stride_token,
+                         value_stride_dim);
+    }
+  }
+
+  den_parts[threadIdx.x] = den_local;
+  num_parts[threadIdx.x] = num_local;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      den_parts[threadIdx.x] += den_parts[threadIdx.x + stride];
+      num_parts[threadIdx.x] += num_parts[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    outputs[head * dim + d] = num_parts[0] / fmaxf(den_parts[0], 1.0e-20f);
+  }
+}
+
 template <typename value_t, typename vcode_t>
 __global__ void gqa_decode_geometric_final_output_codeweights_kernel(
     const value_t* __restrict__ values,
@@ -5894,6 +8167,329 @@ __global__ void gqa_decode_geometric_final_output_codeweights_kernel(
   }
 }
 
+__global__ void gqa_decode_geometric_final_head_stats_kernel(
+    const float* __restrict__ base_logits,
+    const int64_t* __restrict__ base_counts,
+    const float* __restrict__ ranked_logits,
+    const float* __restrict__ tail_partial_max,
+    const float* __restrict__ probe_exact_thresholds,
+    const int64_t* __restrict__ probe_exact_threshold_sels,
+    const int64_t* __restrict__ accepted_counts,
+    float* __restrict__ final_max_logits,
+    float* __restrict__ exact_value_thresholds,
+    int64_t* __restrict__ exact_value_threshold_sels,
+    int64_t heads,
+    int64_t ranked,
+    int64_t max_base,
+    int64_t tail_blocks,
+    int64_t threshold_steps,
+    int64_t min_budget,
+    int64_t max_budget_arg,
+    int64_t granularity,
+    float growth,
+    float probe_scale) {
+  int64_t head = blockIdx.x;
+  if (head >= heads) {
+    return;
+  }
+  extern __shared__ float shared[];
+  int64_t max_budget = max_budget_arg;
+  if (max_budget <= 0 || max_budget > ranked) {
+    max_budget = ranked;
+  }
+  int64_t accepted = accepted_counts[head];
+  accepted = max(static_cast<int64_t>(0), min(accepted, max_budget));
+
+  const float* base_row = base_logits + head * max_base;
+  const float* ranked_row = ranked_logits + head * ranked;
+  int64_t base_count = max(static_cast<int64_t>(0), min(base_counts[head], max_base));
+
+  float local_max = -INFINITY;
+  for (int64_t idx = threadIdx.x; idx < base_count; idx += blockDim.x) {
+    local_max = fmaxf(local_max, base_row[idx]);
+  }
+  for (int64_t sel = threadIdx.x; sel < accepted; sel += blockDim.x) {
+    local_max = fmaxf(local_max, ranked_row[sel]);
+  }
+  for (int64_t block = threadIdx.x; block < tail_blocks; block += blockDim.x) {
+    local_max = fmaxf(local_max, tail_partial_max[head * tail_blocks + block]);
+  }
+  shared[threadIdx.x] = local_max;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    final_max_logits[head] = shared[0];
+    float threshold = INFINITY;
+    int64_t threshold_sel = -1;
+    if (threshold_steps > 0 && probe_exact_thresholds != nullptr && probe_exact_threshold_sels != nullptr) {
+      int64_t chosen_step = threshold_steps - 1;
+      for (int64_t step = 0; step < threshold_steps; ++step) {
+        int64_t tail_budget = 0;
+        int64_t probe_budget = 0;
+        geometric_budget_pair_for_step_device(
+            step,
+            min_budget,
+            max_budget,
+            granularity,
+            growth,
+            probe_scale,
+            &tail_budget,
+            &probe_budget);
+        if (probe_budget >= accepted) {
+          chosen_step = step;
+          break;
+        }
+      }
+      int64_t offset = head * threshold_steps + chosen_step;
+      threshold = probe_exact_thresholds[offset];
+      threshold_sel = probe_exact_threshold_sels[offset];
+    }
+    exact_value_thresholds[head] = threshold;
+    exact_value_threshold_sels[head] = threshold_sel;
+  }
+}
+
+template <typename value_t, typename vcode_t>
+__global__ void gqa_decode_geometric_final_output_codeweights_parallel_kernel(
+    const value_t* __restrict__ values,
+    const float* __restrict__ dense_pq_scores,
+    const float* __restrict__ value_codebooks,
+    const vcode_t* __restrict__ value_codes,
+    const int64_t* __restrict__ page_starts,
+    const int64_t* __restrict__ base_tokens,
+    const float* __restrict__ base_logits,
+    const int64_t* __restrict__ base_counts,
+    const int64_t* __restrict__ ranked_tokens,
+    const float* __restrict__ ranked_logits,
+    const float* __restrict__ tail_partial_max,
+    const float* __restrict__ final_max_logits,
+    const float* __restrict__ confidence_max_logits,
+    const float* __restrict__ tail_denoms,
+    const float* __restrict__ code_weight_sums,
+    const float* __restrict__ exact_value_thresholds,
+    const int64_t* __restrict__ exact_value_threshold_sels,
+    const int64_t* __restrict__ accepted_counts,
+    float* __restrict__ outputs,
+    int64_t heads,
+    int64_t kv_heads,
+    int64_t ranked,
+    int64_t dim,
+    int64_t total_tokens,
+    int64_t value_stride_head,
+    int64_t value_stride_token,
+    int64_t value_stride_dim,
+    int64_t pages,
+    int64_t page_size,
+    int64_t max_base,
+    int64_t value_subvecs,
+    int64_t value_centroids,
+    int64_t value_subdim,
+    int64_t tail_blocks,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    float scale,
+    float tail_blend) {
+  int64_t head = blockIdx.x;
+  int64_t d = blockIdx.y;
+  if (head >= heads || d >= dim) {
+    return;
+  }
+  extern __shared__ float shared[];
+  float* denom_parts = shared;
+  float* selected_denom_parts = denom_parts + blockDim.x;
+  float* numer_parts = selected_denom_parts + blockDim.x;
+  float* selected_numer_parts = numer_parts + blockDim.x;
+
+  int64_t prefix_end = 0;
+  int64_t base_tail_start = 0;
+  token_in_base_window(
+      0,
+      query_context_len,
+      static_prefix,
+      static_suffix,
+      page_size,
+      &prefix_end,
+      &base_tail_start);
+  int64_t kv_head = min(head / group_size, kv_heads - 1);
+  const int64_t* base_tokens_row = base_tokens + head * max_base;
+  const float* base_logits_row = base_logits + head * max_base;
+  int64_t base_count = base_counts[head];
+  const int64_t* ranked_row = ranked_tokens + head * ranked;
+  const float* ranked_logit_row = ranked_logits + head * ranked;
+  const float* dense_row = dense_pq_scores + head * (pages * page_size);
+
+  __shared__ int64_t accepted_shared;
+  __shared__ float threshold_logit_shared;
+  __shared__ int64_t threshold_sel_shared;
+  if (threadIdx.x == 0) {
+    int64_t accepted = accepted_counts[head];
+    if (accepted < 0) {
+      accepted = 0;
+    }
+    if (accepted > ranked) {
+      accepted = ranked;
+    }
+    accepted_shared = accepted;
+    threshold_logit_shared = exact_value_thresholds != nullptr ? exact_value_thresholds[head] : INFINITY;
+    threshold_sel_shared = exact_value_threshold_sels != nullptr ? exact_value_threshold_sels[head] : -1;
+  }
+  __syncthreads();
+
+  int64_t accepted = accepted_shared;
+  float final_max = final_max_logits[head];
+  float threshold_logit = threshold_logit_shared;
+  int64_t threshold_sel = threshold_sel_shared;
+
+  float denom_local = 0.0f;
+  float selected_denom_local = 0.0f;
+  float numer_local = 0.0f;
+  float selected_numer_local = 0.0f;
+  if (isfinite(final_max)) {
+    for (int64_t idx = threadIdx.x; idx < base_count; idx += blockDim.x) {
+      int64_t token = base_tokens_row[idx];
+      float logit = base_logits_row[idx];
+      if (token < 0 || token >= total_tokens || !isfinite(logit)) {
+        continue;
+      }
+      float w = expf(logit - final_max);
+      float v = load_strided3_as_float(
+          values,
+          kv_head,
+          token,
+          d,
+          value_stride_head,
+          value_stride_token,
+          value_stride_dim);
+      denom_local += w;
+      selected_denom_local += w;
+      numer_local += w * v;
+      selected_numer_local += w * v;
+    }
+
+    float tail_scale = expf(confidence_max_logits[head] - final_max);
+    if (threadIdx.x == 0) {
+      denom_local += tail_denoms[head] * tail_scale;
+    }
+    if (value_subdim > 0) {
+      int64_t sub = d / value_subdim;
+      int64_t sub_d = d - sub * value_subdim;
+      if (sub >= 0 && sub < value_subvecs) {
+        int64_t total_codes = pages * value_centroids;
+        for (int64_t idx = threadIdx.x; idx < total_codes; idx += blockDim.x) {
+          int64_t page = idx / value_centroids;
+          int64_t code = idx - page * value_centroids;
+          float weight_sum =
+              code_weight_sums[(((head * pages + page) * value_subvecs + sub) * value_centroids + code)];
+          if (weight_sum == 0.0f) {
+            continue;
+          }
+          float value = value_codebooks
+              [((((kv_head * pages + page) * value_subvecs + sub) * value_centroids + code) * value_subdim) +
+               sub_d];
+          numer_local += (weight_sum * tail_scale) * value;
+        }
+      }
+    }
+
+    for (int64_t sel = threadIdx.x; sel < accepted; sel += blockDim.x) {
+      float logit = ranked_logit_row[sel];
+      int64_t token = ranked_row[sel];
+      if (!isfinite(logit) || token < 0 || token >= query_context_len || token >= total_tokens) {
+        continue;
+      }
+      float w = expf(logit - final_max);
+      bool exact_value = selected_mass_exact_value_for_rank(logit, sel, threshold_logit, threshold_sel);
+      float selected_v = selected_value_for_rank_dim_explicit(
+          values,
+          value_codebooks,
+          value_codes,
+          page_starts,
+          token,
+          exact_value,
+          kv_head,
+          d,
+          total_tokens,
+          value_stride_head,
+          value_stride_token,
+          value_stride_dim,
+          pages,
+          page_size,
+          value_subvecs,
+          value_centroids,
+          value_subdim);
+      denom_local += w;
+      selected_denom_local += w;
+      numer_local += w * selected_v;
+      selected_numer_local += w * selected_v;
+
+      int64_t page = -1;
+      int64_t row = -1;
+      if (complete_page_for_token(
+              page_starts,
+              pages,
+              page_size,
+              token,
+              query_context_len,
+              prefix_end,
+              base_tail_start,
+              &page,
+              &row)) {
+        float pq_w = expf(dense_row[page * page_size + row] * scale - final_max);
+        float pq_v = load_vpq_value_for_dim(
+            value_codebooks,
+            value_codes,
+            kv_head,
+            page,
+            row,
+            d,
+            pages,
+            page_size,
+            value_subvecs,
+            value_centroids,
+            value_subdim);
+        denom_local -= pq_w;
+        numer_local -= pq_w * pq_v;
+      }
+    }
+  }
+
+  denom_parts[threadIdx.x] = denom_local;
+  selected_denom_parts[threadIdx.x] = selected_denom_local;
+  numer_parts[threadIdx.x] = numer_local;
+  selected_numer_parts[threadIdx.x] = selected_numer_local;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      denom_parts[threadIdx.x] += denom_parts[threadIdx.x + stride];
+      selected_denom_parts[threadIdx.x] += selected_denom_parts[threadIdx.x + stride];
+      numer_parts[threadIdx.x] += numer_parts[threadIdx.x + stride];
+      selected_numer_parts[threadIdx.x] += selected_numer_parts[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    if (!isfinite(final_max)) {
+      outputs[head * dim + d] = 0.0f;
+      return;
+    }
+    float full = numer_parts[0] / fmaxf(denom_parts[0], 1.0e-20f);
+    if (tail_blend > 0.0f && tail_blend < 1.0f) {
+      float selected_only = selected_numer_parts[0] / fmaxf(selected_denom_parts[0], 1.0e-20f);
+      outputs[head * dim + d] = selected_only + tail_blend * (full - selected_only);
+    } else {
+      outputs[head * dim + d] = full;
+    }
+  }
+}
+
 __global__ void gqa_decode_proxy_gate_counts_kernel(
     const float* __restrict__ base_logits,
     const int64_t* __restrict__ base_counts,
@@ -5915,6 +8511,14 @@ __global__ void gqa_decode_proxy_gate_counts_kernel(
     return;
   }
   extern __shared__ float shared[];
+  float* red0 = shared;
+  float* red1 = red0 + blockDim.x;
+  float* red2 = red1 + blockDim.x;
+  float* red3 = red2 + blockDim.x;
+  float* red4 = red3 + blockDim.x;
+  float* red5 = red4 + blockDim.x;
+  float* red6 = red5 + blockDim.x;
+  float* red7 = red6 + blockDim.x;
   const int64_t max_budget = max_budget_arg <= 0 ? ranked : min(max_budget_arg, ranked);
   if (max_budget <= 0) {
     if (threadIdx.x == 0) {
@@ -5956,77 +8560,39 @@ __global__ void gqa_decode_proxy_gate_counts_kernel(
     }
   }
 
-  shared[threadIdx.x] = local_x;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
-    __syncthreads();
-  }
   __shared__ float sx, sy, sx2, sy2, sxy, scount, base_max, selected_max;
-  if (threadIdx.x == 0) sx = shared[0];
-  __syncthreads();
-
-  shared[threadIdx.x] = local_y;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) sy = shared[0];
-  __syncthreads();
-
-  shared[threadIdx.x] = local_x2;
+  red0[threadIdx.x] = local_x;
+  red1[threadIdx.x] = local_y;
+  red2[threadIdx.x] = local_x2;
+  red3[threadIdx.x] = local_y2;
+  red4[threadIdx.x] = local_xy;
+  red5[threadIdx.x] = local_count;
+  red6[threadIdx.x] = local_base_max;
+  red7[threadIdx.x] = local_selected_max;
   __syncthreads();
   for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+    if (threadIdx.x < stride) {
+      red0[threadIdx.x] += red0[threadIdx.x + stride];
+      red1[threadIdx.x] += red1[threadIdx.x + stride];
+      red2[threadIdx.x] += red2[threadIdx.x + stride];
+      red3[threadIdx.x] += red3[threadIdx.x + stride];
+      red4[threadIdx.x] += red4[threadIdx.x + stride];
+      red5[threadIdx.x] += red5[threadIdx.x + stride];
+      red6[threadIdx.x] = fmaxf(red6[threadIdx.x], red6[threadIdx.x + stride]);
+      red7[threadIdx.x] = fmaxf(red7[threadIdx.x], red7[threadIdx.x + stride]);
+    }
     __syncthreads();
   }
-  if (threadIdx.x == 0) sx2 = shared[0];
-  __syncthreads();
-
-  shared[threadIdx.x] = local_y2;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
-    __syncthreads();
+  if (threadIdx.x == 0) {
+    sx = red0[0];
+    sy = red1[0];
+    sx2 = red2[0];
+    sy2 = red3[0];
+    sxy = red4[0];
+    scount = red5[0];
+    base_max = red6[0];
+    selected_max = red7[0];
   }
-  if (threadIdx.x == 0) sy2 = shared[0];
-  __syncthreads();
-
-  shared[threadIdx.x] = local_xy;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) sxy = shared[0];
-  __syncthreads();
-
-  shared[threadIdx.x] = local_count;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) scount = shared[0];
-  __syncthreads();
-
-  shared[threadIdx.x] = local_base_max;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) base_max = shared[0];
-  __syncthreads();
-
-  shared[threadIdx.x] = local_selected_max;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) selected_max = shared[0];
   __syncthreads();
 
   __shared__ float fit_scale_shared, fit_bias_shared, corr_shared, relrmse_shared;
@@ -6091,48 +8657,34 @@ __global__ void gqa_decode_proxy_gate_counts_kernel(
     }
   }
 
-  shared[threadIdx.x] = local_x;
+  red0[threadIdx.x] = local_x;
+  red1[threadIdx.x] = local_base_sum;
+  red2[threadIdx.x] = local_selected_sum;
+  red3[threadIdx.x] = local_tail_max;
   __syncthreads();
   for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+    if (threadIdx.x < stride) {
+      red0[threadIdx.x] += red0[threadIdx.x + stride];
+      red1[threadIdx.x] += red1[threadIdx.x + stride];
+      red2[threadIdx.x] += red2[threadIdx.x + stride];
+      red3[threadIdx.x] = fmaxf(red3[threadIdx.x], red3[threadIdx.x + stride]);
+    }
     __syncthreads();
   }
   if (threadIdx.x == 0 && calibrate && scount >= 2.0f) {
     float mean_y = sy / fmaxf(scount, 1.0f);
     float var_y = fmaxf(sy2 / fmaxf(scount, 1.0f) - mean_y * mean_y, 0.0f);
-    float rmse = sqrtf(shared[0] / fmaxf(scount, 1.0f));
+    float rmse = sqrtf(red0[0] / fmaxf(scount, 1.0f));
     relrmse_shared = rmse / fmaxf(sqrtf(var_y), 1.0e-6f);
   }
   __syncthreads();
 
-  shared[threadIdx.x] = local_base_sum;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
-    __syncthreads();
-  }
   __shared__ float base_lse, selected_lse_part, tail_max;
-  if (threadIdx.x == 0) base_lse = (isfinite(base_max) && shared[0] > 0.0f) ? base_max + logf(shared[0]) : -INFINITY;
-  __syncthreads();
-
-  shared[threadIdx.x] = local_selected_sum;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
-    __syncthreads();
-  }
   if (threadIdx.x == 0) {
-    selected_lse_part = (isfinite(selected_max) && shared[0] > 0.0f) ? selected_max + logf(shared[0]) : -INFINITY;
+    base_lse = (isfinite(base_max) && red1[0] > 0.0f) ? base_max + logf(red1[0]) : -INFINITY;
+    selected_lse_part = (isfinite(selected_max) && red2[0] > 0.0f) ? selected_max + logf(red2[0]) : -INFINITY;
+    tail_max = red3[0];
   }
-  __syncthreads();
-
-  shared[threadIdx.x] = local_tail_max;
-  __syncthreads();
-  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) tail_max = shared[0];
   __syncthreads();
 
   float local_tail_sum = 0.0f;
@@ -6143,15 +8695,15 @@ __global__ void gqa_decode_proxy_gate_counts_kernel(
       local_tail_sum += expf(pred - tail_max);
     }
   }
-  shared[threadIdx.x] = local_tail_sum;
+  red0[threadIdx.x] = local_tail_sum;
   __syncthreads();
   for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
+    if (threadIdx.x < stride) red0[threadIdx.x] += red0[threadIdx.x + stride];
     __syncthreads();
   }
   if (threadIdx.x == 0) {
     float selected_lse = logaddexp_device(base_lse, selected_lse_part);
-    float tail_lse = (isfinite(tail_max) && shared[0] > 0.0f) ? tail_max + logf(shared[0]) : -INFINITY;
+    float tail_lse = (isfinite(tail_max) && red0[0] > 0.0f) ? tail_max + logf(red0[0]) : -INFINITY;
     float total_lse = logaddexp_device(selected_lse, tail_lse);
     float selected_mass = isfinite(total_lse) ? expf(selected_lse - total_lse) : 0.0f;
     float tail_mass = isfinite(total_lse) ? expf(tail_lse - total_lse) : 0.0f;
@@ -8607,9 +11159,6 @@ torch::Tensor gqa_decode_vpq_selected_tail_agg_from_scores_cuda(
       tail_blocks);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  const int output_threads = 256;
-  const int64_t output_total = heads * dim;
-  const int output_blocks = static_cast<int>((output_total + output_threads - 1) / output_threads);
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
@@ -8618,8 +11167,7 @@ torch::Tensor gqa_decode_vpq_selected_tail_agg_from_scores_cuda(
       [&] {
         using value_scalar_t = scalar_t;
         if (value_codes.scalar_type() == torch::kUInt8) {
-          gqa_decode_tail_agg_output_kernel<value_scalar_t, uint8_t>
-              <<<output_blocks, output_threads, 0, stream>>>(
+          launch_gqa_decode_tail_agg_output<value_scalar_t, uint8_t>(
                   values.data_ptr<value_scalar_t>(),
                   value_codebooks.data_ptr<float>(),
                   value_codes.data_ptr<uint8_t>(),
@@ -8654,10 +11202,10 @@ torch::Tensor gqa_decode_vpq_selected_tail_agg_from_scores_cuda(
                   static_prefix,
                   static_suffix,
                   static_cast<float>(scale),
-                  static_cast<float>(tail_blend));
+                  static_cast<float>(tail_blend),
+                  stream);
         } else {
-          gqa_decode_tail_agg_output_kernel<value_scalar_t, int64_t>
-              <<<output_blocks, output_threads, 0, stream>>>(
+          launch_gqa_decode_tail_agg_output<value_scalar_t, int64_t>(
                   values.data_ptr<value_scalar_t>(),
                   value_codebooks.data_ptr<float>(),
                   value_codes.data_ptr<int64_t>(),
@@ -8692,7 +11240,8 @@ torch::Tensor gqa_decode_vpq_selected_tail_agg_from_scores_cuda(
                   static_prefix,
                   static_suffix,
                   static_cast<float>(scale),
-                  static_cast<float>(tail_blend));
+                  static_cast<float>(tail_blend),
+                  stream);
         }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -8755,7 +11304,7 @@ torch::Tensor gqa_decode_geometric_accept_counts_cuda_impl(
     return counts;
   }
 
-  const int threads = 256;
+  const int threads = decode_geometric_threads();
   const int shared_bytes = threads * 2 * sizeof(float);
   const int64_t pages_per_block = decode_tail_pages_per_block();
   const int64_t tail_blocks = std::max<int64_t>(1, (pages + pages_per_block - 1) / pages_per_block);
@@ -8943,6 +11492,26 @@ torch::Tensor gqa_decode_geometric_accept_counts_cuda_impl(
       threshold_steps > 0 ? probe_exact_thresholds.data_ptr<float>() : nullptr;
   const int64_t* probe_exact_threshold_sels_ptr =
       threshold_steps > 0 ? probe_exact_threshold_sels.data_ptr<int64_t>() : nullptr;
+  const char* dim_scan_env = std::getenv("SELECTOR_PQ_GEOMETRIC_DIM_SCAN");
+  const bool use_dim_scan =
+      dim_scan_env != nullptr && dim_scan_env[0] != '\0' && dim_scan_env[0] != '0' &&
+      threshold_steps > 0 && exact_value_mass > 0.0;
+  const char* step_parallel_env = std::getenv("SELECTOR_PQ_GEOMETRIC_STEP_PARALLEL");
+  const bool use_step_parallel =
+      !use_dim_scan &&
+      step_parallel_env != nullptr && step_parallel_env[0] != '\0' && step_parallel_env[0] != '0' &&
+      threshold_steps > 0 && exact_value_mass > 0.0;
+  auto diff_squares =
+      (use_step_parallel || use_dim_scan) ? torch::empty({heads, threshold_steps, dim}, opts) : torch::Tensor();
+  auto probe_squares =
+      (use_step_parallel || use_dim_scan) ? torch::empty({heads, threshold_steps, dim}, opts) : torch::Tensor();
+  const int step_shared_bytes = threads * 4 * sizeof(float);
+  const int dim_scan_shared_bytes = threads * 6 * sizeof(float);
+  dim3 step_grid(
+      static_cast<unsigned int>(heads),
+      static_cast<unsigned int>(std::max<int64_t>(1, threshold_steps)),
+      static_cast<unsigned int>(dim));
+  dim3 dim_scan_grid(static_cast<unsigned int>(heads), static_cast<unsigned int>(dim));
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
@@ -8951,7 +11520,249 @@ torch::Tensor gqa_decode_geometric_accept_counts_cuda_impl(
       "gqa_decode_geometric_accept_counts_values",
       [&] {
         using value_scalar_t = scalar_t;
-        if (value_codes.scalar_type() == torch::kUInt8) {
+        if (use_dim_scan && value_codes.scalar_type() == torch::kUInt8) {
+          gqa_decode_geometric_dim_scan_codeweights_kernel<value_scalar_t, uint8_t>
+              <<<dim_scan_grid, threads, dim_scan_shared_bytes, stream>>>(
+                  values.data_ptr<value_scalar_t>(),
+                  dense_pq_scores.data_ptr<float>(),
+                  value_codebooks.data_ptr<float>(),
+                  value_codes.data_ptr<uint8_t>(),
+                  page_starts.data_ptr<int64_t>(),
+                  base_tokens.data_ptr<int64_t>(),
+                  base_logits.data_ptr<float>(),
+                  base_counts.data_ptr<int64_t>(),
+                  ranked_tokens.data_ptr<int64_t>(),
+                  ranked_logits.data_ptr<float>(),
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  max_logits.data_ptr<float>(),
+                  tail_denoms.data_ptr<float>(),
+                  code_weight_sums.data_ptr<float>(),
+                  approx_exact_thresholds_ptr,
+                  approx_exact_threshold_sels_ptr,
+                  probe_exact_thresholds_ptr,
+                  probe_exact_threshold_sels_ptr,
+                  diff_squares.data_ptr<float>(),
+                  probe_squares.data_ptr<float>(),
+                  nullptr,
+                  heads,
+                  kv_heads,
+                  ranked,
+                  dim,
+                  total_tokens,
+                  values.stride(0),
+                  values.stride(1),
+                  values.stride(2),
+                  pages,
+                  page_size,
+                  max_base,
+                  value_subvecs,
+                  value_centroids,
+                  value_subdim,
+                  group_size,
+                  query_context_len,
+                  static_prefix,
+                  static_suffix,
+                  min_budget,
+                  max_budget,
+                  granularity,
+                  static_cast<float>(growth),
+                  static_cast<float>(probe_scale),
+                  static_cast<float>(scale),
+                  probe_includes_tail,
+                  false,
+                  false,
+                  false,
+                  false,
+                  0,
+                  threshold_steps);
+        } else if (use_dim_scan) {
+          gqa_decode_geometric_dim_scan_codeweights_kernel<value_scalar_t, int64_t>
+              <<<dim_scan_grid, threads, dim_scan_shared_bytes, stream>>>(
+                  values.data_ptr<value_scalar_t>(),
+                  dense_pq_scores.data_ptr<float>(),
+                  value_codebooks.data_ptr<float>(),
+                  value_codes.data_ptr<int64_t>(),
+                  page_starts.data_ptr<int64_t>(),
+                  base_tokens.data_ptr<int64_t>(),
+                  base_logits.data_ptr<float>(),
+                  base_counts.data_ptr<int64_t>(),
+                  ranked_tokens.data_ptr<int64_t>(),
+                  ranked_logits.data_ptr<float>(),
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  nullptr,
+                  max_logits.data_ptr<float>(),
+                  tail_denoms.data_ptr<float>(),
+                  code_weight_sums.data_ptr<float>(),
+                  approx_exact_thresholds_ptr,
+                  approx_exact_threshold_sels_ptr,
+                  probe_exact_thresholds_ptr,
+                  probe_exact_threshold_sels_ptr,
+                  diff_squares.data_ptr<float>(),
+                  probe_squares.data_ptr<float>(),
+                  nullptr,
+                  heads,
+                  kv_heads,
+                  ranked,
+                  dim,
+                  total_tokens,
+                  values.stride(0),
+                  values.stride(1),
+                  values.stride(2),
+                  pages,
+                  page_size,
+                  max_base,
+                  value_subvecs,
+                  value_centroids,
+                  value_subdim,
+                  group_size,
+                  query_context_len,
+                  static_prefix,
+                  static_suffix,
+                  min_budget,
+                  max_budget,
+                  granularity,
+                  static_cast<float>(growth),
+                  static_cast<float>(probe_scale),
+                  static_cast<float>(scale),
+                  probe_includes_tail,
+                  false,
+                  false,
+                  false,
+                  false,
+                  0,
+                  threshold_steps);
+        } else if (use_step_parallel && value_codes.scalar_type() == torch::kUInt8) {
+          gqa_decode_geometric_step_diff_codeweights_kernel<value_scalar_t, uint8_t>
+              <<<step_grid, threads, step_shared_bytes, stream>>>(
+                  values.data_ptr<value_scalar_t>(),
+                  dense_pq_scores.data_ptr<float>(),
+                  value_codebooks.data_ptr<float>(),
+                  value_codes.data_ptr<uint8_t>(),
+                  page_starts.data_ptr<int64_t>(),
+                  base_tokens.data_ptr<int64_t>(),
+                  base_logits.data_ptr<float>(),
+                  base_counts.data_ptr<int64_t>(),
+                  ranked_tokens.data_ptr<int64_t>(),
+                  ranked_logits.data_ptr<float>(),
+                  max_logits.data_ptr<float>(),
+                  tail_denoms.data_ptr<float>(),
+                  code_weight_sums.data_ptr<float>(),
+                  approx_exact_thresholds_ptr,
+                  approx_exact_threshold_sels_ptr,
+                  probe_exact_thresholds_ptr,
+                  probe_exact_threshold_sels_ptr,
+                  diff_squares.data_ptr<float>(),
+                  probe_squares.data_ptr<float>(),
+                  heads,
+                  kv_heads,
+                  ranked,
+                  dim,
+                  total_tokens,
+                  values.stride(0),
+                  values.stride(1),
+                  values.stride(2),
+                  pages,
+                  page_size,
+                  max_base,
+                  value_subvecs,
+                  value_centroids,
+                  value_subdim,
+                  group_size,
+                  query_context_len,
+                  static_prefix,
+                  static_suffix,
+                  min_budget,
+                  max_budget,
+                  granularity,
+                  static_cast<float>(growth),
+                  static_cast<float>(probe_scale),
+                  static_cast<float>(scale),
+                  probe_includes_tail,
+                  threshold_steps);
+        } else if (use_step_parallel) {
+          gqa_decode_geometric_step_diff_codeweights_kernel<value_scalar_t, int64_t>
+              <<<step_grid, threads, step_shared_bytes, stream>>>(
+                  values.data_ptr<value_scalar_t>(),
+                  dense_pq_scores.data_ptr<float>(),
+                  value_codebooks.data_ptr<float>(),
+                  value_codes.data_ptr<int64_t>(),
+                  page_starts.data_ptr<int64_t>(),
+                  base_tokens.data_ptr<int64_t>(),
+                  base_logits.data_ptr<float>(),
+                  base_counts.data_ptr<int64_t>(),
+                  ranked_tokens.data_ptr<int64_t>(),
+                  ranked_logits.data_ptr<float>(),
+                  max_logits.data_ptr<float>(),
+                  tail_denoms.data_ptr<float>(),
+                  code_weight_sums.data_ptr<float>(),
+                  approx_exact_thresholds_ptr,
+                  approx_exact_threshold_sels_ptr,
+                  probe_exact_thresholds_ptr,
+                  probe_exact_threshold_sels_ptr,
+                  diff_squares.data_ptr<float>(),
+                  probe_squares.data_ptr<float>(),
+                  heads,
+                  kv_heads,
+                  ranked,
+                  dim,
+                  total_tokens,
+                  values.stride(0),
+                  values.stride(1),
+                  values.stride(2),
+                  pages,
+                  page_size,
+                  max_base,
+                  value_subvecs,
+                  value_centroids,
+                  value_subdim,
+                  group_size,
+                  query_context_len,
+                  static_prefix,
+                  static_suffix,
+                  min_budget,
+                  max_budget,
+                  granularity,
+                  static_cast<float>(growth),
+                  static_cast<float>(probe_scale),
+                  static_cast<float>(scale),
+                  probe_includes_tail,
+                  threshold_steps);
+        } else if (value_codes.scalar_type() == torch::kUInt8) {
           gqa_decode_geometric_accept_counts_codeweights_kernel<value_scalar_t, uint8_t>
               <<<static_cast<int>(heads), threads, shared_bytes, stream>>>(
                   values.data_ptr<value_scalar_t>(),
@@ -9056,8 +11867,30 @@ torch::Tensor gqa_decode_geometric_accept_counts_cuda_impl(
         }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (use_step_parallel || use_dim_scan) {
+    gqa_decode_geometric_pick_counts_from_step_diffs_kernel<<<
+        static_cast<int>(heads),
+        threads,
+        threads * 2 * sizeof(float),
+        stream>>>(
+        diff_squares.data_ptr<float>(),
+        probe_squares.data_ptr<float>(),
+        max_logits.data_ptr<float>(),
+        counts.data_ptr<int64_t>(),
+        heads,
+        threshold_steps,
+        dim,
+        min_budget,
+        max_budget,
+        ranked,
+        granularity,
+        static_cast<float>(growth),
+        static_cast<float>(probe_scale),
+        static_cast<float>(rel_l2_max));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
   if (apply_proxy_gate) {
-    gqa_decode_proxy_gate_counts_kernel<<<static_cast<int>(heads), threads, threads * sizeof(float), stream>>>(
+    gqa_decode_proxy_gate_counts_kernel<<<static_cast<int>(heads), threads, threads * 8 * sizeof(float), stream>>>(
         base_logits.data_ptr<float>(),
         base_counts.data_ptr<int64_t>(),
         ranked_logits.data_ptr<float>(),
@@ -9809,7 +12642,7 @@ std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_l
     return {counts, outputs};
   }
 
-  const int threads = 256;
+  const int threads = decode_geometric_threads();
   const int shared_bytes = threads * 2 * sizeof(float);
   const int64_t pages_per_block = decode_tail_pages_per_block();
   const int64_t tail_blocks = std::max<int64_t>(1, (pages + pages_per_block - 1) / pages_per_block);
@@ -9965,6 +12798,559 @@ std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_l
   const int64_t* probe_exact_threshold_sels_ptr =
       threshold_steps > 0 ? probe_exact_threshold_sels.data_ptr<int64_t>() : nullptr;
 
+  const char* dim_scan_output_env = std::getenv("SELECTOR_PQ_FUSED_DIM_SCAN_OUTPUT");
+  const bool use_dim_scan_output =
+      dim_scan_output_env != nullptr && dim_scan_output_env[0] != '\0' && dim_scan_output_env[0] != '0' &&
+      threshold_steps > 0 && exact_value_mass > 0.0 && tail_blend == 1.0;
+  if (use_dim_scan_output) {
+    auto diff_squares = torch::empty({heads, threshold_steps, dim}, opts);
+    auto probe_squares = torch::empty({heads, threshold_steps, dim}, opts);
+    const char* two_pass_output_env = std::getenv("SELECTOR_PQ_GEOMETRIC_TWO_PASS_OUTPUT");
+    const bool request_two_pass_output =
+        two_pass_output_env != nullptr && two_pass_output_env[0] != '\0' && two_pass_output_env[0] != '0';
+    torch::Tensor candidate_outputs;
+    torch::Tensor ranked_weights;
+    torch::Tensor ranked_pq_weights;
+    torch::Tensor ranked_pages;
+    torch::Tensor ranked_rows;
+    const char* precompute_weights_env = std::getenv("SELECTOR_PQ_PRECOMPUTE_RANK_WEIGHTS");
+    const bool precompute_rank_weights =
+        precompute_weights_env != nullptr && precompute_weights_env[0] != '\0' && precompute_weights_env[0] != '0';
+    if (precompute_rank_weights) {
+      ranked_weights = torch::empty({heads, ranked}, opts);
+      ranked_pq_weights = torch::empty({heads, ranked}, opts);
+      ranked_pages = torch::empty({heads, ranked}, queries.options().dtype(torch::kInt32));
+      ranked_rows = torch::empty({heads, ranked}, queries.options().dtype(torch::kInt32));
+      const int weight_threads = 256;
+      const int64_t weight_total = heads * ranked;
+      const int weight_blocks = static_cast<int>((weight_total + weight_threads - 1) / weight_threads);
+      gqa_decode_rank_weight_metadata_kernel<<<weight_blocks, weight_threads, 0, stream>>>(
+          ranked_tokens.data_ptr<int64_t>(),
+          filtered_ranked_logits.data_ptr<float>(),
+          dense_pq_scores.data_ptr<float>(),
+          page_starts.data_ptr<int64_t>(),
+          max_logits.data_ptr<float>(),
+          ranked_weights.data_ptr<float>(),
+          ranked_pq_weights.data_ptr<float>(),
+          ranked_pages.data_ptr<int32_t>(),
+          ranked_rows.data_ptr<int32_t>(),
+          heads,
+          ranked,
+          pages,
+          page_size,
+          query_context_len,
+          static_prefix,
+          static_suffix,
+          static_cast<float>(scale));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    const float* ranked_weights_ptr = precompute_rank_weights ? ranked_weights.data_ptr<float>() : nullptr;
+    const float* ranked_pq_weights_ptr = precompute_rank_weights ? ranked_pq_weights.data_ptr<float>() : nullptr;
+    const int32_t* ranked_pages_ptr = precompute_rank_weights ? ranked_pages.data_ptr<int32_t>() : nullptr;
+    const int32_t* ranked_rows_ptr = precompute_rank_weights ? ranked_rows.data_ptr<int32_t>() : nullptr;
+    torch::Tensor approx_den_incs;
+    torch::Tensor probe_den_incs;
+    torch::Tensor final_den_incs;
+    torch::Tensor approx_code_incs;
+    torch::Tensor probe_code_incs;
+    torch::Tensor final_code_incs;
+    torch::Tensor approx_exact_num_incs;
+    torch::Tensor probe_exact_num_incs;
+    torch::Tensor final_exact_num_incs;
+    torch::Tensor approx_exact_counts;
+    torch::Tensor probe_exact_counts;
+    torch::Tensor approx_exact_tokens;
+    torch::Tensor probe_exact_tokens;
+    torch::Tensor approx_exact_weights;
+    torch::Tensor probe_exact_weights;
+    const char* selected_code_delta_env = std::getenv("SELECTOR_PQ_SELECTED_CODEWEIGHT_DELTAS");
+    const bool use_selected_code_deltas =
+        precompute_rank_weights && selected_code_delta_env != nullptr && selected_code_delta_env[0] != '\0' &&
+        selected_code_delta_env[0] != '0' && value_subvecs > 0 && value_centroids > 0;
+    if (use_selected_code_deltas) {
+      approx_den_incs = torch::empty({heads, threshold_steps}, opts);
+      probe_den_incs = torch::empty({heads, threshold_steps}, opts);
+      final_den_incs = torch::empty({heads, threshold_steps}, opts);
+      approx_code_incs = torch::zeros({heads, threshold_steps, pages, value_subvecs, value_centroids}, opts);
+      probe_code_incs = torch::zeros({heads, threshold_steps, pages, value_subvecs, value_centroids}, opts);
+      final_code_incs = torch::zeros({heads, threshold_steps, pages, value_subvecs, value_centroids}, opts);
+      dim3 delta_grid(static_cast<unsigned int>(heads), static_cast<unsigned int>(threshold_steps));
+      const int delta_shared_bytes = threads * 3 * sizeof(float);
+      if (value_codes.scalar_type() == torch::kUInt8) {
+        gqa_decode_geometric_selected_code_delta_kernel<uint8_t>
+            <<<delta_grid, threads, delta_shared_bytes, stream>>>(
+                ranked_tokens.data_ptr<int64_t>(),
+                filtered_ranked_logits.data_ptr<float>(),
+                ranked_weights.data_ptr<float>(),
+                ranked_pq_weights.data_ptr<float>(),
+                ranked_pages.data_ptr<int32_t>(),
+                ranked_rows.data_ptr<int32_t>(),
+                value_codes.data_ptr<uint8_t>(),
+                approx_exact_thresholds_ptr,
+                approx_exact_threshold_sels_ptr,
+                probe_exact_thresholds_ptr,
+                probe_exact_threshold_sels_ptr,
+                approx_den_incs.data_ptr<float>(),
+                probe_den_incs.data_ptr<float>(),
+                final_den_incs.data_ptr<float>(),
+                approx_code_incs.data_ptr<float>(),
+                probe_code_incs.data_ptr<float>(),
+                final_code_incs.data_ptr<float>(),
+                heads,
+                kv_heads,
+                ranked,
+                pages,
+                page_size,
+                value_subvecs,
+                value_centroids,
+                group_size,
+                min_budget,
+                max_budget,
+                granularity,
+                static_cast<float>(growth),
+                static_cast<float>(probe_scale),
+                probe_includes_tail,
+                threshold_steps);
+      } else {
+        gqa_decode_geometric_selected_code_delta_kernel<int64_t>
+            <<<delta_grid, threads, delta_shared_bytes, stream>>>(
+                ranked_tokens.data_ptr<int64_t>(),
+                filtered_ranked_logits.data_ptr<float>(),
+                ranked_weights.data_ptr<float>(),
+                ranked_pq_weights.data_ptr<float>(),
+                ranked_pages.data_ptr<int32_t>(),
+                ranked_rows.data_ptr<int32_t>(),
+                value_codes.data_ptr<int64_t>(),
+                approx_exact_thresholds_ptr,
+                approx_exact_threshold_sels_ptr,
+                probe_exact_thresholds_ptr,
+                probe_exact_threshold_sels_ptr,
+                approx_den_incs.data_ptr<float>(),
+                probe_den_incs.data_ptr<float>(),
+                final_den_incs.data_ptr<float>(),
+                approx_code_incs.data_ptr<float>(),
+                probe_code_incs.data_ptr<float>(),
+                final_code_incs.data_ptr<float>(),
+                heads,
+                kv_heads,
+                ranked,
+                pages,
+                page_size,
+                value_subvecs,
+                value_centroids,
+                group_size,
+                min_budget,
+                max_budget,
+                granularity,
+                static_cast<float>(growth),
+                static_cast<float>(probe_scale),
+                probe_includes_tail,
+                threshold_steps);
+      }
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    const char* selected_exact_delta_env = std::getenv("SELECTOR_PQ_SELECTED_EXACT_DELTAS");
+    const bool use_selected_exact_deltas =
+        use_selected_code_deltas && selected_exact_delta_env != nullptr && selected_exact_delta_env[0] != '\0' &&
+        selected_exact_delta_env[0] != '0';
+    if (use_selected_exact_deltas) {
+      approx_exact_num_incs = torch::empty({heads, threshold_steps, dim}, opts);
+      probe_exact_num_incs = torch::empty({heads, threshold_steps, dim}, opts);
+      final_exact_num_incs = torch::empty({heads, threshold_steps, dim}, opts);
+      dim3 exact_delta_grid(static_cast<unsigned int>(heads), static_cast<unsigned int>(threshold_steps));
+      const int exact_delta_shared_bytes = static_cast<int>(3 * dim * sizeof(float));
+      AT_DISPATCH_FLOATING_TYPES_AND2(
+          at::ScalarType::Half,
+          at::ScalarType::BFloat16,
+          values.scalar_type(),
+          "gqa_decode_geometric_selected_exact_delta_values",
+          [&] {
+            gqa_decode_geometric_selected_exact_delta_kernel<scalar_t>
+                <<<exact_delta_grid, threads, exact_delta_shared_bytes, stream>>>(
+                    values.data_ptr<scalar_t>(),
+                    ranked_tokens.data_ptr<int64_t>(),
+                    filtered_ranked_logits.data_ptr<float>(),
+                    ranked_weights.data_ptr<float>(),
+                    ranked_pages.data_ptr<int32_t>(),
+                    ranked_rows.data_ptr<int32_t>(),
+                    approx_exact_thresholds_ptr,
+                    approx_exact_threshold_sels_ptr,
+                    probe_exact_thresholds_ptr,
+                    probe_exact_threshold_sels_ptr,
+                    approx_exact_num_incs.data_ptr<float>(),
+                    probe_exact_num_incs.data_ptr<float>(),
+                    final_exact_num_incs.data_ptr<float>(),
+                    heads,
+                    kv_heads,
+                    ranked,
+                    dim,
+                    total_tokens,
+                    values.stride(0),
+                    values.stride(1),
+                    values.stride(2),
+                    pages,
+                    page_size,
+                    group_size,
+                    min_budget,
+                    max_budget,
+                    granularity,
+                    static_cast<float>(growth),
+                    static_cast<float>(probe_scale),
+                    threshold_steps);
+          });
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    const char* selected_exact_lists_env = std::getenv("SELECTOR_PQ_SELECTED_EXACT_LISTS");
+    const bool use_selected_exact_lists =
+        use_selected_code_deltas && selected_exact_lists_env != nullptr && selected_exact_lists_env[0] != '\0' &&
+        selected_exact_lists_env[0] != '0';
+    int64_t exact_list_capacity = max_budget;
+    if (use_selected_exact_lists) {
+      const char* exact_list_cap_env = std::getenv("SELECTOR_PQ_SELECTED_EXACT_LIST_CAP");
+      if (exact_list_cap_env != nullptr && exact_list_cap_env[0] != '\0') {
+        char* end = nullptr;
+        long parsed = std::strtol(exact_list_cap_env, &end, 10);
+        if (end != exact_list_cap_env && parsed > 0) {
+          exact_list_capacity = std::min<int64_t>(max_budget, static_cast<int64_t>(parsed));
+        }
+      }
+      exact_list_capacity = std::max<int64_t>(1, std::min<int64_t>(max_budget, exact_list_capacity));
+    }
+    const bool use_two_pass_output =
+        request_two_pass_output && use_selected_code_deltas && use_selected_exact_lists &&
+        exact_list_capacity >= std::min<int64_t>(max_budget, ranked);
+    if (!use_two_pass_output) {
+      candidate_outputs = torch::empty({heads, threshold_steps, dim}, opts);
+    }
+    if (use_selected_exact_lists) {
+      approx_exact_counts = torch::empty({heads, threshold_steps}, queries.options().dtype(torch::kInt32));
+      probe_exact_counts = torch::empty({heads, threshold_steps}, queries.options().dtype(torch::kInt32));
+      approx_exact_tokens =
+          torch::empty({heads, threshold_steps, exact_list_capacity}, queries.options().dtype(torch::kInt32));
+      probe_exact_tokens =
+          torch::empty({heads, threshold_steps, exact_list_capacity}, queries.options().dtype(torch::kInt32));
+      approx_exact_weights = torch::empty({heads, threshold_steps, exact_list_capacity}, opts);
+      probe_exact_weights = torch::empty({heads, threshold_steps, exact_list_capacity}, opts);
+      dim3 exact_list_grid(static_cast<unsigned int>(heads), static_cast<unsigned int>(threshold_steps));
+      gqa_decode_geometric_selected_exact_list_kernel<<<exact_list_grid, threads, 0, stream>>>(
+          ranked_tokens.data_ptr<int64_t>(),
+          filtered_ranked_logits.data_ptr<float>(),
+          ranked_weights.data_ptr<float>(),
+          ranked_pages.data_ptr<int32_t>(),
+          ranked_rows.data_ptr<int32_t>(),
+          approx_exact_thresholds_ptr,
+          approx_exact_threshold_sels_ptr,
+          probe_exact_thresholds_ptr,
+          probe_exact_threshold_sels_ptr,
+          approx_exact_counts.data_ptr<int32_t>(),
+          probe_exact_counts.data_ptr<int32_t>(),
+          approx_exact_tokens.data_ptr<int32_t>(),
+          probe_exact_tokens.data_ptr<int32_t>(),
+          approx_exact_weights.data_ptr<float>(),
+          probe_exact_weights.data_ptr<float>(),
+          heads,
+          ranked,
+          total_tokens,
+          pages,
+          page_size,
+          min_budget,
+          max_budget,
+          granularity,
+          static_cast<float>(growth),
+          static_cast<float>(probe_scale),
+          exact_list_capacity,
+          threshold_steps);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    const float* approx_den_incs_ptr = use_selected_code_deltas ? approx_den_incs.data_ptr<float>() : nullptr;
+    const float* probe_den_incs_ptr = use_selected_code_deltas ? probe_den_incs.data_ptr<float>() : nullptr;
+    const float* final_den_incs_ptr = use_selected_code_deltas ? final_den_incs.data_ptr<float>() : nullptr;
+    const float* approx_code_incs_ptr = use_selected_code_deltas ? approx_code_incs.data_ptr<float>() : nullptr;
+    const float* probe_code_incs_ptr = use_selected_code_deltas ? probe_code_incs.data_ptr<float>() : nullptr;
+    const float* final_code_incs_ptr = use_selected_code_deltas ? final_code_incs.data_ptr<float>() : nullptr;
+    const float* approx_exact_num_incs_ptr =
+        use_selected_exact_deltas ? approx_exact_num_incs.data_ptr<float>() : nullptr;
+    const float* probe_exact_num_incs_ptr =
+        use_selected_exact_deltas ? probe_exact_num_incs.data_ptr<float>() : nullptr;
+    const float* final_exact_num_incs_ptr =
+        use_selected_exact_deltas ? final_exact_num_incs.data_ptr<float>() : nullptr;
+    const int32_t* approx_exact_counts_ptr =
+        use_selected_exact_lists ? approx_exact_counts.data_ptr<int32_t>() : nullptr;
+    const int32_t* probe_exact_counts_ptr =
+        use_selected_exact_lists ? probe_exact_counts.data_ptr<int32_t>() : nullptr;
+    const int32_t* approx_exact_tokens_ptr =
+        use_selected_exact_lists ? approx_exact_tokens.data_ptr<int32_t>() : nullptr;
+    const int32_t* probe_exact_tokens_ptr =
+        use_selected_exact_lists ? probe_exact_tokens.data_ptr<int32_t>() : nullptr;
+    const float* approx_exact_weights_ptr =
+        use_selected_exact_lists ? approx_exact_weights.data_ptr<float>() : nullptr;
+    const float* probe_exact_weights_ptr =
+        use_selected_exact_lists ? probe_exact_weights.data_ptr<float>() : nullptr;
+    const int dim_scan_shared_bytes = threads * 6 * sizeof(float);
+    dim3 dim_scan_grid(static_cast<unsigned int>(heads), static_cast<unsigned int>(dim));
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half,
+        at::ScalarType::BFloat16,
+        values.scalar_type(),
+        "gqa_decode_geometric_output_dim_scan_values",
+        [&] {
+          using value_scalar_t = scalar_t;
+          if (value_codes.scalar_type() == torch::kUInt8) {
+            gqa_decode_geometric_dim_scan_codeweights_kernel<value_scalar_t, uint8_t>
+                <<<dim_scan_grid, threads, dim_scan_shared_bytes, stream>>>(
+                    values.data_ptr<value_scalar_t>(),
+                    dense_pq_scores.data_ptr<float>(),
+                    value_codebooks.data_ptr<float>(),
+                    value_codes.data_ptr<uint8_t>(),
+                    page_starts.data_ptr<int64_t>(),
+                    base_tokens.data_ptr<int64_t>(),
+                    base_logits.data_ptr<float>(),
+                    base_counts.data_ptr<int64_t>(),
+                    ranked_tokens.data_ptr<int64_t>(),
+                    filtered_ranked_logits.data_ptr<float>(),
+                    ranked_weights_ptr,
+                    ranked_pq_weights_ptr,
+                    ranked_pages_ptr,
+                    ranked_rows_ptr,
+                    approx_den_incs_ptr,
+                    probe_den_incs_ptr,
+                    final_den_incs_ptr,
+                    approx_code_incs_ptr,
+                    probe_code_incs_ptr,
+                    final_code_incs_ptr,
+                    approx_exact_num_incs_ptr,
+                    probe_exact_num_incs_ptr,
+                    final_exact_num_incs_ptr,
+                    approx_exact_counts_ptr,
+                    probe_exact_counts_ptr,
+                    approx_exact_tokens_ptr,
+                    probe_exact_tokens_ptr,
+                    approx_exact_weights_ptr,
+                    probe_exact_weights_ptr,
+                    max_logits.data_ptr<float>(),
+                    tail_denoms.data_ptr<float>(),
+                    code_weight_sums.data_ptr<float>(),
+                    approx_exact_thresholds_ptr,
+                    approx_exact_threshold_sels_ptr,
+                    probe_exact_thresholds_ptr,
+                    probe_exact_threshold_sels_ptr,
+                    diff_squares.data_ptr<float>(),
+                    probe_squares.data_ptr<float>(),
+                    use_two_pass_output ? nullptr : candidate_outputs.data_ptr<float>(),
+                    heads,
+                    kv_heads,
+                    ranked,
+                    dim,
+                    total_tokens,
+                    values.stride(0),
+                    values.stride(1),
+                    values.stride(2),
+                    pages,
+                    page_size,
+                    max_base,
+                    value_subvecs,
+                    value_centroids,
+                    value_subdim,
+                    group_size,
+                    query_context_len,
+                    static_prefix,
+                    static_suffix,
+                    min_budget,
+                    max_budget,
+                    granularity,
+                    static_cast<float>(growth),
+                    static_cast<float>(probe_scale),
+                    static_cast<float>(scale),
+                    probe_includes_tail,
+                    !use_two_pass_output,
+                    use_selected_code_deltas,
+                    use_selected_exact_deltas,
+                    use_selected_exact_lists,
+                    exact_list_capacity,
+                    threshold_steps);
+          } else {
+            gqa_decode_geometric_dim_scan_codeweights_kernel<value_scalar_t, int64_t>
+                <<<dim_scan_grid, threads, dim_scan_shared_bytes, stream>>>(
+                    values.data_ptr<value_scalar_t>(),
+                    dense_pq_scores.data_ptr<float>(),
+                    value_codebooks.data_ptr<float>(),
+                    value_codes.data_ptr<int64_t>(),
+                    page_starts.data_ptr<int64_t>(),
+                    base_tokens.data_ptr<int64_t>(),
+                    base_logits.data_ptr<float>(),
+                    base_counts.data_ptr<int64_t>(),
+                    ranked_tokens.data_ptr<int64_t>(),
+                    filtered_ranked_logits.data_ptr<float>(),
+                    ranked_weights_ptr,
+                    ranked_pq_weights_ptr,
+                    ranked_pages_ptr,
+                    ranked_rows_ptr,
+                    approx_den_incs_ptr,
+                    probe_den_incs_ptr,
+                    final_den_incs_ptr,
+                    approx_code_incs_ptr,
+                    probe_code_incs_ptr,
+                    final_code_incs_ptr,
+                    approx_exact_num_incs_ptr,
+                    probe_exact_num_incs_ptr,
+                    final_exact_num_incs_ptr,
+                    approx_exact_counts_ptr,
+                    probe_exact_counts_ptr,
+                    approx_exact_tokens_ptr,
+                    probe_exact_tokens_ptr,
+                    approx_exact_weights_ptr,
+                    probe_exact_weights_ptr,
+                    max_logits.data_ptr<float>(),
+                    tail_denoms.data_ptr<float>(),
+                    code_weight_sums.data_ptr<float>(),
+                    approx_exact_thresholds_ptr,
+                    approx_exact_threshold_sels_ptr,
+                    probe_exact_thresholds_ptr,
+                    probe_exact_threshold_sels_ptr,
+                    diff_squares.data_ptr<float>(),
+                    probe_squares.data_ptr<float>(),
+                    use_two_pass_output ? nullptr : candidate_outputs.data_ptr<float>(),
+                    heads,
+                    kv_heads,
+                    ranked,
+                    dim,
+                    total_tokens,
+                    values.stride(0),
+                    values.stride(1),
+                    values.stride(2),
+                    pages,
+                    page_size,
+                    max_base,
+                    value_subvecs,
+                    value_centroids,
+                    value_subdim,
+                    group_size,
+                    query_context_len,
+                    static_prefix,
+                    static_suffix,
+                    min_budget,
+                    max_budget,
+                    granularity,
+                    static_cast<float>(growth),
+                    static_cast<float>(probe_scale),
+                    static_cast<float>(scale),
+                    probe_includes_tail,
+                    !use_two_pass_output,
+                    use_selected_code_deltas,
+                    use_selected_exact_deltas,
+                    use_selected_exact_lists,
+                    exact_list_capacity,
+                    threshold_steps);
+          }
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    gqa_decode_geometric_pick_counts_from_step_diffs_kernel<<<
+        static_cast<int>(heads),
+        threads,
+        threads * 2 * sizeof(float),
+        stream>>>(
+        diff_squares.data_ptr<float>(),
+        probe_squares.data_ptr<float>(),
+        max_logits.data_ptr<float>(),
+        counts.data_ptr<int64_t>(),
+        heads,
+        threshold_steps,
+        dim,
+        min_budget,
+        max_budget,
+        ranked,
+        granularity,
+        static_cast<float>(growth),
+        static_cast<float>(probe_scale),
+        static_cast<float>(rel_l2_max));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    gqa_decode_proxy_gate_counts_kernel<<<static_cast<int>(heads), threads, threads * 8 * sizeof(float), stream>>>(
+        base_logits.data_ptr<float>(),
+        base_counts.data_ptr<int64_t>(),
+        filtered_ranked_logits.data_ptr<float>(),
+        ranked_scores.data_ptr<float>(),
+        counts.data_ptr<int64_t>(),
+        heads,
+        ranked,
+        max_base,
+        max_budget,
+        static_cast<float>(scale),
+        static_cast<float>(proxy_mass_min),
+        static_cast<float>(proxy_tail_mass_max),
+        static_cast<float>(pq_corr_min),
+        static_cast<float>(pq_relrmse_max),
+        calibrate_proxy);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (use_two_pass_output) {
+      const int output_shared_bytes = threads * 2 * sizeof(float);
+      AT_DISPATCH_FLOATING_TYPES_AND2(
+          at::ScalarType::Half,
+          at::ScalarType::BFloat16,
+          values.scalar_type(),
+          "gqa_decode_geometric_two_pass_output_values",
+          [&] {
+            gqa_decode_geometric_pick_output_from_deltas_kernel<scalar_t>
+                <<<dim_scan_grid, threads, output_shared_bytes, stream>>>(
+                    values.data_ptr<scalar_t>(),
+                    value_codebooks.data_ptr<float>(),
+                    base_tokens.data_ptr<int64_t>(),
+                    base_logits.data_ptr<float>(),
+                    base_counts.data_ptr<int64_t>(),
+                    final_den_incs.data_ptr<float>(),
+                    final_code_incs.data_ptr<float>(),
+                    probe_exact_counts.data_ptr<int32_t>(),
+                    probe_exact_tokens.data_ptr<int32_t>(),
+                    probe_exact_weights.data_ptr<float>(),
+                    max_logits.data_ptr<float>(),
+                    tail_denoms.data_ptr<float>(),
+                    code_weight_sums.data_ptr<float>(),
+                    counts.data_ptr<int64_t>(),
+                    outputs.data_ptr<float>(),
+                    heads,
+                    kv_heads,
+                    ranked,
+                    dim,
+                    total_tokens,
+                    values.stride(0),
+                    values.stride(1),
+                    values.stride(2),
+                    pages,
+                    max_base,
+                    value_subvecs,
+                    value_centroids,
+                    value_subdim,
+                    group_size,
+                    min_budget,
+                    max_budget,
+                    granularity,
+                    static_cast<float>(growth),
+                    static_cast<float>(probe_scale),
+                    exact_list_capacity,
+                    threshold_steps);
+          });
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
+      const int pick_threads = 256;
+      const int64_t pick_total = heads * dim;
+      const int pick_blocks = static_cast<int>((pick_total + pick_threads - 1) / pick_threads);
+      gqa_decode_geometric_pick_candidate_outputs_kernel<<<pick_blocks, pick_threads, 0, stream>>>(
+          candidate_outputs.data_ptr<float>(),
+          counts.data_ptr<int64_t>(),
+          outputs.data_ptr<float>(),
+          heads,
+          threshold_steps,
+          dim,
+          min_budget,
+          max_budget,
+          ranked,
+          granularity,
+          static_cast<float>(growth),
+          static_cast<float>(probe_scale));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return {counts, outputs};
+  }
+
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
@@ -10078,7 +13464,7 @@ std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_l
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  gqa_decode_proxy_gate_counts_kernel<<<static_cast<int>(heads), threads, threads * sizeof(float), stream>>>(
+  gqa_decode_proxy_gate_counts_kernel<<<static_cast<int>(heads), threads, threads * 8 * sizeof(float), stream>>>(
       base_logits.data_ptr<float>(),
       base_counts.data_ptr<int64_t>(),
       filtered_ranked_logits.data_ptr<float>(),
@@ -10096,6 +13482,40 @@ std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_l
       calibrate_proxy);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+  const char* final_parallel_env = std::getenv("SELECTOR_PQ_FUSED_GEOMETRIC_OUTPUT_PARALLEL");
+  const bool use_final_parallel =
+      final_parallel_env != nullptr && final_parallel_env[0] != '\0' && final_parallel_env[0] != '0';
+  torch::Tensor final_output_max_logits;
+  torch::Tensor final_exact_thresholds;
+  torch::Tensor final_exact_threshold_sels;
+  if (use_final_parallel) {
+    final_output_max_logits = torch::empty({heads}, opts);
+    final_exact_thresholds = torch::empty({heads}, opts);
+    final_exact_threshold_sels = torch::empty({heads}, long_opts);
+    gqa_decode_geometric_final_head_stats_kernel<<<static_cast<int>(heads), threads, threads * sizeof(float), stream>>>(
+        base_logits.data_ptr<float>(),
+        base_counts.data_ptr<int64_t>(),
+        filtered_ranked_logits.data_ptr<float>(),
+        partial_max.data_ptr<float>(),
+        probe_exact_thresholds_ptr,
+        probe_exact_threshold_sels_ptr,
+        counts.data_ptr<int64_t>(),
+        final_output_max_logits.data_ptr<float>(),
+        final_exact_thresholds.data_ptr<float>(),
+        final_exact_threshold_sels.data_ptr<int64_t>(),
+        heads,
+        ranked,
+        max_base,
+        tail_blocks,
+        threshold_steps,
+        min_budget,
+        max_budget,
+        granularity,
+        static_cast<float>(growth),
+        static_cast<float>(probe_scale));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
@@ -10103,9 +13523,12 @@ std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_l
       "gqa_decode_geometric_output_final_values",
       [&] {
         using value_scalar_t = scalar_t;
+        dim3 parallel_grid(static_cast<unsigned int>(heads), static_cast<unsigned int>(dim));
+        const int parallel_shared_bytes = threads * 4 * sizeof(float);
         if (value_codes.scalar_type() == torch::kUInt8) {
-          gqa_decode_geometric_final_output_codeweights_kernel<value_scalar_t, uint8_t>
-              <<<static_cast<int>(heads), threads, 0, stream>>>(
+          if (use_final_parallel) {
+            gqa_decode_geometric_final_output_codeweights_parallel_kernel<value_scalar_t, uint8_t>
+                <<<parallel_grid, threads, parallel_shared_bytes, stream>>>(
                   values.data_ptr<value_scalar_t>(),
                   dense_pq_scores.data_ptr<float>(),
                   value_codebooks.data_ptr<float>(),
@@ -10117,9 +13540,12 @@ std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_l
                   ranked_tokens.data_ptr<int64_t>(),
                   filtered_ranked_logits.data_ptr<float>(),
                   partial_max.data_ptr<float>(),
+                  final_output_max_logits.data_ptr<float>(),
                   max_logits.data_ptr<float>(),
                   tail_denoms.data_ptr<float>(),
                   code_weight_sums.data_ptr<float>(),
+                  final_exact_thresholds.data_ptr<float>(),
+                  final_exact_threshold_sels.data_ptr<int64_t>(),
                   counts.data_ptr<int64_t>(),
                   outputs.data_ptr<float>(),
                   heads,
@@ -10141,13 +13567,55 @@ std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_l
                   query_context_len,
                   static_prefix,
                   static_suffix,
-                  static_cast<float>(exact_value_mass),
-                  exact_value_min_top,
                   static_cast<float>(scale),
                   static_cast<float>(tail_blend));
+          } else {
+            gqa_decode_geometric_final_output_codeweights_kernel<value_scalar_t, uint8_t>
+                <<<static_cast<int>(heads), threads, 0, stream>>>(
+                    values.data_ptr<value_scalar_t>(),
+                    dense_pq_scores.data_ptr<float>(),
+                    value_codebooks.data_ptr<float>(),
+                    value_codes.data_ptr<uint8_t>(),
+                    page_starts.data_ptr<int64_t>(),
+                    base_tokens.data_ptr<int64_t>(),
+                    base_logits.data_ptr<float>(),
+                    base_counts.data_ptr<int64_t>(),
+                    ranked_tokens.data_ptr<int64_t>(),
+                    filtered_ranked_logits.data_ptr<float>(),
+                    partial_max.data_ptr<float>(),
+                    max_logits.data_ptr<float>(),
+                    tail_denoms.data_ptr<float>(),
+                    code_weight_sums.data_ptr<float>(),
+                    counts.data_ptr<int64_t>(),
+                    outputs.data_ptr<float>(),
+                    heads,
+                    kv_heads,
+                    ranked,
+                    dim,
+                    total_tokens,
+                    values.stride(0),
+                    values.stride(1),
+                    values.stride(2),
+                    pages,
+                    page_size,
+                    max_base,
+                    value_subvecs,
+                    value_centroids,
+                    value_subdim,
+                    tail_blocks,
+                    group_size,
+                    query_context_len,
+                    static_prefix,
+                    static_suffix,
+                    static_cast<float>(exact_value_mass),
+                    exact_value_min_top,
+                    static_cast<float>(scale),
+                    static_cast<float>(tail_blend));
+          }
         } else {
-          gqa_decode_geometric_final_output_codeweights_kernel<value_scalar_t, int64_t>
-              <<<static_cast<int>(heads), threads, 0, stream>>>(
+          if (use_final_parallel) {
+            gqa_decode_geometric_final_output_codeweights_parallel_kernel<value_scalar_t, int64_t>
+                <<<parallel_grid, threads, parallel_shared_bytes, stream>>>(
                   values.data_ptr<value_scalar_t>(),
                   dense_pq_scores.data_ptr<float>(),
                   value_codebooks.data_ptr<float>(),
@@ -10159,9 +13627,12 @@ std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_l
                   ranked_tokens.data_ptr<int64_t>(),
                   filtered_ranked_logits.data_ptr<float>(),
                   partial_max.data_ptr<float>(),
+                  final_output_max_logits.data_ptr<float>(),
                   max_logits.data_ptr<float>(),
                   tail_denoms.data_ptr<float>(),
                   code_weight_sums.data_ptr<float>(),
+                  final_exact_thresholds.data_ptr<float>(),
+                  final_exact_threshold_sels.data_ptr<int64_t>(),
                   counts.data_ptr<int64_t>(),
                   outputs.data_ptr<float>(),
                   heads,
@@ -10183,10 +13654,51 @@ std::vector<torch::Tensor> gqa_decode_geometric_output_vpq_mass_min_proxy_from_l
                   query_context_len,
                   static_prefix,
                   static_suffix,
-                  static_cast<float>(exact_value_mass),
-                  exact_value_min_top,
                   static_cast<float>(scale),
                   static_cast<float>(tail_blend));
+          } else {
+            gqa_decode_geometric_final_output_codeweights_kernel<value_scalar_t, int64_t>
+                <<<static_cast<int>(heads), threads, 0, stream>>>(
+                    values.data_ptr<value_scalar_t>(),
+                    dense_pq_scores.data_ptr<float>(),
+                    value_codebooks.data_ptr<float>(),
+                    value_codes.data_ptr<int64_t>(),
+                    page_starts.data_ptr<int64_t>(),
+                    base_tokens.data_ptr<int64_t>(),
+                    base_logits.data_ptr<float>(),
+                    base_counts.data_ptr<int64_t>(),
+                    ranked_tokens.data_ptr<int64_t>(),
+                    filtered_ranked_logits.data_ptr<float>(),
+                    partial_max.data_ptr<float>(),
+                    max_logits.data_ptr<float>(),
+                    tail_denoms.data_ptr<float>(),
+                    code_weight_sums.data_ptr<float>(),
+                    counts.data_ptr<int64_t>(),
+                    outputs.data_ptr<float>(),
+                    heads,
+                    kv_heads,
+                    ranked,
+                    dim,
+                    total_tokens,
+                    values.stride(0),
+                    values.stride(1),
+                    values.stride(2),
+                    pages,
+                    page_size,
+                    max_base,
+                    value_subvecs,
+                    value_centroids,
+                    value_subdim,
+                    tail_blocks,
+                    group_size,
+                    query_context_len,
+                    static_prefix,
+                    static_suffix,
+                    static_cast<float>(exact_value_mass),
+                    exact_value_min_top,
+                    static_cast<float>(scale),
+                    static_cast<float>(tail_blend));
+          }
         }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -10590,9 +14102,6 @@ torch::Tensor gqa_decode_vpq_selected_from_logits_cuda(
       1);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  const int output_threads = 256;
-  const int64_t output_total = heads * dim;
-  const int output_blocks = static_cast<int>((output_total + output_threads - 1) / output_threads);
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
@@ -10601,8 +14110,7 @@ torch::Tensor gqa_decode_vpq_selected_from_logits_cuda(
       [&] {
         using value_scalar_t = scalar_t;
         if (value_codes.scalar_type() == torch::kUInt8) {
-          gqa_decode_tail_agg_output_kernel<value_scalar_t, uint8_t>
-              <<<output_blocks, output_threads, 0, stream>>>(
+          launch_gqa_decode_tail_agg_output<value_scalar_t, uint8_t>(
                   values.data_ptr<value_scalar_t>(),
                   value_codebooks.data_ptr<float>(),
                   value_codes.data_ptr<uint8_t>(),
@@ -10637,10 +14145,10 @@ torch::Tensor gqa_decode_vpq_selected_from_logits_cuda(
                   static_prefix,
                   static_suffix,
                   static_cast<float>(scale),
-                  0.0f);
+                  0.0f,
+                  stream);
         } else {
-          gqa_decode_tail_agg_output_kernel<value_scalar_t, int64_t>
-              <<<output_blocks, output_threads, 0, stream>>>(
+          launch_gqa_decode_tail_agg_output<value_scalar_t, int64_t>(
                   values.data_ptr<value_scalar_t>(),
                   value_codebooks.data_ptr<float>(),
                   value_codes.data_ptr<int64_t>(),
@@ -10675,7 +14183,8 @@ torch::Tensor gqa_decode_vpq_selected_from_logits_cuda(
                   static_prefix,
                   static_suffix,
                   static_cast<float>(scale),
-                  0.0f);
+                  0.0f,
+                  stream);
         }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -10905,9 +14414,6 @@ torch::Tensor gqa_decode_vpq_selected_tail_agg_from_logits_cuda(
       tail_blocks);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  const int output_threads = 256;
-  const int64_t output_total = heads * dim;
-  const int output_blocks = static_cast<int>((output_total + output_threads - 1) / output_threads);
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
@@ -10916,8 +14422,7 @@ torch::Tensor gqa_decode_vpq_selected_tail_agg_from_logits_cuda(
       [&] {
         using value_scalar_t = scalar_t;
         if (value_codes.scalar_type() == torch::kUInt8) {
-          gqa_decode_tail_agg_output_kernel<value_scalar_t, uint8_t>
-              <<<output_blocks, output_threads, 0, stream>>>(
+          launch_gqa_decode_tail_agg_output<value_scalar_t, uint8_t>(
                   values.data_ptr<value_scalar_t>(),
                   value_codebooks.data_ptr<float>(),
                   value_codes.data_ptr<uint8_t>(),
@@ -10952,10 +14457,10 @@ torch::Tensor gqa_decode_vpq_selected_tail_agg_from_logits_cuda(
                   static_prefix,
                   static_suffix,
                   static_cast<float>(scale),
-                  static_cast<float>(tail_blend));
+                  static_cast<float>(tail_blend),
+                  stream);
         } else {
-          gqa_decode_tail_agg_output_kernel<value_scalar_t, int64_t>
-              <<<output_blocks, output_threads, 0, stream>>>(
+          launch_gqa_decode_tail_agg_output<value_scalar_t, int64_t>(
                   values.data_ptr<value_scalar_t>(),
                   value_codebooks.data_ptr<float>(),
                   value_codes.data_ptr<int64_t>(),
@@ -10990,7 +14495,8 @@ torch::Tensor gqa_decode_vpq_selected_tail_agg_from_logits_cuda(
                   static_prefix,
                   static_suffix,
                   static_cast<float>(scale),
-                  static_cast<float>(tail_blend));
+                  static_cast<float>(tail_blend),
+                  stream);
         }
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -11054,4 +14560,49 @@ torch::Tensor gqa_exact_selected_attention_cuda(
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return outputs;
+}
+
+std::vector<torch::Tensor> selected_mass_thresholds_from_topk_cuda(
+    torch::Tensor top_logits,
+    torch::Tensor top_order,
+    torch::Tensor prefix_lse,
+    torch::Tensor prefix_valid_counts,
+    torch::Tensor base_lse,
+    torch::Tensor budgets,
+    double exact_mass,
+    int64_t min_top) {
+  const auto heads = top_logits.size(0);
+  const auto k_top = top_logits.size(1);
+  const auto rank = prefix_lse.size(1);
+  const auto steps = budgets.size(0);
+  auto float_opts = top_logits.options().dtype(torch::kFloat32);
+  auto long_opts = top_order.options().dtype(torch::kLong);
+  auto byte_opts = top_order.options().dtype(torch::kUInt8);
+  auto thresholds = torch::empty({heads, steps}, float_opts);
+  auto threshold_sels = torch::empty({heads, steps}, long_opts);
+  auto sufficient = torch::empty({heads, steps}, byte_opts);
+  if (heads == 0 || steps == 0) {
+    return {thresholds, threshold_sels, sufficient};
+  }
+  const int threads = 256;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  dim3 grid(static_cast<unsigned int>(heads), static_cast<unsigned int>(steps));
+  selected_mass_thresholds_from_topk_kernel<<<grid, threads, 0, stream>>>(
+      top_logits.data_ptr<float>(),
+      top_order.data_ptr<int64_t>(),
+      prefix_lse.data_ptr<float>(),
+      prefix_valid_counts.data_ptr<int64_t>(),
+      base_lse.data_ptr<float>(),
+      budgets.data_ptr<int64_t>(),
+      thresholds.data_ptr<float>(),
+      threshold_sels.data_ptr<int64_t>(),
+      sufficient.data_ptr<unsigned char>(),
+      heads,
+      k_top,
+      rank,
+      steps,
+      static_cast<float>(exact_mass),
+      min_top);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {thresholds, threshold_sels, sufficient};
 }

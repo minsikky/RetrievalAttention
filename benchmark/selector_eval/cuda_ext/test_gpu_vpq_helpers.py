@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 import numpy as np
@@ -55,6 +56,7 @@ def _test_native_exact_value_counts() -> None:
         gqa_decode_vpq_selected_tail_agg_from_logits_mass_min,
         gqa_decode_vpq_selected_tail_agg_from_logits_mass_min_thresholds,
         gqa_fullscan_pq_topk_scores,
+        selected_mass_thresholds_from_topk,
     )
 
     torch.manual_seed(20260517)
@@ -585,6 +587,35 @@ def _test_native_exact_value_counts() -> None:
         (ranked_decode >= sealed_end) & (ranked_decode < query_context_len)
     )
     ranked_logits_decode_dynamic = ranked_logits_decode.masked_fill(base_rank_mask, float("-inf"))
+
+    def native_thresholds_from_topk(
+        ranked_logits: torch.Tensor,
+        ranked_scores: torch.Tensor,
+        base_lse: torch.Tensor,
+        budgets: list[int],
+        exact_mass: float,
+        min_top: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        valid = torch.isfinite(ranked_scores) & torch.isfinite(ranked_logits)
+        logits = torch.where(valid, ranked_logits.float(), torch.full_like(ranked_logits.float(), float("-inf")))
+        prefix_lse = torch.logcumsumexp(logits, dim=-1)
+        prefix_valid = torch.cumsum(valid.to(torch.long), dim=-1)
+        top_logits, top_order = torch.topk(logits, k=int(logits.shape[-1]), dim=-1, largest=True, sorted=True)
+        budget_tensor = torch.tensor(budgets, dtype=torch.long, device=ranked_logits.device)
+        thresholds, threshold_sels, sufficient = selected_mass_thresholds_from_topk(
+            top_logits.contiguous(),
+            top_order.contiguous(),
+            prefix_lse.contiguous(),
+            prefix_valid.contiguous(),
+            base_lse.float().contiguous(),
+            budget_tensor,
+            float(exact_mass),
+            int(min_top),
+        )
+        if not bool(torch.all(sufficient.to(torch.bool))):
+            raise AssertionError("native top-k threshold helper reported insufficient full top-k")
+        return thresholds, threshold_sels
+
     threshold_mass = 0.5
     ref_decode_tail_mass = gqa_decode_vpq_selected_tail_agg_from_logits_mass_min(
         q_decode,
@@ -615,6 +646,20 @@ def _test_native_exact_value_counts() -> None:
         exact_mass=threshold_mass,
         min_top=1,
     )
+    native_threshold_decode, native_threshold_sel_decode = native_thresholds_from_topk(
+        ranked_logits_decode_dynamic,
+        ranked_scores_decode,
+        base_lse_decode,
+        [ranked],
+        threshold_mass,
+        1,
+    )
+    if not torch.equal(threshold_sel_decode, native_threshold_sel_decode) or not torch.allclose(
+        threshold_decode,
+        native_threshold_decode,
+        equal_nan=True,
+    ):
+        raise AssertionError("native top-k threshold helper mismatches Python threshold helper")
     got_decode_tail_from_thresholds = gqa_decode_vpq_selected_tail_agg_from_logits_mass_min_thresholds(
         q_decode,
         keys,
@@ -776,6 +821,117 @@ def _test_native_exact_value_counts() -> None:
     if not torch.allclose(ref_fused_output, fused_output, atol=3e-3, rtol=3e-3):
         max_diff = float(torch.max(torch.abs(ref_fused_output - fused_output)).detach().cpu().item())
         raise AssertionError(f"fused geometric output mismatch: max_diff={max_diff}")
+
+    env_keys = [
+        "SELECTOR_PQ_FUSED_DIM_SCAN_OUTPUT",
+        "SELECTOR_PQ_PRECOMPUTE_RANK_WEIGHTS",
+        "SELECTOR_PQ_SELECTED_CODEWEIGHT_DELTAS",
+        "SELECTOR_PQ_SELECTED_EXACT_LISTS",
+        "SELECTOR_PQ_GEOMETRIC_TWO_PASS_OUTPUT",
+    ]
+    old_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        os.environ.update(
+            {
+                "SELECTOR_PQ_FUSED_DIM_SCAN_OUTPUT": "1",
+                "SELECTOR_PQ_PRECOMPUTE_RANK_WEIGHTS": "1",
+                "SELECTOR_PQ_SELECTED_CODEWEIGHT_DELTAS": "1",
+                "SELECTOR_PQ_SELECTED_EXACT_LISTS": "1",
+                "SELECTOR_PQ_GEOMETRIC_TWO_PASS_OUTPUT": "0",
+            }
+        )
+        dim_counts, dim_output = gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds(
+            q_decode,
+            keys,
+            values,
+            dense_decode,
+            value_codebooks,
+            value_codes,
+            page_starts,
+            ranked_decode,
+            ranked_scores_decode,
+            ranked_logits_decode,
+            geo_approx_thresholds,
+            geo_approx_threshold_sels,
+            geo_probe_thresholds,
+            geo_probe_threshold_sels,
+            2,
+            query_context_len,
+            static_prefix,
+            static_suffix,
+            page_size,
+            1,
+            ranked,
+            1,
+            1.5,
+            1.5,
+            0.35,
+            threshold_mass,
+            1,
+            scale,
+            0.0,
+            1.0,
+            -1.0,
+            float("inf"),
+            True,
+            False,
+            1.0,
+        )
+        os.environ["SELECTOR_PQ_GEOMETRIC_TWO_PASS_OUTPUT"] = "1"
+        two_counts, two_output = gqa_decode_geometric_output_vpq_mass_min_proxy_from_logits_thresholds(
+            q_decode,
+            keys,
+            values,
+            dense_decode,
+            value_codebooks,
+            value_codes,
+            page_starts,
+            ranked_decode,
+            ranked_scores_decode,
+            ranked_logits_decode,
+            geo_approx_thresholds,
+            geo_approx_threshold_sels,
+            geo_probe_thresholds,
+            geo_probe_threshold_sels,
+            2,
+            query_context_len,
+            static_prefix,
+            static_suffix,
+            page_size,
+            1,
+            ranked,
+            1,
+            1.5,
+            1.5,
+            0.35,
+            threshold_mass,
+            1,
+            scale,
+            0.0,
+            1.0,
+            -1.0,
+            float("inf"),
+            True,
+            False,
+            1.0,
+        )
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    if dim_counts.detach().cpu().tolist() != two_counts.detach().cpu().tolist():
+        raise AssertionError(
+            f"two-pass fused counts mismatch: got={two_counts.detach().cpu().tolist()} "
+            f"expected={dim_counts.detach().cpu().tolist()}"
+        )
+    if not torch.allclose(dim_output, two_output, atol=3e-3, rtol=3e-3):
+        max_diff = float(torch.max(torch.abs(dim_output - two_output)).detach().cpu().item())
+        raise AssertionError(f"two-pass fused output mismatch: max_diff={max_diff}")
+    if not torch.allclose(ref_fused_output, two_output, atol=3e-3, rtol=3e-3):
+        max_diff = float(torch.max(torch.abs(ref_fused_output - two_output)).detach().cpu().item())
+        raise AssertionError(f"two-pass fused output/reference mismatch: max_diff={max_diff}")
 
     keys_pad = torch.empty((kv_heads, total_tokens, dim + 1), device=device, dtype=keys.dtype)
     values_pad = torch.empty((kv_heads, total_tokens, dim + 1), device=device, dtype=values.dtype)
