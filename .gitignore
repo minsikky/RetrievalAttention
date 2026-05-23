@@ -9,6 +9,7 @@ __pycache__/
 *.pyc
 *.swp
 tmp/
+worktrees/
 benchmark/ncu_reports/
 .codex/
 .graphify_python

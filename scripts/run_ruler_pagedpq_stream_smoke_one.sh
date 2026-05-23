@@ -142,6 +142,10 @@ fi
   --geometric_growth "${GEOMETRIC_GROWTH:-1.5}" \
   --geometric_probe_scale "${GEOMETRIC_PROBE_SCALE:-1.5}" \
   --geometric_budget_granularity "${GEOMETRIC_BUDGET_GRANULARITY:-1024}" \
+  --joint_kv_policy "${JOINT_KV_POLICY:-k_first_alternating}" \
+  --joint_kv_k_budgets "${JOINT_KV_K_BUDGETS:-4096,8192,14336,32768}" \
+  --joint_kv_v_budgets "${JOINT_KV_V_BUDGETS:-1024,2048,4096,6144,8192,12288,16384}" \
+  --joint_kv_stability_threshold "${JOINT_KV_STABILITY_THRESHOLD:-0.001}" \
   --selected_value_mode "${SELECTED_VALUE_MODE:-vpq_value}" \
   --selected_value_exact_rule "${SELECTED_VALUE_EXACT_RULE:-selected_mass}" \
   --selected_value_exact_top "${SELECTED_VALUE_EXACT_TOP:-0}" \
@@ -150,6 +154,7 @@ fi
   --selected_value_max_exact_top "${SELECTED_VALUE_MAX_EXACT_TOP:-0}" \
   --selected_value_exact_all_context_max "${SELECTED_VALUE_EXACT_ALL_CONTEXT_MAX:-0}" \
   --selected_value_exact_all_fraction_min "${SELECTED_VALUE_EXACT_ALL_FRACTION_MIN:-0.0}" \
+  --value_code_stat_bytes "${VALUE_CODE_STAT_BYTES:-2}" \
   --page_size "${PAGE_SIZE:-5632}" \
   --prefill_chunk_size "${PREFILL_CHUNK_SIZE:-0}" \
   --prefill_selector_backend "${PREFILL_SELECTOR_BACKEND:-native}" \

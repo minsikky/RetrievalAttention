@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import build_page_pq_gpu  # noqa: E402
 from benchmark.selector_eval.runners.run_hf_paged_pq_intervention_eval import (  # noqa: E402
+    _choose_joint_kv_action,
     _gpu_gqa_base_logsumexp_decode,
     _gpu_gqa_dense_decode_ranked_logits_and_base_lse,
     _gpu_gqa_ranked_exact_logits,
@@ -56,6 +57,24 @@ def _test_native_exact_value_counts() -> None:
         gqa_decode_vpq_selected_tail_agg_from_logits_mass_min,
         gqa_decode_vpq_selected_tail_agg_from_logits_mass_min_thresholds,
         gqa_fullscan_pq_topk_scores,
+        joint_mixed_softmax_base_outputs,
+        joint_mixed_softmax_base_outputs_rankpos,
+        joint_mixed_score_grid,
+        joint_mixed_score_grid_rankpos,
+        joint_mixed_score_grid_no_exact_fill,
+        joint_rank_prefix_tokens,
+        joint_select_policy,
+        joint_select_policy_grouped_flat,
+        joint_select_policy_grouped_flat_no_mb,
+        joint_select_policy_from_grouped_risk,
+        joint_select_policy_from_grouped_risk_batched,
+        joint_vprefix_outputs,
+        joint_vprefix_outputs_from_grouped_risk,
+        joint_vprefix_outputs_from_grouped_risk_batched,
+        joint_vprefix_outputs_from_grouped_risk_topk_batched,
+        joint_vprefix_outputs_from_risk,
+        joint_softmax_base_outputs,
+        joint_vpq_base_outputs_from_probs,
         selected_mass_thresholds_from_topk,
     )
 
@@ -76,6 +95,13 @@ def _test_native_exact_value_counts() -> None:
     query_context_len = 23
     static_prefix = 1
     static_suffix = 1
+    policy_ids = {
+        "k_first_priority": 0,
+        "v_first_priority": 1,
+        "k_first_alternating": 2,
+        "v_first_alternating": 3,
+        "sensitivity_greedy": 4,
+    }
 
     queries = torch.randn((positions, heads, dim), device=device, dtype=torch.float32)
     keys = torch.randn((kv_heads, total_tokens, dim), device=device, dtype=torch.float16)
@@ -106,6 +132,686 @@ def _test_native_exact_value_counts() -> None:
     ranked_scores = torch.randn((positions, heads, ranked), device=device, dtype=torch.float32)
     counts = torch.ones((positions, heads), device=device, dtype=torch.long)
     scale = float(dim) ** -0.5
+
+    k_count = 3
+    v_steps = 4
+    max_exact = 6
+    base_outputs = torch.randn((k_count, heads, dim), device=device, dtype=torch.float32)
+    probs = torch.softmax(torch.randn((k_count, heads, query_context_len), device=device, dtype=torch.float32), dim=2)
+    residual = torch.randn((query_context_len, dim), device=device, dtype=torch.float32)
+    risk = torch.randn((k_count, heads, query_context_len), device=device, dtype=torch.float32)
+    code_error = torch.rand((query_context_len,), device=device, dtype=torch.float32)
+    exact_order = torch.topk(risk, k=max_exact, dim=2, largest=True, sorted=True).indices
+    v_budgets = torch.tensor([0, 1, 3, max_exact], device=device, dtype=torch.long)
+    got_prefix = joint_vprefix_outputs(base_outputs, probs, residual, exact_order, v_budgets)
+    gathered_probs = torch.gather(probs, 2, exact_order)
+    gathered_residual = residual.index_select(0, exact_order.reshape(-1)).reshape(k_count, heads, max_exact, dim)
+    prefix = torch.cumsum(gathered_probs.reshape(k_count, heads, max_exact, 1) * gathered_residual, dim=2)
+    ref_by_v = []
+    for budget in v_budgets.detach().cpu().tolist():
+        exact = max(0, min(int(budget), max_exact, query_context_len))
+        if exact > 0:
+            ref_by_v.append(base_outputs + prefix[:, :, exact - 1, :])
+        else:
+            ref_by_v.append(base_outputs)
+    ref_prefix = torch.stack(ref_by_v, dim=1)
+    if not torch.allclose(got_prefix, ref_prefix, atol=2e-5, rtol=2e-5):
+        raise AssertionError("native joint V-prefix output grid mismatches Torch reference")
+    got_prefix_from_risk = joint_vprefix_outputs_from_risk(
+        base_outputs,
+        probs,
+        residual,
+        code_error,
+        v_budgets,
+    )
+    risk_for_sort = (probs * probs) * code_error.reshape(1, 1, -1)
+    exact_order_for_sort = torch.topk(
+        risk_for_sort,
+        k=query_context_len,
+        dim=2,
+        largest=True,
+        sorted=True,
+    ).indices
+    gathered_probs_for_sort = torch.gather(probs, 2, exact_order_for_sort)
+    gathered_residual_for_sort = residual.index_select(0, exact_order_for_sort.reshape(-1)).reshape(
+        k_count,
+        heads,
+        query_context_len,
+        dim,
+    )
+    prefix_for_sort = torch.cumsum(
+        gathered_probs_for_sort.reshape(k_count, heads, query_context_len, 1) * gathered_residual_for_sort,
+        dim=2,
+    )
+    ref_by_v_from_risk = []
+    for budget in v_budgets.detach().cpu().tolist():
+        exact = max(0, min(int(budget), query_context_len))
+        if exact > 0:
+            ref_by_v_from_risk.append(base_outputs + prefix_for_sort[:, :, exact - 1, :])
+        else:
+            ref_by_v_from_risk.append(base_outputs)
+    ref_prefix_from_risk = torch.stack(ref_by_v_from_risk, dim=1)
+    if not torch.allclose(got_prefix_from_risk, ref_prefix_from_risk, atol=2e-5, rtol=2e-5):
+        raise AssertionError("native joint V-prefix-from-risk output grid mismatches Torch reference")
+
+    base_context = 10
+    base_pages = 2
+    base_page_size = 4
+    base_codes_n = 4
+    base_dim = dim
+    base_probs = torch.softmax(
+        torch.randn((k_count, heads, base_context), device=device, dtype=torch.float32),
+        dim=2,
+    )
+    base_values = torch.randn((base_context, base_dim), device=device, dtype=torch.float16)
+    base_codebooks = torch.randn((base_pages, 1, base_codes_n, base_dim), device=device, dtype=torch.float32)
+    base_codes = torch.randint(0, base_codes_n, (base_pages, base_page_size, 1), device=device, dtype=torch.uint8)
+    base_page_starts = torch.tensor([1, 5], device=device, dtype=torch.long)
+    fallback_tokens = torch.tensor([0, 9], device=device, dtype=torch.long)
+    got_vpq_base = joint_vpq_base_outputs_from_probs(
+        base_probs,
+        base_values,
+        base_codebooks,
+        base_codes,
+        base_page_starts,
+        fallback_tokens,
+    )
+    vhat_ref = base_values.float().clone()
+    for page in range(base_pages):
+        start = int(base_page_starts[page].item())
+        for row in range(base_page_size):
+            token = start + row
+            code = int(base_codes[page, row, 0].item())
+            vhat_ref[token] = base_codebooks[page, 0, code]
+    ref_vpq_base = (
+        base_probs.reshape(k_count * heads, base_context) @ vhat_ref
+    ).reshape(k_count, heads, base_dim)
+    if not torch.allclose(got_vpq_base, ref_vpq_base, atol=3e-5, rtol=3e-5):
+        raise AssertionError("native V-PQ base output aggregation mismatches Torch reference")
+
+    softmax_score_grid = torch.randn((k_count, heads, base_context), device=device, dtype=torch.float32)
+    softmax_values = torch.randn((base_context, base_dim), device=device, dtype=torch.float32)
+    got_softmax_probs, got_softmax_base = joint_softmax_base_outputs(softmax_score_grid, softmax_values)
+    ref_softmax_probs = torch.softmax(softmax_score_grid, dim=2)
+    ref_softmax_base = (
+        ref_softmax_probs.reshape(k_count * heads, base_context) @ softmax_values
+    ).reshape(k_count, heads, base_dim)
+    if not torch.allclose(got_softmax_probs, ref_softmax_probs, atol=3e-6, rtol=3e-6):
+        raise AssertionError("native joint softmax probabilities mismatch Torch reference")
+    if not torch.allclose(got_softmax_base, ref_softmax_base, atol=2e-5, rtol=2e-5):
+        raise AssertionError("native joint softmax base output mismatch Torch reference")
+
+    rank_scores = torch.tensor(
+        [[0.2, 1.5, -0.1, 0.7], [3.0, 2.0, 4.0, 1.0]],
+        device=device,
+        dtype=torch.float32,
+    )
+    rank_tokens = torch.tensor([10, 11, 12, 13], device=device, dtype=torch.long)
+    got_rank_prefix = joint_rank_prefix_tokens(rank_scores, rank_tokens, 3)
+    ref_rank_prefix = rank_tokens.index_select(
+        0,
+        torch.topk(rank_scores, k=3, dim=1, largest=True, sorted=True).indices.reshape(-1),
+    ).reshape(2, 3)
+    if not torch.equal(got_rank_prefix, ref_rank_prefix):
+        raise AssertionError("native joint rank-prefix tokens mismatch Torch topk reference")
+
+    grouped_rows = 7
+    grouped_groups = 3
+    grouped_context = 11
+    grouped_dim = 12
+    grouped_v_budgets = torch.tensor([0, 1, 4, grouped_context], device=device, dtype=torch.long)
+    grouped_base = torch.randn((grouped_rows, grouped_dim), device=device, dtype=torch.float32)
+    grouped_probs = torch.softmax(
+        torch.randn((grouped_rows, grouped_context), device=device, dtype=torch.float32),
+        dim=1,
+    )
+    grouped_residual = torch.randn((grouped_groups, grouped_context, grouped_dim), device=device, dtype=torch.float32)
+    grouped_error = torch.rand((grouped_groups, grouped_context), device=device, dtype=torch.float32)
+    row_group_ids = torch.tensor([0, 1, 1, 2, 0, 2, 1], device=device, dtype=torch.long)
+    got_grouped = joint_vprefix_outputs_from_grouped_risk(
+        grouped_base,
+        grouped_probs,
+        grouped_residual,
+        grouped_error,
+        row_group_ids,
+        grouped_v_budgets,
+    )
+    grouped_ref_rows = []
+    for row in range(grouped_rows):
+        group = int(row_group_ids[row].item())
+        row_risk = grouped_probs[row] * grouped_probs[row] * grouped_error[group]
+        order = torch.topk(row_risk, k=grouped_context, largest=True, sorted=True).indices
+        row_prefix = torch.cumsum(
+            grouped_probs[row, order].reshape(grouped_context, 1) * grouped_residual[group, order],
+            dim=0,
+        )
+        row_by_v = []
+        for budget in grouped_v_budgets.detach().cpu().tolist():
+            exact = max(0, min(int(budget), grouped_context))
+            if exact > 0:
+                row_by_v.append(grouped_base[row] + row_prefix[exact - 1])
+            else:
+                row_by_v.append(grouped_base[row])
+        grouped_ref_rows.append(torch.stack(row_by_v, dim=0))
+    ref_grouped = torch.stack(grouped_ref_rows, dim=0)
+    if not torch.allclose(got_grouped, ref_grouped, atol=2e-5, rtol=2e-5):
+        raise AssertionError("native grouped joint V-prefix-from-risk output grid mismatches Torch reference")
+
+    fused_groups = 3
+    fused_k = 4
+    fused_heads = 2
+    fused_context = 17
+    fused_dim = 16
+    fused_v_budgets = torch.tensor([0, 2, 5, 9], device=device, dtype=torch.long)
+    fused_rows = fused_groups * fused_k * fused_heads
+    fused_base = torch.randn((fused_rows, fused_dim), device=device, dtype=torch.float32)
+    fused_probs = torch.softmax(
+        torch.randn((fused_rows, fused_context), device=device, dtype=torch.float32),
+        dim=1,
+    )
+    fused_residual = torch.randn((fused_groups, fused_context, fused_dim), device=device, dtype=torch.float32)
+    fused_error = torch.rand((fused_groups, fused_context), device=device, dtype=torch.float32)
+    fused_row_group_ids = torch.arange(fused_groups, dtype=torch.long, device=device).repeat_interleave(
+        fused_k * fused_heads
+    )
+    fused_grid_flat = joint_vprefix_outputs_from_grouped_risk(
+        fused_base,
+        fused_probs,
+        fused_residual,
+        fused_error,
+        fused_row_group_ids,
+        fused_v_budgets,
+    )
+    fused_grid_batched = joint_vprefix_outputs_from_grouped_risk_batched(
+        fused_base.reshape(fused_groups, fused_k, fused_heads, fused_dim).contiguous(),
+        fused_probs.reshape(fused_groups, fused_k, fused_heads, fused_context).contiguous(),
+        fused_residual,
+        fused_error,
+        fused_v_budgets,
+    )
+    if not torch.allclose(fused_grid_batched, fused_grid_flat, atol=2e-5, rtol=2e-5):
+        raise AssertionError("native batched grouped-risk V-prefix output grid mismatches flat reference")
+    fused_grid_topk_batched = joint_vprefix_outputs_from_grouped_risk_topk_batched(
+        fused_base.reshape(fused_groups, fused_k, fused_heads, fused_dim).contiguous(),
+        fused_probs.reshape(fused_groups, fused_k, fused_heads, fused_context).contiguous(),
+        fused_residual,
+        fused_error,
+        fused_v_budgets,
+        int(fused_v_budgets.max().item()),
+    )
+    if not torch.allclose(fused_grid_topk_batched, fused_grid_flat, atol=2e-5, rtol=2e-5):
+        raise AssertionError("native top-k grouped-risk V-prefix output grid mismatches full-sort reference")
+    fused_k_mb = torch.stack(
+        [
+            torch.linspace(0.25 + 0.01 * group, 1.75 + 0.01 * group, fused_k, device=device)
+            for group in range(fused_groups)
+        ],
+        dim=0,
+    ).to(torch.float32)
+    fused_v_mb = torch.stack(
+        [
+            torch.linspace(0.10 + 0.02 * group, 1.10 + 0.02 * group, int(fused_v_budgets.numel()), device=device)
+            for group in range(fused_groups)
+        ],
+        dim=0,
+    ).to(torch.float32)
+    for policy_name, policy_id in policy_ids.items():
+        ref_outputs, ref_indices = joint_select_policy_grouped_flat(
+            fused_grid_flat,
+            fused_k_mb,
+            fused_v_mb,
+            fused_k,
+            fused_heads,
+            0.25,
+            policy_id,
+        )
+        got_outputs, got_indices = joint_select_policy_from_grouped_risk(
+            fused_base,
+            fused_probs,
+            fused_residual,
+            fused_error,
+            fused_v_budgets,
+            fused_k_mb,
+            fused_v_mb,
+            fused_k,
+            fused_heads,
+            0.25,
+            policy_id,
+        )
+        if not torch.equal(got_indices, ref_indices):
+            raise AssertionError(f"native fused grouped-risk policy indices mismatch; policy={policy_name}")
+        if not torch.allclose(got_outputs, ref_outputs, atol=2e-5, rtol=2e-5):
+            raise AssertionError(f"native fused grouped-risk policy outputs mismatch; policy={policy_name}")
+        got_batched_outputs, got_batched_indices = joint_select_policy_from_grouped_risk_batched(
+            fused_base.reshape(fused_groups, fused_k, fused_heads, fused_dim).contiguous(),
+            fused_probs.reshape(fused_groups, fused_k, fused_heads, fused_context).contiguous(),
+            fused_residual,
+            fused_error,
+            fused_v_budgets,
+            fused_k_mb,
+            fused_v_mb,
+            0.25,
+            policy_id,
+        )
+        if not torch.equal(got_batched_indices, ref_indices):
+            raise AssertionError(f"native batched grouped-risk policy indices mismatch; policy={policy_name}")
+        if not torch.allclose(got_batched_outputs, ref_outputs, atol=2e-5, rtol=2e-5):
+            raise AssertionError(f"native batched grouped-risk policy outputs mismatch; policy={policy_name}")
+
+    exact_scores = torch.randn((heads, query_context_len), device=device, dtype=torch.float32)
+    indexed_tokens_score = torch.tensor([1, 2, 4, 7, 10, 13, 16, 19, 21], device=device, dtype=torch.long)
+    pq_logits = torch.randn((heads, int(indexed_tokens_score.numel())), device=device, dtype=torch.float32)
+    y_indexed = exact_scores.index_select(1, indexed_tokens_score)
+    base_tokens_score = torch.tensor([0, 22], device=device, dtype=torch.long)
+    ranked_prefix_score = torch.tensor(
+        [
+            [2, 5, 8, 11, 14, 17],
+            [3, 6, 9, 12, 15, 18],
+        ],
+        device=device,
+        dtype=torch.long,
+    )
+    k_take_counts = torch.tensor([0, 2, 5], device=device, dtype=torch.long)
+
+    def _torch_mixed_score_grid(calibrate: bool) -> torch.Tensor:
+        rows = []
+        for take in k_take_counts.detach().cpu().tolist():
+            add_t = ranked_prefix_score[:, : int(take)]
+            base_rows_t = base_tokens_score.reshape(1, -1).expand(heads, -1)
+            selected_t = torch.cat((base_rows_t, add_t), dim=1)
+            score = exact_scores.clone()
+            if calibrate:
+                selected_mask = torch.zeros((heads, query_context_len), dtype=torch.bool, device=device)
+                selected_mask.scatter_(1, selected_t, True)
+                selected_index_mask = selected_mask.index_select(1, indexed_tokens_score)
+                mask_f = selected_index_mask.to(dtype=torch.float32)
+                counts_t = torch.sum(mask_f, dim=1)
+                safe_counts_t = torch.clamp_min(counts_t, 1.0)
+                x_mean_t = torch.sum(mask_f * pq_logits, dim=1) / safe_counts_t
+                y_mean_t = torch.sum(mask_f * y_indexed, dim=1) / safe_counts_t
+                x_centered_t = (pq_logits - x_mean_t.reshape(-1, 1)) * mask_f
+                y_centered_t = (y_indexed - y_mean_t.reshape(-1, 1)) * mask_f
+                x_var_t = torch.sum(x_centered_t * x_centered_t, dim=1) / safe_counts_t
+                cov_t = torch.sum(x_centered_t * y_centered_t, dim=1) / safe_counts_t
+                fitted_scale_t = cov_t / torch.clamp_min(x_var_t, 1e-20)
+                fitted_bias_t = y_mean_t - fitted_scale_t * x_mean_t
+                fit_valid_t = (
+                    (counts_t >= 2.0)
+                    & (x_var_t > 1e-20)
+                    & torch.isfinite(fitted_scale_t)
+                    & (fitted_scale_t > 0.0)
+                )
+                zero_var_t = (counts_t >= 2.0) & (x_var_t <= 1e-20)
+                scale_t = torch.where(
+                    zero_var_t,
+                    torch.zeros_like(fitted_scale_t),
+                    torch.where(fit_valid_t, fitted_scale_t, torch.ones_like(fitted_scale_t)),
+                )
+                bias_t = torch.where(
+                    zero_var_t,
+                    y_mean_t,
+                    torch.where(fit_valid_t, fitted_bias_t, torch.zeros_like(fitted_bias_t)),
+                )
+                calibrated = scale_t.reshape(-1, 1) * pq_logits + bias_t.reshape(-1, 1)
+            else:
+                calibrated = pq_logits
+            score[:, indexed_tokens_score] = calibrated
+            score.scatter_(1, selected_t, exact_scores.gather(1, selected_t))
+            rows.append(score)
+        return torch.stack(rows, dim=0)
+
+    for calibrate in (False, True):
+        got_score_grid = joint_mixed_score_grid(
+            exact_scores,
+            pq_logits,
+            y_indexed,
+            indexed_tokens_score,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            calibrate,
+        )
+        ref_score_grid = _torch_mixed_score_grid(calibrate)
+        if not torch.allclose(got_score_grid, ref_score_grid, atol=2e-5, rtol=2e-5):
+            raise AssertionError(f"native joint mixed score grid mismatches Torch reference; calibrate={calibrate}")
+        got_score_grid_rankpos = joint_mixed_score_grid_rankpos(
+            exact_scores,
+            pq_logits,
+            y_indexed,
+            indexed_tokens_score,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            calibrate,
+        )
+        if not torch.allclose(got_score_grid_rankpos, ref_score_grid, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native rank-position joint mixed score grid mismatches Torch reference; calibrate={calibrate}"
+            )
+        values_for_mixed = torch.randn((query_context_len, dim), device=device, dtype=torch.float32)
+        ref_probs, ref_base = joint_softmax_base_outputs(ref_score_grid.contiguous(), values_for_mixed)
+        got_probs, got_base = joint_mixed_softmax_base_outputs(
+            exact_scores,
+            pq_logits,
+            y_indexed,
+            indexed_tokens_score,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            values_for_mixed,
+            calibrate,
+        )
+        if not torch.allclose(got_probs, ref_probs, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native fused mixed softmax probabilities mismatch score-grid reference; calibrate={calibrate}"
+            )
+        if not torch.allclose(got_base, ref_base, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native fused mixed softmax base output mismatch score-grid reference; calibrate={calibrate}"
+            )
+        got_probs_rankpos, got_base_rankpos = joint_mixed_softmax_base_outputs_rankpos(
+            exact_scores,
+            pq_logits,
+            y_indexed,
+            indexed_tokens_score,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            values_for_mixed,
+            calibrate,
+        )
+        if not torch.allclose(got_probs_rankpos, ref_probs, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native rank-position fused mixed softmax probabilities mismatch score-grid reference; calibrate={calibrate}"
+            )
+        if not torch.allclose(got_base_rankpos, ref_base, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native rank-position fused mixed softmax base output mismatch score-grid reference; calibrate={calibrate}"
+            )
+
+    indexed_tokens_covered = torch.arange(1, query_context_len - 1, device=device, dtype=torch.long)
+    pq_logits_covered = torch.randn(
+        (heads, int(indexed_tokens_covered.numel())),
+        device=device,
+        dtype=torch.float32,
+    )
+    y_indexed_covered = exact_scores.index_select(1, indexed_tokens_covered)
+
+    def _torch_mixed_score_grid_covered(calibrate: bool) -> torch.Tensor:
+        rows = []
+        for take in k_take_counts.detach().cpu().tolist():
+            add_t = ranked_prefix_score[:, : int(take)]
+            base_rows_t = base_tokens_score.reshape(1, -1).expand(heads, -1)
+            selected_t = torch.cat((base_rows_t, add_t), dim=1)
+            score = exact_scores.clone()
+            if calibrate:
+                selected_mask = torch.zeros((heads, query_context_len), dtype=torch.bool, device=device)
+                selected_mask.scatter_(1, selected_t, True)
+                selected_index_mask = selected_mask.index_select(1, indexed_tokens_covered)
+                mask_f = selected_index_mask.to(dtype=torch.float32)
+                counts_t = torch.sum(mask_f, dim=1)
+                safe_counts_t = torch.clamp_min(counts_t, 1.0)
+                x_mean_t = torch.sum(mask_f * pq_logits_covered, dim=1) / safe_counts_t
+                y_mean_t = torch.sum(mask_f * y_indexed_covered, dim=1) / safe_counts_t
+                x_centered_t = (pq_logits_covered - x_mean_t.reshape(-1, 1)) * mask_f
+                y_centered_t = (y_indexed_covered - y_mean_t.reshape(-1, 1)) * mask_f
+                x_var_t = torch.sum(x_centered_t * x_centered_t, dim=1) / safe_counts_t
+                cov_t = torch.sum(x_centered_t * y_centered_t, dim=1) / safe_counts_t
+                fitted_scale_t = cov_t / torch.clamp_min(x_var_t, 1e-20)
+                fitted_bias_t = y_mean_t - fitted_scale_t * x_mean_t
+                fit_valid_t = (
+                    (counts_t >= 2.0)
+                    & (x_var_t > 1e-20)
+                    & torch.isfinite(fitted_scale_t)
+                    & (fitted_scale_t > 0.0)
+                )
+                zero_var_t = (counts_t >= 2.0) & (x_var_t <= 1e-20)
+                scale_t = torch.where(
+                    zero_var_t,
+                    torch.zeros_like(fitted_scale_t),
+                    torch.where(fit_valid_t, fitted_scale_t, torch.ones_like(fitted_scale_t)),
+                )
+                bias_t = torch.where(
+                    zero_var_t,
+                    y_mean_t,
+                    torch.where(fit_valid_t, fitted_bias_t, torch.zeros_like(fitted_bias_t)),
+                )
+                calibrated = scale_t.reshape(-1, 1) * pq_logits_covered + bias_t.reshape(-1, 1)
+            else:
+                calibrated = pq_logits_covered
+            score[:, indexed_tokens_covered] = calibrated
+            score.scatter_(1, selected_t, exact_scores.gather(1, selected_t))
+            rows.append(score)
+        return torch.stack(rows, dim=0)
+
+    for calibrate in (False, True):
+        got_score_grid_no_fill = joint_mixed_score_grid_no_exact_fill(
+            exact_scores,
+            pq_logits_covered,
+            y_indexed_covered,
+            indexed_tokens_covered,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            calibrate,
+        )
+        ref_score_grid_no_fill = _torch_mixed_score_grid_covered(calibrate)
+        if not torch.allclose(got_score_grid_no_fill, ref_score_grid_no_fill, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native no-fill joint mixed score grid mismatches covered Torch reference; calibrate={calibrate}"
+            )
+
+    k_take_counts_with_full_row = torch.tensor([2, 99], device=device, dtype=torch.long)
+    for calibrate in (False, True):
+        got_full_row_grid = joint_mixed_score_grid(
+            exact_scores,
+            pq_logits,
+            y_indexed,
+            indexed_tokens_score,
+            base_tokens_score,
+            ranked_prefix_score[:, :2],
+            k_take_counts_with_full_row,
+            calibrate,
+        )
+        ref_first_row = _torch_mixed_score_grid(calibrate)[1]
+        if not torch.allclose(got_full_row_grid[0], ref_first_row, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native joint mixed score grid truncated-prefix row mismatches Torch reference; calibrate={calibrate}"
+            )
+        if not torch.allclose(got_full_row_grid[1], exact_scores, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native joint mixed score grid full row is not exact; calibrate={calibrate}"
+            )
+        got_full_row_grid_rankpos = joint_mixed_score_grid_rankpos(
+            exact_scores,
+            pq_logits,
+            y_indexed,
+            indexed_tokens_score,
+            base_tokens_score,
+            ranked_prefix_score[:, :2],
+            k_take_counts_with_full_row,
+            calibrate,
+        )
+        if not torch.allclose(got_full_row_grid_rankpos[0], ref_first_row, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native rank-position joint mixed score grid truncated-prefix row mismatches Torch reference; calibrate={calibrate}"
+            )
+        if not torch.allclose(got_full_row_grid_rankpos[1], exact_scores, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native rank-position joint mixed score grid full row is not exact; calibrate={calibrate}"
+            )
+
+        got_full_row_grid_no_fill = joint_mixed_score_grid_no_exact_fill(
+            exact_scores,
+            pq_logits_covered,
+            y_indexed_covered,
+            indexed_tokens_covered,
+            base_tokens_score,
+            ranked_prefix_score[:, :2],
+            k_take_counts_with_full_row,
+            calibrate,
+        )
+        if not torch.allclose(got_full_row_grid_no_fill[0], _torch_mixed_score_grid_covered(calibrate)[1], atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native no-fill joint mixed score grid truncated-prefix row mismatches Torch reference; calibrate={calibrate}"
+            )
+        if not torch.allclose(got_full_row_grid_no_fill[1], exact_scores, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native no-fill joint mixed score grid full row is not exact; calibrate={calibrate}"
+            )
+
+    policy_output_grid = torch.randn((4, 5, heads, dim), device=device, dtype=torch.float32)
+    k_mb = torch.tensor([1.0, 1.5, 2.2, 3.0], device=device, dtype=torch.float32)
+    v_mb = torch.tensor([0.5, 0.7, 1.1, 1.8, 2.6], device=device, dtype=torch.float32)
+
+    def _policy_ref(policy: str, head_i: int, threshold: float) -> tuple[int, int]:
+        ki = 0
+        vi = 0
+        steps = 0
+        while steps < (policy_output_grid.shape[0] + policy_output_grid.shape[1] + 4):
+            cur = policy_output_grid[ki, vi, head_i].double()
+            k_can = ki + 1 < policy_output_grid.shape[0]
+            v_can = vi + 1 < policy_output_grid.shape[1]
+            k_delta = (
+                float(torch.linalg.vector_norm(cur - policy_output_grid[ki + 1, vi, head_i].double()))
+                / max(float(torch.linalg.vector_norm(policy_output_grid[ki + 1, vi, head_i].double())), 1e-20)
+                if k_can
+                else 0.0
+            )
+            v_delta = (
+                float(torch.linalg.vector_norm(cur - policy_output_grid[ki, vi + 1, head_i].double()))
+                / max(float(torch.linalg.vector_norm(policy_output_grid[ki, vi + 1, head_i].double())), 1e-20)
+                if v_can
+                else 0.0
+            )
+            extra_k = float(k_mb[ki + 1] - k_mb[ki]) if k_can else float("inf")
+            extra_v = float(v_mb[vi + 1] - v_mb[vi]) if v_can else float("inf")
+            action = _choose_joint_kv_action(
+                policy=policy,
+                k_delta=k_delta,
+                v_delta=v_delta,
+                k_can=k_can,
+                v_can=v_can,
+                threshold=threshold,
+                turn=steps,
+                extra_k_mb=extra_k,
+                extra_v_mb=extra_v,
+            )
+            if action == "stop":
+                break
+            if action == "k":
+                ki += 1
+            elif action == "v":
+                vi += 1
+            else:
+                raise AssertionError(action)
+            steps += 1
+        return int(ki), int(vi)
+
+    for policy_name, policy_id in policy_ids.items():
+        got_policy = joint_select_policy(policy_output_grid, k_mb, v_mb, 0.75, policy_id)
+        ref_policy = torch.tensor(
+            [_policy_ref(policy_name, head_i, 0.75) for head_i in range(heads)],
+            dtype=torch.long,
+            device=device,
+        )
+        if not torch.equal(got_policy, ref_policy):
+            raise AssertionError(f"native joint policy selector mismatches Torch reference; policy={policy_name}")
+
+    grouped_policy_grid = torch.stack(
+        [
+            policy_output_grid,
+            policy_output_grid * 0.75 + 0.1,
+            policy_output_grid * 1.25 - 0.2,
+        ],
+        dim=0,
+    )
+    grouped_policy_flat = grouped_policy_grid.permute(0, 1, 3, 2, 4).reshape(
+        int(grouped_policy_grid.shape[0]) * int(grouped_policy_grid.shape[1]) * int(grouped_policy_grid.shape[3]),
+        int(grouped_policy_grid.shape[2]),
+        int(grouped_policy_grid.shape[4]),
+    )
+    grouped_k_mb = torch.stack([k_mb, k_mb + 0.05, k_mb + 0.10], dim=0).contiguous()
+    grouped_v_mb = torch.stack([v_mb, v_mb + 0.03, v_mb + 0.06], dim=0).contiguous()
+    for policy_name, policy_id in policy_ids.items():
+        got_outputs, got_indices = joint_select_policy_grouped_flat(
+            grouped_policy_flat,
+            grouped_k_mb,
+            grouped_v_mb,
+            int(policy_output_grid.shape[0]),
+            int(heads),
+            0.75,
+            policy_id,
+        )
+        ref_indices = []
+        ref_outputs = []
+        for group_i in range(int(grouped_policy_grid.shape[0])):
+            group_indices = []
+            group_outputs = []
+            for head_i in range(heads):
+                ki = 0
+                vi = 0
+                steps = 0
+                while steps < (policy_output_grid.shape[0] + policy_output_grid.shape[1] + 4):
+                    cur = grouped_policy_grid[group_i, ki, vi, head_i].double()
+                    k_can = ki + 1 < policy_output_grid.shape[0]
+                    v_can = vi + 1 < policy_output_grid.shape[1]
+                    k_delta = (
+                        float(torch.linalg.vector_norm(cur - grouped_policy_grid[group_i, ki + 1, vi, head_i].double()))
+                        / max(float(torch.linalg.vector_norm(grouped_policy_grid[group_i, ki + 1, vi, head_i].double())), 1e-20)
+                        if k_can
+                        else 0.0
+                    )
+                    v_delta = (
+                        float(torch.linalg.vector_norm(cur - grouped_policy_grid[group_i, ki, vi + 1, head_i].double()))
+                        / max(float(torch.linalg.vector_norm(grouped_policy_grid[group_i, ki, vi + 1, head_i].double())), 1e-20)
+                        if v_can
+                        else 0.0
+                    )
+                    extra_k = float(grouped_k_mb[group_i, ki + 1] - grouped_k_mb[group_i, ki]) if k_can else float("inf")
+                    extra_v = float(grouped_v_mb[group_i, vi + 1] - grouped_v_mb[group_i, vi]) if v_can else float("inf")
+                    action = _choose_joint_kv_action(
+                        policy=policy_name,
+                        k_delta=k_delta,
+                        v_delta=v_delta,
+                        k_can=k_can,
+                        v_can=v_can,
+                        threshold=0.75,
+                        turn=steps,
+                        extra_k_mb=extra_k,
+                        extra_v_mb=extra_v,
+                    )
+                    if action == "stop":
+                        break
+                    if action == "k":
+                        ki += 1
+                    elif action == "v":
+                        vi += 1
+                    else:
+                        raise AssertionError(action)
+                    steps += 1
+                group_indices.append((ki, vi))
+                group_outputs.append(grouped_policy_grid[group_i, ki, vi, head_i])
+            ref_indices.append(group_indices)
+            ref_outputs.append(torch.stack(group_outputs, dim=0))
+        ref_indices_t = torch.tensor(ref_indices, dtype=torch.long, device=device)
+        ref_outputs_t = torch.stack(ref_outputs, dim=0)
+        if not torch.equal(got_indices, ref_indices_t):
+            raise AssertionError(f"native grouped flat joint policy indices mismatch; policy={policy_name}")
+        if not torch.allclose(got_outputs, ref_outputs_t, atol=2e-5, rtol=2e-5):
+            raise AssertionError(f"native grouped flat joint policy outputs mismatch; policy={policy_name}")
+        if policy_name != "sensitivity_greedy":
+            got_outputs_no_mb, got_indices_no_mb = joint_select_policy_grouped_flat_no_mb(
+                grouped_policy_flat,
+                int(policy_output_grid.shape[0]),
+                int(heads),
+                0.75,
+                policy_id,
+            )
+            if not torch.equal(got_indices_no_mb, ref_indices_t):
+                raise AssertionError(f"native grouped flat no-MB policy indices mismatch; policy={policy_name}")
+            if not torch.allclose(got_outputs_no_mb, ref_outputs_t, atol=2e-5, rtol=2e-5):
+                raise AssertionError(f"native grouped flat no-MB policy outputs mismatch; policy={policy_name}")
 
     ref = gqa_causal_vpq_selected_tail_from_scores(
         queries,

@@ -46,6 +46,11 @@ from benchmark.selector_eval.runners.run_layer_quality_eval import (
     _selected_for_budget,
     _vpq_values_for_tokens,
 )
+from benchmark.selector_eval.runners.run_value_exact_strategy_eval import (
+    mixed_scores as frontier_mixed_scores,
+    output_from_exact_mask as frontier_output_from_exact_mask,
+    top_mask as frontier_top_mask,
+)
 from benchmark.selector_eval.metrics.attention import _output_error_metrics
 
 MB = 1024.0 * 1024.0
@@ -57,6 +62,14 @@ def log(msg: str) -> None:
 
 def _env_truthy(name: str, default: str = "0") -> bool:
     return str(os.environ.get(name, default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name, str(default))).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
 
 
 def _canonical_gpu_frontier_mismatches(args) -> list[str]:
@@ -71,35 +84,250 @@ def _canonical_gpu_frontier_mismatches(args) -> list[str]:
         mismatches.append("selector_mode must be fullscan")
     if str(getattr(args, "selector_backend", "")) not in {"cuda_ext", "auto"}:
         mismatches.append("selector_backend must be cuda_ext or auto")
-    if not bool(getattr(args, "native_decode_tail", False)):
-        mismatches.append("native_decode_tail must be enabled")
+    if bool(getattr(args, "approx_prefill", False)):
+        mismatches.append("approx_prefill must be disabled; canonical frontier is decode-only")
     if str(getattr(args, "index_build_backend", "")) != "torch_gpu":
         mismatches.append("index_build_backend must be torch_gpu")
-    if str(getattr(args, "online_confidence_rule", "")) != "geometric_probe_tail_switch":
-        mismatches.append("online_confidence_rule must be geometric_probe_tail_switch")
+    if str(getattr(args, "online_confidence_rule", "")) != "joint_kv_stability":
+        mismatches.append("online_confidence_rule must be joint_kv_stability")
     if str(getattr(args, "tail_mode", "")) != "vpq_value":
         mismatches.append("tail_mode must be vpq_value")
-    if float(getattr(args, "tail_blend", 1.0)) <= 0.0 and getattr(args, "decode_tail_blend", None) is None:
-        mismatches.append("tail_blend/decode_tail_blend must enable V-PQ tail estimation")
     if str(getattr(args, "tail_score_calibration", "")) != "affine_selected":
         mismatches.append("tail_score_calibration must be affine_selected")
-    if not math.isfinite(float(getattr(args, "tail_probe_rel_l2_max", float("inf")))):
-        mismatches.append("tail_probe_rel_l2_max must be finite")
-    if float(getattr(args, "tail_proxy_mass_min", 0.0)) <= 0.0:
-        mismatches.append("tail_proxy_mass_min must enable the proxy-mass gate")
-    if float(getattr(args, "tail_pq_corr_min", -1.0)) <= -1.0:
-        mismatches.append("tail_pq_corr_min must enable the selected-token PQ-correlation gate")
     if str(getattr(args, "selected_value_mode", "")) != "vpq_value":
         mismatches.append("selected_value_mode must be vpq_value")
-    if str(getattr(args, "selected_value_exact_rule", "")) != "selected_mass":
-        mismatches.append("selected_value_exact_rule must be selected_mass")
-    if float(getattr(args, "selected_value_exact_mass", 0.0)) <= 0.0:
-        mismatches.append("selected_value_exact_mass must be positive")
-    if int(getattr(args, "selected_value_min_exact_top", 0)) <= 0:
-        mismatches.append("selected_value_min_exact_top must be positive")
+    if str(getattr(args, "selected_value_exact_rule", "")) != "global_residual_risk":
+        mismatches.append("selected_value_exact_rule must be global_residual_risk")
     if str(getattr(args, "ranked_confidence_cost_mode", "")) != "exact":
         mismatches.append("ranked_confidence_cost_mode must be exact")
+    if _env_truthy("SELECTOR_PQ_JOINT_SEGMENTED_V_PREFIX", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_SEGMENTED_V_PREFIX must be disabled; diagnostic changes accepted budgets")
+    if _env_truthy("SELECTOR_PQ_JOINT_UNSORTED_V_PREFIX", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_UNSORTED_V_PREFIX must be disabled until parity/profile validation promotes it")
+    if _env_truthy("SELECTOR_PQ_JOINT_FAST_AFFINE_SELECTED", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_FAST_AFFINE_SELECTED must be disabled until parity/profile validation promotes it")
+    if _env_truthy("SELECTOR_PQ_JOINT_ONDEMAND_V_PREFIX", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_ONDEMAND_V_PREFIX must be disabled until parity/profile validation promotes it")
+    if _env_truthy("SELECTOR_PQ_JOINT_INCREMENTAL_V_GRID", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_INCREMENTAL_V_GRID must be disabled until parity/profile validation promotes it")
+    if _env_truthy("SELECTOR_PQ_JOINT_INCREMENTAL_VPQ_SIDECAR", "0"):
+        mismatches.append(
+            "SELECTOR_PQ_JOINT_INCREMENTAL_VPQ_SIDECAR must be disabled; long-decode validation did not improve runtime"
+        )
+    if not _env_truthy("SELECTOR_PQ_JOINT_GROUPED_RISK_PREFIX", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_GROUPED_RISK_PREFIX must be enabled; it is the validated canonical grouped risk-prefix path")
+    if _env_truthy("SELECTOR_PQ_JOINT_NATIVE_LAZY_POLICY", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_NATIVE_LAZY_POLICY must be disabled until parity/profile validation promotes it")
+    if not _env_truthy("SELECTOR_PQ_JOINT_NATIVE_RISK_PREFIX", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_NATIVE_RISK_PREFIX must be enabled; it is the validated canonical risk-prefix path")
+    if not _env_truthy("SELECTOR_PQ_JOINT_NATIVE_SCORE_GRID", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_NATIVE_SCORE_GRID must be enabled; it is the validated canonical score-grid path")
+    if not _env_truthy("SELECTOR_PQ_JOINT_NATIVE_POLICY", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_NATIVE_POLICY must be enabled; it is the validated canonical policy path")
+    if not _env_truthy("SELECTOR_PQ_JOINT_NATIVE_V_PREFIX", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_NATIVE_V_PREFIX must be enabled; it is the validated canonical V-prefix path")
+    if not _env_truthy("SELECTOR_PQ_JOINT_PREWARM_VPQ_SIDECARS", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_PREWARM_VPQ_SIDECARS must be enabled for benchmark-ready decode runtime")
+    if not _env_truthy("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE must be enabled for benchmark-ready decode runtime")
+    if _env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_EXACT_PRECOMPUTE", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_ALLHEAD_EXACT_PRECOMPUTE must be disabled; diagnostic changed accepted budgets")
+    if _env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_RANK_PREFIX", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_ALLHEAD_RANK_PREFIX must be disabled; diagnostic changed accepted budgets")
+    if _env_truthy("SELECTOR_PQ_JOINT_NATIVE_RANK_PREFIX", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_NATIVE_RANK_PREFIX must be disabled until parity/profile validation promotes it")
+    if _env_truthy("SELECTOR_PQ_JOINT_SKIP_FULL_BUDGET_SORT", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_SKIP_FULL_BUDGET_SORT must be disabled; diagnostic changed accepted budgets")
+    if not _env_truthy("SELECTOR_PQ_JOINT_EXACT_FULL_BUDGET_GRID", "1"):
+        mismatches.append("SELECTOR_PQ_JOINT_EXACT_FULL_BUDGET_GRID must be enabled; it is the validated canonical score-grid shortcut")
+    if _env_truthy("SELECTOR_PQ_JOINT_SCORE_GRID_NO_EXACT_FILL", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_SCORE_GRID_NO_EXACT_FILL must be disabled until parity/profile validation promotes it")
+    if _env_truthy("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID must be disabled until parity/profile validation promotes it")
+    if _env_truthy("SELECTOR_PQ_JOINT_GROUPED_VPQ_CACHE", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_GROUPED_VPQ_CACHE must be disabled; diagnostic worsened runtime and is not canonical")
+    if _env_truthy("SELECTOR_PQ_JOINT_FUSED_RISK_POLICY", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_FUSED_RISK_POLICY must be disabled until parity/profile validation promotes it")
+    if _env_truthy("SELECTOR_PQ_JOINT_RISK_PREFIX_TOPK", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_RISK_PREFIX_TOPK must be disabled until parity/profile validation promotes it")
+    if not _env_truthy("SELECTOR_PQ_JOINT_FAST_TOKEN_LAYOUT", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_FAST_TOKEN_LAYOUT must be enabled; it is the validated canonical token-layout path")
+    if _env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE must be disabled until parity/profile validation promotes it")
+    if not _env_truthy("SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE must be enabled; it is the validated canonical prob/base path")
+    if _env_truthy("SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE must be disabled until parity/profile validation promotes it")
+    if not _env_truthy("SELECTOR_PQ_JOINT_COLLAPSE_DUP_K_ROWS", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_COLLAPSE_DUP_K_ROWS must be enabled; it is the validated duplicate-budget collapse path")
+    if _env_truthy("SELECTOR_PQ_JOINT_COLLAPSE_DUP_V_ROWS", "0"):
+        mismatches.append("SELECTOR_PQ_JOINT_COLLAPSE_DUP_V_ROWS must be disabled until parity/profile validation promotes it")
+    threshold = float(getattr(args, "joint_kv_stability_threshold", float("inf")))
+    if not math.isfinite(threshold) or threshold <= 0.0:
+        mismatches.append("joint_kv_stability_threshold must be finite and positive")
     return mismatches
+
+
+def _parse_budget_schedule(text: str, *, name: str) -> list[int]:
+    values = sorted({int(x) for x in parse_csv_ints(text) if int(x) > 0})
+    if not values:
+        raise ValueError(f"{name} must contain at least one positive integer budget")
+    return values
+
+
+def _rel_l2_np(a: np.ndarray, b: np.ndarray) -> float:
+    aa = a.astype(np.float64, copy=False)
+    bb = b.astype(np.float64, copy=False)
+    return float(np.linalg.norm(aa - bb)) / max(float(np.linalg.norm(bb)), 1e-20)
+
+
+def _rel_l2_torch(a: torch.Tensor, b: torch.Tensor) -> float:
+    aa = a.to(dtype=torch.float64)
+    bb = b.to(dtype=torch.float64)
+    return float(torch.linalg.vector_norm(aa - bb).item()) / max(float(torch.linalg.vector_norm(bb).item()), 1e-20)
+
+
+def _choose_joint_kv_action(
+    *,
+    policy: str,
+    k_delta: float,
+    v_delta: float,
+    k_can: bool,
+    v_can: bool,
+    threshold: float,
+    turn: int,
+    extra_k_mb: float,
+    extra_v_mb: float,
+) -> str:
+    k_bad = bool(k_can and float(k_delta) > float(threshold))
+    v_bad = bool(v_can and float(v_delta) > float(threshold))
+    if not k_bad and not v_bad:
+        return "stop"
+    if str(policy) == "k_first_priority":
+        return "k" if k_bad else "v"
+    if str(policy) == "v_first_priority":
+        return "v" if v_bad else "k"
+    if str(policy) == "k_first_alternating":
+        preferred = "k" if int(turn) % 2 == 0 else "v"
+        if preferred == "k" and k_bad:
+            return "k"
+        if preferred == "v" and v_bad:
+            return "v"
+        return "v" if v_bad else "k"
+    if str(policy) == "v_first_alternating":
+        preferred = "v" if int(turn) % 2 == 0 else "k"
+        if preferred == "v" and v_bad:
+            return "v"
+        if preferred == "k" and k_bad:
+            return "k"
+        return "k" if k_bad else "v"
+    if str(policy) == "sensitivity_greedy":
+        k_gain = float(k_delta) / max(float(extra_k_mb), 1e-9) if k_bad else -1.0
+        v_gain = float(v_delta) / max(float(extra_v_mb), 1e-9) if v_bad else -1.0
+        return "k" if k_gain >= v_gain else "v"
+    raise ValueError(f"unknown joint_kv_policy: {policy}")
+
+
+def _joint_kv_policy_id(policy: str) -> int:
+    policy_map = {
+        "k_first_priority": 0,
+        "v_first_priority": 1,
+        "k_first_alternating": 2,
+        "v_first_alternating": 3,
+        "sensitivity_greedy": 4,
+    }
+    try:
+        return policy_map[str(policy)]
+    except KeyError as exc:
+        raise ValueError(f"unknown joint_kv_policy: {policy}") from exc
+
+
+def _simulate_joint_kv_policy(
+    *,
+    outputs: dict[tuple[int, int], np.ndarray],
+    k_budgets: list[int],
+    v_budgets: list[int],
+    policy: str,
+    threshold: float,
+    k_mb_by_idx: list[float],
+    v_mb_by_idx: list[float],
+) -> tuple[int, int, int, float, float]:
+    ki = 0
+    vi = 0
+    steps = 0
+    while steps < (len(k_budgets) + len(v_budgets) + 4):
+        cur = outputs[(ki, vi)]
+        k_can = ki + 1 < len(k_budgets)
+        v_can = vi + 1 < len(v_budgets)
+        k_delta = _rel_l2_np(cur, outputs[(ki + 1, vi)]) if k_can else 0.0
+        v_delta = _rel_l2_np(cur, outputs[(ki, vi + 1)]) if v_can else 0.0
+        extra_k_mb = float(k_mb_by_idx[ki + 1] - k_mb_by_idx[ki]) if k_can else float("inf")
+        extra_v_mb = float(v_mb_by_idx[vi + 1] - v_mb_by_idx[vi]) if v_can else float("inf")
+        action = _choose_joint_kv_action(
+            policy=str(policy),
+            k_delta=float(k_delta),
+            v_delta=float(v_delta),
+            k_can=bool(k_can),
+            v_can=bool(v_can),
+            threshold=float(threshold),
+            turn=int(steps),
+            extra_k_mb=float(extra_k_mb),
+            extra_v_mb=float(extra_v_mb),
+        )
+        if action == "stop":
+            return ki, vi, steps, float(k_delta), float(v_delta)
+        if action == "k":
+            ki += 1
+        elif action == "v":
+            vi += 1
+        else:
+            raise AssertionError(action)
+        steps += 1
+    return ki, vi, steps, 0.0, 0.0
+
+
+def _simulate_joint_kv_policy_torch(
+    *,
+    outputs: dict[tuple[int, int], torch.Tensor],
+    k_budgets: list[int],
+    v_budgets: list[int],
+    policy: str,
+    threshold: float,
+    k_mb_by_idx: list[float],
+    v_mb_by_idx: list[float],
+) -> tuple[int, int, int, float, float]:
+    ki = 0
+    vi = 0
+    steps = 0
+    while steps < (len(k_budgets) + len(v_budgets) + 4):
+        cur = outputs[(ki, vi)]
+        k_can = ki + 1 < len(k_budgets)
+        v_can = vi + 1 < len(v_budgets)
+        k_delta = _rel_l2_torch(cur, outputs[(ki + 1, vi)]) if k_can else 0.0
+        v_delta = _rel_l2_torch(cur, outputs[(ki, vi + 1)]) if v_can else 0.0
+        extra_k_mb = float(k_mb_by_idx[ki + 1] - k_mb_by_idx[ki]) if k_can else float("inf")
+        extra_v_mb = float(v_mb_by_idx[vi + 1] - v_mb_by_idx[vi]) if v_can else float("inf")
+        action = _choose_joint_kv_action(
+            policy=str(policy),
+            k_delta=float(k_delta),
+            v_delta=float(v_delta),
+            k_can=bool(k_can),
+            v_can=bool(v_can),
+            threshold=float(threshold),
+            turn=int(steps),
+            extra_k_mb=float(extra_k_mb),
+            extra_v_mb=float(extra_v_mb),
+        )
+        if action == "stop":
+            return ki, vi, steps, float(k_delta), float(v_delta)
+        if action == "k":
+            ki += 1
+        elif action == "v":
+            vi += 1
+        else:
+            raise AssertionError(action)
+        steps += 1
+    return ki, vi, steps, 0.0, 0.0
 
 
 def _require_canonical_gpu_frontier(args) -> None:
@@ -329,7 +557,33 @@ class ApproxStats:
     native_threshold_seconds: float = 0.0
     native_geometric_seconds: float = 0.0
     native_output_seconds: float = 0.0
+    native_joint_rank_prefix_seconds: float = 0.0
+    native_joint_score_grid_seconds: float = 0.0
+    native_joint_prob_base_seconds: float = 0.0
+    native_joint_risk_prefix_seconds: float = 0.0
+    native_joint_policy_seconds: float = 0.0
+    native_joint_precompute_seconds: float = 0.0
+    native_joint_layout_seconds: float = 0.0
+    native_joint_group_pack_seconds: float = 0.0
+    native_joint_accounting_seconds: float = 0.0
     output_projection_seconds: float = 0.0
+    wall_patched_attention_seconds: float = 0.0
+    wall_qkv_cache_seconds: float = 0.0
+    wall_index_sidecar_seconds: float = 0.0
+    wall_output_projection_seconds: float = 0.0
+    wall_joint_total_seconds: float = 0.0
+    wall_joint_precompute_seconds: float = 0.0
+    wall_joint_selector_seconds: float = 0.0
+    wall_joint_exact_logit_seconds: float = 0.0
+    wall_joint_vpq_sidecar_seconds: float = 0.0
+    wall_joint_layout_seconds: float = 0.0
+    wall_joint_rank_prefix_seconds: float = 0.0
+    wall_joint_score_grid_seconds: float = 0.0
+    wall_joint_prob_base_seconds: float = 0.0
+    wall_joint_risk_prefix_seconds: float = 0.0
+    wall_joint_policy_seconds: float = 0.0
+    wall_joint_group_pack_seconds: float = 0.0
+    wall_joint_accounting_seconds: float = 0.0
 
     def add_count(
         self,
@@ -497,8 +751,74 @@ class ApproxStats:
         self.native_geometric_seconds += float(geometric_seconds)
         self.native_output_seconds += float(output_seconds)
 
+    def add_joint_detail_timing(
+        self,
+        *,
+        rank_prefix_seconds: float = 0.0,
+        score_grid_seconds: float = 0.0,
+        prob_base_seconds: float = 0.0,
+        risk_prefix_seconds: float = 0.0,
+        policy_seconds: float = 0.0,
+        precompute_seconds: float = 0.0,
+        layout_seconds: float = 0.0,
+        group_pack_seconds: float = 0.0,
+        accounting_seconds: float = 0.0,
+    ) -> None:
+        self.native_joint_rank_prefix_seconds += float(rank_prefix_seconds)
+        self.native_joint_score_grid_seconds += float(score_grid_seconds)
+        self.native_joint_prob_base_seconds += float(prob_base_seconds)
+        self.native_joint_risk_prefix_seconds += float(risk_prefix_seconds)
+        self.native_joint_policy_seconds += float(policy_seconds)
+        self.native_joint_precompute_seconds += float(precompute_seconds)
+        self.native_joint_layout_seconds += float(layout_seconds)
+        self.native_joint_group_pack_seconds += float(group_pack_seconds)
+        self.native_joint_accounting_seconds += float(accounting_seconds)
+
     def add_output_projection_timing(self, seconds: float) -> None:
         self.output_projection_seconds += float(seconds)
+
+    def add_wall_patched_attention_timing(self, seconds: float) -> None:
+        self.wall_patched_attention_seconds += float(seconds)
+
+    def add_wall_qkv_cache_timing(self, seconds: float) -> None:
+        self.wall_qkv_cache_seconds += float(seconds)
+
+    def add_wall_index_sidecar_timing(self, seconds: float) -> None:
+        self.wall_index_sidecar_seconds += float(seconds)
+
+    def add_wall_output_projection_timing(self, seconds: float) -> None:
+        self.wall_output_projection_seconds += float(seconds)
+
+    def add_joint_wall_timing(
+        self,
+        *,
+        total_seconds: float = 0.0,
+        precompute_seconds: float = 0.0,
+        selector_seconds: float = 0.0,
+        exact_logit_seconds: float = 0.0,
+        vpq_sidecar_seconds: float = 0.0,
+        layout_seconds: float = 0.0,
+        rank_prefix_seconds: float = 0.0,
+        score_grid_seconds: float = 0.0,
+        prob_base_seconds: float = 0.0,
+        risk_prefix_seconds: float = 0.0,
+        policy_seconds: float = 0.0,
+        group_pack_seconds: float = 0.0,
+        accounting_seconds: float = 0.0,
+    ) -> None:
+        self.wall_joint_total_seconds += float(total_seconds)
+        self.wall_joint_precompute_seconds += float(precompute_seconds)
+        self.wall_joint_selector_seconds += float(selector_seconds)
+        self.wall_joint_exact_logit_seconds += float(exact_logit_seconds)
+        self.wall_joint_vpq_sidecar_seconds += float(vpq_sidecar_seconds)
+        self.wall_joint_layout_seconds += float(layout_seconds)
+        self.wall_joint_rank_prefix_seconds += float(rank_prefix_seconds)
+        self.wall_joint_score_grid_seconds += float(score_grid_seconds)
+        self.wall_joint_prob_base_seconds += float(prob_base_seconds)
+        self.wall_joint_risk_prefix_seconds += float(risk_prefix_seconds)
+        self.wall_joint_policy_seconds += float(policy_seconds)
+        self.wall_joint_group_pack_seconds += float(group_pack_seconds)
+        self.wall_joint_accounting_seconds += float(accounting_seconds)
 
 
 def parse_head_budget_map(text: str) -> dict[int, int]:
@@ -751,8 +1071,8 @@ def vpq_values_for_tokens_gpu(
             value_subbits=int(value_subbits),
             device=values.device,
         )
-    exact_values = values.index_select(0, tokens.reshape(-1)).reshape(*tokens.shape, int(values.shape[-1])).float()
     if pack is None or tokens.numel() == 0:
+        exact_values = values.index_select(0, tokens.reshape(-1)).reshape(*tokens.shape, int(values.shape[-1])).float()
         return exact_values, torch.zeros_like(tokens, dtype=torch.bool), torch.full_like(tokens, -1), int(value_subbits)
     codebooks, codes, page_starts, page_size, actual_value_subbits = pack
     first_start = int(page_starts[0].item())
@@ -762,6 +1082,7 @@ def vpq_values_for_tokens_gpu(
     rows = tokens - page_starts.index_select(0, clamped_page_ids.reshape(-1)).reshape_as(tokens)
     valid = in_range & (rows >= 0) & (rows < int(page_size))
     if not bool(torch.any(valid)):
+        exact_values = values.index_select(0, tokens.reshape(-1)).reshape(*tokens.shape, int(values.shape[-1])).float()
         return exact_values, valid, page_ids, int(actual_value_subbits)
     flat_valid = valid.reshape(-1)
     flat_page_ids = clamped_page_ids.reshape(-1).index_select(0, torch.nonzero(flat_valid, as_tuple=False).reshape(-1))
@@ -777,9 +1098,17 @@ def vpq_values_for_tokens_gpu(
             sub_ids[sub].expand_as(flat_page_ids),
             selected_codes[:, sub],
         ]
-    out = exact_values.reshape(-1, int(values.shape[-1])).clone()
+    out = torch.empty((int(tokens.numel()), int(values.shape[-1])), dtype=torch.float32, device=values.device)
     out[flat_valid] = approx_flat
-    return out.reshape_as(exact_values), valid, page_ids, int(actual_value_subbits)
+    if int(flat_valid.numel()) != int(approx_flat.shape[0]):
+        invalid_flat = ~flat_valid
+        if bool(torch.any(invalid_flat)):
+            invalid_tokens = tokens.reshape(-1).index_select(
+                0,
+                torch.nonzero(invalid_flat, as_tuple=False).reshape(-1),
+            )
+            out[invalid_flat] = values.index_select(0, invalid_tokens).float()
+    return out.reshape(*tokens.shape, int(values.shape[-1])), valid, page_ids, int(actual_value_subbits)
 
 
 def reconstruct_all_vpq_values_gpu(
@@ -843,6 +1172,145 @@ def reconstruct_all_vpq_values_gpu(
     cached[cache_key] = packed
     setattr(index, "_all_value_vpq_gpu_by_params", cached)
     return packed
+
+
+def value_vpq_code_stat_risk_torch(
+    *,
+    index: GPUIndex,
+    values: torch.Tensor,
+    vhat_all: torch.Tensor,
+    residual_all: torch.Tensor | None = None,
+    valid: torch.Tensor,
+    page_ids: torch.Tensor,
+    subbits: int,
+    value_subvecs: int,
+    value_subbits: int,
+    value_bytes: int,
+) -> tuple[torch.Tensor, int]:
+    """Per-token deployable V-PQ residual-risk sidecar using torch-built V-PQ.
+
+    This mirrors the CPU reference's page/code mean residual statistic without
+    invoking the CPU NumPy k-means sidecar path during HF benchmark decode.
+    Invalid/non-indexed tokens use exact V fallback in `vhat_all`, so their
+    residual risk is zero.
+    """
+
+    out = torch.zeros((int(values.shape[0]),), dtype=torch.float64, device=values.device)
+    pack = value_vpq_pack_torch(
+        index=index,
+        values=values,
+        value_subvecs=int(value_subvecs),
+        value_subbits=int(value_subbits) if int(value_subbits) > 0 else int(subbits),
+        key_bytes=int(value_bytes),
+        device=values.device,
+    )
+    if pack is None or values.numel() == 0 or not bool(torch.any(valid)):
+        actual_value_subbits = int(value_subbits) if int(value_subbits) > 0 else int(subbits)
+        return out, int(actual_value_subbits)
+    codebooks, codes, page_starts, page_size, actual_value_subbits = pack
+    tokens = torch.arange(int(values.shape[0]), dtype=torch.long, device=values.device)
+    valid_flat = valid.reshape(-1)
+    valid_idx = torch.nonzero(valid_flat, as_tuple=False).reshape(-1)
+    valid_pages = page_ids.reshape(-1).index_select(0, valid_idx).to(torch.long)
+    valid_pages = torch.clamp(valid_pages, min=0, max=max(0, int(page_starts.numel()) - 1))
+    rows = tokens.index_select(0, valid_idx) - page_starts.index_select(0, valid_pages)
+    row_mask = (rows >= 0) & (rows < int(page_size))
+    if not bool(torch.any(row_mask)):
+        return out, int(actual_value_subbits)
+    valid_idx = valid_idx.index_select(0, torch.nonzero(row_mask, as_tuple=False).reshape(-1))
+    valid_pages = valid_pages.index_select(0, torch.nonzero(row_mask, as_tuple=False).reshape(-1))
+    rows = rows.index_select(0, torch.nonzero(row_mask, as_tuple=False).reshape(-1)).to(torch.long)
+    selected_codes = codes[valid_pages, rows].to(torch.long)
+    if residual_all is None:
+        residual_valid = (values.float() - vhat_all.float()).index_select(0, valid_idx).to(torch.float64)
+    else:
+        residual_valid = residual_all.index_select(0, valid_idx).to(torch.float64)
+    subvecs = int(selected_codes.shape[1])
+    subdim = int(codebooks.shape[-1])
+    risk_valid = torch.zeros((int(valid_idx.numel()),), dtype=torch.float64, device=values.device)
+    num_codes = 1 << int(actual_value_subbits)
+    num_pages = int(page_starts.numel())
+    bucket_count = int(max(1, num_pages * num_codes))
+    for sub in range(subvecs):
+        lo = int(sub) * subdim
+        hi = lo + subdim
+        per_token = torch.sum(residual_valid[:, lo:hi] * residual_valid[:, lo:hi], dim=1)
+        bucket_ids = valid_pages * int(num_codes) + selected_codes[:, int(sub)]
+        bucket_ids = torch.clamp(bucket_ids, min=0, max=bucket_count - 1)
+        sums = torch.bincount(bucket_ids, weights=per_token, minlength=bucket_count)
+        counts = torch.bincount(bucket_ids, minlength=bucket_count).to(dtype=torch.float64)
+        means = sums / torch.clamp_min(counts, 1.0)
+        risk_valid += means.index_select(0, bucket_ids)
+    out.index_copy_(0, valid_idx, risk_valid)
+    return out, int(actual_value_subbits)
+
+
+def value_vpq_code_stat_risk_subset_torch(
+    *,
+    index: GPUIndex,
+    values: torch.Tensor,
+    tokens: torch.Tensor,
+    residual_subset: torch.Tensor,
+    valid: torch.Tensor,
+    page_ids: torch.Tensor,
+    subbits: int,
+    value_subvecs: int,
+    value_subbits: int,
+    value_bytes: int,
+) -> tuple[torch.Tensor, int]:
+    """Per-token V-PQ residual-risk stats for a sealed page subset.
+
+    The full risk statistic is page/code-local, so a newly sealed page can be
+    refreshed without rereading/recomputing older pages.
+    """
+
+    out = torch.zeros((int(tokens.numel()),), dtype=torch.float64, device=values.device)
+    pack = value_vpq_pack_torch(
+        index=index,
+        values=values,
+        value_subvecs=int(value_subvecs),
+        value_subbits=int(value_subbits) if int(value_subbits) > 0 else int(subbits),
+        key_bytes=int(value_bytes),
+        device=values.device,
+    )
+    if pack is None or tokens.numel() == 0 or not bool(torch.any(valid)):
+        actual_value_subbits = int(value_subbits) if int(value_subbits) > 0 else int(subbits)
+        return out.reshape(tokens.shape), int(actual_value_subbits)
+    codebooks, codes, page_starts, page_size, actual_value_subbits = pack
+    flat_tokens = tokens.reshape(-1)
+    valid_flat = valid.reshape(-1)
+    valid_idx = torch.nonzero(valid_flat, as_tuple=False).reshape(-1)
+    valid_pages = page_ids.reshape(-1).index_select(0, valid_idx).to(torch.long)
+    valid_pages = torch.clamp(valid_pages, min=0, max=max(0, int(page_starts.numel()) - 1))
+    token_values = flat_tokens.index_select(0, valid_idx)
+    rows = token_values - page_starts.index_select(0, valid_pages)
+    row_mask = (rows >= 0) & (rows < int(page_size))
+    if not bool(torch.any(row_mask)):
+        return out.reshape(tokens.shape), int(actual_value_subbits)
+    row_idx = torch.nonzero(row_mask, as_tuple=False).reshape(-1)
+    valid_idx = valid_idx.index_select(0, row_idx)
+    valid_pages = valid_pages.index_select(0, row_idx)
+    rows = rows.index_select(0, row_idx).to(torch.long)
+    selected_codes = codes[valid_pages, rows].to(torch.long)
+    residual_valid = residual_subset.reshape(-1, int(values.shape[-1])).index_select(0, valid_idx).to(torch.float64)
+    subvecs = int(selected_codes.shape[1])
+    subdim = int(codebooks.shape[-1])
+    risk_valid = torch.zeros((int(valid_idx.numel()),), dtype=torch.float64, device=values.device)
+    num_codes = 1 << int(actual_value_subbits)
+    num_pages = int(page_starts.numel())
+    bucket_count = int(max(1, num_pages * num_codes))
+    for sub in range(subvecs):
+        lo = int(sub) * subdim
+        hi = lo + subdim
+        per_token = torch.sum(residual_valid[:, lo:hi] * residual_valid[:, lo:hi], dim=1)
+        bucket_ids = valid_pages * int(num_codes) + selected_codes[:, int(sub)]
+        bucket_ids = torch.clamp(bucket_ids, min=0, max=bucket_count - 1)
+        sums = torch.bincount(bucket_ids, weights=per_token, minlength=bucket_count)
+        counts = torch.bincount(bucket_ids, minlength=bucket_count).to(dtype=torch.float64)
+        means = sums / torch.clamp_min(counts, 1.0)
+        risk_valid += means.index_select(0, bucket_ids)
+    out.index_copy_(0, valid_idx, risk_valid)
+    return out.reshape(tokens.shape), int(actual_value_subbits)
 
 
 def selected_value_exact_mask_gpu(
@@ -1960,6 +2428,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
         "geometric_probe_tail_switch",
         "geometric_tail_stability_switch",
         "geometric_exact_delta",
+        "joint_kv_stability",
         "pq_proxy_mass_budget",
         "pq_ranked_mass_budget",
     }:
@@ -2136,6 +2605,21 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
         base_tail_start = max(int(sealed_end), int(prefix_end))
         return int(prefix_end) + max(0, int(query_context_len) - int(base_tail_start))
 
+    def joint_vpq_cache_key_for(kv_head: int, values_t: torch.Tensor, index: GPUIndex) -> tuple[object, ...]:
+        actual_value_subbits_key = int(args.value_subbits) if int(args.value_subbits) > 0 else int(args.subbits)
+        return (
+            int(kv_head),
+            str(values_t.device),
+            int(args.subbits),
+            int(args.value_subvecs),
+            int(actual_value_subbits_key),
+            int(value_bytes),
+            int(len(index.pages)),
+            int(index.pages[0].start) if index.pages else -1,
+            (int(index.pages[-1].start) + int(index.pages[-1].size)) if index.pages else -1,
+            int(index.pages[0].size) if index.pages else 0,
+        )
+
     def warm_dense_prefill_decode_sidecars(layer_id: int, module, cache_obj) -> None:
         if bool(getattr(args, "skip_prefill_index_build", False)):
             return
@@ -2173,6 +2657,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
             str(args.selected_value_mode) == "vpq_value"
             or (float(decode_tail_blend) > 0.0 and str(args.tail_mode) == "vpq_value")
         )
+        warmed_indexes: list[GPUIndex | None] = [None] * num_kv_heads
         for kv_head in range(num_kv_heads):
             if str(args.selector_mode) in {"fullscan", "oracle"}:
                 cache_key = (
@@ -2251,6 +2736,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
             if str(args.selector_mode) in {"fullscan", "oracle"}:
                 cached_index.pending_start = int(sealed_end)
                 cached_index.indexed_end = int(indexed_end)
+                warmed_indexes[int(kv_head)] = cached_index
             if (
                 needs_vpq_sidecar
                 and str(getattr(args, "index_build_backend", "numpy")) == "torch_gpu"
@@ -2268,6 +2754,113 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                 build_stats = getattr(cached_index, "_last_value_vpq_build_stats", None)
                 if build_stats is not None:
                     stats[int(layer_id)].add_index_build(*build_stats)
+                if _env_truthy("SELECTOR_PQ_JOINT_PREWARM_VPQ_SIDECARS", "0"):
+                    persistent_cache = getattr(module, "_pagedpq_joint_vpq_sidecar_cache", None)
+                    if not isinstance(persistent_cache, dict):
+                        persistent_cache = {}
+                        setattr(module, "_pagedpq_joint_vpq_sidecar_cache", persistent_cache)
+                    values_t = values_all[int(kv_head)].detach()
+                    context_len_i = int(values_t.shape[0])
+                    cache_key = joint_vpq_cache_key_for(int(kv_head), values_t, cached_index)
+                    if cache_key not in persistent_cache:
+                        sidecar_t0 = time.perf_counter()
+                        all_tokens_t = torch.arange(context_len_i, dtype=torch.long, device=values_t.device)
+                        vhat_all_t, vpq_valid_t, vpq_page_ids_t, actual_value_subbits_for_cost = vpq_values_for_tokens_gpu(
+                            index=cached_index,
+                            values=values_t,
+                            values_np=None,
+                            tokens=all_tokens_t,
+                            subbits=int(args.subbits),
+                            value_subvecs=int(args.value_subvecs),
+                            value_subbits=int(args.value_subbits),
+                            prefer_torch=True,
+                            value_bytes=int(value_bytes),
+                        )
+                        residual_t = values_t.float() - vhat_all_t.float()
+                        code_error_t, actual_value_subbits_for_cost = value_vpq_code_stat_risk_torch(
+                            index=cached_index,
+                            values=values_t,
+                            vhat_all=vhat_all_t,
+                            residual_all=residual_t,
+                            valid=vpq_valid_t,
+                            page_ids=vpq_page_ids_t,
+                            subbits=int(args.subbits),
+                            value_subvecs=int(args.value_subvecs),
+                            value_subbits=int(args.value_subbits),
+                            value_bytes=int(value_bytes),
+                        )
+                        cache_len_i = int(context_len_i)
+                        grow_pad_i = max(
+                            0,
+                            _env_int("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE_GROW_PAD", 256),
+                        )
+                        cache_capacity_i = int(cache_len_i + grow_pad_i)
+                        if cache_capacity_i > cache_len_i:
+                            vhat_buf_t = torch.empty(
+                                (cache_capacity_i, int(vhat_all_t.shape[1])),
+                                dtype=vhat_all_t.dtype,
+                                device=vhat_all_t.device,
+                            )
+                            residual_buf_t = torch.empty(
+                                (cache_capacity_i, int(residual_t.shape[1])),
+                                dtype=residual_t.dtype,
+                                device=residual_t.device,
+                            )
+                            code_error_buf_t = torch.empty(
+                                (cache_capacity_i,),
+                                dtype=code_error_t.dtype,
+                                device=code_error_t.device,
+                            )
+                            vhat_buf_t[:cache_len_i].copy_(vhat_all_t)
+                            residual_buf_t[:cache_len_i].copy_(residual_t)
+                            code_error_buf_t[:cache_len_i].copy_(code_error_t)
+                            vhat_all_t = vhat_buf_t
+                            residual_t = residual_buf_t
+                            code_error_t = code_error_buf_t
+                        if bool(getattr(args, "profile_native_ops", False)) and device.type == "cuda":
+                            torch.cuda.synchronize(device)
+                        stats[int(layer_id)].add_index_sidecar_timing(time.perf_counter() - sidecar_t0)
+                        persistent_cache[cache_key] = (
+                            int(cache_len_i),
+                            int(cache_capacity_i),
+                            vhat_all_t.detach(),
+                            residual_t.detach(),
+                            code_error_t.detach(),
+                            int(actual_value_subbits_for_cost),
+                        )
+        if (
+            str(args.selector_mode) in {"fullscan", "oracle"}
+            and str(args.selector_backend) == "cuda_ext"
+            and all(index is not None and index.pages for index in warmed_indexes)
+        ):
+            fast_decode_index_cache_key = (
+                "fullscan_decode",
+                str(online_confidence_rule),
+                int(dynamic_start),
+                int(sealed_end),
+                int(args.page_size),
+                int(args.subvecs),
+                int(args.subbits),
+                int(args.kmeans_iters),
+                int(args.seed),
+                int(key_bytes),
+                str(getattr(args, "index_build_backend", "numpy")),
+                str(args.selected_value_mode),
+                str(args.tail_mode),
+                int(args.value_subvecs),
+                int(args.value_subbits),
+                int(args.value_pq_group_pages),
+                int(value_bytes),
+                int(num_kv_heads),
+            )
+            fast_decode_index_cache = getattr(module, "_pagedpq_fast_decode_index_cache", None)
+            if not isinstance(fast_decode_index_cache, dict):
+                fast_decode_index_cache = {}
+                setattr(module, "_pagedpq_fast_decode_index_cache", fast_decode_index_cache)
+            fast_decode_index_cache.clear()
+            fast_decode_index_cache[fast_decode_index_cache_key] = tuple(
+                index for index in warmed_indexes if index is not None
+            )
 
     def make_forward(layer_id: int, module):
         original_forward = module.forward
@@ -2367,12 +2960,15 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                 return call_original_forward()
 
             stats[layer_id].add_approx_attention_call()
+            wall_profile_enabled = _env_truthy("SELECTOR_PQ_JOINT_WALL_PROFILE", "0")
+            patched_attention_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
             if bool(getattr(args, "profile_native_ops", False)):
                 _sync_if_cuda(device)
                 patched_attention_t0 = time.perf_counter()
             else:
                 patched_attention_t0 = 0.0
 
+            qkv_cache_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
             if bool(getattr(args, "profile_native_ops", False)):
                 _sync_if_cuda(device)
                 qkv_cache_t0 = time.perf_counter()
@@ -2398,6 +2994,8 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
             if bool(getattr(args, "profile_native_ops", False)):
                 _sync_if_cuda(device)
                 stats[layer_id].add_qkv_cache_timing(time.perf_counter() - qkv_cache_t0)
+            if wall_profile_enabled:
+                stats[layer_id].add_wall_qkv_cache_timing(time.perf_counter() - qkv_cache_wall_t0)
 
             keys_all = key_states[0].detach()
             values_all = value_states[0].detach()
@@ -2510,16 +3108,24 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                 and str(args.selected_value_mode) == "exact"
                 and not fast_tail_vpq_possible
             )
+            joint_fast_decode_index_possible = (
+                query_len == 1
+                and online_confidence_rule == "joint_kv_stability"
+                and str(args.selector_backend) in {"cuda_ext", "auto"}
+                and str(args.selector_mode) == "fullscan"
+                and str(getattr(args, "index_build_backend", "numpy")) == "torch_gpu"
+            )
             fast_decode_index_cache_key: tuple[object, ...] | None = None
             fast_decode_cached_indexes: tuple[GPUIndex, ...] | None = None
             if (
                 query_len == 1
-                and fast_native_decode_possible
+                and (fast_native_decode_possible or joint_fast_decode_index_possible)
                 and str(args.selector_backend) == "cuda_ext"
                 and str(args.selector_mode) == "fullscan"
             ):
                 fast_decode_index_cache_key = (
                     "fullscan_decode",
+                    str(online_confidence_rule),
                     int(dynamic_start),
                     int(sealed_end),
                     int(args.page_size),
@@ -2542,13 +3148,24 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                     cached_indexes = fast_decode_index_cache.get(fast_decode_index_cache_key)
                     if isinstance(cached_indexes, tuple) and len(cached_indexes) == int(num_kv_heads):
                         fast_decode_cached_indexes = cached_indexes
+            index_sidecar_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
             if bool(getattr(args, "profile_native_ops", False)):
                 _sync_if_cuda(device)
                 sidecar_t0 = time.perf_counter()
             else:
                 sidecar_t0 = 0.0
             if fast_decode_cached_indexes is not None:
-                index_cache = {int(kv_head): fast_decode_cached_indexes[int(kv_head)] for kv_head in range(num_kv_heads)}
+                index_cache = {}
+                for kv_head in range(num_kv_heads):
+                    cached_index = fast_decode_cached_indexes[int(kv_head)]
+                    if str(args.selector_mode) in {"fullscan", "oracle"}:
+                        cached_index.pending_start = int(sealed_end)
+                        cached_index.indexed_end = int(indexed_end)
+                    index_cache[int(kv_head)] = cached_index
+                if not strict_native_exact_decode:
+                    for kv_head in range(num_kv_heads):
+                        torch_k_cache[int(kv_head)] = keys_all[int(kv_head)].to(device)
+                        torch_v_cache[int(kv_head)] = values_all[int(kv_head)].to(device)
             else:
                 for kv_head in range(num_kv_heads):
                     if str(args.selector_mode) in {"fullscan", "oracle"}:
@@ -2680,6 +3297,8 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
             if bool(getattr(args, "profile_native_ops", False)):
                 _sync_if_cuda(device)
                 stats[layer_id].add_index_sidecar_timing(time.perf_counter() - sidecar_t0)
+            if wall_profile_enabled:
+                stats[layer_id].add_wall_index_sidecar_timing(time.perf_counter() - index_sidecar_wall_t0)
 
             def prefix_index_for(kv_head: int, query_context_len: int) -> GPUIndex:
                 full_index = index_cache[int(kv_head)]
@@ -8253,9 +8872,488 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                                 outputs[head] = weights_h @ values_h
                 return outputs
 
+            joint_gqa_ranked_t: torch.Tensor | None = None
+            joint_gqa_ranked_scores: torch.Tensor | None = None
+            joint_exact_scores_t: torch.Tensor | None = None
+            joint_gqa_selector_mb = 0.0
+            joint_vpq_runtime_cache: dict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = {}
+
+            def joint_vpq_sidecars_for(
+                *,
+                kv_head: int,
+                index: GPUIndex,
+                values_t: torch.Tensor,
+                context_len_i: int,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+                use_joint_vpq_cache = _env_truthy("SELECTOR_PQ_JOINT_VPQ_CACHE", "1")
+                use_persistent_vpq_cache = use_joint_vpq_cache and _env_truthy(
+                    "SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE",
+                    "0",
+                )
+                cache_key = joint_vpq_cache_key_for(int(kv_head), values_t, index)
+                persistent_cache = getattr(self, "_pagedpq_joint_vpq_sidecar_cache", None)
+                if use_persistent_vpq_cache and not isinstance(persistent_cache, dict):
+                    persistent_cache = {}
+                    setattr(self, "_pagedpq_joint_vpq_sidecar_cache", persistent_cache)
+                cached = (
+                    persistent_cache.get(cache_key)
+                    if use_persistent_vpq_cache and isinstance(persistent_cache, dict)
+                    else None
+                )
+                if cached is not None:
+                    if len(cached) == 6:
+                        (
+                            cached_len,
+                            cached_capacity,
+                            vhat_cached,
+                            residual_cached,
+                            code_error_cached,
+                            cached_subbits,
+                        ) = cached
+                        cached_capacity_i = int(cached_capacity)
+                    else:
+                        cached_len, vhat_cached, residual_cached, code_error_cached, cached_subbits = cached
+                        cached_capacity_i = int(vhat_cached.shape[0])
+                    cached_len_i = int(cached_len)
+                    if cached_len_i >= int(context_len_i):
+                        return (
+                            vhat_cached[:context_len_i],
+                            residual_cached[:context_len_i],
+                            code_error_cached[:context_len_i],
+                            int(cached_subbits),
+                        )
+                    if cached_len_i >= 0 and cached_len_i < int(context_len_i):
+                        context_len_target_i = int(context_len_i)
+                        if cached_capacity_i < context_len_target_i:
+                            grow_pad_i = max(
+                                0,
+                                _env_int("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE_GROW_PAD", 256),
+                            )
+                            new_capacity_i = max(
+                                context_len_target_i,
+                                cached_capacity_i + max(grow_pad_i, context_len_target_i - cached_capacity_i),
+                            )
+                            vhat_buf_t = torch.empty(
+                                (new_capacity_i, int(vhat_cached.shape[1])),
+                                dtype=vhat_cached.dtype,
+                                device=vhat_cached.device,
+                            )
+                            residual_buf_t = torch.empty(
+                                (new_capacity_i, int(residual_cached.shape[1])),
+                                dtype=residual_cached.dtype,
+                                device=residual_cached.device,
+                            )
+                            code_error_buf_t = torch.empty(
+                                (new_capacity_i,),
+                                dtype=code_error_cached.dtype,
+                                device=code_error_cached.device,
+                            )
+                            if cached_len_i > 0:
+                                vhat_buf_t[:cached_len_i].copy_(vhat_cached[:cached_len_i])
+                                residual_buf_t[:cached_len_i].copy_(residual_cached[:cached_len_i])
+                                code_error_buf_t[:cached_len_i].copy_(code_error_cached[:cached_len_i])
+                            vhat_cached = vhat_buf_t
+                            residual_cached = residual_buf_t
+                            code_error_cached = code_error_buf_t
+                            cached_capacity_i = int(new_capacity_i)
+                        extra_values = values_t[cached_len_i:context_len_target_i].float()
+                        if int(extra_values.numel()) > 0:
+                            vhat_cached[cached_len_i:context_len_target_i].copy_(
+                                extra_values.to(dtype=vhat_cached.dtype)
+                            )
+                            residual_cached[cached_len_i:context_len_target_i].zero_()
+                            code_error_cached[cached_len_i:context_len_target_i].zero_()
+                        persistent_cache[cache_key] = (
+                            int(context_len_target_i),
+                            int(cached_capacity_i),
+                            vhat_cached,
+                            residual_cached,
+                            code_error_cached,
+                            int(cached_subbits),
+                        )
+                        return (
+                            vhat_cached[:context_len_target_i],
+                            residual_cached[:context_len_target_i],
+                            code_error_cached[:context_len_target_i],
+                            int(cached_subbits),
+                        )
+
+                use_incremental_vpq_sidecar = _env_truthy(
+                    "SELECTOR_PQ_JOINT_INCREMENTAL_VPQ_SIDECAR",
+                    "0",
+                )
+                if (
+                    use_incremental_vpq_sidecar
+                    and use_persistent_vpq_cache
+                    and isinstance(persistent_cache, dict)
+                    and persistent_cache
+                ):
+                    best_old_key = None
+                    best_old_end = -1
+                    for old_key in persistent_cache:
+                        if not isinstance(old_key, tuple) or len(old_key) != len(cache_key):
+                            continue
+                        if old_key[:6] != cache_key[:6]:
+                            continue
+                        if int(old_key[7]) != int(cache_key[7]) or int(old_key[9]) != int(cache_key[9]):
+                            continue
+                        old_end_i = int(old_key[8])
+                        new_end_i = int(cache_key[8])
+                        if old_end_i < 0 or old_end_i > new_end_i:
+                            continue
+                        if old_end_i > best_old_end:
+                            best_old_end = old_end_i
+                            best_old_key = old_key
+                    if best_old_key is not None and best_old_key != cache_key:
+                        old_cached = persistent_cache.get(best_old_key)
+                        if old_cached is not None:
+                            if len(old_cached) == 6:
+                                (
+                                    cached_len,
+                                    cached_capacity,
+                                    vhat_cached,
+                                    residual_cached,
+                                    code_error_cached,
+                                    cached_subbits,
+                                ) = old_cached
+                                cached_capacity_i = int(cached_capacity)
+                            else:
+                                cached_len, vhat_cached, residual_cached, code_error_cached, cached_subbits = old_cached
+                                cached_capacity_i = int(vhat_cached.shape[0])
+                            cached_len_i = int(cached_len)
+                            context_len_target_i = int(context_len_i)
+                            if cached_capacity_i < context_len_target_i:
+                                grow_pad_i = max(
+                                    0,
+                                    _env_int("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE_GROW_PAD", 256),
+                                )
+                                new_capacity_i = max(
+                                    context_len_target_i,
+                                    cached_capacity_i + max(grow_pad_i, context_len_target_i - cached_capacity_i),
+                                )
+                                vhat_buf_t = torch.empty(
+                                    (new_capacity_i, int(vhat_cached.shape[1])),
+                                    dtype=vhat_cached.dtype,
+                                    device=vhat_cached.device,
+                                )
+                                residual_buf_t = torch.empty(
+                                    (new_capacity_i, int(residual_cached.shape[1])),
+                                    dtype=residual_cached.dtype,
+                                    device=residual_cached.device,
+                                )
+                                code_error_buf_t = torch.empty(
+                                    (new_capacity_i,),
+                                    dtype=code_error_cached.dtype,
+                                    device=code_error_cached.device,
+                                )
+                                copy_len_i = min(cached_len_i, int(vhat_cached.shape[0]))
+                                if copy_len_i > 0:
+                                    vhat_buf_t[:copy_len_i].copy_(vhat_cached[:copy_len_i])
+                                    residual_buf_t[:copy_len_i].copy_(residual_cached[:copy_len_i])
+                                    code_error_buf_t[:copy_len_i].copy_(code_error_cached[:copy_len_i])
+                                vhat_cached = vhat_buf_t
+                                residual_cached = residual_buf_t
+                                code_error_cached = code_error_buf_t
+                                cached_capacity_i = int(new_capacity_i)
+                            old_sealed_end_i = max(0, min(int(best_old_end), context_len_target_i))
+                            new_sealed_end_i = max(0, min(int(cache_key[8]), context_len_target_i))
+                            if new_sealed_end_i > old_sealed_end_i:
+                                update_tokens_t = torch.arange(
+                                    old_sealed_end_i,
+                                    new_sealed_end_i,
+                                    dtype=torch.long,
+                                    device=values_t.device,
+                                )
+                                vhat_update_t, valid_update_t, page_ids_update_t, actual_subbits_i = vpq_values_for_tokens_gpu(
+                                    index=index,
+                                    values=values_t,
+                                    values_np=None,
+                                    tokens=update_tokens_t,
+                                    subbits=int(args.subbits),
+                                    value_subvecs=int(args.value_subvecs),
+                                    value_subbits=int(args.value_subbits),
+                                    prefer_torch=True,
+                                    value_bytes=int(value_bytes),
+                                )
+                                residual_update_t = values_t.index_select(0, update_tokens_t).float() - vhat_update_t.float()
+                                code_error_update_t, actual_subbits_i = value_vpq_code_stat_risk_subset_torch(
+                                    index=index,
+                                    values=values_t,
+                                    tokens=update_tokens_t,
+                                    residual_subset=residual_update_t,
+                                    valid=valid_update_t,
+                                    page_ids=page_ids_update_t,
+                                    subbits=int(args.subbits),
+                                    value_subvecs=int(args.value_subvecs),
+                                    value_subbits=int(args.value_subbits),
+                                    value_bytes=int(value_bytes),
+                                )
+                                vhat_cached[old_sealed_end_i:new_sealed_end_i].copy_(
+                                    vhat_update_t.to(dtype=vhat_cached.dtype)
+                                )
+                                residual_cached[old_sealed_end_i:new_sealed_end_i].copy_(
+                                    residual_update_t.to(dtype=residual_cached.dtype)
+                                )
+                                code_error_cached[old_sealed_end_i:new_sealed_end_i].copy_(
+                                    code_error_update_t.to(dtype=code_error_cached.dtype)
+                                )
+                                cached_subbits = int(actual_subbits_i)
+                            if context_len_target_i > new_sealed_end_i:
+                                extra_values = values_t[new_sealed_end_i:context_len_target_i].float()
+                                if int(extra_values.numel()) > 0:
+                                    vhat_cached[new_sealed_end_i:context_len_target_i].copy_(
+                                        extra_values.to(dtype=vhat_cached.dtype)
+                                    )
+                                    residual_cached[new_sealed_end_i:context_len_target_i].zero_()
+                                    code_error_cached[new_sealed_end_i:context_len_target_i].zero_()
+                            persistent_cache[cache_key] = (
+                                int(context_len_target_i),
+                                int(cached_capacity_i),
+                                vhat_cached,
+                                residual_cached,
+                                code_error_cached,
+                                int(cached_subbits),
+                            )
+                            max_entries = max(
+                                1,
+                                int(
+                                    os.environ.get(
+                                        "SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE_MAX_ENTRIES",
+                                        str(max(1, num_kv_heads)),
+                                    )
+                                ),
+                            )
+                            while len(persistent_cache) > max_entries:
+                                oldest_key = next(iter(persistent_cache))
+                                if oldest_key == cache_key and len(persistent_cache) == 1:
+                                    break
+                                persistent_cache.pop(oldest_key, None)
+                            return (
+                                vhat_cached[:context_len_target_i],
+                                residual_cached[:context_len_target_i],
+                                code_error_cached[:context_len_target_i],
+                                int(cached_subbits),
+                            )
+
+                runtime_key = (*cache_key, int(context_len_i))
+                if use_joint_vpq_cache and runtime_key in joint_vpq_runtime_cache:
+                    return joint_vpq_runtime_cache[runtime_key]
+
+                all_tokens_t = torch.arange(int(context_len_i), dtype=torch.long, device=values_t.device)
+                vhat_all_t, vpq_valid_t, vpq_page_ids_t, actual_value_subbits_for_cost = vpq_values_for_tokens_gpu(
+                    index=index,
+                    values=values_t,
+                    values_np=None,
+                    tokens=all_tokens_t,
+                    subbits=int(args.subbits),
+                    value_subvecs=int(args.value_subvecs),
+                    value_subbits=int(args.value_subbits),
+                    prefer_torch=True,
+                    value_bytes=int(value_bytes),
+                )
+                residual_t = values_t.float() - vhat_all_t.float()
+                code_error_t, actual_value_subbits_for_cost = value_vpq_code_stat_risk_torch(
+                    index=index,
+                    values=values_t,
+                    vhat_all=vhat_all_t,
+                    residual_all=residual_t,
+                    valid=vpq_valid_t,
+                    page_ids=vpq_page_ids_t,
+                    subbits=int(args.subbits),
+                    value_subvecs=int(args.value_subvecs),
+                    value_subbits=int(args.value_subbits),
+                    value_bytes=int(value_bytes),
+                )
+                out = (
+                    vhat_all_t.detach(),
+                    residual_t.detach(),
+                    code_error_t.detach(),
+                    int(actual_value_subbits_for_cost),
+                )
+                if use_joint_vpq_cache:
+                    joint_vpq_runtime_cache[runtime_key] = out
+                    if use_persistent_vpq_cache and isinstance(persistent_cache, dict):
+                        cache_len_i = int(context_len_i)
+                        grow_pad_i = max(
+                            0,
+                            _env_int("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE_GROW_PAD", 256),
+                        )
+                        cache_capacity_i = int(cache_len_i + grow_pad_i)
+                        vhat_cached = out[0]
+                        residual_cached = out[1]
+                        code_error_cached = out[2]
+                        if cache_capacity_i > cache_len_i:
+                            vhat_buf_t = torch.empty(
+                                (cache_capacity_i, int(vhat_cached.shape[1])),
+                                dtype=vhat_cached.dtype,
+                                device=vhat_cached.device,
+                            )
+                            residual_buf_t = torch.empty(
+                                (cache_capacity_i, int(residual_cached.shape[1])),
+                                dtype=residual_cached.dtype,
+                                device=residual_cached.device,
+                            )
+                            code_error_buf_t = torch.empty(
+                                (cache_capacity_i,),
+                                dtype=code_error_cached.dtype,
+                                device=code_error_cached.device,
+                            )
+                            vhat_buf_t[:cache_len_i].copy_(vhat_cached)
+                            residual_buf_t[:cache_len_i].copy_(residual_cached)
+                            code_error_buf_t[:cache_len_i].copy_(code_error_cached)
+                            vhat_cached = vhat_buf_t
+                            residual_cached = residual_buf_t
+                            code_error_cached = code_error_buf_t
+                        persistent_cache[cache_key] = (
+                            int(cache_len_i),
+                            int(cache_capacity_i),
+                            vhat_cached.detach(),
+                            residual_cached.detach(),
+                            code_error_cached.detach(),
+                            int(out[3]),
+                        )
+                        max_entries = max(
+                            1,
+                            int(
+                                os.environ.get(
+                                    "SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE_MAX_ENTRIES",
+                                    str(max(1, num_kv_heads)),
+                                )
+                            ),
+                        )
+                        while len(persistent_cache) > max_entries:
+                            oldest_key = next(iter(persistent_cache))
+                            if oldest_key == cache_key and len(persistent_cache) == 1:
+                                break
+                            persistent_cache.pop(oldest_key, None)
+                return out
+
+            def joint_vpq_pack_and_fallback_for(
+                *,
+                index: GPUIndex,
+                values_t: torch.Tensor,
+                context_len_i: int,
+            ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, torch.Tensor] | None:
+                if int(args.value_subvecs) != 1:
+                    return None
+                pack = value_vpq_pack_torch(
+                    index=index,
+                    values=values_t,
+                    value_subvecs=int(args.value_subvecs),
+                    value_subbits=int(args.value_subbits),
+                    key_bytes=int(value_bytes),
+                    device=values_t.device,
+                )
+                if pack is None or not index.pages:
+                    return None
+                codebooks, codes, page_starts, page_size, actual_value_subbits = pack
+                if int(codebooks.shape[1]) != 1:
+                    return None
+                fallback_parts: list[torch.Tensor] = []
+                cursor_i = 0
+                for page in sorted(index.pages, key=lambda p: int(p.start)):
+                    start_i = max(0, min(int(page.start), int(context_len_i)))
+                    end_i = max(start_i, min(int(page.start) + int(page.size), int(context_len_i)))
+                    if start_i > cursor_i:
+                        fallback_parts.append(
+                            torch.arange(cursor_i, start_i, dtype=torch.long, device=values_t.device)
+                        )
+                    cursor_i = max(cursor_i, end_i)
+                if cursor_i < int(context_len_i):
+                    fallback_parts.append(
+                        torch.arange(cursor_i, int(context_len_i), dtype=torch.long, device=values_t.device)
+                    )
+                if fallback_parts:
+                    fallback_tokens = torch.cat(fallback_parts, dim=0).contiguous()
+                else:
+                    fallback_tokens = torch.empty((0,), dtype=torch.long, device=values_t.device)
+                return codebooks, codes, page_starts, int(page_size), int(actual_value_subbits), fallback_tokens
+
+            if (
+                online_confidence_rule == "joint_kv_stability"
+                and str(args.selector_mode) == "fullscan"
+                and str(args.selector_backend) in {"cuda_ext", "auto"}
+            ):
+                if _env_truthy("SELECTOR_PQ_JOINT_GQA_RANK", "0"):
+                    try:
+                        gqa_indexes = [prefix_index_for(int(kv_head), int(context_len)) for kv_head in range(num_kv_heads)]
+                        if gqa_indexes and all(index.pages for index in gqa_indexes):
+                            max_joint_rank_budget = max(
+                                int(sum(int(page.size) for page in index.pages))
+                                for index in gqa_indexes
+                            )
+                            if max_joint_rank_budget > 0:
+                                native = load_selector_paged_pq_ext()
+                                codebooks, codes, page_starts = gqa_native_fullscan_pack(gqa_indexes)
+                                if bool(getattr(args, "profile_native_ops", False)):
+                                    _sync_if_cuda(device)
+                                    selector_t0 = time.perf_counter()
+                                joint_gqa_ranked_t, joint_gqa_ranked_scores = native.gqa_fullscan_pq_topk(
+                                    q_all[:, 0, :].to(device).contiguous(),
+                                    codebooks,
+                                    codes,
+                                    page_starts,
+                                    int(group_size),
+                                    int(max_joint_rank_budget),
+                                )
+                                if bool(getattr(args, "profile_native_ops", False)):
+                                    _sync_if_cuda(device)
+                                    stats[layer_id].add_native_timing(
+                                        selector_seconds=float(time.perf_counter() - selector_t0)
+                                    )
+                                joint_gqa_selector_mb = selector_bytes_fullscan(
+                                    gqa_indexes[0],
+                                    key_bytes=int(key_bytes),
+                                    subbits=int(args.subbits),
+                                ) / MB
+                    except Exception:
+                        if str(args.selector_backend) == "cuda_ext":
+                            raise
+                        joint_gqa_ranked_t = None
+                        joint_gqa_ranked_scores = None
+                if _env_truthy("SELECTOR_PQ_JOINT_EXACT_GEMM", "0"):
+                    try:
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            exact_t0 = time.perf_counter()
+                        joint_exact_scores_t = torch.empty(
+                            (num_heads, int(context_len)),
+                            dtype=torch.float32,
+                            device=device,
+                        )
+                        score_scale = 1.0 / math.sqrt(float(self.head_dim))
+                        for kv_head in range(num_kv_heads):
+                            head_start = int(kv_head) * int(group_size)
+                            head_end = min(num_heads, head_start + int(group_size))
+                            if head_start >= head_end:
+                                continue
+                            queries_h = q_all[head_start:head_end, 0, :].to(device=device, dtype=torch.float32)
+                            keys_h = torch_k_cache[int(kv_head)][: int(context_len)].to(device=device, dtype=torch.float32)
+                            joint_exact_scores_t[head_start:head_end] = (queries_h @ keys_h.transpose(0, 1)) * score_scale
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            stats[layer_id].add_native_detail_timing(
+                                exact_logit_seconds=float(time.perf_counter() - exact_t0)
+                            )
+                    except Exception:
+                        if str(args.selector_backend) == "cuda_ext":
+                            raise
+                        joint_exact_scores_t = None
+
             def approximate_one_head(head: int, local_qpos: int, query_context_len: int) -> torch.Tensor:
                 budget = int(budget_by_head.get(int(head), int(args.budget)))
                 rank_budget = int(budget)
+                joint_kv_enabled = online_confidence_rule == "joint_kv_stability"
+                joint_k_budgets = (
+                    _parse_budget_schedule(str(getattr(args, "joint_kv_k_budgets", "")), name="joint_kv_k_budgets")
+                    if joint_kv_enabled
+                    else []
+                )
+                joint_v_budgets = (
+                    _parse_budget_schedule(str(getattr(args, "joint_kv_v_budgets", "")), name="joint_kv_v_budgets")
+                    if joint_kv_enabled
+                    else []
+                )
                 if online_confidence_rule == "geometric_tail_stability_switch":
                     raise RuntimeError("geometric_tail_stability_switch requires the native batched fast path")
                 if online_confidence_rule == "geometric_probe_tail_switch":
@@ -8264,6 +9362,8 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                         int(getattr(args, "geometric_min_budget", 0)),
                         int(getattr(args, "geometric_max_budget", 0)),
                     )
+                elif joint_kv_enabled:
+                    rank_budget = max(int(rank_budget), int(max(joint_k_budgets)))
                 elif online_confidence_rule in {"pq_proxy_mass_budget", "pq_ranked_mass_budget"}:
                     raise RuntimeError(f"{online_confidence_rule} requires the native batched fast path")
                 kv_head = int(head // group_size)
@@ -8279,7 +9379,19 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                     static_tokens(int(query_context_len) - 1, int(args.static_prefix), int(args.static_suffix)) + pending,
                     context_len=int(query_context_len),
                 )
-                if index.pages and str(args.selector_mode) == "oracle":
+                joint_tail_tokens_t: torch.Tensor | None = None
+                joint_tail_scores_t: torch.Tensor | None = None
+                if joint_kv_enabled and joint_gqa_ranked_t is not None and joint_gqa_ranked_scores is not None:
+                    ranked_t = joint_gqa_ranked_t[int(head)].to(device=device, dtype=torch.long)
+                    ranked_scores_t = joint_gqa_ranked_scores[int(head)].to(device=device, dtype=torch.float32)
+                    if joint_kv_enabled:
+                        ranked_cpu = np.empty((0,), dtype=np.int64)
+                        ranked_scores_cpu = np.empty((0,), dtype=np.float32)
+                    else:
+                        ranked_cpu = np.asarray(ranked_t.detach().cpu().tolist(), dtype=np.int64)
+                        ranked_scores_cpu = np.asarray(ranked_scores_t.detach().cpu().tolist(), dtype=np.float32)
+                    selector_mb = float(joint_gqa_selector_mb)
+                elif index.pages and str(args.selector_mode) == "oracle":
                     token_parts = [
                         torch.arange(
                             int(page.start),
@@ -8306,23 +9418,69 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                     ranked_cpu = ranked_t.detach().cpu().numpy().astype(np.int64, copy=False)
                     ranked_scores_cpu = ranked_scores_t.detach().cpu().numpy().astype(np.float32, copy=False)
                 elif index.pages:
-                    ranked_t, ranked_scores_t, _seconds, selector_mb, _nprobe = rank_paged_pq(
-                        query,
-                        index,
-                        mode=str(args.selector_mode),
-                        selector_backend=str(args.selector_backend),
-                        nprobes=nprobes,
-                        budget=rank_budget,
-                        key_bytes=key_bytes,
-                        subbits=int(args.subbits),
-                    )
-                    ranked_cpu = ranked_t.detach().cpu().numpy().astype(np.int64, copy=False)
-                    ranked_scores_cpu = ranked_scores_t.detach().cpu().numpy().astype(np.float32, copy=False)
+                    selector_t0 = 0.0
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        selector_t0 = time.perf_counter()
+                    if joint_kv_enabled and str(args.selector_mode) == "fullscan":
+                        selector_topk_budget = 1
+                        ranked_rows_t, ranked_score_rows_t, dense_score_rows_t, _seconds, selector_mb, _nprobe = (
+                            rank_paged_pq_batched_with_scores(
+                                query.reshape(1, -1).contiguous(),
+                                index,
+                                mode=str(args.selector_mode),
+                                selector_backend=str(args.selector_backend),
+                                nprobes=nprobes,
+                                budget=int(selector_topk_budget),
+                                key_bytes=key_bytes,
+                                subbits=int(args.subbits),
+                            )
+                        )
+                        ranked_t = ranked_rows_t[0].to(device=device, dtype=torch.long)
+                        ranked_scores_t = ranked_score_rows_t[0].to(device=device, dtype=torch.float32)
+                        token_parts = [
+                            torch.arange(
+                                int(page.start),
+                                min(int(page.start) + int(page.size), int(query_context_len)),
+                                dtype=torch.long,
+                                device=device,
+                            )
+                            for page in index.pages
+                            if int(page.start) < int(query_context_len) and int(page.size) > 0
+                        ]
+                        joint_tail_tokens_t = torch.cat(token_parts) if token_parts else torch.empty((0,), dtype=torch.long, device=device)
+                        joint_tail_scores_t = dense_score_rows_t[0].to(device=device, dtype=torch.float32)
+                    else:
+                        ranked_t, ranked_scores_t, _seconds, selector_mb, _nprobe = rank_paged_pq(
+                            query,
+                            index,
+                            mode=str(args.selector_mode),
+                            selector_backend=str(args.selector_backend),
+                            nprobes=nprobes,
+                            budget=rank_budget,
+                            key_bytes=key_bytes,
+                            subbits=int(args.subbits),
+                        )
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        stats[layer_id].add_native_timing(
+                            selector_seconds=float(time.perf_counter() - selector_t0)
+                        )
+                    if joint_kv_enabled:
+                        ranked_cpu = np.empty((0,), dtype=np.int64)
+                        ranked_scores_cpu = np.empty((0,), dtype=np.float32)
+                    else:
+                        ranked_cpu = ranked_t.detach().cpu().numpy().astype(np.int64, copy=False)
+                        ranked_scores_cpu = ranked_scores_t.detach().cpu().numpy().astype(np.float32, copy=False)
                 else:
+                    ranked_t = torch.empty((0,), dtype=torch.long, device=device)
+                    ranked_scores_t = torch.empty((0,), dtype=torch.float32, device=device)
                     ranked_cpu = np.empty((0,), dtype=np.int64)
                     ranked_scores_cpu = np.empty((0,), dtype=np.float32)
                     selector_mb = 0.0
                 rerank_key_mb = 0.0
+                if joint_kv_enabled and int(args.rerank_candidates) > 0:
+                    raise RuntimeError("joint_kv_stability does not support rerank_candidates; rerank changes CPU-reference semantics")
                 if int(args.rerank_candidates) > 0 and ranked_cpu.size:
                     rerank_count = min(int(args.rerank_candidates), int(ranked_cpu.size))
                     rerank_tokens = torch.as_tensor(ranked_cpu[:rerank_count], dtype=torch.long, device=device)
@@ -8333,6 +9491,331 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                     rest = np.asarray([int(tok) for tok in ranked_cpu.tolist() if int(tok) not in reranked_set], dtype=np.int64)
                     ranked_cpu = np.concatenate([reranked, rest]) if rest.size else reranked
                     rerank_key_mb = float(rerank_count * int(self.head_dim) * key_bytes) / MB
+                if joint_kv_enabled:
+                    if str(args.selector_mode) != "fullscan":
+                        raise RuntimeError("joint_kv_stability requires fullscan paged K-PQ ranking")
+                    if str(args.tail_score_calibration) not in {"none", "affine_selected"}:
+                        raise RuntimeError(f"unsupported tail_score_calibration for joint_kv_stability: {args.tail_score_calibration}")
+                    values_t = torch_v_cache[kv_head][: int(query_context_len)].float()
+                    vsidecar_t0 = 0.0
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        vsidecar_t0 = time.perf_counter()
+                    vhat_all_t, residual_t, code_error_t, actual_value_subbits_for_cost = joint_vpq_sidecars_for(
+                        kv_head=int(kv_head),
+                        index=index,
+                        values_t=values_t,
+                        context_len_i=int(query_context_len),
+                    )
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        stats[layer_id].add_native_detail_timing(
+                            output_seconds=float(time.perf_counter() - vsidecar_t0)
+                        )
+                    if joint_exact_scores_t is not None and int(query_context_len) == int(context_len):
+                        exact_scores_t = joint_exact_scores_t[int(head)]
+                    else:
+                        exact_t0 = 0.0
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            exact_t0 = time.perf_counter()
+                        exact_scores_t = (
+                            torch_k_cache[kv_head][: int(query_context_len)].float()
+                            @ query.float()
+                        ) / math.sqrt(float(self.head_dim))
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            stats[layer_id].add_native_detail_timing(
+                                exact_logit_seconds=float(time.perf_counter() - exact_t0)
+                            )
+
+                    context_len_i = int(query_context_len)
+                    sqrt_dim = float(math.sqrt(float(self.head_dim)))
+                    prob_dtype = torch.float32 if _env_truthy("SELECTOR_PQ_JOINT_FP32_PROBS", "1") else torch.float64
+                    ranked_select_t = ranked_t.to(device=device, dtype=torch.long)
+                    ranked_t_full = (
+                        joint_tail_tokens_t.to(device=device, dtype=torch.long)
+                        if joint_tail_tokens_t is not None
+                        else ranked_select_t
+                    )
+                    ranked_scores_t_full = (
+                        joint_tail_scores_t.to(device=device, dtype=torch.float32)
+                        if joint_tail_scores_t is not None
+                        else ranked_scores_t.to(device=device, dtype=torch.float32)
+                    )
+
+                    def mixed_probs_for_selected(selected_t_i: torch.Tensor) -> torch.Tensor:
+                        score_vec = torch.full(
+                            (context_len_i,),
+                            -float("inf"),
+                            dtype=prob_dtype,
+                            device=device,
+                        )
+                        selected_t_i = selected_t_i.to(device=device, dtype=torch.long)
+                        selected_mask = torch.zeros((context_len_i,), dtype=torch.bool, device=device)
+                        if int(selected_t_i.numel()) > 0:
+                            selected_t_i = selected_t_i[(selected_t_i >= 0) & (selected_t_i < context_len_i)]
+                            if int(selected_t_i.numel()) > 0:
+                                selected_mask.index_fill_(0, selected_t_i, True)
+                                score_vec.index_copy_(0, selected_t_i, exact_scores_t.index_select(0, selected_t_i).to(prob_dtype))
+
+                        scale = 1.0
+                        bias = 0.0
+                        valid_rank = (ranked_t_full >= 0) & (ranked_t_full < context_len_i)
+                        if (
+                            str(args.tail_score_calibration) == "affine_selected"
+                            and int(selected_t_i.numel()) > 0
+                            and int(torch.count_nonzero(valid_rank).item()) > 0
+                        ):
+                            valid_tokens = ranked_t_full[valid_rank]
+                            selected_rank = selected_mask.index_select(0, valid_tokens)
+                            if int(torch.count_nonzero(selected_rank).item()) >= 2:
+                                x = ranked_scores_t_full[valid_rank][selected_rank].to(prob_dtype) / sqrt_dim
+                                y = exact_scores_t.index_select(0, valid_tokens[selected_rank]).to(prob_dtype)
+                                x_mean = torch.mean(x)
+                                y_mean = torch.mean(y)
+                                x_var = torch.mean((x - x_mean) * (x - x_mean))
+                                if float(x_var.item()) <= 1e-20:
+                                    scale = 0.0
+                                    bias = float(y_mean.item())
+                                else:
+                                    cov = torch.mean((x - x_mean) * (y - y_mean))
+                                    fitted_scale = float((cov / x_var).item())
+                                    fitted_bias = float((y_mean - fitted_scale * x_mean).item())
+                                    if fitted_scale > 0.0 and math.isfinite(fitted_scale):
+                                        scale = fitted_scale
+                                        bias = fitted_bias
+
+                        if int(ranked_t_full.numel()) > 0 and int(torch.count_nonzero(valid_rank).item()) > 0:
+                            valid_tokens = ranked_t_full[valid_rank]
+                            tail_rank = ~selected_mask.index_select(0, valid_tokens)
+                            if int(torch.count_nonzero(tail_rank).item()) > 0:
+                                tail_tokens = valid_tokens[tail_rank]
+                                tail_scores = (
+                                    float(scale)
+                                    * (ranked_scores_t_full[valid_rank][tail_rank].to(prob_dtype) / sqrt_dim)
+                                    + float(bias)
+                                )
+                                score_vec.index_copy_(0, tail_tokens, tail_scores)
+
+                        missing = ~torch.isfinite(score_vec)
+                        if bool(torch.any(missing)):
+                            missing_idx = torch.nonzero(missing, as_tuple=False).reshape(-1)
+                            score_vec.index_copy_(0, missing_idx, exact_scores_t.index_select(0, missing_idx).to(prob_dtype))
+                        return torch.softmax(score_vec, dim=0)
+
+                    v_mb_by_idx: list[float] = []
+                    base_t = torch.as_tensor(base, dtype=torch.long, device=device)
+                    if int(base_t.numel()) > 0:
+                        base_t = base_t[(base_t >= 0) & (base_t < int(query_context_len))]
+                    base_rank_mask_t = torch.zeros((context_len_i,), dtype=torch.bool, device=device)
+                    if int(base_t.numel()) > 0:
+                        base_rank_mask_t.index_fill_(0, base_t, True)
+                    if joint_tail_tokens_t is not None and joint_tail_scores_t is not None:
+                        budget_source_tokens_t = ranked_t_full
+                        budget_source_scores_t = ranked_scores_t_full
+                    else:
+                        budget_source_tokens_t = ranked_select_t
+                        budget_source_scores_t = ranked_scores_t.to(device=device, dtype=torch.float32)
+                    valid_rank_for_budget_t = (budget_source_tokens_t >= 0) & (budget_source_tokens_t < context_len_i)
+                    ranked_valid_for_budget_t = budget_source_tokens_t[valid_rank_for_budget_t]
+                    ranked_valid_scores_for_budget_t = budget_source_scores_t[valid_rank_for_budget_t]
+                    if int(ranked_valid_for_budget_t.numel()) > 0:
+                        nonbase_mask_t = ~base_rank_mask_t.index_select(0, ranked_valid_for_budget_t)
+                        ranked_nonbase_t = ranked_valid_for_budget_t[nonbase_mask_t]
+                        ranked_nonbase_scores_t = ranked_valid_scores_for_budget_t[nonbase_mask_t]
+                    else:
+                        ranked_nonbase_t = ranked_valid_for_budget_t
+                        ranked_nonbase_scores_t = ranked_valid_scores_for_budget_t
+
+                    selected_by_take_torch: dict[int, torch.Tensor] = {}
+
+                    def selected_for_budget_torch(k_budget: int) -> torch.Tensor:
+                        take = max(0, min(int(k_budget), int(ranked_nonbase_t.numel())))
+                        cached_selected = selected_by_take_torch.get(int(take))
+                        if cached_selected is not None:
+                            return cached_selected
+                        if take > 0 and joint_tail_tokens_t is not None and joint_tail_scores_t is not None:
+                            order_t = torch.topk(
+                                ranked_nonbase_scores_t,
+                                k=int(take),
+                                largest=True,
+                                sorted=True,
+                            ).indices
+                            add_t = ranked_nonbase_t.index_select(0, order_t)
+                        else:
+                            add_t = ranked_nonbase_t[: int(take)]
+                        if int(base_t.numel()) == 0:
+                            selected_out = add_t
+                            selected_by_take_torch[int(take)] = selected_out
+                            return selected_out
+                        if int(add_t.numel()) == 0:
+                            selected_out = base_t
+                            selected_by_take_torch[int(take)] = selected_out
+                            return selected_out
+                        selected_out = torch.cat((base_t, add_t), dim=0)
+                        selected_by_take_torch[int(take)] = selected_out
+                        return selected_out
+
+                    actual_value_subbits = int(actual_value_subbits_for_cost)
+                    actual_value_subvecs = int(args.value_subvecs) if int(args.value_subvecs) > 0 else int(args.subvecs)
+                    code_bytes = 1 if int(actual_value_subbits) <= 8 else 2
+                    metadata_mb = (
+                        float(int(query_context_len) * actual_value_subvecs * code_bytes)
+                        + float(
+                            len(index.pages)
+                            * actual_value_subvecs
+                            * (1 << int(actual_value_subbits))
+                            * int(getattr(args, "value_code_stat_bytes", getattr(args, "selected_value_residual_norm_bytes", 2)))
+                        )
+                    ) / MB
+                    v_pq_codebook_mb = float(
+                        len(index.pages)
+                        * actual_value_subvecs
+                        * (1 << int(actual_value_subbits))
+                        * (int(self.head_dim) // max(1, actual_value_subvecs))
+                        * value_bytes
+                    ) / MB
+                    for v_budget in joint_v_budgets:
+                        exact_count = max(0, min(int(v_budget), int(query_context_len)))
+                        exact_v_mb = float(exact_count * int(self.head_dim) * value_bytes) / MB
+                        compressed_v_codes_mb = (
+                            float(max(0, int(query_context_len) - exact_count) * actual_value_subvecs * code_bytes) / MB
+                        )
+                        v_mb_by_idx.append(exact_v_mb + v_pq_codebook_mb + compressed_v_codes_mb + metadata_mb)
+
+                    max_exact_v_count = max(
+                        [max(0, min(int(v_budget), int(query_context_len))) for v_budget in joint_v_budgets],
+                        default=0,
+                    )
+                    k_cache: dict[int, tuple[torch.Tensor, float, torch.Tensor, torch.Tensor | None]] = {}
+                    k_cache_by_selected_len: dict[int, tuple[torch.Tensor, float, torch.Tensor, torch.Tensor | None]] = {}
+                    output_cache: dict[tuple[int, int], torch.Tensor] = {}
+
+                    def k_artifacts(ki_i: int) -> tuple[torch.Tensor, float, torch.Tensor, torch.Tensor | None]:
+                        cached = k_cache.get(int(ki_i))
+                        if cached is not None:
+                            return cached
+                        selected_t_i = selected_for_budget_torch(int(joint_k_budgets[int(ki_i)]))
+                        selected_len_i = int(selected_t_i.numel())
+                        cached_by_len = k_cache_by_selected_len.get(selected_len_i)
+                        if cached_by_len is not None:
+                            k_cache[int(ki_i)] = cached_by_len
+                            return cached_by_len
+                        probs_t = mixed_probs_for_selected(selected_t_i)
+                        exact_key_mb_i = float(int(selected_t_i.numel()) * int(self.head_dim) * key_bytes) / MB
+                        risk_t = (probs_t * probs_t) * code_error_t.to(dtype=prob_dtype)
+                        base_output_t = torch.sum(probs_t.to(torch.float32).reshape(-1, 1) * vhat_all_t.float(), dim=0)
+                        prefix_delta_t: torch.Tensor | None = None
+                        if int(max_exact_v_count) > 0:
+                            if int(max_exact_v_count) >= int(query_context_len):
+                                exact_order_t = torch.argsort(risk_t, descending=True, stable=True)
+                            else:
+                                exact_order_t = torch.topk(
+                                    risk_t,
+                                    k=int(max_exact_v_count),
+                                    largest=True,
+                                    sorted=True,
+                                ).indices
+                            exact_weighted_residuals_t = (
+                                probs_t.index_select(0, exact_order_t).to(torch.float32).reshape(-1, 1)
+                                * residual_t.index_select(0, exact_order_t).float()
+                            )
+                            prefix_delta_t = torch.cumsum(exact_weighted_residuals_t, dim=0)
+                        out = (selected_t_i, float(selector_mb) + exact_key_mb_i, base_output_t, prefix_delta_t)
+                        k_cache[int(ki_i)] = out
+                        k_cache_by_selected_len[selected_len_i] = out
+                        return out
+
+                    def output_for_budget(ki_i: int, vi_i: int) -> torch.Tensor:
+                        key = (int(ki_i), int(vi_i))
+                        cached = output_cache.get(key)
+                        if cached is not None:
+                            return cached
+                        _selected_t_i, _k_mb_i, base_output_t, prefix_delta_t = k_artifacts(int(ki_i))
+                        exact_count = max(0, min(int(joint_v_budgets[int(vi_i)]), int(query_context_len)))
+                        if exact_count > 0 and prefix_delta_t is not None:
+                            out = base_output_t + prefix_delta_t[int(exact_count) - 1]
+                        else:
+                            out = base_output_t
+                        output_cache[key] = out
+                        return out
+
+                    sim_t0 = 0.0
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        sim_t0 = time.perf_counter()
+                    ki = 0
+                    vi = 0
+                    _steps = 0
+                    _final_k_delta = 0.0
+                    _final_v_delta = 0.0
+                    threshold_value = float(getattr(args, "joint_kv_stability_threshold", 0.001))
+                    while _steps < (len(joint_k_budgets) + len(joint_v_budgets) + 4):
+                        cur_output_t = output_for_budget(int(ki), int(vi))
+                        k_can = int(ki) + 1 < len(joint_k_budgets)
+                        v_can = int(vi) + 1 < len(joint_v_budgets)
+                        _final_k_delta = (
+                            _rel_l2_torch(cur_output_t, output_for_budget(int(ki) + 1, int(vi))) if k_can else 0.0
+                        )
+                        _final_v_delta = (
+                            _rel_l2_torch(cur_output_t, output_for_budget(int(ki), int(vi) + 1)) if v_can else 0.0
+                        )
+                        extra_k_mb = (
+                            float(k_artifacts(int(ki) + 1)[1] - k_artifacts(int(ki))[1]) if k_can else float("inf")
+                        )
+                        extra_v_mb = (
+                            float(v_mb_by_idx[int(vi) + 1] - v_mb_by_idx[int(vi)]) if v_can else float("inf")
+                        )
+                        action = _choose_joint_kv_action(
+                            policy=policy_name,
+                            k_delta=float(_final_k_delta),
+                            v_delta=float(_final_v_delta),
+                            k_can=bool(k_can),
+                            v_can=bool(v_can),
+                            threshold=threshold_value,
+                            turn=int(_steps),
+                            extra_k_mb=float(extra_k_mb),
+                            extra_v_mb=float(extra_v_mb),
+                        )
+                        if action == "stop":
+                            break
+                        if action == "k":
+                            ki += 1
+                        elif action == "v":
+                            vi += 1
+                        else:
+                            raise AssertionError(action)
+                        _steps += 1
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        stats[layer_id].add_native_detail_timing(
+                            geometric_seconds=float(time.perf_counter() - sim_t0)
+                        )
+                    selected_t = k_artifacts(int(ki))[0]
+                    selected_cpu = selected_t.detach().cpu().numpy().astype(np.int64, copy=False)
+                    exact_v_count = max(0, min(int(joint_v_budgets[int(vi)]), int(query_context_len)))
+                    exact_key_mb = float(selected_cpu.size * int(self.head_dim) * key_bytes) / MB
+                    exact_v_mb = float(exact_v_count * int(self.head_dim) * value_bytes) / MB
+                    compressed_v_codes_mb = (
+                        float(max(0, int(query_context_len) - exact_v_count) * actual_value_subvecs * code_bytes) / MB
+                    )
+                    tail_mb_override = float(v_pq_codebook_mb + compressed_v_codes_mb + metadata_mb)
+                    dense_physical_key_mb = float(int(query_context_len) * int(self.head_dim) * key_bytes) / MB
+                    stats[layer_id].add(
+                        selected_cpu.tolist(),
+                        max(0, int(query_context_len) - int(exact_v_count)),
+                        float(selector_mb),
+                        int(self.head_dim),
+                        key_bytes,
+                        value_bytes,
+                        tail_mb_override=tail_mb_override,
+                        exact_kv_mb_override=float(exact_key_mb + exact_v_mb),
+                        confidence_mb_override=0.0,
+                        physical_gpu_exact_kv_mb_override=float(dense_physical_key_mb + exact_v_mb),
+                        physical_gpu_confidence_mb_override=0.0,
+                    )
+                    return output_for_budget(int(ki), int(vi)).to(dtype=hidden_states.dtype, device=device)
                 selected_cache: dict[bytes, tuple[torch.Tensor, np.ndarray, float, np.ndarray]] = {}
 
                 def selected_output_for(selected_arr: np.ndarray) -> tuple[torch.Tensor, np.ndarray, float, np.ndarray]:
@@ -8690,12 +10173,2305 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                 )
                 return approx_head.to(hidden_states.dtype)
 
+            def approximate_joint_kv_all_heads(
+                local_qpos: int,
+                query_context_len: int,
+            ) -> torch.Tensor | None:
+                if online_confidence_rule != "joint_kv_stability":
+                    return None
+                if not _env_truthy("SELECTOR_PQ_JOINT_GQA_BATCHED", "0"):
+                    return None
+                if str(args.selector_mode) != "fullscan" or str(args.selector_backend) not in {"cuda_ext", "auto"}:
+                    return None
+                if str(args.tail_score_calibration) not in {"none", "affine_selected"}:
+                    return None
+
+                policy_name = str(getattr(args, "joint_kv_policy", "k_first_alternating"))
+                policy_id = int(_joint_kv_policy_id(policy_name))
+                policy_uses_mb = policy_name == "sensitivity_greedy"
+                needs_logical_accounting = not bool(getattr(args, "disable_cost_stats", False))
+                needs_budget_mb_vectors = bool(policy_uses_mb or needs_logical_accounting)
+
+                k_budget_text = str(getattr(args, "joint_kv_k_budgets", ""))
+                v_budget_text = str(getattr(args, "joint_kv_v_budgets", ""))
+                budget_cache_key = (
+                    k_budget_text,
+                    v_budget_text,
+                    str(device.type),
+                    int(device.index) if device.index is not None else -1,
+                )
+                budget_cache = getattr(args, "_pagedpq_joint_budget_cache", None)
+                if not isinstance(budget_cache, dict):
+                    budget_cache = {}
+                    setattr(args, "_pagedpq_joint_budget_cache", budget_cache)
+                cached_budgets = budget_cache.get(budget_cache_key)
+                if cached_budgets is None:
+                    parsed_k_budgets = _parse_budget_schedule(k_budget_text, name="joint_kv_k_budgets")
+                    parsed_v_budgets = _parse_budget_schedule(v_budget_text, name="joint_kv_v_budgets")
+                    cached_budgets = (
+                        tuple(int(v) for v in parsed_k_budgets),
+                        tuple(int(v) for v in parsed_v_budgets),
+                        torch.as_tensor(parsed_v_budgets, dtype=torch.long, device=device),
+                    )
+                    budget_cache[budget_cache_key] = cached_budgets
+                joint_k_budgets = list(cached_budgets[0])
+                joint_v_budgets = list(cached_budgets[1])
+                joint_v_budgets_t = cached_budgets[2]
+                if not joint_k_budgets or not joint_v_budgets:
+                    return None
+
+                context_len_i = int(query_context_len)
+                if _env_truthy("SELECTOR_PQ_JOINT_COLLAPSE_DUP_V_ROWS", "0"):
+                    collapsed_v_budgets: list[int] = []
+                    seen_v_counts: set[int] = set()
+                    for v_budget in joint_v_budgets:
+                        exact_count_i = max(0, min(int(v_budget), context_len_i))
+                        if int(exact_count_i) in seen_v_counts:
+                            continue
+                        seen_v_counts.add(int(exact_count_i))
+                        collapsed_v_budgets.append(int(v_budget))
+                    if collapsed_v_budgets:
+                        joint_v_budgets = collapsed_v_budgets
+                        joint_v_budgets_t = torch.as_tensor(
+                            joint_v_budgets,
+                            dtype=torch.long,
+                            device=device,
+                        )
+                sqrt_dim = float(math.sqrt(float(self.head_dim)))
+                prob_dtype = torch.float32 if _env_truthy("SELECTOR_PQ_JOINT_FP32_PROBS", "1") else torch.float64
+                outputs_all = torch.empty((num_heads, int(self.head_dim)), dtype=torch.float32, device=device)
+                use_grouped_risk_prefix = (
+                    _env_truthy("SELECTOR_PQ_JOINT_GROUPED_RISK_PREFIX", "0")
+                    and _env_truthy("SELECTOR_PQ_JOINT_GRID_ARTIFACTS", "1")
+                    and _env_truthy("SELECTOR_PQ_JOINT_NATIVE_RISK_PREFIX", "0")
+                    and not _env_truthy("SELECTOR_PQ_JOINT_INCREMENTAL_V_GRID", "0")
+                    and not _env_truthy("SELECTOR_PQ_JOINT_ONDEMAND_V_PREFIX", "0")
+                )
+                grouped_risk_records: list[dict[str, object]] = []
+                grouped_geo_t0 = 0.0
+                joint_total_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                allhead_precompute = _env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_PRECOMPUTE", "1")
+                allhead_exact_precompute = _env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_EXACT_PRECOMPUTE", "0")
+                allhead_indexes: list[GPUIndex] | None = None
+                allhead_dense_pq_scores_t: torch.Tensor | None = None
+                allhead_selector_mb: float | None = None
+                allhead_exact_scores_t: torch.Tensor | None = None
+                joint_precompute_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                if bool(getattr(args, "profile_native_ops", False)):
+                    _sync_if_cuda(device)
+                    joint_precompute_t0 = time.perf_counter()
+                else:
+                    joint_precompute_t0 = 0.0
+                if allhead_precompute:
+                    candidate_indexes = [prefix_index_for(int(kv_head), context_len_i) for kv_head in range(num_kv_heads)]
+                    if candidate_indexes and all(index.pages for index in candidate_indexes):
+                        allhead_indexes = candidate_indexes
+                        try:
+                            native = load_selector_paged_pq_ext()
+                            codebooks, codes, page_starts = gqa_native_fullscan_pack(allhead_indexes)
+                            selector_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                            if bool(getattr(args, "profile_native_ops", False)):
+                                _sync_if_cuda(device)
+                                selector_t0 = time.perf_counter()
+                            _top_tokens_t, _top_scores_t, allhead_dense_pq_scores_t = native.gqa_fullscan_pq_topk_scores(
+                                q_all[:, int(local_qpos), :].to(device=device, dtype=torch.float32).contiguous(),
+                                codebooks,
+                                codes,
+                                page_starts,
+                                int(group_size),
+                                0,
+                            )
+                            allhead_dense_pq_scores_t = allhead_dense_pq_scores_t.to(device=device, dtype=torch.float32)
+                            allhead_selector_mb = (
+                                selector_bytes_fullscan(
+                                    allhead_indexes[0],
+                                    key_bytes=int(key_bytes),
+                                    subbits=int(args.subbits),
+                                )
+                                / MB
+                            )
+                            if bool(getattr(args, "profile_native_ops", False)):
+                                _sync_if_cuda(device)
+                                stats[layer_id].add_native_timing(
+                                    selector_seconds=float(time.perf_counter() - selector_t0)
+                                )
+                            if wall_profile_enabled:
+                                stats[layer_id].add_joint_wall_timing(
+                                    selector_seconds=float(time.perf_counter() - selector_wall_t0)
+                                )
+                        except Exception:
+                            if str(args.selector_backend) == "cuda_ext":
+                                raise
+                            allhead_dense_pq_scores_t = None
+                            allhead_selector_mb = None
+                    if allhead_indexes is not None and allhead_exact_precompute:
+                        try:
+                            exact_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                            if bool(getattr(args, "profile_native_ops", False)):
+                                _sync_if_cuda(device)
+                                exact_t0 = time.perf_counter()
+                            key_count_i = min(max(0, context_len_i), int(keys_all.shape[1]))
+                            if key_count_i > 0:
+                                keys_t_cache = dense_decode_key_t_float_cache(
+                                    layer_id=int(layer_id),
+                                    keys_all=keys_all,
+                                    key_count=key_count_i,
+                                )
+                                allhead_exact_scores_t = torch.empty(
+                                    (num_heads, key_count_i),
+                                    dtype=torch.float32,
+                                    device=device,
+                                )
+                                dim_i = int(self.head_dim)
+                                group_i = max(1, int(group_size))
+                                covered_heads = min(int(num_heads), int(num_kv_heads) * group_i)
+                                aligned_heads = (covered_heads // group_i) * group_i
+                                if aligned_heads > 0:
+                                    aligned_kv_heads = aligned_heads // group_i
+                                    queries_grouped_t = q_all[:aligned_heads, int(local_qpos), :].to(
+                                        device=device,
+                                        dtype=torch.float32,
+                                    ).reshape(aligned_kv_heads, group_i, dim_i)
+                                    if keys_t_cache is not None:
+                                        keys_grouped_t = keys_t_cache[:aligned_kv_heads, :, :key_count_i]
+                                    else:
+                                        keys_grouped_t = keys_all[:aligned_kv_heads, :key_count_i, :].to(
+                                            device=device,
+                                            dtype=torch.float32,
+                                        ).transpose(1, 2).contiguous()
+                                    allhead_exact_scores_t[:aligned_heads] = (
+                                        torch.bmm(queries_grouped_t, keys_grouped_t).reshape(aligned_heads, key_count_i)
+                                        / sqrt_dim
+                                    )
+                                for tail_kv_head in range(aligned_heads // group_i, int(num_kv_heads)):
+                                    head_start_tail = int(tail_kv_head) * group_i
+                                    head_end_tail = min(int(num_heads), head_start_tail + group_i)
+                                    if head_start_tail >= head_end_tail:
+                                        continue
+                                    queries_tail_t = q_all[head_start_tail:head_end_tail, int(local_qpos), :].to(
+                                        device=device,
+                                        dtype=torch.float32,
+                                    )
+                                    if keys_t_cache is not None:
+                                        keys_tail_t = keys_t_cache[int(tail_kv_head), :, :key_count_i]
+                                    else:
+                                        keys_tail_t = keys_all[int(tail_kv_head), :key_count_i, :].to(
+                                            device=device,
+                                            dtype=torch.float32,
+                                        ).transpose(0, 1).contiguous()
+                                    allhead_exact_scores_t[head_start_tail:head_end_tail] = (
+                                        torch.matmul(queries_tail_t, keys_tail_t) / sqrt_dim
+                                    )
+                            if bool(getattr(args, "profile_native_ops", False)):
+                                _sync_if_cuda(device)
+                                stats[layer_id].add_native_detail_timing(
+                                    exact_logit_seconds=float(time.perf_counter() - exact_t0)
+                                )
+                            if wall_profile_enabled:
+                                stats[layer_id].add_joint_wall_timing(
+                                    exact_logit_seconds=float(time.perf_counter() - exact_wall_t0)
+                                )
+                        except Exception:
+                            if str(args.selector_backend) == "cuda_ext":
+                                raise
+                            allhead_exact_scores_t = None
+                if bool(getattr(args, "profile_native_ops", False)):
+                    _sync_if_cuda(device)
+                    stats[layer_id].add_joint_detail_timing(
+                        precompute_seconds=float(time.perf_counter() - joint_precompute_t0)
+                    )
+                if wall_profile_enabled:
+                    stats[layer_id].add_joint_wall_timing(
+                        precompute_seconds=float(time.perf_counter() - joint_precompute_wall_t0)
+                    )
+
+                token_layout_cache: dict[
+                    tuple[object, ...],
+                    tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, bool],
+                ] = {}
+                allhead_rank_prefix_cache: dict[tuple[int, int, int, int], torch.Tensor] = {}
+
+                def grouped_vpq_residual_sidecars_for(
+                    gqa_indexes: list[GPUIndex],
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
+                    if not _env_truthy("SELECTOR_PQ_JOINT_GROUPED_VPQ_CACHE", "0"):
+                        return None
+                    if len(gqa_indexes) != int(num_kv_heads):
+                        return None
+                    group_key = (
+                        tuple(
+                            joint_vpq_cache_key_for(
+                                int(kv_head),
+                                torch_v_cache[int(kv_head)][:context_len_i],
+                                gqa_indexes[int(kv_head)],
+                            )
+                            for kv_head in range(int(num_kv_heads))
+                        ),
+                        int(num_kv_heads),
+                    )
+                    grouped_cache = getattr(self, "_pagedpq_joint_grouped_vpq_sidecar_cache", None)
+                    if not isinstance(grouped_cache, dict):
+                        grouped_cache = {}
+                        setattr(self, "_pagedpq_joint_grouped_vpq_sidecar_cache", grouped_cache)
+                    cached = grouped_cache.get(group_key)
+                    if cached is not None:
+                        if len(cached) != 6:
+                            grouped_cache.pop(group_key, None)
+                        else:
+                            (
+                                cached_len,
+                                cached_capacity,
+                                vhat_groups_t,
+                                residual_groups_t,
+                                code_error_groups_t,
+                                cached_subbits,
+                            ) = cached
+                            cached_capacity_i = int(cached_capacity)
+                            cached_len_i = int(cached_len)
+                            if cached_len_i >= int(context_len_i):
+                                return (
+                                    vhat_groups_t[:, :context_len_i, :],
+                                    residual_groups_t[:, :context_len_i, :],
+                                    code_error_groups_t[:, :context_len_i],
+                                    int(cached_subbits),
+                                )
+                            if cached_len_i >= 0 and cached_len_i < int(context_len_i):
+                                context_len_target_i = int(context_len_i)
+                                if cached_capacity_i < context_len_target_i:
+                                    grow_pad_i = max(
+                                        0,
+                                        _env_int("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE_GROW_PAD", 256),
+                                    )
+                                    new_capacity_i = max(
+                                        context_len_target_i,
+                                        cached_capacity_i + max(grow_pad_i, context_len_target_i - cached_capacity_i),
+                                    )
+                                    vhat_buf_t = torch.empty(
+                                        (
+                                            int(num_kv_heads),
+                                            int(new_capacity_i),
+                                            int(vhat_groups_t.shape[2]),
+                                        ),
+                                        dtype=vhat_groups_t.dtype,
+                                        device=vhat_groups_t.device,
+                                    )
+                                    residual_buf_t = torch.empty(
+                                        (
+                                            int(num_kv_heads),
+                                            int(new_capacity_i),
+                                            int(residual_groups_t.shape[2]),
+                                        ),
+                                        dtype=residual_groups_t.dtype,
+                                        device=residual_groups_t.device,
+                                    )
+                                    code_error_buf_t = torch.empty(
+                                        (int(num_kv_heads), int(new_capacity_i)),
+                                        dtype=code_error_groups_t.dtype,
+                                        device=code_error_groups_t.device,
+                                    )
+                                    if cached_len_i > 0:
+                                        vhat_buf_t[:, :cached_len_i, :].copy_(vhat_groups_t[:, :cached_len_i, :])
+                                        residual_buf_t[:, :cached_len_i, :].copy_(residual_groups_t[:, :cached_len_i, :])
+                                        code_error_buf_t[:, :cached_len_i].copy_(code_error_groups_t[:, :cached_len_i])
+                                    vhat_groups_t = vhat_buf_t
+                                    residual_groups_t = residual_buf_t
+                                    code_error_groups_t = code_error_buf_t
+                                    cached_capacity_i = int(new_capacity_i)
+                                for kv_head in range(int(num_kv_heads)):
+                                    extra_values = torch_v_cache[int(kv_head)][cached_len_i:context_len_target_i]
+                                    if int(extra_values.numel()) > 0:
+                                        vhat_groups_t[
+                                            int(kv_head),
+                                            cached_len_i:context_len_target_i,
+                                            :,
+                                        ].copy_(extra_values.to(dtype=vhat_groups_t.dtype))
+                                residual_groups_t[:, cached_len_i:context_len_target_i, :].zero_()
+                                code_error_groups_t[:, cached_len_i:context_len_target_i].zero_()
+                                grouped_cache[group_key] = (
+                                    int(context_len_target_i),
+                                    int(cached_capacity_i),
+                                    vhat_groups_t,
+                                    residual_groups_t,
+                                    code_error_groups_t,
+                                    int(cached_subbits),
+                                )
+                                return (
+                                    vhat_groups_t[:, :context_len_target_i, :],
+                                    residual_groups_t[:, :context_len_target_i, :],
+                                    code_error_groups_t[:, :context_len_target_i],
+                                    int(cached_subbits),
+                                )
+
+                    vhat_parts: list[torch.Tensor] = []
+                    residual_parts: list[torch.Tensor] = []
+                    code_error_parts: list[torch.Tensor] = []
+                    actual_subbits = int(args.value_subbits) if int(args.value_subbits) > 0 else int(args.subbits)
+                    for kv_head in range(int(num_kv_heads)):
+                        _vhat_t, residual_t, code_error_t, actual_subbits_i = joint_vpq_sidecars_for(
+                            kv_head=int(kv_head),
+                            index=gqa_indexes[int(kv_head)],
+                            values_t=torch_v_cache[int(kv_head)][:context_len_i],
+                            context_len_i=context_len_i,
+                        )
+                        vhat_parts.append(_vhat_t.to(dtype=torch.float32))
+                        residual_parts.append(residual_t.to(dtype=torch.float32))
+                        code_error_parts.append(code_error_t.to(dtype=torch.float32))
+                        actual_subbits = int(actual_subbits_i)
+                    vhat_groups_t = torch.stack(vhat_parts, dim=0).contiguous()
+                    residual_groups_t = torch.stack(residual_parts, dim=0).contiguous()
+                    code_error_groups_t = torch.stack(code_error_parts, dim=0).contiguous()
+                    grow_pad_i = max(
+                        0,
+                        _env_int("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE_GROW_PAD", 256),
+                    )
+                    cache_capacity_i = int(context_len_i + grow_pad_i)
+                    if cache_capacity_i > int(context_len_i):
+                        vhat_buf_t = torch.empty(
+                            (
+                                int(num_kv_heads),
+                                int(cache_capacity_i),
+                                int(vhat_groups_t.shape[2]),
+                            ),
+                            dtype=vhat_groups_t.dtype,
+                            device=vhat_groups_t.device,
+                        )
+                        residual_buf_t = torch.empty(
+                            (
+                                int(num_kv_heads),
+                                int(cache_capacity_i),
+                                int(residual_groups_t.shape[2]),
+                            ),
+                            dtype=residual_groups_t.dtype,
+                            device=residual_groups_t.device,
+                        )
+                        code_error_buf_t = torch.empty(
+                            (int(num_kv_heads), int(cache_capacity_i)),
+                            dtype=code_error_groups_t.dtype,
+                            device=code_error_groups_t.device,
+                        )
+                        vhat_buf_t[:, :context_len_i, :].copy_(vhat_groups_t)
+                        residual_buf_t[:, :context_len_i, :].copy_(residual_groups_t)
+                        code_error_buf_t[:, :context_len_i].copy_(code_error_groups_t)
+                        vhat_groups_t = vhat_buf_t
+                        residual_groups_t = residual_buf_t
+                        code_error_groups_t = code_error_buf_t
+                    if grouped_cache:
+                        grouped_cache.clear()
+                    grouped_cache[group_key] = (
+                        int(context_len_i),
+                        int(cache_capacity_i),
+                        vhat_groups_t,
+                        residual_groups_t,
+                        code_error_groups_t,
+                        int(actual_subbits),
+                    )
+                    return (
+                        vhat_groups_t[:, :context_len_i, :],
+                        residual_groups_t[:, :context_len_i, :],
+                        code_error_groups_t[:, :context_len_i],
+                        int(actual_subbits),
+                    )
+
+                def token_layout_for(index: GPUIndex) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, bool]:
+                    page_ranges = tuple(
+                        (
+                            int(page.start),
+                            min(int(page.start) + int(page.size), context_len_i),
+                        )
+                        for page in index.pages
+                        if int(page.start) < context_len_i and int(page.size) > 0
+                    )
+                    layout_key = (
+                        int(context_len_i),
+                        int(index.pending_start),
+                        int(index.indexed_end),
+                        int(args.static_prefix),
+                        int(args.static_suffix),
+                        page_ranges,
+                    )
+                    cached_layout = token_layout_cache.get(layout_key)
+                    if cached_layout is not None:
+                        return cached_layout
+
+                    prefix_end_i = min(max(0, int(args.static_prefix)), context_len_i)
+                    suffix_start_i = max(0, context_len_i - max(0, int(args.static_suffix)))
+                    sealed_end_i = max((end for _, end in page_ranges), default=prefix_end_i)
+                    pages_contiguous = True
+                    expected_start_i = prefix_end_i
+                    for start, end in page_ranges:
+                        if int(start) != int(expected_start_i) or int(end) < int(start):
+                            pages_contiguous = False
+                            break
+                        expected_start_i = int(end)
+                    pages_contiguous = pages_contiguous and int(expected_start_i) == int(sealed_end_i)
+                    indexed_end_i = max(0, min(int(index.indexed_end), context_len_i))
+                    pending_start_i = max(prefix_end_i, int(index.pending_start))
+                    pending_end_i = max(pending_start_i, min(indexed_end_i, suffix_start_i))
+
+                    if (
+                        _env_truthy("SELECTOR_PQ_JOINT_FAST_TOKEN_LAYOUT", "0")
+                        and pages_contiguous
+                        and int(index.pending_start) == int(sealed_end_i)
+                        and int(sealed_end_i) <= int(suffix_start_i)
+                        and int(indexed_end_i) >= int(suffix_start_i)
+                    ):
+                        # Canonical fullscan pages are contiguous. Avoid building
+                        # thousands of Python token IDs every decode step; preserve
+                        # unique_tokens(static_tokens + pending) order:
+                        # prefix, suffix, then pending.
+                        indexed_tokens_layout_t = (
+                            torch.arange(prefix_end_i, sealed_end_i, dtype=torch.long, device=device)
+                            if sealed_end_i > prefix_end_i
+                            else torch.empty((0,), dtype=torch.long, device=device)
+                        )
+                        base_parts_t = []
+                        if prefix_end_i > 0:
+                            base_parts_t.append(torch.arange(0, prefix_end_i, dtype=torch.long, device=device))
+                        if context_len_i > suffix_start_i:
+                            base_parts_t.append(torch.arange(suffix_start_i, context_len_i, dtype=torch.long, device=device))
+                        if pending_end_i > pending_start_i:
+                            base_parts_t.append(torch.arange(pending_start_i, pending_end_i, dtype=torch.long, device=device))
+                        base_layout_t = (
+                            torch.cat(base_parts_t)
+                            if base_parts_t
+                            else torch.empty((0,), dtype=torch.long, device=device)
+                        )
+                        out = (indexed_tokens_layout_t, base_layout_t, None, True)
+                        token_layout_cache[layout_key] = out
+                        return out
+
+                    token_parts = [
+                        torch.arange(start, end, dtype=torch.long, device=device)
+                        for start, end in page_ranges
+                        if end > start
+                    ]
+                    indexed_tokens_layout_t = (
+                        torch.cat(token_parts)
+                        if token_parts
+                        else torch.empty((0,), dtype=torch.long, device=device)
+                    )
+
+                    pending_layout = list(
+                        range(
+                            max(0, int(index.pending_start)),
+                            max(0, min(int(index.indexed_end), context_len_i)),
+                        )
+                    )
+                    base_layout = unique_tokens(
+                        static_tokens(context_len_i - 1, int(args.static_prefix), int(args.static_suffix))
+                        + pending_layout,
+                        context_len=context_len_i,
+                    )
+                    coverage_intervals: list[tuple[int, int]] = [
+                        (max(0, int(start)), min(context_len_i, int(end)))
+                        for start, end in page_ranges
+                        if int(end) > int(start)
+                    ]
+                    base_tokens_sorted = sorted(
+                        int(token)
+                        for token in base_layout
+                        if 0 <= int(token) < context_len_i
+                    )
+                    if base_tokens_sorted:
+                        run_start = base_tokens_sorted[0]
+                        prev = base_tokens_sorted[0]
+                        for token in base_tokens_sorted[1:]:
+                            if token == prev + 1:
+                                prev = token
+                                continue
+                            coverage_intervals.append((run_start, prev + 1))
+                            run_start = token
+                            prev = token
+                        coverage_intervals.append((run_start, prev + 1))
+                    coverage_end = 0
+                    layout_covers_context = context_len_i <= 0
+                    for start, end in sorted(coverage_intervals):
+                        if end <= coverage_end:
+                            continue
+                        if start > coverage_end:
+                            break
+                        coverage_end = max(coverage_end, end)
+                        if coverage_end >= context_len_i:
+                            layout_covers_context = True
+                            break
+                    base_layout_t = torch.as_tensor(base_layout, dtype=torch.long, device=device)
+                    if int(base_layout_t.numel()) > 0:
+                        base_layout_t = base_layout_t[(base_layout_t >= 0) & (base_layout_t < context_len_i)]
+
+                    indexed_end_without_suffix = context_len_i - max(0, int(args.static_suffix))
+                    nonbase_all = all(
+                        start >= min(max(0, int(args.static_prefix)), context_len_i)
+                        and end <= int(index.pending_start)
+                        and end <= indexed_end_without_suffix
+                        for start, end in page_ranges
+                    )
+                    if nonbase_all:
+                        nonbase_mask_layout_t = None
+                    else:
+                        base_rank_mask_t = torch.zeros((context_len_i,), dtype=torch.bool, device=device)
+                        if int(base_layout_t.numel()) > 0:
+                            base_rank_mask_t.index_fill_(0, base_layout_t, True)
+                        nonbase_mask_layout_t = ~base_rank_mask_t.index_select(0, indexed_tokens_layout_t)
+
+                    out = (indexed_tokens_layout_t, base_layout_t, nonbase_mask_layout_t, bool(layout_covers_context))
+                    token_layout_cache[layout_key] = out
+                    return out
+
+                grouped_vpq_vhat_groups_t: torch.Tensor | None = None
+                grouped_vpq_residual_groups_t: torch.Tensor | None = None
+                grouped_vpq_code_error_groups_t: torch.Tensor | None = None
+                grouped_vpq_actual_subbits: int | None = None
+                if use_grouped_risk_prefix:
+                    gqa_indexes_for_grouped = (
+                        allhead_indexes
+                        if allhead_indexes is not None
+                        else [prefix_index_for(int(kv_head), context_len_i) for kv_head in range(num_kv_heads)]
+                    )
+                    if gqa_indexes_for_grouped and all(index.pages for index in gqa_indexes_for_grouped):
+                        grouped_vpq_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            grouped_vpq_t0 = time.perf_counter()
+                        else:
+                            grouped_vpq_t0 = 0.0
+                        grouped_vpq = grouped_vpq_residual_sidecars_for(gqa_indexes_for_grouped)
+                        if grouped_vpq is not None:
+                            (
+                                grouped_vpq_vhat_groups_t,
+                                grouped_vpq_residual_groups_t,
+                                grouped_vpq_code_error_groups_t,
+                                grouped_vpq_actual_subbits,
+                            ) = grouped_vpq
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            stats[layer_id].add_native_detail_timing(
+                                output_seconds=float(time.perf_counter() - grouped_vpq_t0)
+                            )
+                        if wall_profile_enabled:
+                            stats[layer_id].add_joint_wall_timing(
+                                vpq_sidecar_seconds=float(time.perf_counter() - grouped_vpq_wall_t0)
+                            )
+
+                for kv_head_i in range(num_kv_heads):
+                    index = (
+                        allhead_indexes[int(kv_head_i)]
+                        if allhead_indexes is not None
+                        else prefix_index_for(int(kv_head_i), context_len_i)
+                    )
+                    if not index.pages:
+                        return None
+                    head_start_i = int(kv_head_i) * int(group_size)
+                    head_end_i = min(int(num_heads), head_start_i + int(group_size))
+                    if head_start_i >= head_end_i:
+                        continue
+                    group_heads_i = int(head_end_i - head_start_i)
+                    queries_h = q_all[head_start_i:head_end_i, int(local_qpos), :].to(
+                        device=device,
+                        dtype=torch.float32,
+                    )
+
+                    layout_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        layout_t0 = time.perf_counter()
+                    else:
+                        layout_t0 = 0.0
+                    indexed_tokens_t, base_t, nonbase_mask_t, layout_covers_context = token_layout_for(index)
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        stats[layer_id].add_joint_detail_timing(
+                            layout_seconds=float(time.perf_counter() - layout_t0)
+                        )
+                    if wall_profile_enabled:
+                        stats[layer_id].add_joint_wall_timing(
+                            layout_seconds=float(time.perf_counter() - layout_wall_t0)
+                        )
+                    if int(indexed_tokens_t.numel()) == 0:
+                        return None
+
+                    if allhead_dense_pq_scores_t is not None and allhead_selector_mb is not None:
+                        dense_score_rows_t = allhead_dense_pq_scores_t[head_start_i:head_end_i]
+                        selector_mb = float(allhead_selector_mb)
+                    else:
+                        selector_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            selector_t0 = time.perf_counter()
+                        else:
+                            selector_t0 = 0.0
+                        _ranked_rows_t, _ranked_score_rows_t, dense_score_rows_t, _seconds, selector_mb, _nprobe = (
+                            rank_paged_pq_batched_with_scores(
+                                queries_h.contiguous(),
+                                index,
+                                mode=str(args.selector_mode),
+                                selector_backend=str(args.selector_backend),
+                                nprobes=nprobes,
+                                budget=1,
+                                key_bytes=key_bytes,
+                                subbits=int(args.subbits),
+                            )
+                        )
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            stats[layer_id].add_native_timing(selector_seconds=float(time.perf_counter() - selector_t0))
+                        if wall_profile_enabled:
+                            stats[layer_id].add_joint_wall_timing(
+                                selector_seconds=float(time.perf_counter() - selector_wall_t0)
+                            )
+
+                    dense_score_rows_t = dense_score_rows_t.to(device=device, dtype=torch.float32)
+                    indexed_count = min(int(indexed_tokens_t.numel()), int(dense_score_rows_t.shape[1]))
+                    indexed_tokens_t = indexed_tokens_t[:indexed_count]
+                    dense_score_rows_t = dense_score_rows_t[:, :indexed_count]
+                    token_to_indexed_pos_t: torch.Tensor | None = None
+                    if _env_truthy("SELECTOR_PQ_JOINT_FAST_AFFINE_SELECTED", "0"):
+                        token_to_indexed_pos_t = torch.full(
+                            (context_len_i,),
+                            -1,
+                            dtype=torch.long,
+                            device=device,
+                        )
+                        token_to_indexed_pos_t.index_copy_(
+                            0,
+                            indexed_tokens_t,
+                            torch.arange(int(indexed_tokens_t.numel()), dtype=torch.long, device=device),
+                        )
+
+                    if nonbase_mask_t is None:
+                        ranked_nonbase_t = indexed_tokens_t
+                        ranked_nonbase_scores_t = dense_score_rows_t
+                    else:
+                        ranked_nonbase_t = indexed_tokens_t[nonbase_mask_t]
+                        ranked_nonbase_scores_t = dense_score_rows_t[:, nonbase_mask_t]
+
+                    if allhead_exact_scores_t is not None and int(allhead_exact_scores_t.shape[1]) >= context_len_i:
+                        exact_scores_h = allhead_exact_scores_t[head_start_i:head_end_i, :context_len_i]
+                    else:
+                        exact_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            exact_t0 = time.perf_counter()
+                        else:
+                            exact_t0 = 0.0
+                        keys_t = torch_k_cache[int(kv_head_i)][:context_len_i].to(device=device, dtype=torch.float32)
+                        exact_scores_h = (queries_h @ keys_t.transpose(0, 1)) / sqrt_dim
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            stats[layer_id].add_native_detail_timing(
+                                exact_logit_seconds=float(time.perf_counter() - exact_t0)
+                            )
+                        if wall_profile_enabled:
+                            stats[layer_id].add_joint_wall_timing(
+                                exact_logit_seconds=float(time.perf_counter() - exact_wall_t0)
+                            )
+                    exact_scores_prob_t = exact_scores_h.to(dtype=prob_dtype)
+                    pq_logits_t = dense_score_rows_t.to(dtype=prob_dtype) / sqrt_dim
+                    y_indexed_prob_t = (
+                        exact_scores_h.index_select(1, indexed_tokens_t).to(prob_dtype)
+                        if str(args.tail_score_calibration) == "affine_selected"
+                        else None
+                    )
+
+                    values_t = torch_v_cache[int(kv_head_i)][:context_len_i]
+                    vsidecar_t0 = 0.0
+                    vsidecar_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        vsidecar_t0 = time.perf_counter()
+                    if (
+                        grouped_vpq_vhat_groups_t is not None
+                        and grouped_vpq_residual_groups_t is not None
+                        and grouped_vpq_code_error_groups_t is not None
+                        and int(grouped_vpq_residual_groups_t.shape[0]) > int(kv_head_i)
+                    ):
+                        vhat_all_t = grouped_vpq_vhat_groups_t[int(kv_head_i)]
+                        residual_t = grouped_vpq_residual_groups_t[int(kv_head_i)]
+                        code_error_t = grouped_vpq_code_error_groups_t[int(kv_head_i)]
+                        if grouped_vpq_actual_subbits is not None:
+                            actual_value_subbits_for_cost = int(grouped_vpq_actual_subbits)
+                    else:
+                        vhat_all_t, residual_t, code_error_t, actual_value_subbits_for_cost = joint_vpq_sidecars_for(
+                            kv_head=int(kv_head_i),
+                            index=index,
+                            values_t=values_t,
+                            context_len_i=context_len_i,
+                        )
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        stats[layer_id].add_native_detail_timing(
+                            output_seconds=float(time.perf_counter() - vsidecar_t0)
+                        )
+                    if wall_profile_enabled:
+                        stats[layer_id].add_joint_wall_timing(
+                            vpq_sidecar_seconds=float(time.perf_counter() - vsidecar_wall_t0)
+                        )
+
+                    selected_batch_by_take: dict[int, torch.Tensor] = {}
+                    ranked_nonbase_count = int(ranked_nonbase_t.numel())
+                    active_joint_k_budgets = joint_k_budgets
+                    collapse_duplicate_k_rows = _env_truthy("SELECTOR_PQ_JOINT_COLLAPSE_DUP_K_ROWS", "0")
+                    if collapse_duplicate_k_rows:
+                        collapsed_k_budgets: list[int] = []
+                        seen_take_counts: set[int] = set()
+                        for k_budget in joint_k_budgets:
+                            take_i = max(0, min(int(k_budget), ranked_nonbase_count))
+                            if int(take_i) in seen_take_counts:
+                                continue
+                            seen_take_counts.add(int(take_i))
+                            collapsed_k_budgets.append(int(k_budget))
+                        if collapsed_k_budgets:
+                            active_joint_k_budgets = collapsed_k_budgets
+                    skip_full_budget_sort = _env_truthy("SELECTOR_PQ_JOINT_SKIP_FULL_BUDGET_SORT", "0")
+                    avoid_full_budget_rank = bool(
+                        skip_full_budget_sort
+                        or (
+                            collapse_duplicate_k_rows
+                            and _env_truthy("SELECTOR_PQ_JOINT_EXACT_FULL_BUDGET_GRID", "1")
+                        )
+                    )
+                    if avoid_full_budget_rank:
+                        # Diagnostic only: a K budget that reaches every non-base token is
+                        # semantically a dense exact-logit row, but skipping the full sort can
+                        # perturb tie handling. Keep canonical default on the conservative path.
+                        partial_rank_takes = [
+                            max(0, min(int(v), ranked_nonbase_count))
+                            for v in active_joint_k_budgets
+                            if max(0, min(int(v), ranked_nonbase_count)) < ranked_nonbase_count
+                        ]
+                        max_rank_take = max(partial_rank_takes, default=0)
+                    else:
+                        max_rank_take = max(
+                            0,
+                            min(max(int(v) for v in active_joint_k_budgets), ranked_nonbase_count),
+                        )
+                    ranked_prefix_tokens_t: torch.Tensor | None = None
+                    if (
+                        max_rank_take > 0
+                        and _env_truthy("SELECTOR_PQ_JOINT_REUSE_MAX_TOPK", "1")
+                    ):
+                        use_allhead_rank_prefix = (
+                            _env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_RANK_PREFIX", "0")
+                            and allhead_dense_pq_scores_t is not None
+                            and nonbase_mask_t is None
+                            and int(allhead_dense_pq_scores_t.shape[0]) >= int(num_heads)
+                            and int(allhead_dense_pq_scores_t.shape[1]) >= int(indexed_count)
+                        )
+                        if use_allhead_rank_prefix:
+                            rank_prefix_key = (
+                                int(allhead_dense_pq_scores_t.data_ptr()),
+                                int(indexed_tokens_t.data_ptr()),
+                                int(indexed_count),
+                                int(max_rank_take),
+                            )
+                            allhead_ranked_prefix_t = allhead_rank_prefix_cache.get(rank_prefix_key)
+                            if allhead_ranked_prefix_t is None:
+                                rank_prefix_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                                if bool(getattr(args, "profile_native_ops", False)):
+                                    _sync_if_cuda(device)
+                                    rank_prefix_t0 = time.perf_counter()
+                                else:
+                                    rank_prefix_t0 = 0.0
+                                if _env_truthy("SELECTOR_PQ_JOINT_NATIVE_RANK_PREFIX", "0"):
+                                    native = load_selector_paged_pq_ext()
+                                    allhead_ranked_prefix_t = native.joint_rank_prefix_tokens(
+                                        allhead_dense_pq_scores_t[:num_heads, :indexed_count]
+                                        .to(dtype=torch.float32)
+                                        .contiguous(),
+                                        indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                                        int(max_rank_take),
+                                    )
+                                else:
+                                    allhead_order_t = torch.topk(
+                                        allhead_dense_pq_scores_t[:num_heads, :indexed_count],
+                                        k=int(max_rank_take),
+                                        dim=1,
+                                        largest=True,
+                                        sorted=True,
+                                    ).indices
+                                    allhead_ranked_prefix_t = indexed_tokens_t.index_select(
+                                        0,
+                                        allhead_order_t.reshape(-1),
+                                    ).reshape(
+                                        int(num_heads),
+                                        int(max_rank_take),
+                                    )
+                                allhead_rank_prefix_cache[rank_prefix_key] = allhead_ranked_prefix_t
+                                if bool(getattr(args, "profile_native_ops", False)):
+                                    _sync_if_cuda(device)
+                                    stats[layer_id].add_joint_detail_timing(
+                                        rank_prefix_seconds=float(time.perf_counter() - rank_prefix_t0)
+                                    )
+                                if wall_profile_enabled:
+                                    stats[layer_id].add_joint_wall_timing(
+                                        rank_prefix_seconds=float(time.perf_counter() - rank_prefix_wall_t0)
+                                    )
+                            ranked_prefix_tokens_t = allhead_ranked_prefix_t[head_start_i:head_end_i]
+                        else:
+                            rank_prefix_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                            if bool(getattr(args, "profile_native_ops", False)):
+                                _sync_if_cuda(device)
+                                rank_prefix_t0 = time.perf_counter()
+                            else:
+                                rank_prefix_t0 = 0.0
+                            if _env_truthy("SELECTOR_PQ_JOINT_NATIVE_RANK_PREFIX", "0"):
+                                native = load_selector_paged_pq_ext()
+                                ranked_prefix_tokens_t = native.joint_rank_prefix_tokens(
+                                    ranked_nonbase_scores_t.to(dtype=torch.float32).contiguous(),
+                                    ranked_nonbase_t.to(dtype=torch.long).contiguous(),
+                                    int(max_rank_take),
+                                )
+                            else:
+                                max_order_t = torch.topk(
+                                    ranked_nonbase_scores_t,
+                                    k=int(max_rank_take),
+                                    dim=1,
+                                    largest=True,
+                                    sorted=True,
+                                ).indices
+                                ranked_prefix_tokens_t = ranked_nonbase_t.index_select(0, max_order_t.reshape(-1)).reshape(
+                                    group_heads_i,
+                                    int(max_rank_take),
+                                )
+                            if bool(getattr(args, "profile_native_ops", False)):
+                                _sync_if_cuda(device)
+                                stats[layer_id].add_joint_detail_timing(
+                                    rank_prefix_seconds=float(time.perf_counter() - rank_prefix_t0)
+                                )
+                            if wall_profile_enabled:
+                                stats[layer_id].add_joint_wall_timing(
+                                    rank_prefix_seconds=float(time.perf_counter() - rank_prefix_wall_t0)
+                                )
+
+                    def selected_for_budget_batch(k_budget: int) -> torch.Tensor:
+                        take = max(0, min(int(k_budget), int(ranked_nonbase_t.numel())))
+                        cached_selected = selected_batch_by_take.get(int(take))
+                        if cached_selected is not None:
+                            return cached_selected
+                        if avoid_full_budget_rank and take >= ranked_nonbase_count and ranked_nonbase_count > 0:
+                            add_t = ranked_nonbase_t.reshape(1, -1).expand(group_heads_i, -1)
+                        elif take > 0 and ranked_prefix_tokens_t is not None and take <= int(ranked_prefix_tokens_t.shape[1]):
+                            add_t = ranked_prefix_tokens_t[:, : int(take)]
+                        elif take > 0:
+                            order_t = torch.topk(
+                                ranked_nonbase_scores_t,
+                                k=int(take),
+                                dim=1,
+                                largest=True,
+                                sorted=True,
+                            ).indices
+                            add_t = ranked_nonbase_t.index_select(0, order_t.reshape(-1)).reshape(group_heads_i, take)
+                        else:
+                            add_t = torch.empty((group_heads_i, 0), dtype=torch.long, device=device)
+                        if int(base_t.numel()) == 0:
+                            selected_out = add_t
+                            selected_batch_by_take[int(take)] = selected_out
+                            return selected_out
+                        base_rows_t = base_t.reshape(1, -1).expand(group_heads_i, -1)
+                        if int(add_t.numel()) == 0:
+                            selected_out = base_rows_t
+                            selected_batch_by_take[int(take)] = selected_out
+                            return selected_out
+                        selected_out = torch.cat((base_rows_t, add_t), dim=1)
+                        selected_batch_by_take[int(take)] = selected_out
+                        return selected_out
+
+                    def mixed_scores_for_selected_batch(selected_t_i: torch.Tensor) -> torch.Tensor:
+                        selected_t_i = selected_t_i.to(device=device, dtype=torch.long)
+                        selected_t_i = torch.clamp(selected_t_i, min=0, max=max(0, context_len_i - 1))
+                        if (
+                            _env_truthy("SELECTOR_PQ_JOINT_NATIVE_SCORE_GRID", "0")
+                            and selected_t_i.ndim == 2
+                            and prob_dtype == torch.float32
+                        ):
+                            native = load_selector_paged_pq_ext()
+                            take_i = max(0, int(selected_t_i.shape[1]) - int(base_t.numel()))
+                            if (
+                                _env_truthy("SELECTOR_PQ_JOINT_EXACT_FULL_BUDGET_GRID", "1")
+                                and take_i >= ranked_nonbase_count
+                            ):
+                                return exact_scores_h.to(dtype=prob_dtype)
+                            if ranked_prefix_tokens_t is None:
+                                ranked_prefix_tokens_for_grid_t = torch.empty(
+                                    (group_heads_i, 0),
+                                    dtype=torch.long,
+                                    device=device,
+                                )
+                            else:
+                                ranked_prefix_tokens_for_grid_t = ranked_prefix_tokens_t
+                            y_for_grid_t = (
+                                y_indexed_prob_t.to(dtype=torch.float32)
+                                if y_indexed_prob_t is not None
+                                else torch.empty_like(pq_logits_t, dtype=torch.float32)
+                            )
+                            score_grid_one_t = native.joint_mixed_score_grid(
+                                exact_scores_h.to(dtype=torch.float32).contiguous(),
+                                pq_logits_t.to(dtype=torch.float32).contiguous(),
+                                y_for_grid_t.contiguous(),
+                                indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                                base_t.to(dtype=torch.long).contiguous(),
+                                ranked_prefix_tokens_for_grid_t.to(dtype=torch.long).contiguous(),
+                                torch.as_tensor([int(take_i)], dtype=torch.long, device=device),
+                                bool(str(args.tail_score_calibration) == "affine_selected"),
+                            )
+                            return score_grid_one_t[0].to(dtype=prob_dtype)
+                        score_vec = exact_scores_prob_t.clone()
+                        pq_logits = pq_logits_t
+                        if str(args.tail_score_calibration) == "affine_selected":
+                            if y_indexed_prob_t is None:
+                                raise RuntimeError("missing indexed exact logits for affine selected calibration")
+                            y_indexed_t = y_indexed_prob_t
+                            if _env_truthy("SELECTOR_PQ_JOINT_FAST_AFFINE_SELECTED", "0"):
+                                if token_to_indexed_pos_t is None:
+                                    raise RuntimeError("missing token_to_indexed_pos_t for fast affine selected calibration")
+                                selected_index_pos_t = token_to_indexed_pos_t.index_select(
+                                    0,
+                                    selected_t_i.reshape(-1),
+                                ).reshape_as(selected_t_i)
+                                selected_index_valid_t = selected_index_pos_t >= 0
+                                selected_index_pos_safe_t = torch.clamp(selected_index_pos_t, min=0)
+                                mask_f = selected_index_valid_t.to(dtype=prob_dtype)
+                                counts_t = torch.sum(mask_f, dim=1)
+                                safe_counts_t = torch.clamp_min(counts_t, 1.0)
+                                x_selected_t = torch.gather(pq_logits, 1, selected_index_pos_safe_t)
+                                y_selected_t = torch.gather(y_indexed_t, 1, selected_index_pos_safe_t)
+                                x_sum_t = torch.sum(x_selected_t * mask_f, dim=1)
+                                y_sum_t = torch.sum(y_selected_t * mask_f, dim=1)
+                                x_mean_t = x_sum_t / safe_counts_t
+                                y_mean_t = y_sum_t / safe_counts_t
+                                x_centered_selected_t = (x_selected_t - x_mean_t.reshape(-1, 1)) * mask_f
+                                y_centered_selected_t = (y_selected_t - y_mean_t.reshape(-1, 1)) * mask_f
+                                x_var_t = torch.sum(x_centered_selected_t * x_centered_selected_t, dim=1) / safe_counts_t
+                                cov_t = torch.sum(x_centered_selected_t * y_centered_selected_t, dim=1) / safe_counts_t
+                            else:
+                                selected_index_mask = torch.zeros(
+                                    (group_heads_i, context_len_i),
+                                    dtype=torch.bool,
+                                    device=device,
+                                )
+                                if int(selected_t_i.numel()) > 0:
+                                    selected_index_mask.scatter_(1, selected_t_i, True)
+                                selected_index_mask = selected_index_mask.index_select(1, indexed_tokens_t)
+                                mask_f = selected_index_mask.to(dtype=prob_dtype)
+                                counts_t = torch.sum(mask_f, dim=1)
+                                safe_counts_t = torch.clamp_min(counts_t, 1.0)
+                                x_mean_t = torch.sum(mask_f * pq_logits, dim=1) / safe_counts_t
+                                y_mean_t = torch.sum(mask_f * y_indexed_t, dim=1) / safe_counts_t
+                                x_centered_t = (pq_logits - x_mean_t.reshape(-1, 1)) * mask_f
+                                y_centered_t = (y_indexed_t - y_mean_t.reshape(-1, 1)) * mask_f
+                                x_var_t = torch.sum(x_centered_t * x_centered_t, dim=1) / safe_counts_t
+                                cov_t = torch.sum(x_centered_t * y_centered_t, dim=1) / safe_counts_t
+                            fitted_scale_t = cov_t / torch.clamp_min(x_var_t, 1e-20)
+                            fitted_bias_t = y_mean_t - fitted_scale_t * x_mean_t
+                            fit_valid_t = (
+                                (counts_t >= 2.0)
+                                & (x_var_t > 1e-20)
+                                & torch.isfinite(fitted_scale_t)
+                                & (fitted_scale_t > 0.0)
+                            )
+                            zero_var_t = (counts_t >= 2.0) & (x_var_t <= 1e-20)
+                            scale_t = torch.where(
+                                zero_var_t,
+                                torch.zeros_like(fitted_scale_t),
+                                torch.where(fit_valid_t, fitted_scale_t, torch.ones_like(fitted_scale_t)),
+                            )
+                            bias_t = torch.where(
+                                zero_var_t,
+                                y_mean_t,
+                                torch.where(fit_valid_t, fitted_bias_t, torch.zeros_like(fitted_bias_t)),
+                            )
+                            calibrated_scores_t = scale_t.reshape(-1, 1) * pq_logits + bias_t.reshape(-1, 1)
+                        else:
+                            calibrated_scores_t = pq_logits
+                        score_vec[:, indexed_tokens_t] = calibrated_scores_t
+                        if int(selected_t_i.numel()) > 0:
+                            exact_selected_scores_t = exact_scores_h.gather(1, selected_t_i).to(prob_dtype)
+                            score_vec.scatter_(1, selected_t_i, exact_selected_scores_t)
+                        return score_vec
+
+                    def mixed_probs_for_selected_batch(selected_t_i: torch.Tensor) -> torch.Tensor:
+                        return torch.softmax(mixed_scores_for_selected_batch(selected_t_i), dim=1)
+
+                    actual_value_subbits = int(actual_value_subbits_for_cost)
+                    actual_value_subvecs = int(args.value_subvecs) if int(args.value_subvecs) > 0 else int(args.subvecs)
+                    code_bytes = 1 if int(actual_value_subbits) <= 8 else 2
+                    metadata_mb = (
+                        float(context_len_i * actual_value_subvecs * code_bytes)
+                        + float(
+                            len(index.pages)
+                            * actual_value_subvecs
+                            * (1 << int(actual_value_subbits))
+                            * int(getattr(args, "value_code_stat_bytes", getattr(args, "selected_value_residual_norm_bytes", 2)))
+                        )
+                    ) / MB
+                    v_pq_codebook_mb = float(
+                        len(index.pages)
+                        * actual_value_subvecs
+                        * (1 << int(actual_value_subbits))
+                        * (int(self.head_dim) // max(1, actual_value_subvecs))
+                        * value_bytes
+                    ) / MB
+                    v_mb_by_idx: list[float] | None = None
+                    if needs_budget_mb_vectors:
+                        v_mb_by_idx = []
+                        for v_budget in joint_v_budgets:
+                            exact_count = max(0, min(int(v_budget), context_len_i))
+                            exact_v_mb = float(exact_count * int(self.head_dim) * value_bytes) / MB
+                            compressed_v_codes_mb = (
+                                float(max(0, context_len_i - exact_count) * actual_value_subvecs * code_bytes) / MB
+                            )
+                            v_mb_by_idx.append(exact_v_mb + v_pq_codebook_mb + compressed_v_codes_mb + metadata_mb)
+
+                    max_exact_v_count = max(
+                        [max(0, min(int(v_budget), context_len_i)) for v_budget in joint_v_budgets],
+                        default=0,
+                    )
+                    use_ondemand_v_prefix = _env_truthy("SELECTOR_PQ_JOINT_ONDEMAND_V_PREFIX", "0")
+                    k_core_by_idx: dict[
+                        int,
+                        tuple[torch.Tensor, float, torch.Tensor, torch.Tensor, torch.Tensor],
+                    ] = {}
+                    k_artifacts_by_idx: dict[int, tuple[torch.Tensor, float, torch.Tensor, torch.Tensor | None]] = {}
+                    k_artifacts_by_selected_len: dict[int, tuple[torch.Tensor, float, torch.Tensor, torch.Tensor | None]] = {}
+                    outputs_by_budget: dict[tuple[int, int], torch.Tensor] = {}
+                    v_outputs_by_count: dict[tuple[int, int], torch.Tensor] = {}
+                    native_v_grid_by_ki: dict[int, torch.Tensor] = {}
+
+                    def k_core_batch(
+                        ki_i: int,
+                    ) -> tuple[torch.Tensor, float, torch.Tensor, torch.Tensor, torch.Tensor]:
+                        cached = k_core_by_idx.get(int(ki_i))
+                        if cached is not None:
+                            return cached
+                        selected_t_i = selected_for_budget_batch(int(active_joint_k_budgets[int(ki_i)]))
+                        selected_len_i = int(selected_t_i.shape[1]) if selected_t_i.ndim == 2 else int(selected_t_i.numel())
+                        probs_t = mixed_probs_for_selected_batch(selected_t_i)
+                        exact_key_mb_i = float(selected_len_i * int(self.head_dim) * key_bytes) / MB
+                        risk_t = (probs_t * probs_t) * code_error_t.to(dtype=prob_dtype).reshape(1, -1)
+                        base_output_t = probs_t.to(torch.float32) @ vhat_all_t.float()
+                        out = (
+                            selected_t_i,
+                            float(selector_mb) + exact_key_mb_i,
+                            probs_t,
+                            base_output_t,
+                            risk_t,
+                        )
+                        k_core_by_idx[int(ki_i)] = out
+                        return out
+
+                    def k_artifacts_batch(ki_i: int) -> tuple[torch.Tensor, float, torch.Tensor, torch.Tensor | None]:
+                        cached = k_artifacts_by_idx.get(int(ki_i))
+                        if cached is not None:
+                            return cached
+                        if use_ondemand_v_prefix:
+                            selected_t_i, k_mb_i, _probs_t, base_output_t, _risk_t = k_core_batch(int(ki_i))
+                            out = (selected_t_i, float(k_mb_i), base_output_t, None)
+                            k_artifacts_by_idx[int(ki_i)] = out
+                            return out
+                        selected_t_i = selected_for_budget_batch(int(active_joint_k_budgets[int(ki_i)]))
+                        selected_len_i = int(selected_t_i.shape[1]) if selected_t_i.ndim == 2 else int(selected_t_i.numel())
+                        cached_by_len = k_artifacts_by_selected_len.get(selected_len_i)
+                        if cached_by_len is not None:
+                            k_artifacts_by_idx[int(ki_i)] = cached_by_len
+                            return cached_by_len
+                        probs_t = mixed_probs_for_selected_batch(selected_t_i)
+                        exact_key_mb_i = float(selected_len_i * int(self.head_dim) * key_bytes) / MB
+                        risk_t = (probs_t * probs_t) * code_error_t.to(dtype=prob_dtype).reshape(1, -1)
+                        base_output_t = probs_t.to(torch.float32) @ vhat_all_t.float()
+                        prefix_delta_t: torch.Tensor | None = None
+                        if int(max_exact_v_count) > 0:
+                            if int(max_exact_v_count) >= context_len_i:
+                                exact_order_t = torch.argsort(risk_t, dim=1, descending=True, stable=True)
+                            else:
+                                exact_order_t = torch.topk(
+                                    risk_t,
+                                    k=int(max_exact_v_count),
+                                    dim=1,
+                                    largest=True,
+                                    sorted=True,
+                                ).indices
+                            gathered_probs_t = torch.gather(probs_t.to(torch.float32), 1, exact_order_t)
+                            gathered_residual_t = residual_t.index_select(0, exact_order_t.reshape(-1)).reshape(
+                                group_heads_i,
+                                int(exact_order_t.shape[1]),
+                                int(self.head_dim),
+                            )
+                            prefix_delta_t = torch.cumsum(
+                                gathered_probs_t.reshape(group_heads_i, -1, 1) * gathered_residual_t.float(),
+                                dim=1,
+                            )
+                        out = (selected_t_i, float(selector_mb) + exact_key_mb_i, base_output_t, prefix_delta_t)
+                        k_artifacts_by_idx[int(ki_i)] = out
+                        k_artifacts_by_selected_len[selected_len_i] = out
+                        return out
+
+                    def output_for_budget_batch(ki_i: int, vi_i: int) -> torch.Tensor:
+                        key = (int(ki_i), int(vi_i))
+                        cached = outputs_by_budget.get(key)
+                        if cached is not None:
+                            return cached
+                        if use_ondemand_v_prefix:
+                            _selected_t_i, _k_mb_i, probs_t, base_output_t, risk_t = k_core_batch(int(ki_i))
+                            if _env_truthy("SELECTOR_PQ_JOINT_NATIVE_RISK_PREFIX", "0"):
+                                cached_grid_t = native_v_grid_by_ki.get(int(ki_i))
+                                if cached_grid_t is None:
+                                    native = load_selector_paged_pq_ext()
+                                    cached_grid_t = native.joint_vprefix_outputs_from_risk(
+                                        base_output_t.to(dtype=torch.float32).reshape(1, group_heads_i, int(self.head_dim)).contiguous(),
+                                        probs_t.to(dtype=torch.float32).reshape(1, group_heads_i, context_len_i).contiguous(),
+                                        residual_t.to(dtype=torch.float32).contiguous(),
+                                        code_error_t.to(dtype=torch.float32).contiguous(),
+                                        joint_v_budgets_t,
+                                    )[0]
+                                    native_v_grid_by_ki[int(ki_i)] = cached_grid_t
+                                out = cached_grid_t[int(vi_i)]
+                                outputs_by_budget[key] = out
+                                return out
+                            exact_count = max(0, min(int(joint_v_budgets[int(vi_i)]), context_len_i))
+                            count_key = (int(ki_i), int(exact_count))
+                            cached_count = v_outputs_by_count.get(count_key)
+                            if cached_count is not None:
+                                outputs_by_budget[key] = cached_count
+                                return cached_count
+                            if exact_count <= 0:
+                                out = base_output_t
+                            elif exact_count >= context_len_i:
+                                delta_t = probs_t.to(torch.float32) @ residual_t.float()
+                                out = base_output_t + delta_t
+                            else:
+                                exact_order_t = torch.topk(
+                                    risk_t,
+                                    k=int(exact_count),
+                                    dim=1,
+                                    largest=True,
+                                    sorted=True,
+                                ).indices
+                                gathered_probs_t = torch.gather(probs_t.to(torch.float32), 1, exact_order_t)
+                                gathered_residual_t = residual_t.index_select(0, exact_order_t.reshape(-1)).reshape(
+                                    group_heads_i,
+                                    int(exact_order_t.shape[1]),
+                                    int(self.head_dim),
+                                )
+                                delta_t = torch.sum(
+                                    gathered_probs_t.reshape(group_heads_i, -1, 1) * gathered_residual_t.float(),
+                                    dim=1,
+                                )
+                                out = base_output_t + delta_t
+                            v_outputs_by_count[count_key] = out
+                            outputs_by_budget[key] = out
+                            return out
+                        _selected_t_i, _k_mb_i, base_output_t, prefix_delta_t = k_artifacts_batch(int(ki_i))
+                        exact_count = max(0, min(int(joint_v_budgets[int(vi_i)]), context_len_i))
+                        if exact_count > 0 and prefix_delta_t is not None:
+                            out = base_output_t + prefix_delta_t[:, int(exact_count) - 1, :]
+                        else:
+                            out = base_output_t
+                        outputs_by_budget[key] = out
+                        return out
+
+                    sim_t0 = 0.0
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        sim_t0 = time.perf_counter()
+                    policy_name = str(getattr(args, "joint_kv_policy", "k_first_alternating"))
+                    threshold_value = float(getattr(args, "joint_kv_stability_threshold", 0.001))
+                    final_ki_by_head: list[int] = []
+                    final_vi_by_head: list[int] = []
+                    final_idx_t_for_output: torch.Tensor | None = None
+                    final_output_grid_t: torch.Tensor | None = None
+                    grid_outputs_t: torch.Tensor | None = None
+                    incremental_grid_outputs_by_v_idx: dict[int, torch.Tensor] | None = None
+                    grid_outputs_for_v_idx = None
+                    grid_selected_by_ki: list[torch.Tensor | None] | None = None
+                    grid_selected_counts_by_ki: list[int] | None = None
+                    grid_k_mb_by_idx: list[float] | None = None
+                    use_incremental_v_grid = _env_truthy("SELECTOR_PQ_JOINT_INCREMENTAL_V_GRID", "0")
+                    if _env_truthy("SELECTOR_PQ_JOINT_GRID_ARTIFACTS", "1"):
+                        joint_score_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            joint_score_t0 = time.perf_counter()
+                        else:
+                            joint_score_t0 = 0.0
+                        grid_selected_by_ki = []
+                        grid_selected_counts_by_ki = [] if needs_logical_accounting else None
+                        grid_score_rows: list[torch.Tensor] = []
+                        grid_k_mb_by_idx = [] if needs_budget_mb_vectors else None
+                        grid_take_counts: list[int] = []
+                        exact_full_budget_grid_flag = _env_truthy("SELECTOR_PQ_JOINT_EXACT_FULL_BUDGET_GRID", "1")
+                        native_score_grid_enabled = _env_truthy("SELECTOR_PQ_JOINT_NATIVE_SCORE_GRID", "0")
+                        fused_mixed_softmax_base_enabled = _env_truthy(
+                            "SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE",
+                            "0",
+                        )
+                        if fused_mixed_softmax_base_enabled and not native_score_grid_enabled:
+                            raise RuntimeError("SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE requires native score-grid mode")
+                        if fused_mixed_softmax_base_enabled and not _env_truthy(
+                            "SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE",
+                            "0",
+                        ):
+                            raise RuntimeError("SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE requires native softmax/base mode")
+                        for ki_i, k_budget in enumerate(active_joint_k_budgets):
+                            take_i = max(0, min(int(k_budget), int(ranked_nonbase_t.numel())))
+                            grid_take_counts.append(int(take_i))
+                            if exact_full_budget_grid_flag and int(take_i) >= ranked_nonbase_count:
+                                # This K-budget row is exact over the full context, so avoid
+                                # materializing the full selected-token tensor on the hot path.
+                                selected_t_i = None
+                                selected_len_i = int(base_t.numel()) + int(ranked_nonbase_count)
+                            elif native_score_grid_enabled:
+                                # The native score-grid path only needs the take count, base
+                                # tokens, and ranked prefix. Avoid allocating base+prefix
+                                # selected-token tensors for every K budget.
+                                selected_t_i = None
+                                selected_len_i = int(base_t.numel()) + int(take_i)
+                            else:
+                                selected_t_i = selected_for_budget_batch(int(k_budget))
+                                selected_len_i = int(selected_t_i.shape[1]) if selected_t_i.ndim == 2 else int(selected_t_i.numel())
+                            grid_selected_by_ki.append(selected_t_i)
+                            if grid_selected_counts_by_ki is not None:
+                                grid_selected_counts_by_ki.append(int(selected_len_i))
+                            if grid_k_mb_by_idx is not None:
+                                grid_k_mb_by_idx.append(
+                                    float(selector_mb) + float(selected_len_i * int(self.head_dim) * key_bytes) / MB
+                                )
+                            if not native_score_grid_enabled:
+                                if selected_t_i is None:
+                                    selected_t_i = selected_for_budget_batch(int(k_budget))
+                                    grid_selected_by_ki[-1] = selected_t_i
+                                grid_score_rows.append(mixed_scores_for_selected_batch(selected_t_i))
+                        probs_grid_t: torch.Tensor | None = None
+                        base_output_grid_t: torch.Tensor | None = None
+                        if native_score_grid_enabled:
+                            if prob_dtype != torch.float32:
+                                raise RuntimeError("native joint score-grid currently requires fp32 probabilities")
+                            if ranked_prefix_tokens_t is None:
+                                ranked_prefix_tokens_for_grid_t = torch.empty(
+                                    (group_heads_i, 0),
+                                    dtype=torch.long,
+                                    device=device,
+                                )
+                            else:
+                                ranked_prefix_tokens_for_grid_t = ranked_prefix_tokens_t
+                            native = load_selector_paged_pq_ext()
+                            k_take_counts_t = torch.as_tensor(
+                                grid_take_counts,
+                                dtype=torch.long,
+                                device=device,
+                            )
+                            y_for_grid_t = (
+                                y_indexed_prob_t.to(dtype=torch.float32)
+                                if y_indexed_prob_t is not None
+                                else torch.empty_like(pq_logits_t, dtype=torch.float32)
+                            )
+                            use_score_grid_no_fill = _env_truthy("SELECTOR_PQ_JOINT_SCORE_GRID_NO_EXACT_FILL", "0")
+                            if use_score_grid_no_fill:
+                                if not bool(layout_covers_context):
+                                    raise RuntimeError(
+                                        "SELECTOR_PQ_JOINT_SCORE_GRID_NO_EXACT_FILL requires indexed tokens plus base "
+                                        "tokens to cover the full context"
+                                    )
+                            if fused_mixed_softmax_base_enabled:
+                                if use_score_grid_no_fill:
+                                    raise RuntimeError(
+                                        "SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE does not support no-fill diagnostic mode"
+                                    )
+                                use_rankpos_score_grid = _env_truthy("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID", "0")
+                                fused_score_fn_name = (
+                                    "joint_mixed_softmax_base_outputs_rankpos"
+                                    if use_rankpos_score_grid
+                                    else "joint_mixed_softmax_base_outputs"
+                                )
+                                if not hasattr(native, fused_score_fn_name):
+                                    raise RuntimeError(
+                                        f"SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE requires updated CUDA extension: {fused_score_fn_name}"
+                                    )
+                                probs_grid_t, base_output_grid_t = getattr(native, fused_score_fn_name)(
+                                    exact_scores_h.to(dtype=torch.float32).contiguous(),
+                                    pq_logits_t.to(dtype=torch.float32).contiguous(),
+                                    y_for_grid_t.contiguous(),
+                                    indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                                    base_t.to(dtype=torch.long).contiguous(),
+                                    ranked_prefix_tokens_for_grid_t.to(dtype=torch.long).contiguous(),
+                                    k_take_counts_t,
+                                    vhat_all_t.to(dtype=torch.float32).contiguous(),
+                                    bool(str(args.tail_score_calibration) == "affine_selected"),
+                                )
+                                score_grid_t = None
+                            else:
+                                use_rankpos_score_grid = _env_truthy("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID", "0")
+                                if use_rankpos_score_grid and use_score_grid_no_fill:
+                                    raise RuntimeError(
+                                        "SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID does not support no-fill diagnostic mode"
+                                    )
+                                if use_rankpos_score_grid:
+                                    if not hasattr(native, "joint_mixed_score_grid_rankpos"):
+                                        raise RuntimeError(
+                                            "SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID requires updated CUDA extension"
+                                        )
+                                    score_grid_fn = native.joint_mixed_score_grid_rankpos
+                                else:
+                                    score_grid_fn = (
+                                        getattr(native, "joint_mixed_score_grid_no_exact_fill")
+                                        if use_score_grid_no_fill
+                                        and hasattr(native, "joint_mixed_score_grid_no_exact_fill")
+                                        else native.joint_mixed_score_grid
+                                    )
+                                score_grid_t = score_grid_fn(
+                                    exact_scores_h.to(dtype=torch.float32).contiguous(),
+                                    pq_logits_t.to(dtype=torch.float32).contiguous(),
+                                    y_for_grid_t.contiguous(),
+                                    indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                                    base_t.to(dtype=torch.long).contiguous(),
+                                    ranked_prefix_tokens_for_grid_t.to(dtype=torch.long).contiguous(),
+                                    k_take_counts_t,
+                                    bool(str(args.tail_score_calibration) == "affine_selected"),
+                                )
+                        else:
+                            score_grid_t = torch.stack(grid_score_rows, dim=0)
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            stats[layer_id].add_joint_detail_timing(
+                                score_grid_seconds=float(time.perf_counter() - joint_score_t0)
+                            )
+                            joint_prob_t0 = time.perf_counter()
+                        else:
+                            joint_prob_t0 = 0.0
+                        if wall_profile_enabled:
+                            stats[layer_id].add_joint_wall_timing(
+                                score_grid_seconds=float(time.perf_counter() - joint_score_wall_t0)
+                            )
+                        joint_prob_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                        k_count_i = len(active_joint_k_budgets)
+                        if probs_grid_t is None and _env_truthy("SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE", "0"):
+                            native = load_selector_paged_pq_ext()
+                            if not hasattr(native, "joint_softmax_base_outputs"):
+                                raise RuntimeError(
+                                    "SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE requires updated CUDA extension"
+                                )
+                            if score_grid_t is None:
+                                raise RuntimeError("missing score grid for native softmax/base")
+                            probs_grid_t, base_output_grid_t = native.joint_softmax_base_outputs(
+                                score_grid_t.to(dtype=torch.float32).contiguous(),
+                                vhat_all_t.to(dtype=torch.float32).contiguous(),
+                            )
+                        elif probs_grid_t is None:
+                            if score_grid_t is None:
+                                raise RuntimeError("missing score grid for Torch softmax/base")
+                            probs_grid_t = torch.softmax(score_grid_t, dim=2)
+                        if base_output_grid_t is None and _env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE", "0"):
+                            native = load_selector_paged_pq_ext()
+                            if not hasattr(native, "joint_vpq_base_outputs_from_probs"):
+                                raise RuntimeError("SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE requires updated CUDA extension")
+                            vpq_pack = joint_vpq_pack_and_fallback_for(
+                                index=index,
+                                values_t=values_t,
+                                context_len_i=context_len_i,
+                            )
+                            if vpq_pack is None:
+                                raise RuntimeError(
+                                    "SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE requires VALUE_SUBVECS=1 V-PQ pack"
+                                )
+                            value_codebooks_t, value_codes_t, value_page_starts_t, _value_page_size_i, _value_subbits_i, fallback_tokens_t = vpq_pack
+                            base_output_grid_t = native.joint_vpq_base_outputs_from_probs(
+                                probs_grid_t.to(torch.float32).contiguous(),
+                                values_t.contiguous(),
+                                value_codebooks_t.to(dtype=torch.float32).contiguous(),
+                                value_codes_t.contiguous(),
+                                value_page_starts_t.to(dtype=torch.long).contiguous(),
+                                fallback_tokens_t.to(dtype=torch.long).contiguous(),
+                            )
+                        if base_output_grid_t is None:
+                            base_output_grid_t = (
+                                probs_grid_t.to(torch.float32).reshape(k_count_i * group_heads_i, context_len_i)
+                                @ vhat_all_t.float()
+                            ).reshape(k_count_i, group_heads_i, int(self.head_dim))
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            stats[layer_id].add_joint_detail_timing(
+                                prob_base_seconds=float(time.perf_counter() - joint_prob_t0)
+                            )
+                            joint_risk_t0 = time.perf_counter()
+                        else:
+                            joint_risk_t0 = 0.0
+                        if wall_profile_enabled:
+                            stats[layer_id].add_joint_wall_timing(
+                                prob_base_seconds=float(time.perf_counter() - joint_prob_wall_t0)
+                            )
+                        if use_grouped_risk_prefix:
+                            if grouped_geo_t0 == 0.0 and bool(getattr(args, "profile_native_ops", False)):
+                                grouped_geo_t0 = sim_t0
+                            grouped_risk_records.append(
+                                {
+                                    "head_start": int(head_start_i),
+                                    "head_end": int(head_end_i),
+                                    "group_heads": int(group_heads_i),
+                                    "context_len": int(context_len_i),
+                                    "selector_mb": float(selector_mb),
+                                    "v_pq_codebook_mb": float(v_pq_codebook_mb),
+                                    "actual_value_subvecs": int(actual_value_subvecs),
+                                    "grid_selected_by_ki": grid_selected_by_ki,
+                                    "grid_selected_counts_by_ki": grid_selected_counts_by_ki,
+                                    "grid_k_mb_by_idx": grid_k_mb_by_idx,
+                                    "v_mb_by_idx": v_mb_by_idx,
+                                    "base_output_grid": base_output_grid_t.to(dtype=torch.float32).contiguous(),
+                                    "probs_grid": probs_grid_t.to(dtype=torch.float32).contiguous(),
+                                    "residual": residual_t.to(dtype=torch.float32).contiguous(),
+                                    "code_error": code_error_t.to(dtype=torch.float32).contiguous(),
+                                }
+                            )
+                            continue
+                        prefix_delta_grid_t: torch.Tensor | None = None
+                        prefix_delta_by_count: dict[int, torch.Tensor] | None = None
+                        joint_risk_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                        if use_incremental_v_grid:
+                            incremental_grid_outputs_by_v_idx = {}
+                            risk_grid_incremental_t = (
+                                (probs_grid_t * probs_grid_t) * code_error_t.to(dtype=prob_dtype).reshape(1, 1, -1)
+                                if int(max_exact_v_count) > 0
+                                else None
+                            )
+
+                            def grid_outputs_for_v_idx_fn(vi_i: int) -> torch.Tensor:
+                                cached_v = incremental_grid_outputs_by_v_idx.get(int(vi_i))
+                                if cached_v is not None:
+                                    return cached_v
+                                exact_count = max(
+                                    0,
+                                    min(
+                                        int(joint_v_budgets[int(vi_i)]),
+                                        context_len_i,
+                                        int(max_exact_v_count),
+                                    ),
+                                )
+                                if exact_count <= 0:
+                                    out_v = base_output_grid_t
+                                elif exact_count >= context_len_i:
+                                    delta_t = (
+                                        probs_grid_t.to(torch.float32).reshape(k_count_i * group_heads_i, context_len_i)
+                                        @ residual_t.float()
+                                    ).reshape(k_count_i, group_heads_i, int(self.head_dim))
+                                    out_v = base_output_grid_t + delta_t
+                                else:
+                                    if risk_grid_incremental_t is None:
+                                        raise RuntimeError("missing residual-risk grid for incremental V-grid")
+                                    exact_order_local_t = torch.topk(
+                                        risk_grid_incremental_t,
+                                        k=int(exact_count),
+                                        dim=2,
+                                        largest=True,
+                                        sorted=True,
+                                    ).indices
+                                    gathered_probs_local_t = torch.gather(
+                                        probs_grid_t.to(torch.float32),
+                                        2,
+                                        exact_order_local_t,
+                                    )
+                                    gathered_residual_local_t = residual_t.index_select(
+                                        0,
+                                        exact_order_local_t.reshape(-1),
+                                    ).reshape(
+                                        k_count_i,
+                                        group_heads_i,
+                                        int(exact_order_local_t.shape[2]),
+                                        int(self.head_dim),
+                                    )
+                                    delta_t = torch.sum(
+                                        gathered_probs_local_t.reshape(k_count_i, group_heads_i, -1, 1)
+                                        * gathered_residual_local_t.float(),
+                                        dim=2,
+                                    )
+                                    out_v = base_output_grid_t + delta_t
+                                incremental_grid_outputs_by_v_idx[int(vi_i)] = out_v
+                                return out_v
+
+                            grid_outputs_for_v_idx = grid_outputs_for_v_idx_fn
+                        elif int(max_exact_v_count) > 0:
+                            risk_grid_t = (probs_grid_t * probs_grid_t) * code_error_t.to(dtype=prob_dtype).reshape(1, 1, -1)
+                            if _env_truthy("SELECTOR_PQ_JOINT_NATIVE_RISK_PREFIX", "0"):
+                                native = load_selector_paged_pq_ext()
+                                grid_outputs_t = native.joint_vprefix_outputs_from_risk(
+                                    base_output_grid_t.to(dtype=torch.float32).contiguous(),
+                                    probs_grid_t.to(dtype=torch.float32).contiguous(),
+                                    residual_t.to(dtype=torch.float32).contiguous(),
+                                    code_error_t.to(dtype=torch.float32).contiguous(),
+                                    joint_v_budgets_t,
+                                )
+                            elif _env_truthy("SELECTOR_PQ_JOINT_UNSORTED_V_PREFIX", "0"):
+                                grid_outputs_by_v = []
+                                for v_budget in joint_v_budgets:
+                                    exact_count = max(0, min(int(v_budget), context_len_i, int(max_exact_v_count)))
+                                    if exact_count <= 0:
+                                        grid_outputs_by_v.append(base_output_grid_t)
+                                    elif exact_count >= context_len_i:
+                                        delta_t = (
+                                            probs_grid_t.to(torch.float32).reshape(k_count_i * group_heads_i, context_len_i)
+                                            @ residual_t.float()
+                                        ).reshape(k_count_i, group_heads_i, int(self.head_dim))
+                                        grid_outputs_by_v.append(base_output_grid_t + delta_t)
+                                    else:
+                                        exact_order_i_t = torch.topk(
+                                            risk_grid_t,
+                                            k=int(exact_count),
+                                            dim=2,
+                                            largest=True,
+                                            sorted=False,
+                                        ).indices
+                                        gathered_probs_i_t = torch.gather(
+                                            probs_grid_t.to(torch.float32),
+                                            2,
+                                            exact_order_i_t,
+                                        )
+                                        gathered_residual_i_t = residual_t.index_select(
+                                            0,
+                                            exact_order_i_t.reshape(-1),
+                                        ).reshape(
+                                            k_count_i,
+                                            group_heads_i,
+                                            int(exact_count),
+                                            int(self.head_dim),
+                                        )
+                                        delta_t = torch.sum(
+                                            gathered_probs_i_t.reshape(k_count_i, group_heads_i, int(exact_count), 1)
+                                            * gathered_residual_i_t.float(),
+                                            dim=2,
+                                        )
+                                        grid_outputs_by_v.append(base_output_grid_t + delta_t)
+                                grid_outputs_t = torch.stack(grid_outputs_by_v, dim=1)
+                            else:
+                                if int(max_exact_v_count) >= context_len_i:
+                                    exact_order_grid_t = torch.argsort(risk_grid_t, dim=2, descending=True, stable=True)
+                                else:
+                                    exact_order_grid_t = torch.topk(
+                                        risk_grid_t,
+                                        k=int(max_exact_v_count),
+                                        dim=2,
+                                        largest=True,
+                                        sorted=True,
+                                    ).indices
+                                if _env_truthy("SELECTOR_PQ_JOINT_NATIVE_V_PREFIX", "0"):
+                                    native = load_selector_paged_pq_ext()
+                                    grid_outputs_t = native.joint_vprefix_outputs(
+                                        base_output_grid_t.to(dtype=torch.float32).contiguous(),
+                                        probs_grid_t.to(dtype=torch.float32).contiguous(),
+                                        residual_t.to(dtype=torch.float32).contiguous(),
+                                        exact_order_grid_t.to(dtype=torch.long).contiguous(),
+                                        joint_v_budgets_t,
+                                    )
+                                else:
+                                    gathered_probs_grid_t = torch.gather(
+                                        probs_grid_t.to(torch.float32),
+                                        2,
+                                        exact_order_grid_t,
+                                    )
+                                    gathered_residual_grid_t = residual_t.index_select(0, exact_order_grid_t.reshape(-1)).reshape(
+                                        k_count_i,
+                                        group_heads_i,
+                                        int(exact_order_grid_t.shape[2]),
+                                        int(self.head_dim),
+                                    )
+                                    weighted_residual_grid_t = (
+                                        gathered_probs_grid_t.reshape(k_count_i, group_heads_i, -1, 1)
+                                        * gathered_residual_grid_t.float()
+                                    )
+                            if grid_outputs_t is None and _env_truthy("SELECTOR_PQ_JOINT_SEGMENTED_V_PREFIX", "0"):
+                                prefix_delta_by_count = {}
+                                running_delta_t = torch.zeros_like(base_output_grid_t, dtype=torch.float32)
+                                prev_count = 0
+                                exact_counts_sorted = sorted(
+                                    {
+                                        max(0, min(int(v_budget), context_len_i, int(max_exact_v_count)))
+                                        for v_budget in joint_v_budgets
+                                        if max(0, min(int(v_budget), context_len_i, int(max_exact_v_count))) > 0
+                                    }
+                                )
+                                for exact_count in exact_counts_sorted:
+                                    if int(exact_count) > int(prev_count):
+                                        running_delta_t = running_delta_t + torch.sum(
+                                            weighted_residual_grid_t[:, :, int(prev_count): int(exact_count), :],
+                                        dim=2,
+                                    )
+                                prefix_delta_by_count[int(exact_count)] = running_delta_t.clone()
+                                prev_count = int(exact_count)
+                            elif grid_outputs_t is None:
+                                prefix_delta_grid_t = torch.cumsum(
+                                    weighted_residual_grid_t,
+                                    dim=2,
+                                )
+                        if grid_outputs_t is None and not use_incremental_v_grid:
+                            grid_outputs_by_v: list[torch.Tensor] = []
+                            for v_budget in joint_v_budgets:
+                                exact_count = max(0, min(int(v_budget), context_len_i))
+                                if exact_count > 0 and prefix_delta_by_count is not None:
+                                    grid_outputs_by_v.append(
+                                        base_output_grid_t
+                                        + prefix_delta_by_count[
+                                            max(0, min(int(exact_count), int(max_exact_v_count)))
+                                        ]
+                                    )
+                                elif exact_count > 0 and prefix_delta_grid_t is not None:
+                                    grid_outputs_by_v.append(base_output_grid_t + prefix_delta_grid_t[:, :, int(exact_count) - 1, :])
+                                else:
+                                    grid_outputs_by_v.append(base_output_grid_t)
+                            grid_outputs_t = torch.stack(grid_outputs_by_v, dim=1)
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            stats[layer_id].add_joint_detail_timing(
+                                risk_prefix_seconds=float(time.perf_counter() - joint_risk_t0)
+                            )
+                        if wall_profile_enabled and int(max_exact_v_count) > 0:
+                            stats[layer_id].add_joint_wall_timing(
+                                risk_prefix_seconds=float(time.perf_counter() - joint_risk_wall_t0)
+                            )
+                    joint_policy_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        joint_policy_t0 = time.perf_counter()
+                    else:
+                        joint_policy_t0 = 0.0
+                    if use_incremental_v_grid and grid_outputs_for_v_idx is not None:
+                        k_mb_by_idx = (
+                            grid_k_mb_by_idx
+                            if grid_k_mb_by_idx is not None
+                            else [float(k_artifacts_batch(int(ki_i))[1]) for ki_i in range(len(active_joint_k_budgets))]
+                            if policy_uses_mb
+                            else [0.0 for _ in active_joint_k_budgets]
+                        )
+                        for local_head_i in range(group_heads_i):
+                            ki = 0
+                            vi = 0
+                            steps = 0
+                            while steps < (len(active_joint_k_budgets) + len(joint_v_budgets) + 4):
+                                cur_output_t = grid_outputs_for_v_idx(int(vi))[int(ki), int(local_head_i)]
+                                k_can = int(ki) + 1 < len(active_joint_k_budgets)
+                                v_can = int(vi) + 1 < len(joint_v_budgets)
+                                k_delta = (
+                                    _rel_l2_torch(
+                                        cur_output_t,
+                                        grid_outputs_for_v_idx(int(vi))[int(ki) + 1, int(local_head_i)],
+                                    )
+                                    if k_can
+                                    else 0.0
+                                )
+                                v_delta = (
+                                    _rel_l2_torch(
+                                        cur_output_t,
+                                        grid_outputs_for_v_idx(int(vi) + 1)[int(ki), int(local_head_i)],
+                                    )
+                                    if v_can
+                                    else 0.0
+                                )
+                                extra_k_mb = (
+                                    float(k_mb_by_idx[int(ki) + 1] - k_mb_by_idx[int(ki)])
+                                    if k_can
+                                    else float("inf")
+                                )
+                                extra_v_mb = (
+                                    float(v_mb_by_idx[int(vi) + 1] - v_mb_by_idx[int(vi)])
+                                    if v_can and v_mb_by_idx is not None
+                                    else 0.0
+                                    if v_can
+                                    else float("inf")
+                                )
+                                action = _choose_joint_kv_action(
+                                    policy=policy_name,
+                                    k_delta=float(k_delta),
+                                    v_delta=float(v_delta),
+                                    k_can=bool(k_can),
+                                    v_can=bool(v_can),
+                                    threshold=threshold_value,
+                                    turn=int(steps),
+                                    extra_k_mb=float(extra_k_mb),
+                                    extra_v_mb=float(extra_v_mb),
+                                )
+                                if action == "stop":
+                                    break
+                                if action == "k":
+                                    ki += 1
+                                elif action == "v":
+                                    vi += 1
+                                else:
+                                    raise AssertionError(action)
+                                steps += 1
+                            final_ki_by_head.append(int(ki))
+                            final_vi_by_head.append(int(vi))
+                    elif (
+                        _env_truthy("SELECTOR_PQ_JOINT_VECTOR_POLICY", "1")
+                        and not _env_truthy("SELECTOR_PQ_JOINT_NATIVE_LAZY_POLICY", "0")
+                    ):
+                        output_grid_t = (
+                            grid_outputs_t
+                            if grid_outputs_t is not None
+                            else torch.stack(
+                                [
+                                    torch.stack(
+                                        [
+                                            output_for_budget_batch(int(ki_i), int(vi_i))
+                                            for vi_i in range(len(joint_v_budgets))
+                                        ],
+                                        dim=0,
+                                    )
+                                    for ki_i in range(len(active_joint_k_budgets))
+                                ],
+                                dim=0,
+                            )
+                        )
+                        if _env_truthy("SELECTOR_PQ_JOINT_NATIVE_POLICY", "0"):
+                            native = load_selector_paged_pq_ext()
+                            if policy_uses_mb:
+                                k_mb_by_idx = (
+                                    grid_k_mb_by_idx
+                                    if grid_k_mb_by_idx is not None
+                                    else [float(k_artifacts_batch(int(ki_i))[1]) for ki_i in range(len(active_joint_k_budgets))]
+                                )
+                                k_mb_t = torch.as_tensor(k_mb_by_idx, dtype=torch.float32, device=device)
+                                v_mb_t = torch.as_tensor(v_mb_by_idx, dtype=torch.float32, device=device)
+                            else:
+                                k_mb_t = torch.empty((len(active_joint_k_budgets),), dtype=torch.float32, device=device)
+                                v_mb_t = torch.empty((len(joint_v_budgets),), dtype=torch.float32, device=device)
+                            final_idx_t = native.joint_select_policy(
+                                output_grid_t.to(dtype=torch.float32).contiguous(),
+                                k_mb_t,
+                                v_mb_t,
+                                float(threshold_value),
+                                policy_id,
+                            )
+                            if bool(getattr(args, "disable_cost_stats", False)):
+                                final_idx_t_for_output = final_idx_t
+                                final_output_grid_t = output_grid_t
+                            else:
+                                final_idx_rows = final_idx_t.detach().cpu().tolist()
+                                for row in final_idx_rows:
+                                    final_ki_by_head.append(int(row[0]))
+                                    final_vi_by_head.append(int(row[1]))
+                        else:
+                            output_grid64_t = output_grid_t.to(dtype=torch.float64)
+                            if len(active_joint_k_budgets) > 1:
+                                k_cur_t = output_grid64_t[:-1]
+                                k_next_t = output_grid64_t[1:]
+                                k_delta_t = torch.linalg.vector_norm(k_cur_t - k_next_t, dim=-1) / torch.clamp_min(
+                                    torch.linalg.vector_norm(k_next_t, dim=-1),
+                                    1e-20,
+                                )
+                                k_delta_np = k_delta_t.detach().cpu().numpy()
+                            else:
+                                k_delta_np = np.empty((0, len(joint_v_budgets), group_heads_i), dtype=np.float64)
+                            if len(joint_v_budgets) > 1:
+                                v_cur_t = output_grid64_t[:, :-1]
+                                v_next_t = output_grid64_t[:, 1:]
+                                v_delta_t = torch.linalg.vector_norm(v_cur_t - v_next_t, dim=-1) / torch.clamp_min(
+                                    torch.linalg.vector_norm(v_next_t, dim=-1),
+                                    1e-20,
+                                )
+                                v_delta_np = v_delta_t.detach().cpu().numpy()
+                            else:
+                                v_delta_np = np.empty((len(active_joint_k_budgets), 0, group_heads_i), dtype=np.float64)
+                            k_mb_by_idx = (
+                                grid_k_mb_by_idx
+                                if grid_k_mb_by_idx is not None
+                                else [float(k_artifacts_batch(int(ki_i))[1]) for ki_i in range(len(active_joint_k_budgets))]
+                                if policy_uses_mb
+                                else [0.0 for _ in active_joint_k_budgets]
+                            )
+                            for local_head_i in range(group_heads_i):
+                                ki = 0
+                                vi = 0
+                                steps = 0
+                                while steps < (len(active_joint_k_budgets) + len(joint_v_budgets) + 4):
+                                    k_can = int(ki) + 1 < len(active_joint_k_budgets)
+                                    v_can = int(vi) + 1 < len(joint_v_budgets)
+                                    k_delta = float(k_delta_np[int(ki), int(vi), int(local_head_i)]) if k_can else 0.0
+                                    v_delta = float(v_delta_np[int(ki), int(vi), int(local_head_i)]) if v_can else 0.0
+                                    extra_k_mb = (
+                                        float(k_mb_by_idx[int(ki) + 1] - k_mb_by_idx[int(ki)])
+                                        if k_can
+                                        else float("inf")
+                                    )
+                                    extra_v_mb = (
+                                        float(v_mb_by_idx[int(vi) + 1] - v_mb_by_idx[int(vi)])
+                                        if v_can and v_mb_by_idx is not None
+                                        else 0.0
+                                        if v_can
+                                        else float("inf")
+                                    )
+                                    action = _choose_joint_kv_action(
+                                        policy=policy_name,
+                                        k_delta=k_delta,
+                                        v_delta=v_delta,
+                                        k_can=bool(k_can),
+                                        v_can=bool(v_can),
+                                        threshold=threshold_value,
+                                        turn=int(steps),
+                                        extra_k_mb=float(extra_k_mb),
+                                        extra_v_mb=float(extra_v_mb),
+                                    )
+                                    if action == "stop":
+                                        break
+                                    if action == "k":
+                                        ki += 1
+                                    elif action == "v":
+                                        vi += 1
+                                    else:
+                                        raise AssertionError(action)
+                                    steps += 1
+                                final_ki_by_head.append(int(ki))
+                                final_vi_by_head.append(int(vi))
+                    else:
+                        for local_head_i in range(group_heads_i):
+                            ki = 0
+                            vi = 0
+                            steps = 0
+                            while steps < (len(active_joint_k_budgets) + len(joint_v_budgets) + 4):
+                                cur_output_t = output_for_budget_batch(int(ki), int(vi))[int(local_head_i)]
+                                k_can = int(ki) + 1 < len(active_joint_k_budgets)
+                                v_can = int(vi) + 1 < len(joint_v_budgets)
+                                k_delta = (
+                                    _rel_l2_torch(
+                                        cur_output_t,
+                                        output_for_budget_batch(int(ki) + 1, int(vi))[int(local_head_i)],
+                                    )
+                                    if k_can
+                                    else 0.0
+                                )
+                                v_delta = (
+                                    _rel_l2_torch(
+                                        cur_output_t,
+                                        output_for_budget_batch(int(ki), int(vi) + 1)[int(local_head_i)],
+                                    )
+                                    if v_can
+                                    else 0.0
+                                )
+                                extra_k_mb = (
+                                    float(k_artifacts_batch(int(ki) + 1)[1] - k_artifacts_batch(int(ki))[1])
+                                    if k_can
+                                    else float("inf")
+                                )
+                                extra_v_mb = (
+                                    float(v_mb_by_idx[int(vi) + 1] - v_mb_by_idx[int(vi)])
+                                    if v_can and v_mb_by_idx is not None
+                                    else 0.0
+                                    if v_can
+                                    else float("inf")
+                                )
+                                action = _choose_joint_kv_action(
+                                    policy=policy_name,
+                                    k_delta=float(k_delta),
+                                    v_delta=float(v_delta),
+                                    k_can=bool(k_can),
+                                    v_can=bool(v_can),
+                                    threshold=threshold_value,
+                                    turn=int(steps),
+                                    extra_k_mb=float(extra_k_mb),
+                                    extra_v_mb=float(extra_v_mb),
+                                )
+                                if action == "stop":
+                                    break
+                                if action == "k":
+                                    ki += 1
+                                elif action == "v":
+                                    vi += 1
+                                else:
+                                    raise AssertionError(action)
+                                steps += 1
+                            final_ki_by_head.append(int(ki))
+                            final_vi_by_head.append(int(vi))
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        stats[layer_id].add_joint_detail_timing(
+                            policy_seconds=float(time.perf_counter() - joint_policy_t0)
+                        )
+                    if wall_profile_enabled:
+                        stats[layer_id].add_joint_wall_timing(
+                            policy_seconds=float(time.perf_counter() - joint_policy_wall_t0)
+                        )
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        stats[layer_id].add_native_detail_timing(
+                            geometric_seconds=float(time.perf_counter() - sim_t0)
+                        )
+
+                    if (
+                        final_idx_t_for_output is not None
+                        and final_output_grid_t is not None
+                        and bool(getattr(args, "disable_cost_stats", False))
+                    ):
+                        head_idx_t = torch.arange(group_heads_i, dtype=torch.long, device=device)
+                        final_idx_t_for_output = final_idx_t_for_output.to(device=device, dtype=torch.long)
+                        outputs_all[head_start_i:head_end_i] = final_output_grid_t[
+                            final_idx_t_for_output[:, 0],
+                            final_idx_t_for_output[:, 1],
+                            head_idx_t,
+                        ]
+                        continue
+
+                    for local_head_i, (ki, vi) in enumerate(zip(final_ki_by_head, final_vi_by_head, strict=True)):
+                        global_head_i = int(head_start_i + local_head_i)
+                        if not bool(getattr(args, "disable_cost_stats", False)):
+                            if grid_selected_counts_by_ki is not None:
+                                selected_count_i = int(grid_selected_counts_by_ki[int(ki)])
+                            else:
+                                selected_t_i = (
+                                    grid_selected_by_ki[int(ki)][int(local_head_i)]
+                                    if grid_selected_by_ki is not None
+                                    else k_artifacts_batch(int(ki))[0][int(local_head_i)]
+                                )
+                                selected_count_i = int(selected_t_i.numel())
+                            exact_v_count = max(0, min(int(joint_v_budgets[int(vi)]), context_len_i))
+                            exact_key_mb = float(selected_count_i * int(self.head_dim) * key_bytes) / MB
+                            exact_v_mb = float(exact_v_count * int(self.head_dim) * value_bytes) / MB
+                            compressed_v_codes_mb = (
+                                float(max(0, context_len_i - exact_v_count) * actual_value_subvecs * code_bytes) / MB
+                            )
+                            tail_mb_override = float(v_pq_codebook_mb + compressed_v_codes_mb + metadata_mb)
+                            dense_physical_key_mb = float(context_len_i * int(self.head_dim) * key_bytes) / MB
+                            stats[layer_id].add_count(
+                                int(selected_count_i),
+                                max(0, context_len_i - int(exact_v_count)),
+                                float(selector_mb),
+                                int(self.head_dim),
+                                key_bytes,
+                                value_bytes,
+                                tail_mb_override=tail_mb_override,
+                                exact_kv_mb_override=float(exact_key_mb + exact_v_mb),
+                                confidence_mb_override=0.0,
+                                physical_gpu_exact_kv_mb_override=float(dense_physical_key_mb + exact_v_mb),
+                                physical_gpu_confidence_mb_override=0.0,
+                            )
+                        outputs_all[global_head_i] = (
+                            grid_outputs_t[int(ki), int(vi), int(local_head_i)]
+                            if grid_outputs_t is not None
+                            else grid_outputs_for_v_idx(int(vi))[int(ki), int(local_head_i)]
+                            if grid_outputs_for_v_idx is not None
+                            else output_for_budget_batch(int(ki), int(vi))[int(local_head_i)]
+                        )
+
+                if grouped_risk_records:
+                    if not _env_truthy("SELECTOR_PQ_JOINT_NATIVE_POLICY", "0"):
+                        raise RuntimeError("SELECTOR_PQ_JOINT_GROUPED_RISK_PREFIX requires native joint policy")
+                    native = load_selector_paged_pq_ext()
+                    grouped_by_shape: dict[tuple[int, int, int, int], list[dict[str, object]]] = {}
+                    for record in grouped_risk_records:
+                        base_grid = record["base_output_grid"]
+                        probs_grid = record["probs_grid"]
+                        if not isinstance(base_grid, torch.Tensor) or not isinstance(probs_grid, torch.Tensor):
+                            raise RuntimeError("invalid grouped risk-prefix record")
+                        shape_key = (
+                            int(base_grid.shape[0]),
+                            int(base_grid.shape[1]),
+                            int(probs_grid.shape[2]),
+                            int(base_grid.shape[2]),
+                        )
+                        grouped_by_shape.setdefault(shape_key, []).append(record)
+
+                    grouped_risk_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        grouped_risk_t0 = time.perf_counter()
+                    else:
+                        grouped_risk_t0 = 0.0
+                    grouped_policy_batches: list[
+                        tuple[list[dict[str, object]], int, int, int, torch.Tensor]
+                    ] = []
+                    use_fused_grouped_risk_policy = _env_truthy("SELECTOR_PQ_JOINT_FUSED_RISK_POLICY", "0")
+
+                    def grouped_policy_mb_tensors(
+                        records_i: list[dict[str, object]],
+                        k_count_i: int,
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+                        if not policy_uses_mb:
+                            return (
+                                torch.empty((len(records_i), int(k_count_i)), dtype=torch.float32, device=device),
+                                torch.empty((len(records_i), len(joint_v_budgets)), dtype=torch.float32, device=device),
+                            )
+                        return (
+                            torch.stack(
+                                [
+                                    torch.as_tensor(record["grid_k_mb_by_idx"], dtype=torch.float32, device=device)
+                                    for record in records_i
+                                ],
+                                dim=0,
+                            ).contiguous(),
+                            torch.stack(
+                                [
+                                    torch.as_tensor(record["v_mb_by_idx"], dtype=torch.float32, device=device)
+                                    for record in records_i
+                                ],
+                                dim=0,
+                            ).contiguous(),
+                        )
+
+                    for (k_count_i, group_heads_i, context_len_bucket, dim_i), records in grouped_by_shape.items():
+                        rows_per_group = int(k_count_i) * int(group_heads_i)
+                        group_pack_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            group_pack_t0 = time.perf_counter()
+                        else:
+                            group_pack_t0 = 0.0
+                        base_grouped_t = torch.stack(
+                            [
+                                record["base_output_grid"]
+                                for record in records
+                                if isinstance(record["base_output_grid"], torch.Tensor)
+                            ],
+                            dim=0,
+                        ).contiguous()
+                        probs_grouped_t = torch.stack(
+                            [
+                                record["probs_grid"]
+                                for record in records
+                                if isinstance(record["probs_grid"], torch.Tensor)
+                            ],
+                            dim=0,
+                        ).contiguous()
+                        if (
+                            grouped_vpq_residual_groups_t is not None
+                            and grouped_vpq_code_error_groups_t is not None
+                            and len(records) == int(grouped_vpq_residual_groups_t.shape[0])
+                        ):
+                            residual_groups_t = grouped_vpq_residual_groups_t.contiguous()
+                            code_error_groups_t = grouped_vpq_code_error_groups_t.contiguous()
+                        else:
+                            residual_groups_t = torch.stack(
+                                [
+                                    record["residual"]
+                                    for record in records
+                                    if isinstance(record["residual"], torch.Tensor)
+                                ],
+                                dim=0,
+                            ).contiguous()
+                            code_error_groups_t = torch.stack(
+                                [
+                                    record["code_error"]
+                                    for record in records
+                                    if isinstance(record["code_error"], torch.Tensor)
+                                ],
+                                dim=0,
+                            ).contiguous()
+                        if bool(getattr(args, "profile_native_ops", False)):
+                            _sync_if_cuda(device)
+                            stats[layer_id].add_joint_detail_timing(
+                                group_pack_seconds=float(time.perf_counter() - group_pack_t0)
+                            )
+                        if wall_profile_enabled:
+                            stats[layer_id].add_joint_wall_timing(
+                                group_pack_seconds=float(time.perf_counter() - group_pack_wall_t0)
+                            )
+                        if use_fused_grouped_risk_policy:
+                            k_mb_groups_t, v_mb_groups_t = grouped_policy_mb_tensors(records, int(k_count_i))
+                            if hasattr(native, "joint_select_policy_from_grouped_risk_batched"):
+                                final_outputs_grouped_t, final_idx_grouped_t = (
+                                    native.joint_select_policy_from_grouped_risk_batched(
+                                        base_grouped_t,
+                                        probs_grouped_t,
+                                        residual_groups_t,
+                                        code_error_groups_t,
+                                        joint_v_budgets_t,
+                                        k_mb_groups_t,
+                                        v_mb_groups_t,
+                                        float(threshold_value),
+                                        policy_id,
+                                    )
+                                )
+                            else:
+                                final_outputs_grouped_t, final_idx_grouped_t = native.joint_select_policy_from_grouped_risk(
+                                    base_grouped_t.reshape(len(records) * rows_per_group, dim_i),
+                                    probs_grouped_t.reshape(len(records) * rows_per_group, context_len_bucket),
+                                    residual_groups_t,
+                                    code_error_groups_t,
+                                    joint_v_budgets_t,
+                                    k_mb_groups_t,
+                                    v_mb_groups_t,
+                                    int(k_count_i),
+                                    int(group_heads_i),
+                                    float(threshold_value),
+                                    policy_id,
+                                )
+                            for record_i, record in enumerate(records):
+                                record["final_outputs"] = final_outputs_grouped_t[int(record_i)]
+                                record["final_indices"] = final_idx_grouped_t[int(record_i)]
+                            continue
+                        if (
+                            _env_truthy("SELECTOR_PQ_JOINT_RISK_PREFIX_TOPK", "0")
+                            and hasattr(native, "joint_vprefix_outputs_from_grouped_risk_topk_batched")
+                        ):
+                            max_exact_v_count_i = max(
+                                0,
+                                min(
+                                    max((int(v) for v in joint_v_budgets), default=0),
+                                    int(context_len_bucket),
+                                ),
+                            )
+                            grouped_outputs_flat_t = native.joint_vprefix_outputs_from_grouped_risk_topk_batched(
+                                base_grouped_t,
+                                probs_grouped_t,
+                                residual_groups_t,
+                                code_error_groups_t,
+                                joint_v_budgets_t,
+                                int(max_exact_v_count_i),
+                            )
+                        elif hasattr(native, "joint_vprefix_outputs_from_grouped_risk_batched"):
+                            grouped_outputs_flat_t = native.joint_vprefix_outputs_from_grouped_risk_batched(
+                                base_grouped_t,
+                                probs_grouped_t,
+                                residual_groups_t,
+                                code_error_groups_t,
+                                joint_v_budgets_t,
+                            )
+                        else:
+                            row_group_ids_t = torch.arange(
+                                len(records),
+                                dtype=torch.long,
+                                device=device,
+                            ).repeat_interleave(rows_per_group)
+                            grouped_outputs_flat_t = native.joint_vprefix_outputs_from_grouped_risk(
+                                base_grouped_t.reshape(len(records) * rows_per_group, dim_i),
+                                probs_grouped_t.reshape(len(records) * rows_per_group, context_len_bucket),
+                                residual_groups_t,
+                                code_error_groups_t,
+                                row_group_ids_t,
+                                joint_v_budgets_t,
+                            )
+                        grouped_policy_batches.append(
+                            (records, int(k_count_i), int(group_heads_i), int(dim_i), grouped_outputs_flat_t)
+                        )
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        stats[layer_id].add_joint_detail_timing(
+                            risk_prefix_seconds=float(time.perf_counter() - grouped_risk_t0)
+                        )
+                        grouped_policy_t0 = time.perf_counter()
+                    else:
+                        grouped_policy_t0 = 0.0
+                    if wall_profile_enabled:
+                        stats[layer_id].add_joint_wall_timing(
+                            risk_prefix_seconds=float(time.perf_counter() - grouped_risk_wall_t0)
+                        )
+                    grouped_policy_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+
+                    for records, k_count_i, group_heads_i, dim_i, grouped_outputs_flat_t in grouped_policy_batches:
+                        if (not policy_uses_mb) and hasattr(native, "joint_select_policy_grouped_flat_no_mb"):
+                            final_outputs_grouped_t, final_idx_grouped_t = native.joint_select_policy_grouped_flat_no_mb(
+                                grouped_outputs_flat_t,
+                                int(k_count_i),
+                                int(group_heads_i),
+                                float(threshold_value),
+                                policy_id,
+                            )
+                        else:
+                            k_mb_groups_t, v_mb_groups_t = grouped_policy_mb_tensors(records, int(k_count_i))
+                            final_outputs_grouped_t, final_idx_grouped_t = native.joint_select_policy_grouped_flat(
+                                grouped_outputs_flat_t,
+                                k_mb_groups_t,
+                                v_mb_groups_t,
+                                int(k_count_i),
+                                int(group_heads_i),
+                                float(threshold_value),
+                                policy_id,
+                            )
+                        for record_i, record in enumerate(records):
+                            record["final_outputs"] = final_outputs_grouped_t[int(record_i)]
+                            record["final_indices"] = final_idx_grouped_t[int(record_i)]
+
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        stats[layer_id].add_joint_detail_timing(
+                            policy_seconds=float(time.perf_counter() - grouped_policy_t0)
+                        )
+                        grouped_accounting_t0 = time.perf_counter()
+                    else:
+                        grouped_accounting_t0 = 0.0
+                    if wall_profile_enabled:
+                        stats[layer_id].add_joint_wall_timing(
+                            policy_seconds=float(time.perf_counter() - grouped_policy_wall_t0)
+                        )
+                    grouped_accounting_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+
+                    for record in grouped_risk_records:
+                        final_output_t = record["final_outputs"]
+                        final_idx_t = record["final_indices"]
+                        if not isinstance(final_output_t, torch.Tensor) or not isinstance(final_idx_t, torch.Tensor):
+                            raise RuntimeError("missing grouped risk-prefix final output")
+                        group_heads_i = int(record["group_heads"])
+                        head_start_i = int(record["head_start"])
+                        head_end_i = int(record["head_end"])
+                        context_len_i = int(record["context_len"])
+                        if bool(getattr(args, "disable_cost_stats", False)):
+                            outputs_all[head_start_i:head_end_i] = final_output_t[:group_heads_i]
+                            continue
+
+                        grid_selected_by_ki = record["grid_selected_by_ki"]
+                        if not isinstance(grid_selected_by_ki, list):
+                            raise RuntimeError("invalid grouped risk-prefix selected-token metadata")
+                        grid_selected_counts_by_ki = record.get("grid_selected_counts_by_ki")
+                        if grid_selected_counts_by_ki is not None and not isinstance(grid_selected_counts_by_ki, list):
+                            raise RuntimeError("invalid grouped risk-prefix selected-count metadata")
+                        final_idx_rows = final_idx_t.detach().cpu().tolist()
+                        for local_head_i, row in enumerate(final_idx_rows):
+                            ki = int(row[0])
+                            vi = int(row[1])
+                            global_head_i = int(head_start_i + local_head_i)
+                            if grid_selected_counts_by_ki is not None:
+                                selected_count_i = int(grid_selected_counts_by_ki[int(ki)])
+                            else:
+                                selected_t_i = grid_selected_by_ki[int(ki)]
+                                if selected_t_i is None:
+                                    raise RuntimeError("missing selected-token tensor for grouped risk-prefix accounting")
+                                selected_count_i = int(selected_t_i[int(local_head_i)].numel())
+                            exact_v_count = max(0, min(int(joint_v_budgets[int(vi)]), context_len_i))
+                            exact_key_mb = float(selected_count_i * int(self.head_dim) * key_bytes) / MB
+                            exact_v_mb = float(exact_v_count * int(self.head_dim) * value_bytes) / MB
+                            compressed_v_codes_mb = (
+                                float(max(0, context_len_i - exact_v_count) * int(record["actual_value_subvecs"]) * code_bytes) / MB
+                            )
+                            tail_mb_override = (
+                                float(record["v_pq_codebook_mb"]) + compressed_v_codes_mb + metadata_mb
+                            )
+                            dense_physical_key_mb = float(context_len_i * int(self.head_dim) * key_bytes) / MB
+                            stats[layer_id].add_count(
+                                int(selected_count_i),
+                                max(0, context_len_i - int(exact_v_count)),
+                                float(record["selector_mb"]),
+                                int(self.head_dim),
+                                key_bytes,
+                                value_bytes,
+                                tail_mb_override=tail_mb_override,
+                                exact_kv_mb_override=float(exact_key_mb + exact_v_mb),
+                                confidence_mb_override=0.0,
+                                physical_gpu_exact_kv_mb_override=float(dense_physical_key_mb + exact_v_mb),
+                                physical_gpu_confidence_mb_override=0.0,
+                            )
+                            outputs_all[global_head_i] = final_output_t[int(local_head_i)]
+
+                    if bool(getattr(args, "profile_native_ops", False)):
+                        _sync_if_cuda(device)
+                        stats[layer_id].add_joint_detail_timing(
+                            accounting_seconds=float(time.perf_counter() - grouped_accounting_t0)
+                        )
+                        if grouped_geo_t0 > 0.0:
+                            stats[layer_id].add_native_detail_timing(
+                                geometric_seconds=float(time.perf_counter() - grouped_geo_t0)
+                            )
+                    if wall_profile_enabled:
+                        stats[layer_id].add_joint_wall_timing(
+                            accounting_seconds=float(time.perf_counter() - grouped_accounting_wall_t0)
+                        )
+
+                if wall_profile_enabled:
+                    stats[layer_id].add_joint_wall_timing(
+                        total_seconds=float(time.perf_counter() - joint_total_wall_t0)
+                    )
+                return outputs_all.to(dtype=hidden_states.dtype, device=device)
+
             fast_outputs = approximate_decode_fast_exact(0, context_len) if query_len == 1 else None
             if fast_outputs is not None:
                 attn_output = fast_outputs.reshape(1, 1, -1).to(hidden_states.dtype).contiguous()
             elif query_len == 1:
-                outputs = [approximate_one_head(head, 0, context_len) for head in range(num_heads)]
-                attn_output = torch.stack(outputs, dim=0).reshape(1, 1, -1).contiguous()
+                joint_outputs = approximate_joint_kv_all_heads(0, context_len)
+                if joint_outputs is not None:
+                    attn_output = joint_outputs.reshape(1, 1, -1).contiguous()
+                else:
+                    outputs = [approximate_one_head(head, 0, context_len) for head in range(num_heads)]
+                    attn_output = torch.stack(outputs, dim=0).reshape(1, 1, -1).contiguous()
             else:
                 fast_prefill_outputs = approximate_prefill_fast_exact()
                 if fast_prefill_outputs is not None:
@@ -8715,6 +12491,7 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                         per_pos_outputs.append(torch.stack(outputs, dim=0).reshape(-1))
                     attn_output = torch.stack(per_pos_outputs, dim=0).reshape(1, query_len, -1).contiguous()
 
+            oproj_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
             if bool(getattr(args, "profile_native_ops", False)):
                 _sync_if_cuda(device)
                 oproj_t0 = time.perf_counter()
@@ -8724,9 +12501,15 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
             if bool(getattr(args, "profile_native_ops", False)):
                 _sync_if_cuda(device)
                 stats[layer_id].add_output_projection_timing(time.perf_counter() - oproj_t0)
+            if wall_profile_enabled:
+                stats[layer_id].add_wall_output_projection_timing(time.perf_counter() - oproj_wall_t0)
             if bool(getattr(args, "profile_native_ops", False)):
                 _sync_if_cuda(device)
                 stats[layer_id].add_patched_attention_timing(time.perf_counter() - patched_attention_t0)
+            if wall_profile_enabled:
+                stats[layer_id].add_wall_patched_attention_timing(
+                    time.perf_counter() - patched_attention_wall_t0
+                )
             return attn_output, None
 
         return types.MethodType(forward, module)
@@ -8737,10 +12520,24 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
             originals[int(layer_id)] = module.forward
             stats[int(layer_id)] = ApproxStats()
             module.forward = make_forward(int(layer_id), module)
+            setattr(
+                module,
+                "_pagedpq_warm_decode_sidecars",
+                lambda cache_obj, lid=int(layer_id), mod=module: warm_dense_prefill_decode_sidecars(
+                    int(lid),
+                    mod,
+                    cache_obj,
+                ),
+            )
         yield
     finally:
         for layer_id, forward in originals.items():
-            model.model.layers[int(layer_id)].self_attn.forward = forward
+            module = model.model.layers[int(layer_id)].self_attn
+            module.forward = forward
+            if hasattr(module, "_pagedpq_warm_decode_sidecars"):
+                delattr(module, "_pagedpq_warm_decode_sidecars")
+            if hasattr(module, "_pagedpq_joint_vpq_sidecar_cache"):
+                delattr(module, "_pagedpq_joint_vpq_sidecar_cache")
 
 
 def run() -> None:
@@ -8778,6 +12575,7 @@ def run() -> None:
             "geometric_probe_tail_switch",
             "geometric_tail_stability_switch",
             "geometric_exact_delta",
+            "joint_kv_stability",
             "pq_proxy_mass_budget",
             "pq_ranked_mass_budget",
         ],
@@ -8814,10 +12612,31 @@ def run() -> None:
     parser.add_argument("--geometric_growth", type=float, default=1.5)
     parser.add_argument("--geometric_probe_scale", type=float, default=1.5)
     parser.add_argument("--geometric_budget_granularity", type=int, default=1024)
+    parser.add_argument(
+        "--joint_kv_policy",
+        choices=[
+            "k_first_priority",
+            "v_first_priority",
+            "k_first_alternating",
+            "v_first_alternating",
+            "sensitivity_greedy",
+        ],
+        default="k_first_alternating",
+    )
+    parser.add_argument("--joint_kv_k_budgets", default="4096,8192,14336,32768")
+    parser.add_argument("--joint_kv_v_budgets", default="1024,2048,4096,6144,8192,12288,16384")
+    parser.add_argument("--joint_kv_stability_threshold", type=float, default=0.001)
     parser.add_argument("--selected_value_mode", choices=["exact", "vpq_value"], default="exact")
     parser.add_argument(
         "--selected_value_exact_rule",
-        choices=["fixed", "selector_rank", "selected_mass", "selected_risk_mass", "selected_mass_or_risk"],
+        choices=[
+            "fixed",
+            "selector_rank",
+            "selected_mass",
+            "selected_risk_mass",
+            "selected_mass_or_risk",
+            "global_residual_risk",
+        ],
         default="fixed",
     )
     parser.add_argument("--selected_value_exact_top", type=int, default=0)
@@ -8828,6 +12647,7 @@ def run() -> None:
     parser.add_argument("--selected_value_exact_all_context_max", type=int, default=0)
     parser.add_argument("--selected_value_exact_all_fraction_min", type=float, default=0.0)
     parser.add_argument("--selected_value_residual_norm_bytes", type=int, default=2)
+    parser.add_argument("--value_code_stat_bytes", type=int, default=2)
     parser.add_argument("--value_subvecs", type=int, default=0)
     parser.add_argument("--value_subbits", type=int, default=0)
     parser.add_argument("--value_pq_group_pages", type=int, default=1)
@@ -9036,6 +12856,32 @@ def run() -> None:
             "native_threshold_seconds": s.native_threshold_seconds,
             "native_geometric_seconds": s.native_geometric_seconds,
             "native_output_seconds": s.native_output_seconds,
+            "native_joint_rank_prefix_seconds": s.native_joint_rank_prefix_seconds,
+            "native_joint_score_grid_seconds": s.native_joint_score_grid_seconds,
+            "native_joint_prob_base_seconds": s.native_joint_prob_base_seconds,
+            "native_joint_risk_prefix_seconds": s.native_joint_risk_prefix_seconds,
+            "native_joint_policy_seconds": s.native_joint_policy_seconds,
+            "native_joint_precompute_seconds": s.native_joint_precompute_seconds,
+            "native_joint_layout_seconds": s.native_joint_layout_seconds,
+            "native_joint_group_pack_seconds": s.native_joint_group_pack_seconds,
+            "native_joint_accounting_seconds": s.native_joint_accounting_seconds,
+            "wall_patched_attention_seconds": s.wall_patched_attention_seconds,
+            "wall_qkv_cache_seconds": s.wall_qkv_cache_seconds,
+            "wall_index_sidecar_seconds": s.wall_index_sidecar_seconds,
+            "wall_output_projection_seconds": s.wall_output_projection_seconds,
+            "wall_joint_total_seconds": s.wall_joint_total_seconds,
+            "wall_joint_precompute_seconds": s.wall_joint_precompute_seconds,
+            "wall_joint_selector_seconds": s.wall_joint_selector_seconds,
+            "wall_joint_exact_logit_seconds": s.wall_joint_exact_logit_seconds,
+            "wall_joint_vpq_sidecar_seconds": s.wall_joint_vpq_sidecar_seconds,
+            "wall_joint_layout_seconds": s.wall_joint_layout_seconds,
+            "wall_joint_rank_prefix_seconds": s.wall_joint_rank_prefix_seconds,
+            "wall_joint_score_grid_seconds": s.wall_joint_score_grid_seconds,
+            "wall_joint_prob_base_seconds": s.wall_joint_prob_base_seconds,
+            "wall_joint_risk_prefix_seconds": s.wall_joint_risk_prefix_seconds,
+            "wall_joint_policy_seconds": s.wall_joint_policy_seconds,
+            "wall_joint_group_pack_seconds": s.wall_joint_group_pack_seconds,
+            "wall_joint_accounting_seconds": s.wall_joint_accounting_seconds,
             "output_projection_seconds": s.output_projection_seconds,
         }
     task = {

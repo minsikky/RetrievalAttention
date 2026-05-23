@@ -15,6 +15,8 @@ class QKVTrace:
     positions: np.ndarray
     input_len: int
     metadata: dict
+    graph_queries: np.ndarray | None = None
+    graph_positions: np.ndarray | None = None
 
     @property
     def num_heads(self) -> int:
@@ -45,9 +47,20 @@ def load_trace(path: str | Path) -> QKVTrace:
     values = np.asarray(data["values"], dtype=np.float32)
     queries = np.asarray(data["queries"], dtype=np.float32)
     positions = np.asarray(data["positions"], dtype=np.int64)
+    graph_queries = np.asarray(data["graph_queries"], dtype=np.float32) if "graph_queries" in data else None
+    graph_positions = np.asarray(data["graph_positions"], dtype=np.int64) if "graph_positions" in data else None
     metadata = json.loads(str(data["metadata"].item())) if "metadata" in data else {}
     input_len = int(metadata.get("input_len", int(positions.min()) + 1))
-    return QKVTrace(keys=keys, values=values, queries=queries, positions=positions, input_len=input_len, metadata=metadata)
+    return QKVTrace(
+        keys=keys,
+        values=values,
+        queries=queries,
+        positions=positions,
+        input_len=input_len,
+        metadata=metadata,
+        graph_queries=graph_queries,
+        graph_positions=graph_positions,
+    )
 
 
 def static_tokens(position: int, static_prefix: int, static_suffix: int) -> list[int]:
@@ -77,4 +90,3 @@ def attention_probs(keys: np.ndarray, query: np.ndarray) -> tuple[np.ndarray, np
     probs = np.exp(logits).astype(np.float32)
     probs /= max(float(probs.sum()), 1e-20)
     return scores.astype(np.float32, copy=False), probs
-

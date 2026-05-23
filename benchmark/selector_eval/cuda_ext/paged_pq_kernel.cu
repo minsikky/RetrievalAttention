@@ -1,6 +1,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 
+#include <cub/cub.cuh>
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstdint>
@@ -9278,6 +9280,1643 @@ __global__ void gqa_causal_geometric_accept_counts_kernel(
   }
 }
 
+template <typename order_t>
+__global__ void joint_vprefix_outputs_kernel(
+    const float* __restrict__ base_outputs,
+    const float* __restrict__ probs,
+    const float* __restrict__ residual,
+    const order_t* __restrict__ exact_order,
+    const int64_t* __restrict__ v_budgets,
+    float* __restrict__ outputs,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len,
+    int64_t max_exact,
+    int64_t v_steps,
+    int64_t dim) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = k_count * heads * dim;
+  if (linear >= total) {
+    return;
+  }
+
+  int64_t d = linear % dim;
+  int64_t tmp = linear / dim;
+  int64_t head = tmp % heads;
+  int64_t ki = tmp / heads;
+  int64_t kh = ki * heads + head;
+
+  float acc = base_outputs[kh * dim + d];
+  int64_t prev_count = 0;
+  for (int64_t vi = 0; vi < v_steps; ++vi) {
+    int64_t exact_count = v_budgets[vi];
+    exact_count = max(static_cast<int64_t>(0), min(exact_count, context_len));
+    exact_count = min(exact_count, max_exact);
+    if (exact_count < prev_count) {
+      // The Python budget parser sorts canonical schedules, but keep this helper
+      // well-defined for diagnostic calls with unsorted budgets.
+      acc = base_outputs[kh * dim + d];
+      prev_count = 0;
+    }
+    for (int64_t j = prev_count; j < exact_count; ++j) {
+      int64_t token = static_cast<int64_t>(exact_order[(kh * max_exact) + j]);
+      if (token >= 0 && token < context_len) {
+        acc += probs[kh * context_len + token] * residual[token * dim + d];
+      }
+    }
+    outputs[((ki * v_steps + vi) * heads + head) * dim + d] = acc;
+    prev_count = exact_count;
+  }
+}
+
+__global__ void joint_risk_sort_inputs_kernel(
+    const float* __restrict__ probs,
+    const float* __restrict__ code_error,
+    float* __restrict__ risk,
+    int32_t* __restrict__ token_ids,
+    int64_t rows,
+    int64_t context_len) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = rows * context_len;
+  if (linear >= total) {
+    return;
+  }
+  int64_t token = linear % context_len;
+  float p = probs[linear];
+  float e = code_error[token];
+  risk[linear] = p * p * e;
+  token_ids[linear] = static_cast<int32_t>(token);
+}
+
+__global__ void joint_grouped_risk_sort_inputs_kernel(
+    const float* __restrict__ probs,
+    const float* __restrict__ code_error_groups,
+    const int64_t* __restrict__ row_group_ids,
+    float* __restrict__ risk,
+    int32_t* __restrict__ token_ids,
+    int64_t rows,
+    int64_t context_len) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = rows * context_len;
+  if (linear >= total) {
+    return;
+  }
+  int64_t token = linear % context_len;
+  int64_t row = linear / context_len;
+  int64_t group = row_group_ids[row];
+  float p = probs[linear];
+  float e = code_error_groups[group * context_len + token];
+  risk[linear] = p * p * e;
+  token_ids[linear] = static_cast<int32_t>(token);
+}
+
+__global__ void joint_grouped_flat_risk_sort_inputs_kernel(
+    const float* __restrict__ probs,
+    const float* __restrict__ code_error_groups,
+    float* __restrict__ risk,
+    int32_t* __restrict__ token_ids,
+    int64_t groups,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t rows = groups * k_count * heads;
+  int64_t total = rows * context_len;
+  if (linear >= total) {
+    return;
+  }
+  int64_t token = linear % context_len;
+  int64_t row = linear / context_len;
+  int64_t group = row / (k_count * heads);
+  float p = probs[linear];
+  float e = code_error_groups[group * context_len + token];
+  risk[linear] = p * p * e;
+  token_ids[linear] = static_cast<int32_t>(token);
+}
+
+template <typename code_t>
+__global__ void joint_vpq_code_weight_kernel(
+    const float* __restrict__ probs,
+    const code_t* __restrict__ value_codes,
+    const int64_t* __restrict__ page_starts,
+    float* __restrict__ code_weights,
+    int64_t rows,
+    int64_t context_len,
+    int64_t pages,
+    int64_t page_size,
+    int64_t value_subvecs,
+    int64_t code_count) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = rows * context_len;
+  if (linear >= total || pages <= 0 || page_size <= 0 || value_subvecs <= 0 || code_count <= 0) {
+    return;
+  }
+
+  int64_t token = linear % context_len;
+  int64_t row = linear / context_len;
+  int64_t first_start = page_starts[0];
+  int64_t page = (token - first_start) / page_size;
+  if (token < first_start || page < 0 || page >= pages) {
+    return;
+  }
+  int64_t page_start = page_starts[page];
+  int64_t row_in_page = token - page_start;
+  if (row_in_page < 0 || row_in_page >= page_size) {
+    return;
+  }
+
+  int64_t code = static_cast<int64_t>(value_codes[(page * page_size + row_in_page) * value_subvecs]);
+  code = max(static_cast<int64_t>(0), min(code, code_count - 1));
+  atomicAdd(&code_weights[(row * pages + page) * code_count + code], probs[linear]);
+}
+
+template <typename value_t>
+__global__ void joint_vpq_base_from_code_weights_kernel(
+    const float* __restrict__ probs,
+    const value_t* __restrict__ values,
+    const float* __restrict__ value_codebooks,
+    const float* __restrict__ code_weights,
+    const int64_t* __restrict__ fallback_tokens,
+    float* __restrict__ outputs,
+    int64_t rows,
+    int64_t context_len,
+    int64_t dim,
+    int64_t pages,
+    int64_t code_count,
+    int64_t fallback_count) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = rows * dim;
+  if (linear >= total) {
+    return;
+  }
+
+  int64_t d = linear % dim;
+  int64_t row = linear / dim;
+  float acc = 0.0f;
+
+  for (int64_t page = 0; page < pages; ++page) {
+    const float* weights = code_weights + (row * pages + page) * code_count;
+    const float* codebook = value_codebooks + page * code_count * dim;
+    for (int64_t code = 0; code < code_count; ++code) {
+      acc += weights[code] * codebook[code * dim + d];
+    }
+  }
+
+  for (int64_t i = 0; i < fallback_count; ++i) {
+    int64_t token = fallback_tokens[i];
+    if (token >= 0 && token < context_len) {
+      acc += probs[row * context_len + token] * load_as_float(values, token * dim + d);
+    }
+  }
+
+  outputs[row * dim + d] = acc;
+}
+
+__global__ void joint_softmax_rows_kernel(
+    const float* __restrict__ scores,
+    float* __restrict__ probs,
+    int64_t rows,
+    int64_t context_len) {
+  int64_t row = static_cast<int64_t>(blockIdx.x);
+  if (row >= rows || context_len <= 0) {
+    return;
+  }
+
+  extern __shared__ float shared[];
+  float local_max = -INFINITY;
+  const int64_t row_offset = row * context_len;
+  for (int64_t token = threadIdx.x; token < context_len; token += blockDim.x) {
+    local_max = fmaxf(local_max, scores[row_offset + token]);
+  }
+  shared[threadIdx.x] = local_max;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  const float max_v = shared[0];
+
+  float local_sum = 0.0f;
+  for (int64_t token = threadIdx.x; token < context_len; token += blockDim.x) {
+    float p = expf(scores[row_offset + token] - max_v);
+    probs[row_offset + token] = p;
+    local_sum += p;
+  }
+  shared[threadIdx.x] = local_sum;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  const float denom = fmaxf(shared[0], 1.0e-20f);
+  for (int64_t token = threadIdx.x; token < context_len; token += blockDim.x) {
+    probs[row_offset + token] /= denom;
+  }
+}
+
+template <int DIMS_PER_BLOCK>
+__global__ void joint_base_outputs_from_probs_kernel(
+    const float* __restrict__ probs,
+    const float* __restrict__ values,
+    float* __restrict__ outputs,
+    int64_t rows,
+    int64_t context_len,
+    int64_t dim) {
+  constexpr int THREADS = 256;
+  constexpr int TOKEN_LANES = THREADS / DIMS_PER_BLOCK;
+  __shared__ float partial[DIMS_PER_BLOCK][TOKEN_LANES];
+
+  int64_t dim_tiles = (dim + DIMS_PER_BLOCK - 1) / DIMS_PER_BLOCK;
+  int64_t block = static_cast<int64_t>(blockIdx.x);
+  int64_t dim_tile = block % dim_tiles;
+  int64_t row = block / dim_tiles;
+  if (row >= rows) {
+    return;
+  }
+
+  int lane_dim = static_cast<int>(threadIdx.x % DIMS_PER_BLOCK);
+  int lane_token = static_cast<int>(threadIdx.x / DIMS_PER_BLOCK);
+  int64_t d = dim_tile * DIMS_PER_BLOCK + lane_dim;
+  float acc = 0.0f;
+  if (d < dim) {
+    const int64_t prob_offset = row * context_len;
+    for (int64_t token = lane_token; token < context_len; token += TOKEN_LANES) {
+      acc += probs[prob_offset + token] * values[token * dim + d];
+    }
+  }
+
+  partial[lane_dim][lane_token] = acc;
+  __syncthreads();
+  for (int stride = TOKEN_LANES >> 1; stride > 0; stride >>= 1) {
+    if (lane_token < stride) {
+      partial[lane_dim][lane_token] += partial[lane_dim][lane_token + stride];
+    }
+    __syncthreads();
+  }
+  if (lane_token == 0 && d < dim) {
+    outputs[row * dim + d] = partial[lane_dim][0];
+  }
+}
+
+__global__ void joint_grouped_flat_risk_values_kernel(
+    const float* __restrict__ probs,
+    const float* __restrict__ code_error_groups,
+    float* __restrict__ risk,
+    int64_t groups,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t rows = groups * k_count * heads;
+  int64_t total = rows * context_len;
+  if (linear >= total) {
+    return;
+  }
+  int64_t token = linear % context_len;
+  int64_t row = linear / context_len;
+  int64_t group = row / (k_count * heads);
+  float p = probs[linear];
+  float e = code_error_groups[group * context_len + token];
+  risk[linear] = p * p * e;
+}
+
+__global__ void joint_rank_prefix_sort_inputs_kernel(
+    const float* __restrict__ scores,
+    float* __restrict__ score_in,
+    int32_t* __restrict__ pos_in,
+    int64_t rows,
+    int64_t count) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = rows * count;
+  if (linear >= total) {
+    return;
+  }
+  int64_t pos = linear % count;
+  score_in[linear] = scores[linear];
+  pos_in[linear] = static_cast<int32_t>(pos);
+}
+
+__global__ void joint_rank_prefix_gather_tokens_kernel(
+    const int32_t* __restrict__ sorted_pos,
+    const int64_t* __restrict__ indexed_tokens,
+    int64_t* __restrict__ ranked_tokens,
+    int64_t rows,
+    int64_t count,
+    int64_t max_take) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = rows * max_take;
+  if (linear >= total) {
+    return;
+  }
+  int64_t take = linear % max_take;
+  int64_t row = linear / max_take;
+  int64_t pos = static_cast<int64_t>(sorted_pos[row * count + take]);
+  ranked_tokens[linear] = (pos >= 0 && pos < count) ? indexed_tokens[pos] : static_cast<int64_t>(-1);
+}
+
+template <typename order_t>
+__global__ void joint_grouped_vprefix_outputs_kernel(
+    const float* __restrict__ base_outputs,
+    const float* __restrict__ probs,
+    const float* __restrict__ residual_groups,
+    const int64_t* __restrict__ row_group_ids,
+    const order_t* __restrict__ exact_order,
+    const int64_t* __restrict__ v_budgets,
+    float* __restrict__ outputs,
+    int64_t rows,
+    int64_t context_len,
+    int64_t max_exact,
+    int64_t v_steps,
+    int64_t dim) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = rows * dim;
+  if (linear >= total) {
+    return;
+  }
+
+  int64_t d = linear % dim;
+  int64_t row = linear / dim;
+  int64_t group = row_group_ids[row];
+
+  float acc = base_outputs[row * dim + d];
+  int64_t prev_count = 0;
+  for (int64_t vi = 0; vi < v_steps; ++vi) {
+    int64_t exact_count = v_budgets[vi];
+    exact_count = max(static_cast<int64_t>(0), min(exact_count, context_len));
+    exact_count = min(exact_count, max_exact);
+    if (exact_count < prev_count) {
+      acc = base_outputs[row * dim + d];
+      prev_count = 0;
+    }
+    for (int64_t j = prev_count; j < exact_count; ++j) {
+      int64_t token = static_cast<int64_t>(exact_order[row * max_exact + j]);
+      if (token >= 0 && token < context_len) {
+        acc += probs[row * context_len + token] * residual_groups[(group * context_len + token) * dim + d];
+      }
+    }
+    outputs[(row * v_steps + vi) * dim + d] = acc;
+    prev_count = exact_count;
+  }
+}
+
+template <typename order_t>
+__global__ void joint_grouped_flat_vprefix_outputs_kernel(
+    const float* __restrict__ base_outputs,
+    const float* __restrict__ probs,
+    const float* __restrict__ residual_groups,
+    const order_t* __restrict__ exact_order,
+    const int64_t* __restrict__ v_budgets,
+    float* __restrict__ outputs,
+    int64_t groups,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len,
+    int64_t max_exact,
+    int64_t v_steps,
+    int64_t dim) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t rows = groups * k_count * heads;
+  int64_t total = rows * dim;
+  if (linear >= total) {
+    return;
+  }
+
+  int64_t d = linear % dim;
+  int64_t row = linear / dim;
+  int64_t group = row / (k_count * heads);
+
+  float acc = base_outputs[row * dim + d];
+  int64_t prev_count = 0;
+  for (int64_t vi = 0; vi < v_steps; ++vi) {
+    int64_t exact_count = v_budgets[vi];
+    exact_count = max(static_cast<int64_t>(0), min(exact_count, context_len));
+    exact_count = min(exact_count, max_exact);
+    if (exact_count < prev_count) {
+      acc = base_outputs[row * dim + d];
+      prev_count = 0;
+    }
+    for (int64_t j = prev_count; j < exact_count; ++j) {
+      int64_t token = static_cast<int64_t>(exact_order[row * max_exact + j]);
+      if (token >= 0 && token < context_len) {
+        acc += probs[row * context_len + token] * residual_groups[(group * context_len + token) * dim + d];
+      }
+    }
+    outputs[(row * v_steps + vi) * dim + d] = acc;
+    prev_count = exact_count;
+  }
+}
+
+template <typename order_t, int DIMS_PER_BLOCK>
+__global__ void joint_grouped_flat_vprefix_interval_sums_kernel(
+    const float* __restrict__ probs,
+    const float* __restrict__ residual_groups,
+    const order_t* __restrict__ exact_order,
+    const int64_t* __restrict__ v_budgets,
+    float* __restrict__ interval_sums,
+    int64_t groups,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len,
+    int64_t max_exact,
+    int64_t v_steps,
+    int64_t dim) {
+  constexpr int THREADS = 256;
+  constexpr int TOKEN_LANES = THREADS / DIMS_PER_BLOCK;
+  __shared__ float partial[DIMS_PER_BLOCK][TOKEN_LANES];
+
+  int64_t rows = groups * k_count * heads;
+  int64_t dim_tiles = (dim + DIMS_PER_BLOCK - 1) / DIMS_PER_BLOCK;
+  int64_t block = static_cast<int64_t>(blockIdx.x);
+  int64_t dim_tile = block % dim_tiles;
+  block /= dim_tiles;
+  int64_t vi = block % v_steps;
+  int64_t row = block / v_steps;
+  if (row >= rows || vi >= v_steps) {
+    return;
+  }
+
+  int lane_dim = static_cast<int>(threadIdx.x % DIMS_PER_BLOCK);
+  int lane_token = static_cast<int>(threadIdx.x / DIMS_PER_BLOCK);
+  int64_t d = dim_tile * DIMS_PER_BLOCK + lane_dim;
+  float acc = 0.0f;
+
+  int64_t exact_count = v_budgets[vi];
+  exact_count = max(static_cast<int64_t>(0), min(exact_count, context_len));
+  exact_count = min(exact_count, max_exact);
+  int64_t prev_count = 0;
+  if (vi > 0) {
+    prev_count = v_budgets[vi - 1];
+    prev_count = max(static_cast<int64_t>(0), min(prev_count, context_len));
+    prev_count = min(prev_count, max_exact);
+  }
+  int64_t start_count = exact_count < prev_count ? 0 : prev_count;
+
+  if (d < dim) {
+    int64_t group = row / (k_count * heads);
+    for (int64_t j = start_count + lane_token; j < exact_count; j += TOKEN_LANES) {
+      int64_t token = static_cast<int64_t>(exact_order[row * max_exact + j]);
+      if (token >= 0 && token < context_len) {
+        acc += probs[row * context_len + token] * residual_groups[(group * context_len + token) * dim + d];
+      }
+    }
+  }
+
+  partial[lane_dim][lane_token] = acc;
+  __syncthreads();
+  for (int stride = TOKEN_LANES >> 1; stride > 0; stride >>= 1) {
+    if (lane_token < stride) {
+      partial[lane_dim][lane_token] += partial[lane_dim][lane_token + stride];
+    }
+    __syncthreads();
+  }
+  if (lane_token == 0 && d < dim) {
+    interval_sums[(row * v_steps + vi) * dim + d] = partial[lane_dim][0];
+  }
+}
+
+__global__ void joint_grouped_flat_vprefix_prefix_intervals_kernel(
+    const float* __restrict__ base_outputs,
+    const float* __restrict__ interval_sums,
+    const int64_t* __restrict__ v_budgets,
+    float* __restrict__ outputs,
+    int64_t rows,
+    int64_t context_len,
+    int64_t max_exact,
+    int64_t v_steps,
+    int64_t dim) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = rows * dim;
+  if (linear >= total) {
+    return;
+  }
+
+  int64_t d = linear % dim;
+  int64_t row = linear / dim;
+  float acc = base_outputs[row * dim + d];
+  int64_t prev_count = 0;
+  for (int64_t vi = 0; vi < v_steps; ++vi) {
+    int64_t exact_count = v_budgets[vi];
+    exact_count = max(static_cast<int64_t>(0), min(exact_count, context_len));
+    exact_count = min(exact_count, max_exact);
+    if (exact_count < prev_count) {
+      acc = base_outputs[row * dim + d];
+    }
+    acc += interval_sums[(row * v_steps + vi) * dim + d];
+    outputs[(row * v_steps + vi) * dim + d] = acc;
+    prev_count = exact_count;
+  }
+}
+
+template <typename order_t>
+__device__ float joint_grouped_flat_output_value(
+    const float* __restrict__ base_outputs,
+    const float* __restrict__ probs,
+    const float* __restrict__ residual_groups,
+    const order_t* __restrict__ exact_order,
+    const int64_t* __restrict__ v_budgets,
+    int64_t group,
+    int64_t ki,
+    int64_t vi,
+    int64_t head,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len,
+    int64_t v_count,
+    int64_t dim,
+    int64_t d) {
+  int64_t row = group * (k_count * heads) + ki * heads + head;
+  float acc = base_outputs[row * dim + d];
+  int64_t exact_count = v_budgets[vi];
+  exact_count = max(static_cast<int64_t>(0), min(exact_count, context_len));
+  for (int64_t j = 0; j < exact_count; ++j) {
+    int64_t token = static_cast<int64_t>(exact_order[row * context_len + j]);
+    if (token >= 0 && token < context_len) {
+      acc += probs[row * context_len + token] * residual_groups[(group * context_len + token) * dim + d];
+    }
+  }
+  return acc;
+}
+
+__global__ void joint_select_policy_kernel(
+    const float* __restrict__ outputs,
+    const float* __restrict__ k_mb,
+    const float* __restrict__ v_mb,
+    int64_t* __restrict__ final_indices,
+    int64_t k_count,
+    int64_t v_count,
+    int64_t heads,
+    int64_t dim,
+    double threshold,
+    int policy_id) {
+  int64_t head = blockIdx.x;
+  if (head >= heads || k_count <= 0 || v_count <= 0 || dim <= 0) {
+    return;
+  }
+  extern __shared__ double joint_policy_shared[];
+  double* k_diff_parts = joint_policy_shared;
+  double* k_ref_parts = k_diff_parts + blockDim.x;
+  double* v_diff_parts = k_ref_parts + blockDim.x;
+  double* v_ref_parts = v_diff_parts + blockDim.x;
+  __shared__ int64_t ki_shared;
+  __shared__ int64_t vi_shared;
+  __shared__ int stop_shared;
+  if (threadIdx.x == 0) {
+    ki_shared = 0;
+    vi_shared = 0;
+    stop_shared = 0;
+  }
+  __syncthreads();
+
+  int64_t max_steps = k_count + v_count + 4;
+  for (int64_t step = 0; step < max_steps; ++step) {
+    int64_t ki = ki_shared;
+    int64_t vi = vi_shared;
+    bool k_can = (ki + 1) < k_count;
+    bool v_can = (vi + 1) < v_count;
+    double k_diff = 0.0;
+    double k_ref = 0.0;
+    double v_diff = 0.0;
+    double v_ref = 0.0;
+    for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+      int64_t cur_idx = (((ki * v_count + vi) * heads + head) * dim + d);
+      double cur = static_cast<double>(outputs[cur_idx]);
+      if (k_can) {
+        int64_t next_idx = ((((ki + 1) * v_count + vi) * heads + head) * dim + d);
+        double nxt = static_cast<double>(outputs[next_idx]);
+        double delta = cur - nxt;
+        k_diff += delta * delta;
+        k_ref += nxt * nxt;
+      }
+      if (v_can) {
+        int64_t next_idx = (((ki * v_count + (vi + 1)) * heads + head) * dim + d);
+        double nxt = static_cast<double>(outputs[next_idx]);
+        double delta = cur - nxt;
+        v_diff += delta * delta;
+        v_ref += nxt * nxt;
+      }
+    }
+    k_diff_parts[threadIdx.x] = k_diff;
+    k_ref_parts[threadIdx.x] = k_ref;
+    v_diff_parts[threadIdx.x] = v_diff;
+    v_ref_parts[threadIdx.x] = v_ref;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        k_diff_parts[threadIdx.x] += k_diff_parts[threadIdx.x + stride];
+        k_ref_parts[threadIdx.x] += k_ref_parts[threadIdx.x + stride];
+        v_diff_parts[threadIdx.x] += v_diff_parts[threadIdx.x + stride];
+        v_ref_parts[threadIdx.x] += v_ref_parts[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      double k_delta = k_can ? sqrt(fmax(k_diff_parts[0], 0.0)) / fmax(sqrt(fmax(k_ref_parts[0], 0.0)), 1.0e-20) : 0.0;
+      double v_delta = v_can ? sqrt(fmax(v_diff_parts[0], 0.0)) / fmax(sqrt(fmax(v_ref_parts[0], 0.0)), 1.0e-20) : 0.0;
+      bool k_bad = k_can && k_delta > threshold;
+      bool v_bad = v_can && v_delta > threshold;
+      if (!k_bad && !v_bad) {
+        stop_shared = 1;
+      } else {
+        int action = 0;  // 0 = K, 1 = V
+        if (policy_id == 0) {
+          action = k_bad ? 0 : 1;
+        } else if (policy_id == 1) {
+          action = v_bad ? 1 : 0;
+        } else if (policy_id == 2) {
+          int preferred = (static_cast<int>(step) % 2 == 0) ? 0 : 1;
+          if (preferred == 0 && k_bad) {
+            action = 0;
+          } else if (preferred == 1 && v_bad) {
+            action = 1;
+          } else {
+            action = v_bad ? 1 : 0;
+          }
+        } else if (policy_id == 3) {
+          int preferred = (static_cast<int>(step) % 2 == 0) ? 1 : 0;
+          if (preferred == 1 && v_bad) {
+            action = 1;
+          } else if (preferred == 0 && k_bad) {
+            action = 0;
+          } else {
+            action = k_bad ? 0 : 1;
+          }
+        } else {
+          double extra_k = k_can ? static_cast<double>(k_mb[ki + 1] - k_mb[ki]) : INFINITY;
+          double extra_v = v_can ? static_cast<double>(v_mb[vi + 1] - v_mb[vi]) : INFINITY;
+          double k_gain = k_bad ? k_delta / fmax(extra_k, 1.0e-9) : -1.0;
+          double v_gain = v_bad ? v_delta / fmax(extra_v, 1.0e-9) : -1.0;
+          action = (k_gain >= v_gain) ? 0 : 1;
+        }
+        if (action == 0 && k_can) {
+          ki_shared = ki + 1;
+        } else if (action == 1 && v_can) {
+          vi_shared = vi + 1;
+        } else {
+          stop_shared = 1;
+        }
+      }
+    }
+    __syncthreads();
+    if (stop_shared != 0) {
+      break;
+    }
+  }
+  if (threadIdx.x == 0) {
+    final_indices[head * 2] = ki_shared;
+    final_indices[head * 2 + 1] = vi_shared;
+  }
+}
+
+template <typename order_t>
+__global__ void joint_select_policy_grouped_risk_kernel(
+    const float* __restrict__ base_outputs,
+    const float* __restrict__ probs,
+    const float* __restrict__ residual_groups,
+    const order_t* __restrict__ exact_order,
+    const int64_t* __restrict__ v_budgets,
+    const float* __restrict__ k_mb,
+    const float* __restrict__ v_mb,
+    int64_t* __restrict__ final_indices,
+    float* __restrict__ final_outputs,
+    int64_t groups,
+    int64_t k_count,
+    int64_t v_count,
+    int64_t heads,
+    int64_t dim,
+    int64_t context_len,
+    double threshold,
+    int policy_id) {
+  int64_t gh = blockIdx.x;
+  int64_t group = gh / heads;
+  int64_t head = gh - group * heads;
+  if (group >= groups || head >= heads || k_count <= 0 || v_count <= 0 || dim <= 0) {
+    return;
+  }
+  extern __shared__ double joint_policy_shared[];
+  double* k_diff_parts = joint_policy_shared;
+  double* k_ref_parts = k_diff_parts + blockDim.x;
+  double* v_diff_parts = k_ref_parts + blockDim.x;
+  double* v_ref_parts = v_diff_parts + blockDim.x;
+  __shared__ int64_t ki_shared;
+  __shared__ int64_t vi_shared;
+  __shared__ int stop_shared;
+  if (threadIdx.x == 0) {
+    ki_shared = 0;
+    vi_shared = 0;
+    stop_shared = 0;
+  }
+  __syncthreads();
+
+  int64_t max_steps = k_count + v_count + 4;
+  for (int64_t step = 0; step < max_steps; ++step) {
+    int64_t ki = ki_shared;
+    int64_t vi = vi_shared;
+    bool k_can = (ki + 1) < k_count;
+    bool v_can = (vi + 1) < v_count;
+    double k_diff = 0.0;
+    double k_ref = 0.0;
+    double v_diff = 0.0;
+    double v_ref = 0.0;
+    for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+      float cur_f = joint_grouped_flat_output_value(
+          base_outputs,
+          probs,
+          residual_groups,
+          exact_order,
+          v_budgets,
+          group,
+          ki,
+          vi,
+          head,
+          k_count,
+          heads,
+          context_len,
+          v_count,
+          dim,
+          d);
+      double cur = static_cast<double>(cur_f);
+      if (k_can) {
+        double nxt = static_cast<double>(joint_grouped_flat_output_value(
+            base_outputs,
+            probs,
+            residual_groups,
+            exact_order,
+            v_budgets,
+            group,
+            ki + 1,
+            vi,
+            head,
+            k_count,
+            heads,
+            context_len,
+            v_count,
+            dim,
+            d));
+        double delta = cur - nxt;
+        k_diff += delta * delta;
+        k_ref += nxt * nxt;
+      }
+      if (v_can) {
+        double nxt = static_cast<double>(joint_grouped_flat_output_value(
+            base_outputs,
+            probs,
+            residual_groups,
+            exact_order,
+            v_budgets,
+            group,
+            ki,
+            vi + 1,
+            head,
+            k_count,
+            heads,
+            context_len,
+            v_count,
+            dim,
+            d));
+        double delta = cur - nxt;
+        v_diff += delta * delta;
+        v_ref += nxt * nxt;
+      }
+    }
+    k_diff_parts[threadIdx.x] = k_diff;
+    k_ref_parts[threadIdx.x] = k_ref;
+    v_diff_parts[threadIdx.x] = v_diff;
+    v_ref_parts[threadIdx.x] = v_ref;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        k_diff_parts[threadIdx.x] += k_diff_parts[threadIdx.x + stride];
+        k_ref_parts[threadIdx.x] += k_ref_parts[threadIdx.x + stride];
+        v_diff_parts[threadIdx.x] += v_diff_parts[threadIdx.x + stride];
+        v_ref_parts[threadIdx.x] += v_ref_parts[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      double k_delta = k_can ? sqrt(fmax(k_diff_parts[0], 0.0)) / fmax(sqrt(fmax(k_ref_parts[0], 0.0)), 1.0e-20) : 0.0;
+      double v_delta = v_can ? sqrt(fmax(v_diff_parts[0], 0.0)) / fmax(sqrt(fmax(v_ref_parts[0], 0.0)), 1.0e-20) : 0.0;
+      bool k_bad = k_can && k_delta > threshold;
+      bool v_bad = v_can && v_delta > threshold;
+      if (!k_bad && !v_bad) {
+        stop_shared = 1;
+      } else {
+        int action = 0;
+        if (policy_id == 0) {
+          action = k_bad ? 0 : 1;
+        } else if (policy_id == 1) {
+          action = v_bad ? 1 : 0;
+        } else if (policy_id == 2) {
+          int preferred = (static_cast<int>(step) % 2 == 0) ? 0 : 1;
+          if (preferred == 0 && k_bad) {
+            action = 0;
+          } else if (preferred == 1 && v_bad) {
+            action = 1;
+          } else {
+            action = v_bad ? 1 : 0;
+          }
+        } else if (policy_id == 3) {
+          int preferred = (static_cast<int>(step) % 2 == 0) ? 1 : 0;
+          if (preferred == 1 && v_bad) {
+            action = 1;
+          } else if (preferred == 0 && k_bad) {
+            action = 0;
+          } else {
+            action = k_bad ? 0 : 1;
+          }
+        } else {
+          double extra_k = k_can ? static_cast<double>(k_mb[group * k_count + ki + 1] - k_mb[group * k_count + ki]) : INFINITY;
+          double extra_v = v_can ? static_cast<double>(v_mb[group * v_count + vi + 1] - v_mb[group * v_count + vi]) : INFINITY;
+          double k_gain = k_bad ? k_delta / fmax(extra_k, 1.0e-9) : -1.0;
+          double v_gain = v_bad ? v_delta / fmax(extra_v, 1.0e-9) : -1.0;
+          action = (k_gain >= v_gain) ? 0 : 1;
+        }
+        if (action == 0 && k_can) {
+          ki_shared = ki + 1;
+        } else if (action == 1 && v_can) {
+          vi_shared = vi + 1;
+        } else {
+          stop_shared = 1;
+        }
+      }
+    }
+    __syncthreads();
+    if (stop_shared != 0) {
+      break;
+    }
+  }
+
+  int64_t final_ki = ki_shared;
+  int64_t final_vi = vi_shared;
+  for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+    final_outputs[(gh * dim) + d] = joint_grouped_flat_output_value(
+        base_outputs,
+        probs,
+        residual_groups,
+        exact_order,
+        v_budgets,
+        group,
+        final_ki,
+        final_vi,
+        head,
+        k_count,
+        heads,
+        context_len,
+        v_count,
+        dim,
+        d);
+  }
+  if (threadIdx.x == 0) {
+    final_indices[gh * 2] = final_ki;
+    final_indices[gh * 2 + 1] = final_vi;
+  }
+}
+
+__global__ void joint_select_policy_grouped_flat_kernel(
+    const float* __restrict__ outputs,
+    const float* __restrict__ k_mb,
+    const float* __restrict__ v_mb,
+    int64_t* __restrict__ final_indices,
+    float* __restrict__ final_outputs,
+    int64_t groups,
+    int64_t k_count,
+    int64_t v_count,
+    int64_t heads,
+    int64_t dim,
+    double threshold,
+    int policy_id) {
+  int64_t gh = blockIdx.x;
+  int64_t group = gh / heads;
+  int64_t head = gh - group * heads;
+  if (group >= groups || head >= heads || k_count <= 0 || v_count <= 0 || dim <= 0) {
+    return;
+  }
+  extern __shared__ double joint_policy_shared[];
+  double* k_diff_parts = joint_policy_shared;
+  double* k_ref_parts = k_diff_parts + blockDim.x;
+  double* v_diff_parts = k_ref_parts + blockDim.x;
+  double* v_ref_parts = v_diff_parts + blockDim.x;
+  __shared__ int64_t ki_shared;
+  __shared__ int64_t vi_shared;
+  __shared__ int stop_shared;
+  if (threadIdx.x == 0) {
+    ki_shared = 0;
+    vi_shared = 0;
+    stop_shared = 0;
+  }
+  __syncthreads();
+
+  const int64_t rows_per_group = k_count * heads;
+  const int64_t group_row_base = group * rows_per_group;
+  int64_t max_steps = k_count + v_count + 4;
+  for (int64_t step = 0; step < max_steps; ++step) {
+    int64_t ki = ki_shared;
+    int64_t vi = vi_shared;
+    bool k_can = (ki + 1) < k_count;
+    bool v_can = (vi + 1) < v_count;
+    double k_diff = 0.0;
+    double k_ref = 0.0;
+    double v_diff = 0.0;
+    double v_ref = 0.0;
+    int64_t cur_row = group_row_base + ki * heads + head;
+    for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+      double cur = static_cast<double>(outputs[(cur_row * v_count + vi) * dim + d]);
+      if (k_can) {
+        int64_t next_row = group_row_base + (ki + 1) * heads + head;
+        double nxt = static_cast<double>(outputs[(next_row * v_count + vi) * dim + d]);
+        double delta = cur - nxt;
+        k_diff += delta * delta;
+        k_ref += nxt * nxt;
+      }
+      if (v_can) {
+        double nxt = static_cast<double>(outputs[(cur_row * v_count + (vi + 1)) * dim + d]);
+        double delta = cur - nxt;
+        v_diff += delta * delta;
+        v_ref += nxt * nxt;
+      }
+    }
+    k_diff_parts[threadIdx.x] = k_diff;
+    k_ref_parts[threadIdx.x] = k_ref;
+    v_diff_parts[threadIdx.x] = v_diff;
+    v_ref_parts[threadIdx.x] = v_ref;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        k_diff_parts[threadIdx.x] += k_diff_parts[threadIdx.x + stride];
+        k_ref_parts[threadIdx.x] += k_ref_parts[threadIdx.x + stride];
+        v_diff_parts[threadIdx.x] += v_diff_parts[threadIdx.x + stride];
+        v_ref_parts[threadIdx.x] += v_ref_parts[threadIdx.x + stride];
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      double k_delta = k_can ? sqrt(fmax(k_diff_parts[0], 0.0)) / fmax(sqrt(fmax(k_ref_parts[0], 0.0)), 1.0e-20) : 0.0;
+      double v_delta = v_can ? sqrt(fmax(v_diff_parts[0], 0.0)) / fmax(sqrt(fmax(v_ref_parts[0], 0.0)), 1.0e-20) : 0.0;
+      bool k_bad = k_can && k_delta > threshold;
+      bool v_bad = v_can && v_delta > threshold;
+      if (!k_bad && !v_bad) {
+        stop_shared = 1;
+      } else {
+        int action = 0;
+        if (policy_id == 0) {
+          action = k_bad ? 0 : 1;
+        } else if (policy_id == 1) {
+          action = v_bad ? 1 : 0;
+        } else if (policy_id == 2) {
+          int preferred = (static_cast<int>(step) % 2 == 0) ? 0 : 1;
+          if (preferred == 0 && k_bad) {
+            action = 0;
+          } else if (preferred == 1 && v_bad) {
+            action = 1;
+          } else {
+            action = v_bad ? 1 : 0;
+          }
+        } else if (policy_id == 3) {
+          int preferred = (static_cast<int>(step) % 2 == 0) ? 1 : 0;
+          if (preferred == 1 && v_bad) {
+            action = 1;
+          } else if (preferred == 0 && k_bad) {
+            action = 0;
+          } else {
+            action = k_bad ? 0 : 1;
+          }
+        } else {
+          double extra_k = k_can ? static_cast<double>(k_mb[group * k_count + ki + 1] - k_mb[group * k_count + ki]) : INFINITY;
+          double extra_v = v_can ? static_cast<double>(v_mb[group * v_count + vi + 1] - v_mb[group * v_count + vi]) : INFINITY;
+          double k_gain = k_bad ? k_delta / fmax(extra_k, 1.0e-9) : -1.0;
+          double v_gain = v_bad ? v_delta / fmax(extra_v, 1.0e-9) : -1.0;
+          action = (k_gain >= v_gain) ? 0 : 1;
+        }
+        if (action == 0 && k_can) {
+          ki_shared = ki + 1;
+        } else if (action == 1 && v_can) {
+          vi_shared = vi + 1;
+        } else {
+          stop_shared = 1;
+        }
+      }
+    }
+    __syncthreads();
+    if (stop_shared != 0) {
+      break;
+    }
+  }
+
+  int64_t final_ki = ki_shared;
+  int64_t final_vi = vi_shared;
+  int64_t final_row = group_row_base + final_ki * heads + head;
+  for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+    final_outputs[(gh * dim) + d] = outputs[(final_row * v_count + final_vi) * dim + d];
+  }
+  if (threadIdx.x == 0) {
+    final_indices[gh * 2] = final_ki;
+    final_indices[gh * 2 + 1] = final_vi;
+  }
+}
+
+__global__ void joint_segment_offsets_kernel(
+    int64_t* __restrict__ offsets,
+    int64_t rows,
+    int64_t context_len) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx > rows) {
+    return;
+  }
+  offsets[idx] = idx * context_len;
+}
+
+__global__ void joint_selected_mask_set_base_kernel(
+    unsigned char* __restrict__ selected_mask,
+    const int64_t* __restrict__ base_tokens,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len,
+    int64_t base_count) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = k_count * heads * base_count;
+  if (linear >= total) {
+    return;
+  }
+  int64_t base_i = linear % base_count;
+  int64_t tmp = linear / base_count;
+  int64_t head = tmp % heads;
+  int64_t ki = tmp / heads;
+  int64_t token = base_tokens[base_i];
+  if (token >= 0 && token < context_len) {
+    selected_mask[(ki * heads + head) * context_len + token] = static_cast<unsigned char>(1);
+  }
+}
+
+__global__ void joint_selected_mask_set_ranked_kernel(
+    unsigned char* __restrict__ selected_mask,
+    const int64_t* __restrict__ ranked_prefix_tokens,
+    const int64_t* __restrict__ k_take_counts,
+    int64_t k_count,
+    int64_t heads,
+    int64_t max_rank_take,
+    int64_t context_len) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = k_count * heads * max_rank_take;
+  if (linear >= total) {
+    return;
+  }
+  int64_t rank_i = linear % max_rank_take;
+  int64_t tmp = linear / max_rank_take;
+  int64_t head = tmp % heads;
+  int64_t ki = tmp / heads;
+  int64_t take = k_take_counts[ki];
+  if (rank_i >= take) {
+    return;
+  }
+  int64_t token = ranked_prefix_tokens[head * max_rank_take + rank_i];
+  if (token >= 0 && token < context_len) {
+    selected_mask[(ki * heads + head) * context_len + token] = static_cast<unsigned char>(1);
+  }
+}
+
+__global__ void joint_indexed_token_to_pos_kernel(
+    int* __restrict__ token_to_indexed,
+    const int64_t* __restrict__ indexed_tokens,
+    int64_t indexed_count,
+    int64_t context_len) {
+  int64_t j = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (j >= indexed_count) {
+    return;
+  }
+  int64_t token = indexed_tokens[j];
+  if (token >= 0 && token < context_len) {
+    token_to_indexed[token] = static_cast<int>(j);
+  }
+}
+
+__global__ void joint_base_mask_set_kernel(
+    unsigned char* __restrict__ base_mask,
+    const int64_t* __restrict__ base_tokens,
+    int64_t base_count,
+    int64_t context_len) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= base_count) {
+    return;
+  }
+  int64_t token = base_tokens[idx];
+  if (token >= 0 && token < context_len) {
+    base_mask[token] = static_cast<unsigned char>(1);
+  }
+}
+
+__global__ void joint_rank_position_scatter_kernel(
+    int* __restrict__ rank_pos,
+    const int64_t* __restrict__ ranked_prefix_tokens,
+    int64_t heads,
+    int64_t max_rank_take,
+    int64_t context_len) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = heads * max_rank_take;
+  if (linear >= total) {
+    return;
+  }
+  int64_t rank_i = linear % max_rank_take;
+  int64_t head = linear / max_rank_take;
+  int64_t token = ranked_prefix_tokens[head * max_rank_take + rank_i];
+  if (token >= 0 && token < context_len) {
+    rank_pos[head * context_len + token] = static_cast<int>(rank_i);
+  }
+}
+
+__global__ void joint_affine_selected_fit_kernel(
+    const float* __restrict__ pq_logits,
+    const float* __restrict__ y_indexed,
+    const int64_t* __restrict__ indexed_tokens,
+    const unsigned char* __restrict__ selected_mask,
+    float* __restrict__ fit_scale,
+    float* __restrict__ fit_bias,
+    int64_t k_count,
+    int64_t heads,
+    int64_t indexed_count,
+    int64_t context_len,
+    bool calibrate) {
+  int64_t kh = blockIdx.x;
+  int64_t rows = k_count * heads;
+  if (kh >= rows) {
+    return;
+  }
+  extern __shared__ float shared[];
+  float* sx_parts = shared;
+  float* sy_parts = sx_parts + blockDim.x;
+  float* sx2_parts = sy_parts + blockDim.x;
+  float* sxy_parts = sx2_parts + blockDim.x;
+  float* count_parts = sxy_parts + blockDim.x;
+
+  int64_t head = kh % heads;
+  float sx = 0.0f;
+  float sy = 0.0f;
+  float sx2 = 0.0f;
+  float sxy = 0.0f;
+  float count = 0.0f;
+  if (calibrate) {
+    for (int64_t j = threadIdx.x; j < indexed_count; j += blockDim.x) {
+      int64_t token = indexed_tokens[j];
+      if (token < 0 || token >= context_len) {
+        continue;
+      }
+      if (selected_mask[kh * context_len + token] == static_cast<unsigned char>(0)) {
+        continue;
+      }
+      float x = pq_logits[head * indexed_count + j];
+      float y = y_indexed[head * indexed_count + j];
+      sx += x;
+      sy += y;
+      sx2 += x * x;
+      sxy += x * y;
+      count += 1.0f;
+    }
+  }
+  sx_parts[threadIdx.x] = sx;
+  sy_parts[threadIdx.x] = sy;
+  sx2_parts[threadIdx.x] = sx2;
+  sxy_parts[threadIdx.x] = sxy;
+  count_parts[threadIdx.x] = count;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      sx_parts[threadIdx.x] += sx_parts[threadIdx.x + stride];
+      sy_parts[threadIdx.x] += sy_parts[threadIdx.x + stride];
+      sx2_parts[threadIdx.x] += sx2_parts[threadIdx.x + stride];
+      sxy_parts[threadIdx.x] += sxy_parts[threadIdx.x + stride];
+      count_parts[threadIdx.x] += count_parts[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    float scale = 1.0f;
+    float bias = 0.0f;
+    float n = count_parts[0];
+    if (calibrate && n >= 2.0f) {
+      float inv_n = 1.0f / n;
+      float mean_x = sx_parts[0] * inv_n;
+      float mean_y = sy_parts[0] * inv_n;
+      float var_x = fmaxf(sx2_parts[0] * inv_n - mean_x * mean_x, 0.0f);
+      float cov = sxy_parts[0] * inv_n - mean_x * mean_y;
+      if (var_x <= 1.0e-20f) {
+        scale = 0.0f;
+        bias = mean_y;
+      } else {
+        float fitted_scale = cov / fmaxf(var_x, 1.0e-20f);
+        float fitted_bias = mean_y - fitted_scale * mean_x;
+        if (isfinite(fitted_scale) && fitted_scale > 0.0f) {
+          scale = fitted_scale;
+          bias = fitted_bias;
+        }
+      }
+    }
+    fit_scale[kh] = scale;
+    fit_bias[kh] = bias;
+  }
+}
+
+__global__ void joint_affine_selected_fit_rankpos_kernel(
+    const float* __restrict__ pq_logits,
+    const float* __restrict__ y_indexed,
+    const int64_t* __restrict__ indexed_tokens,
+    const unsigned char* __restrict__ base_mask,
+    const int* __restrict__ rank_pos,
+    const int64_t* __restrict__ k_take_counts,
+    float* __restrict__ fit_scale,
+    float* __restrict__ fit_bias,
+    int64_t k_count,
+    int64_t heads,
+    int64_t indexed_count,
+    int64_t context_len,
+    bool calibrate) {
+  int64_t kh = blockIdx.x;
+  int64_t rows = k_count * heads;
+  if (kh >= rows) {
+    return;
+  }
+  extern __shared__ float shared[];
+  float* sx_parts = shared;
+  float* sy_parts = sx_parts + blockDim.x;
+  float* sx2_parts = sy_parts + blockDim.x;
+  float* sxy_parts = sx2_parts + blockDim.x;
+  float* count_parts = sxy_parts + blockDim.x;
+
+  int64_t head = kh % heads;
+  int64_t ki = kh / heads;
+  int64_t take = k_take_counts[ki];
+  float sx = 0.0f;
+  float sy = 0.0f;
+  float sx2 = 0.0f;
+  float sxy = 0.0f;
+  float count = 0.0f;
+  if (calibrate) {
+    for (int64_t j = threadIdx.x; j < indexed_count; j += blockDim.x) {
+      int64_t token = indexed_tokens[j];
+      if (token < 0 || token >= context_len) {
+        continue;
+      }
+      bool selected = base_mask[token] != static_cast<unsigned char>(0);
+      int pos = rank_pos[head * context_len + token];
+      selected = selected || (pos >= 0 && static_cast<int64_t>(pos) < take);
+      if (!selected) {
+        continue;
+      }
+      float x = pq_logits[head * indexed_count + j];
+      float y = y_indexed[head * indexed_count + j];
+      sx += x;
+      sy += y;
+      sx2 += x * x;
+      sxy += x * y;
+      count += 1.0f;
+    }
+  }
+  sx_parts[threadIdx.x] = sx;
+  sy_parts[threadIdx.x] = sy;
+  sx2_parts[threadIdx.x] = sx2;
+  sxy_parts[threadIdx.x] = sxy;
+  count_parts[threadIdx.x] = count;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      sx_parts[threadIdx.x] += sx_parts[threadIdx.x + stride];
+      sy_parts[threadIdx.x] += sy_parts[threadIdx.x + stride];
+      sx2_parts[threadIdx.x] += sx2_parts[threadIdx.x + stride];
+      sxy_parts[threadIdx.x] += sxy_parts[threadIdx.x + stride];
+      count_parts[threadIdx.x] += count_parts[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    float scale = 1.0f;
+    float bias = 0.0f;
+    float n = count_parts[0];
+    if (calibrate && n >= 2.0f) {
+      float inv_n = 1.0f / n;
+      float mean_x = sx_parts[0] * inv_n;
+      float mean_y = sy_parts[0] * inv_n;
+      float var_x = fmaxf(sx2_parts[0] * inv_n - mean_x * mean_x, 0.0f);
+      float cov = sxy_parts[0] * inv_n - mean_x * mean_y;
+      if (var_x <= 1.0e-20f) {
+        scale = 0.0f;
+        bias = mean_y;
+      } else {
+        float fitted_scale = cov / fmaxf(var_x, 1.0e-20f);
+        float fitted_bias = mean_y - fitted_scale * mean_x;
+        if (isfinite(fitted_scale) && fitted_scale > 0.0f) {
+          scale = fitted_scale;
+          bias = fitted_bias;
+        }
+      }
+    }
+    fit_scale[kh] = scale;
+    fit_bias[kh] = bias;
+  }
+}
+
+__global__ void joint_mixed_softmax_rows_kernel(
+    const float* __restrict__ exact_scores,
+    const float* __restrict__ pq_logits,
+    const int* __restrict__ token_to_indexed,
+    const int64_t* __restrict__ k_take_counts,
+    const unsigned char* __restrict__ selected_mask,
+    const float* __restrict__ fit_scale,
+    const float* __restrict__ fit_bias,
+    float* __restrict__ probs,
+    int64_t rows,
+    int64_t heads,
+    int64_t indexed_count,
+    int64_t max_rank_take,
+    int64_t context_len) {
+  int64_t row = static_cast<int64_t>(blockIdx.x);
+  if (row >= rows || context_len <= 0) {
+    return;
+  }
+
+  int64_t head = row % heads;
+  int64_t ki = row / heads;
+  bool full_exact = k_take_counts[ki] > max_rank_take;
+  const int64_t exact_offset = head * context_len;
+  const int64_t pq_offset = head * indexed_count;
+  const int64_t row_offset = row * context_len;
+  const float scale = fit_scale[row];
+  const float bias = fit_bias[row];
+
+  extern __shared__ float shared[];
+  float local_max = -INFINITY;
+  for (int64_t token = threadIdx.x; token < context_len; token += blockDim.x) {
+    float score = exact_scores[exact_offset + token];
+    int pos = token_to_indexed[token];
+    if (pos >= 0 && !full_exact && selected_mask[row_offset + token] == static_cast<unsigned char>(0)) {
+      score = scale * pq_logits[pq_offset + static_cast<int64_t>(pos)] + bias;
+    }
+    local_max = fmaxf(local_max, score);
+  }
+  shared[threadIdx.x] = local_max;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  const float max_v = shared[0];
+
+  float local_sum = 0.0f;
+  for (int64_t token = threadIdx.x; token < context_len; token += blockDim.x) {
+    float score = exact_scores[exact_offset + token];
+    int pos = token_to_indexed[token];
+    if (pos >= 0 && !full_exact && selected_mask[row_offset + token] == static_cast<unsigned char>(0)) {
+      score = scale * pq_logits[pq_offset + static_cast<int64_t>(pos)] + bias;
+    }
+    float p = expf(score - max_v);
+    probs[row_offset + token] = p;
+    local_sum += p;
+  }
+  shared[threadIdx.x] = local_sum;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  const float denom = fmaxf(shared[0], 1.0e-20f);
+  for (int64_t token = threadIdx.x; token < context_len; token += blockDim.x) {
+    probs[row_offset + token] /= denom;
+  }
+}
+
+__global__ void joint_mixed_softmax_rows_rankpos_kernel(
+    const float* __restrict__ exact_scores,
+    const float* __restrict__ pq_logits,
+    const int* __restrict__ token_to_indexed,
+    const unsigned char* __restrict__ base_mask,
+    const int* __restrict__ rank_pos,
+    const int64_t* __restrict__ k_take_counts,
+    const float* __restrict__ fit_scale,
+    const float* __restrict__ fit_bias,
+    float* __restrict__ probs,
+    int64_t rows,
+    int64_t heads,
+    int64_t indexed_count,
+    int64_t max_rank_take,
+    int64_t context_len) {
+  int64_t row = static_cast<int64_t>(blockIdx.x);
+  if (row >= rows || context_len <= 0) {
+    return;
+  }
+
+  int64_t head = row % heads;
+  int64_t ki = row / heads;
+  int64_t take = k_take_counts[ki];
+  bool full_exact = take > max_rank_take;
+  const int64_t exact_offset = head * context_len;
+  const int64_t pq_offset = head * indexed_count;
+  const int64_t rank_offset = head * context_len;
+  const int64_t row_offset = row * context_len;
+  const float scale = fit_scale[row];
+  const float bias = fit_bias[row];
+
+  extern __shared__ float shared[];
+  float local_max = -INFINITY;
+  for (int64_t token = threadIdx.x; token < context_len; token += blockDim.x) {
+    float score = exact_scores[exact_offset + token];
+    int pos = token_to_indexed[token];
+    if (pos >= 0 && !full_exact) {
+      bool selected = base_mask[token] != static_cast<unsigned char>(0);
+      int rank_i = rank_pos[rank_offset + token];
+      selected = selected || (rank_i >= 0 && static_cast<int64_t>(rank_i) < take);
+      if (!selected) {
+        score = scale * pq_logits[pq_offset + static_cast<int64_t>(pos)] + bias;
+      }
+    }
+    local_max = fmaxf(local_max, score);
+  }
+  shared[threadIdx.x] = local_max;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] = fmaxf(shared[threadIdx.x], shared[threadIdx.x + stride]);
+    }
+    __syncthreads();
+  }
+  const float max_v = shared[0];
+
+  float local_sum = 0.0f;
+  for (int64_t token = threadIdx.x; token < context_len; token += blockDim.x) {
+    float score = exact_scores[exact_offset + token];
+    int pos = token_to_indexed[token];
+    if (pos >= 0 && !full_exact) {
+      bool selected = base_mask[token] != static_cast<unsigned char>(0);
+      int rank_i = rank_pos[rank_offset + token];
+      selected = selected || (rank_i >= 0 && static_cast<int64_t>(rank_i) < take);
+      if (!selected) {
+        score = scale * pq_logits[pq_offset + static_cast<int64_t>(pos)] + bias;
+      }
+    }
+    float p = expf(score - max_v);
+    probs[row_offset + token] = p;
+    local_sum += p;
+  }
+  shared[threadIdx.x] = local_sum;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+  const float denom = fmaxf(shared[0], 1.0e-20f);
+  for (int64_t token = threadIdx.x; token < context_len; token += blockDim.x) {
+    probs[row_offset + token] /= denom;
+  }
+}
+
+__global__ void joint_mixed_score_grid_apply_indexed_rankpos_kernel(
+    const float* __restrict__ exact_scores,
+    const float* __restrict__ pq_logits,
+    const int64_t* __restrict__ indexed_tokens,
+    const unsigned char* __restrict__ base_mask,
+    const int* __restrict__ rank_pos,
+    const int64_t* __restrict__ k_take_counts,
+    const float* __restrict__ fit_scale,
+    const float* __restrict__ fit_bias,
+    float* __restrict__ score_grid,
+    int64_t k_count,
+    int64_t heads,
+    int64_t indexed_count,
+    int64_t max_rank_take,
+    int64_t context_len) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = k_count * heads * indexed_count;
+  if (linear >= total) {
+    return;
+  }
+  int64_t j = linear % indexed_count;
+  int64_t tmp = linear / indexed_count;
+  int64_t head = tmp % heads;
+  int64_t ki = tmp / heads;
+  int64_t token = indexed_tokens[j];
+  if (token < 0 || token >= context_len) {
+    return;
+  }
+  int64_t kh = ki * heads + head;
+  int64_t take = k_take_counts[ki];
+  bool full_exact = take > max_rank_take;
+  bool selected = base_mask[token] != static_cast<unsigned char>(0);
+  int pos = rank_pos[head * context_len + token];
+  selected = selected || (pos >= 0 && static_cast<int64_t>(pos) < take);
+  if (full_exact || selected) {
+    score_grid[kh * context_len + token] = exact_scores[head * context_len + token];
+  } else {
+    float calibrated = fit_scale[kh] * pq_logits[head * indexed_count + j] + fit_bias[kh];
+    score_grid[kh * context_len + token] = calibrated;
+  }
+}
+
+__global__ void joint_mixed_score_grid_fill_exact_kernel(
+    const float* __restrict__ exact_scores,
+    float* __restrict__ score_grid,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = k_count * heads * context_len;
+  if (linear >= total) {
+    return;
+  }
+  int64_t token = linear % context_len;
+  int64_t head = (linear / context_len) % heads;
+  score_grid[linear] = exact_scores[head * context_len + token];
+}
+
+__global__ void joint_mixed_score_grid_apply_indexed_kernel(
+    const float* __restrict__ exact_scores,
+    const float* __restrict__ pq_logits,
+    const int64_t* __restrict__ indexed_tokens,
+    const int64_t* __restrict__ k_take_counts,
+    const float* __restrict__ fit_scale,
+    const float* __restrict__ fit_bias,
+    float* __restrict__ score_grid,
+    int64_t k_count,
+    int64_t heads,
+    int64_t indexed_count,
+    int64_t max_rank_take,
+    int64_t context_len) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = k_count * heads * indexed_count;
+  if (linear >= total) {
+    return;
+  }
+  int64_t j = linear % indexed_count;
+  int64_t tmp = linear / indexed_count;
+  int64_t head = tmp % heads;
+  int64_t ki = tmp / heads;
+  int64_t token = indexed_tokens[j];
+  if (token >= 0 && token < context_len) {
+    int64_t kh = ki * heads + head;
+    if (k_take_counts[ki] > max_rank_take) {
+      score_grid[kh * context_len + token] = exact_scores[head * context_len + token];
+    } else {
+      float calibrated = fit_scale[kh] * pq_logits[head * indexed_count + j] + fit_bias[kh];
+      score_grid[kh * context_len + token] = calibrated;
+    }
+  }
+}
+
+__global__ void joint_mixed_score_grid_apply_base_exact_kernel(
+    const float* __restrict__ exact_scores,
+    const int64_t* __restrict__ base_tokens,
+    float* __restrict__ score_grid,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len,
+    int64_t base_count) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = k_count * heads * base_count;
+  if (linear >= total) {
+    return;
+  }
+  int64_t base_i = linear % base_count;
+  int64_t tmp = linear / base_count;
+  int64_t head = tmp % heads;
+  int64_t ki = tmp / heads;
+  int64_t token = base_tokens[base_i];
+  if (token >= 0 && token < context_len) {
+    score_grid[(ki * heads + head) * context_len + token] = exact_scores[head * context_len + token];
+  }
+}
+
+__global__ void joint_mixed_score_grid_apply_ranked_exact_kernel(
+    const float* __restrict__ exact_scores,
+    const int64_t* __restrict__ ranked_prefix_tokens,
+    const int64_t* __restrict__ k_take_counts,
+    float* __restrict__ score_grid,
+    int64_t k_count,
+    int64_t heads,
+    int64_t max_rank_take,
+    int64_t context_len) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = k_count * heads * max_rank_take;
+  if (linear >= total) {
+    return;
+  }
+  int64_t rank_i = linear % max_rank_take;
+  int64_t tmp = linear / max_rank_take;
+  int64_t head = tmp % heads;
+  int64_t ki = tmp / heads;
+  int64_t take = k_take_counts[ki];
+  if (rank_i >= take) {
+    return;
+  }
+  int64_t token = ranked_prefix_tokens[head * max_rank_take + rank_i];
+  if (token >= 0 && token < context_len) {
+    score_grid[(ki * heads + head) * context_len + token] = exact_scores[head * context_len + token];
+  }
+}
+
 }  // namespace
 
 std::vector<torch::Tensor> fullscan_pq_topk_cuda(
@@ -14605,4 +16244,1556 @@ std::vector<torch::Tensor> selected_mass_thresholds_from_topk_cuda(
       min_top);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {thresholds, threshold_sels, sufficient};
+}
+
+torch::Tensor joint_vprefix_outputs_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual,
+    torch::Tensor exact_order,
+    torch::Tensor v_budgets) {
+  const auto k_count = base_outputs.size(0);
+  const auto heads = base_outputs.size(1);
+  const auto dim = base_outputs.size(2);
+  const auto context_len = probs.size(2);
+  const auto max_exact = exact_order.size(2);
+  const auto v_steps = v_budgets.size(0);
+  auto outputs = torch::empty({k_count, v_steps, heads, dim}, base_outputs.options().dtype(torch::kFloat32));
+  if (k_count == 0 || heads == 0 || dim == 0 || v_steps == 0) {
+    return outputs;
+  }
+  const int threads = 256;
+  const int64_t total = k_count * heads * dim;
+  const int64_t blocks = (total + threads - 1) / threads;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  joint_vprefix_outputs_kernel<int64_t><<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      base_outputs.data_ptr<float>(),
+      probs.data_ptr<float>(),
+      residual.data_ptr<float>(),
+      exact_order.data_ptr<int64_t>(),
+      v_budgets.data_ptr<int64_t>(),
+      outputs.data_ptr<float>(),
+      k_count,
+      heads,
+      context_len,
+      max_exact,
+      v_steps,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return outputs;
+}
+
+torch::Tensor joint_vpq_base_outputs_from_probs_cuda(
+    torch::Tensor probs,
+    torch::Tensor values,
+    torch::Tensor value_codebooks,
+    torch::Tensor value_codes,
+    torch::Tensor page_starts,
+    torch::Tensor fallback_tokens) {
+  TORCH_CHECK(probs.is_cuda(), "probs must be CUDA");
+  TORCH_CHECK(values.is_cuda(), "values must be CUDA");
+  TORCH_CHECK(value_codebooks.is_cuda(), "value_codebooks must be CUDA");
+  TORCH_CHECK(value_codes.is_cuda(), "value_codes must be CUDA");
+  TORCH_CHECK(page_starts.is_cuda(), "page_starts must be CUDA");
+  TORCH_CHECK(fallback_tokens.is_cuda(), "fallback_tokens must be CUDA");
+  TORCH_CHECK(probs.dim() == 3, "probs must have shape [k_count, heads, context_len]");
+  TORCH_CHECK(values.dim() == 2, "values must have shape [context_len, dim]");
+  TORCH_CHECK(value_codebooks.dim() == 4, "value_codebooks must have shape [pages, subvecs, codes, subdim]");
+  TORCH_CHECK(value_codes.dim() == 3, "value_codes must have shape [pages, page_size, subvecs]");
+  TORCH_CHECK(page_starts.dim() == 1, "page_starts must be 1-D");
+  TORCH_CHECK(fallback_tokens.dim() == 1, "fallback_tokens must be 1-D");
+  TORCH_CHECK(probs.scalar_type() == torch::kFloat32, "probs must be float32");
+  TORCH_CHECK(value_codebooks.scalar_type() == torch::kFloat32, "value_codebooks must be float32");
+  TORCH_CHECK(page_starts.scalar_type() == torch::kLong, "page_starts must be int64");
+  TORCH_CHECK(fallback_tokens.scalar_type() == torch::kLong, "fallback_tokens must be int64");
+
+  const auto k_count = probs.size(0);
+  const auto heads = probs.size(1);
+  const auto context_len = probs.size(2);
+  const auto dim = values.size(1);
+  const auto pages = value_codebooks.size(0);
+  const auto value_subvecs = value_codebooks.size(1);
+  const auto code_count = value_codebooks.size(2);
+  const auto subdim = value_codebooks.size(3);
+  const auto page_size = value_codes.size(1);
+  const auto code_subvecs = value_codes.size(2);
+  const auto fallback_count = fallback_tokens.size(0);
+  TORCH_CHECK(values.size(0) >= context_len, "values length must cover probs context_len");
+  TORCH_CHECK(value_subvecs == 1, "joint_vpq_base_outputs_from_probs currently supports VALUE_SUBVECS=1 only");
+  TORCH_CHECK(code_subvecs >= 1, "value_codes must have at least one subvector");
+  TORCH_CHECK(subdim == dim, "single-subvector V-PQ codebook dim must match value dim");
+  TORCH_CHECK(value_codes.size(0) == pages, "value_codes pages must match value_codebooks pages");
+  TORCH_CHECK(page_starts.size(0) == pages, "page_starts pages must match value_codebooks pages");
+
+  auto probs_c = probs.contiguous();
+  auto values_c = values.contiguous();
+  auto codebooks_c = value_codebooks.contiguous();
+  auto codes_c = value_codes.contiguous();
+  auto page_starts_c = page_starts.contiguous();
+  auto fallback_tokens_c = fallback_tokens.contiguous();
+  auto outputs = torch::empty({k_count, heads, dim}, probs.options().dtype(torch::kFloat32));
+  if (k_count == 0 || heads == 0 || dim == 0) {
+    return outputs;
+  }
+
+  const int64_t rows = k_count * heads;
+  auto weights = torch::zeros({rows, pages, code_count}, probs.options().dtype(torch::kFloat32));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int threads = 256;
+  const int64_t total = rows * context_len;
+  const int64_t weight_blocks = (total + threads - 1) / threads;
+  if (total > 0 && pages > 0 && code_count > 0) {
+    if (value_codes.scalar_type() == torch::kUInt8) {
+      joint_vpq_code_weight_kernel<uint8_t><<<static_cast<unsigned int>(weight_blocks), threads, 0, stream>>>(
+          probs_c.data_ptr<float>(),
+          codes_c.data_ptr<uint8_t>(),
+          page_starts_c.data_ptr<int64_t>(),
+          weights.data_ptr<float>(),
+          rows,
+          context_len,
+          pages,
+          page_size,
+          code_subvecs,
+          code_count);
+    } else if (value_codes.scalar_type() == torch::kLong) {
+      joint_vpq_code_weight_kernel<int64_t><<<static_cast<unsigned int>(weight_blocks), threads, 0, stream>>>(
+          probs_c.data_ptr<float>(),
+          codes_c.data_ptr<int64_t>(),
+          page_starts_c.data_ptr<int64_t>(),
+          weights.data_ptr<float>(),
+          rows,
+          context_len,
+          pages,
+          page_size,
+          code_subvecs,
+          code_count);
+    } else if (value_codes.scalar_type() == torch::kInt) {
+      joint_vpq_code_weight_kernel<int32_t><<<static_cast<unsigned int>(weight_blocks), threads, 0, stream>>>(
+          probs_c.data_ptr<float>(),
+          codes_c.data_ptr<int32_t>(),
+          page_starts_c.data_ptr<int64_t>(),
+          weights.data_ptr<float>(),
+          rows,
+          context_len,
+          pages,
+          page_size,
+          code_subvecs,
+          code_count);
+    } else {
+      TORCH_CHECK(false, "value_codes must be uint8, int32, or int64");
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  const int64_t out_total = rows * dim;
+  const int64_t out_blocks = (out_total + threads - 1) / threads;
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, values.scalar_type(), "joint_vpq_base_values", [&] {
+    joint_vpq_base_from_code_weights_kernel<scalar_t><<<static_cast<unsigned int>(out_blocks), threads, 0, stream>>>(
+        probs_c.data_ptr<float>(),
+        values_c.data_ptr<scalar_t>(),
+        codebooks_c.data_ptr<float>(),
+        weights.data_ptr<float>(),
+        fallback_tokens_c.data_ptr<int64_t>(),
+        outputs.data_ptr<float>(),
+        rows,
+        context_len,
+        dim,
+        pages,
+        code_count,
+        fallback_count);
+  });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return outputs;
+}
+
+std::vector<torch::Tensor> joint_softmax_base_outputs_cuda(
+    torch::Tensor score_grid,
+    torch::Tensor values) {
+  TORCH_CHECK(score_grid.is_cuda(), "score_grid must be CUDA");
+  TORCH_CHECK(values.is_cuda(), "values must be CUDA");
+  TORCH_CHECK(score_grid.scalar_type() == torch::kFloat32, "score_grid must be float32");
+  TORCH_CHECK(values.scalar_type() == torch::kFloat32, "values must be float32");
+  TORCH_CHECK(score_grid.dim() == 3, "score_grid shape must be [k_count, heads, context_len]");
+  TORCH_CHECK(values.dim() == 2, "values shape must be [context_len, dim]");
+  const auto k_count = score_grid.size(0);
+  const auto heads = score_grid.size(1);
+  const auto context_len = score_grid.size(2);
+  const auto dim = values.size(1);
+  TORCH_CHECK(values.size(0) >= context_len, "values length must cover score_grid context_len");
+
+  auto scores_c = score_grid.contiguous();
+  auto values_c = values.contiguous();
+  auto probs = torch::empty_like(scores_c, scores_c.options().dtype(torch::kFloat32));
+  auto outputs = torch::empty({k_count, heads, dim}, scores_c.options().dtype(torch::kFloat32));
+  if (k_count == 0 || heads == 0 || context_len == 0 || dim == 0) {
+    if (context_len == 0 && k_count > 0 && heads > 0 && dim > 0) {
+      outputs.zero_();
+    }
+    return {probs, outputs};
+  }
+
+  const int threads = 256;
+  const int64_t rows = k_count * heads;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  joint_softmax_rows_kernel<<<static_cast<unsigned int>(rows), threads, threads * sizeof(float), stream>>>(
+      scores_c.data_ptr<float>(),
+      probs.data_ptr<float>(),
+      rows,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  constexpr int dims_per_block = 8;
+  const int64_t dim_tiles = (dim + dims_per_block - 1) / dims_per_block;
+  const int64_t out_blocks = rows * dim_tiles;
+  joint_base_outputs_from_probs_kernel<dims_per_block><<<
+      static_cast<unsigned int>(out_blocks), threads, 0, stream>>>(
+      probs.data_ptr<float>(),
+      values_c.data_ptr<float>(),
+      outputs.data_ptr<float>(),
+      rows,
+      context_len,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {probs, outputs};
+}
+
+std::vector<torch::Tensor> joint_mixed_softmax_base_outputs_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    torch::Tensor values,
+    bool calibrate) {
+  TORCH_CHECK(exact_scores.is_cuda(), "exact_scores must be CUDA");
+  TORCH_CHECK(pq_logits.is_cuda(), "pq_logits must be CUDA");
+  TORCH_CHECK(y_indexed.is_cuda(), "y_indexed must be CUDA");
+  TORCH_CHECK(indexed_tokens.is_cuda(), "indexed_tokens must be CUDA");
+  TORCH_CHECK(base_tokens.is_cuda(), "base_tokens must be CUDA");
+  TORCH_CHECK(ranked_prefix_tokens.is_cuda(), "ranked_prefix_tokens must be CUDA");
+  TORCH_CHECK(k_take_counts.is_cuda(), "k_take_counts must be CUDA");
+  TORCH_CHECK(values.is_cuda(), "values must be CUDA");
+  TORCH_CHECK(exact_scores.scalar_type() == torch::kFloat32, "exact_scores must be float32");
+  TORCH_CHECK(pq_logits.scalar_type() == torch::kFloat32, "pq_logits must be float32");
+  TORCH_CHECK(y_indexed.scalar_type() == torch::kFloat32, "y_indexed must be float32");
+  TORCH_CHECK(indexed_tokens.scalar_type() == torch::kLong, "indexed_tokens must be int64");
+  TORCH_CHECK(base_tokens.scalar_type() == torch::kLong, "base_tokens must be int64");
+  TORCH_CHECK(ranked_prefix_tokens.scalar_type() == torch::kLong, "ranked_prefix_tokens must be int64");
+  TORCH_CHECK(k_take_counts.scalar_type() == torch::kLong, "k_take_counts must be int64");
+  TORCH_CHECK(values.scalar_type() == torch::kFloat32, "values must be float32");
+  TORCH_CHECK(exact_scores.dim() == 2, "exact_scores shape must be [heads, context_len]");
+  TORCH_CHECK(pq_logits.dim() == 2, "pq_logits shape must be [heads, indexed_count]");
+  TORCH_CHECK(y_indexed.sizes() == pq_logits.sizes(), "y_indexed must match pq_logits shape");
+  TORCH_CHECK(indexed_tokens.dim() == 1, "indexed_tokens shape must be [indexed_count]");
+  TORCH_CHECK(base_tokens.dim() == 1, "base_tokens shape must be [base_count]");
+  TORCH_CHECK(ranked_prefix_tokens.dim() == 2, "ranked_prefix_tokens shape must be [heads, max_rank_take]");
+  TORCH_CHECK(k_take_counts.dim() == 1, "k_take_counts shape must be [k_count]");
+  TORCH_CHECK(values.dim() == 2, "values shape must be [context_len, dim]");
+  TORCH_CHECK(pq_logits.size(0) == exact_scores.size(0), "pq_logits heads must match exact_scores");
+  TORCH_CHECK(y_indexed.size(0) == exact_scores.size(0), "y_indexed heads must match exact_scores");
+  TORCH_CHECK(indexed_tokens.size(0) == pq_logits.size(1), "indexed_tokens length must match pq_logits indexed_count");
+  TORCH_CHECK(ranked_prefix_tokens.size(0) == exact_scores.size(0), "ranked_prefix_tokens heads must match exact_scores");
+  TORCH_CHECK(values.size(0) >= exact_scores.size(1), "values length must cover context_len");
+
+  const auto heads = exact_scores.size(0);
+  const auto context_len = exact_scores.size(1);
+  const auto indexed_count = indexed_tokens.size(0);
+  const auto k_count = k_take_counts.size(0);
+  const auto max_rank_take = ranked_prefix_tokens.size(1);
+  const auto dim = values.size(1);
+  auto probs = torch::empty({k_count, heads, context_len}, exact_scores.options().dtype(torch::kFloat32));
+  auto outputs = torch::empty({k_count, heads, dim}, exact_scores.options().dtype(torch::kFloat32));
+  if (k_count == 0 || heads == 0 || context_len == 0 || dim == 0) {
+    if (context_len == 0 && k_count > 0 && heads > 0 && dim > 0) {
+      outputs.zero_();
+    }
+    return {probs, outputs};
+  }
+
+  const int threads = 256;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto byte_opts = exact_scores.options().dtype(torch::kUInt8);
+  auto selected_mask = torch::zeros({k_count, heads, context_len}, byte_opts);
+  const int64_t base_count = base_tokens.size(0);
+  if (base_count > 0) {
+    const int64_t total = k_count * heads * base_count;
+    const int64_t blocks = (total + threads - 1) / threads;
+    joint_selected_mask_set_base_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        selected_mask.data_ptr<unsigned char>(),
+        base_tokens.data_ptr<int64_t>(),
+        k_count,
+        heads,
+        context_len,
+        base_count);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  if (max_rank_take > 0) {
+    const int64_t total = k_count * heads * max_rank_take;
+    const int64_t blocks = (total + threads - 1) / threads;
+    joint_selected_mask_set_ranked_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        selected_mask.data_ptr<unsigned char>(),
+        ranked_prefix_tokens.data_ptr<int64_t>(),
+        k_take_counts.data_ptr<int64_t>(),
+        k_count,
+        heads,
+        max_rank_take,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  auto fit_scale = torch::empty({k_count, heads}, exact_scores.options().dtype(torch::kFloat32));
+  auto fit_bias = torch::empty({k_count, heads}, exact_scores.options().dtype(torch::kFloat32));
+  const int64_t fit_blocks = k_count * heads;
+  const size_t fit_shared_bytes = static_cast<size_t>(threads) * 5 * sizeof(float);
+  joint_affine_selected_fit_kernel<<<static_cast<unsigned int>(fit_blocks), threads, fit_shared_bytes, stream>>>(
+      pq_logits.data_ptr<float>(),
+      y_indexed.data_ptr<float>(),
+      indexed_tokens.data_ptr<int64_t>(),
+      selected_mask.data_ptr<unsigned char>(),
+      fit_scale.data_ptr<float>(),
+      fit_bias.data_ptr<float>(),
+      k_count,
+      heads,
+      indexed_count,
+      context_len,
+      calibrate);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto pos_opts = exact_scores.options().dtype(torch::kInt);
+  auto token_to_indexed = torch::full({context_len}, -1, pos_opts);
+  if (indexed_count > 0) {
+    const int64_t blocks = (indexed_count + threads - 1) / threads;
+    joint_indexed_token_to_pos_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        token_to_indexed.data_ptr<int>(),
+        indexed_tokens.data_ptr<int64_t>(),
+        indexed_count,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  const int64_t rows = k_count * heads;
+  joint_mixed_softmax_rows_kernel<<<static_cast<unsigned int>(rows), threads, threads * sizeof(float), stream>>>(
+      exact_scores.data_ptr<float>(),
+      pq_logits.data_ptr<float>(),
+      token_to_indexed.data_ptr<int>(),
+      k_take_counts.data_ptr<int64_t>(),
+      selected_mask.data_ptr<unsigned char>(),
+      fit_scale.data_ptr<float>(),
+      fit_bias.data_ptr<float>(),
+      probs.data_ptr<float>(),
+      rows,
+      heads,
+      indexed_count,
+      max_rank_take,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  constexpr int dims_per_block = 8;
+  const int64_t dim_tiles = (dim + dims_per_block - 1) / dims_per_block;
+  const int64_t out_blocks = rows * dim_tiles;
+  joint_base_outputs_from_probs_kernel<dims_per_block><<<
+      static_cast<unsigned int>(out_blocks), threads, 0, stream>>>(
+      probs.data_ptr<float>(),
+      values.data_ptr<float>(),
+      outputs.data_ptr<float>(),
+      rows,
+      context_len,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {probs, outputs};
+}
+
+std::vector<torch::Tensor> joint_mixed_softmax_base_outputs_rankpos_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    torch::Tensor values,
+    bool calibrate) {
+  TORCH_CHECK(exact_scores.is_cuda(), "exact_scores must be CUDA");
+  TORCH_CHECK(pq_logits.is_cuda(), "pq_logits must be CUDA");
+  TORCH_CHECK(y_indexed.is_cuda(), "y_indexed must be CUDA");
+  TORCH_CHECK(indexed_tokens.is_cuda(), "indexed_tokens must be CUDA");
+  TORCH_CHECK(base_tokens.is_cuda(), "base_tokens must be CUDA");
+  TORCH_CHECK(ranked_prefix_tokens.is_cuda(), "ranked_prefix_tokens must be CUDA");
+  TORCH_CHECK(k_take_counts.is_cuda(), "k_take_counts must be CUDA");
+  TORCH_CHECK(values.is_cuda(), "values must be CUDA");
+  TORCH_CHECK(exact_scores.scalar_type() == torch::kFloat32, "exact_scores must be float32");
+  TORCH_CHECK(pq_logits.scalar_type() == torch::kFloat32, "pq_logits must be float32");
+  TORCH_CHECK(y_indexed.scalar_type() == torch::kFloat32, "y_indexed must be float32");
+  TORCH_CHECK(indexed_tokens.scalar_type() == torch::kLong, "indexed_tokens must be int64");
+  TORCH_CHECK(base_tokens.scalar_type() == torch::kLong, "base_tokens must be int64");
+  TORCH_CHECK(ranked_prefix_tokens.scalar_type() == torch::kLong, "ranked_prefix_tokens must be int64");
+  TORCH_CHECK(k_take_counts.scalar_type() == torch::kLong, "k_take_counts must be int64");
+  TORCH_CHECK(values.scalar_type() == torch::kFloat32, "values must be float32");
+  TORCH_CHECK(exact_scores.dim() == 2, "exact_scores shape must be [heads, context_len]");
+  TORCH_CHECK(pq_logits.dim() == 2, "pq_logits shape must be [heads, indexed_count]");
+  TORCH_CHECK(y_indexed.sizes() == pq_logits.sizes(), "y_indexed must match pq_logits shape");
+  TORCH_CHECK(indexed_tokens.dim() == 1, "indexed_tokens shape must be [indexed_count]");
+  TORCH_CHECK(base_tokens.dim() == 1, "base_tokens shape must be [base_count]");
+  TORCH_CHECK(ranked_prefix_tokens.dim() == 2, "ranked_prefix_tokens shape must be [heads, max_rank_take]");
+  TORCH_CHECK(k_take_counts.dim() == 1, "k_take_counts shape must be [k_count]");
+  TORCH_CHECK(values.dim() == 2, "values shape must be [context_len, dim]");
+  TORCH_CHECK(pq_logits.size(0) == exact_scores.size(0), "pq_logits heads must match exact_scores");
+  TORCH_CHECK(y_indexed.size(0) == exact_scores.size(0), "y_indexed heads must match exact_scores");
+  TORCH_CHECK(indexed_tokens.size(0) == pq_logits.size(1), "indexed_tokens length must match pq_logits indexed_count");
+  TORCH_CHECK(ranked_prefix_tokens.size(0) == exact_scores.size(0), "ranked_prefix_tokens heads must match exact_scores");
+  TORCH_CHECK(values.size(0) >= exact_scores.size(1), "values length must cover context_len");
+
+  const auto heads = exact_scores.size(0);
+  const auto context_len = exact_scores.size(1);
+  const auto indexed_count = indexed_tokens.size(0);
+  const auto k_count = k_take_counts.size(0);
+  const auto max_rank_take = ranked_prefix_tokens.size(1);
+  const auto dim = values.size(1);
+  auto probs = torch::empty({k_count, heads, context_len}, exact_scores.options().dtype(torch::kFloat32));
+  auto outputs = torch::empty({k_count, heads, dim}, exact_scores.options().dtype(torch::kFloat32));
+  if (k_count == 0 || heads == 0 || context_len == 0 || dim == 0) {
+    if (context_len == 0 && k_count > 0 && heads > 0 && dim > 0) {
+      outputs.zero_();
+    }
+    return {probs, outputs};
+  }
+
+  const int threads = 256;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto byte_opts = exact_scores.options().dtype(torch::kUInt8);
+  auto int_opts = exact_scores.options().dtype(torch::kInt);
+  auto base_mask = torch::zeros({context_len}, byte_opts);
+  auto rank_pos = torch::full({heads, context_len}, -1, int_opts);
+  const int64_t base_count = base_tokens.size(0);
+  if (base_count > 0) {
+    const int64_t blocks = (base_count + threads - 1) / threads;
+    joint_base_mask_set_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        base_mask.data_ptr<unsigned char>(),
+        base_tokens.data_ptr<int64_t>(),
+        base_count,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  if (max_rank_take > 0) {
+    const int64_t total = heads * max_rank_take;
+    const int64_t blocks = (total + threads - 1) / threads;
+    joint_rank_position_scatter_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        rank_pos.data_ptr<int>(),
+        ranked_prefix_tokens.data_ptr<int64_t>(),
+        heads,
+        max_rank_take,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  auto fit_scale = torch::empty({k_count, heads}, exact_scores.options().dtype(torch::kFloat32));
+  auto fit_bias = torch::empty({k_count, heads}, exact_scores.options().dtype(torch::kFloat32));
+  const int64_t fit_blocks = k_count * heads;
+  const size_t fit_shared_bytes = static_cast<size_t>(threads) * 5 * sizeof(float);
+  joint_affine_selected_fit_rankpos_kernel<<<static_cast<unsigned int>(fit_blocks), threads, fit_shared_bytes, stream>>>(
+      pq_logits.data_ptr<float>(),
+      y_indexed.data_ptr<float>(),
+      indexed_tokens.data_ptr<int64_t>(),
+      base_mask.data_ptr<unsigned char>(),
+      rank_pos.data_ptr<int>(),
+      k_take_counts.data_ptr<int64_t>(),
+      fit_scale.data_ptr<float>(),
+      fit_bias.data_ptr<float>(),
+      k_count,
+      heads,
+      indexed_count,
+      context_len,
+      calibrate);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto token_to_indexed = torch::full({context_len}, -1, int_opts);
+  if (indexed_count > 0) {
+    const int64_t blocks = (indexed_count + threads - 1) / threads;
+    joint_indexed_token_to_pos_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        token_to_indexed.data_ptr<int>(),
+        indexed_tokens.data_ptr<int64_t>(),
+        indexed_count,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  const int64_t rows = k_count * heads;
+  joint_mixed_softmax_rows_rankpos_kernel<<<static_cast<unsigned int>(rows), threads, threads * sizeof(float), stream>>>(
+      exact_scores.data_ptr<float>(),
+      pq_logits.data_ptr<float>(),
+      token_to_indexed.data_ptr<int>(),
+      base_mask.data_ptr<unsigned char>(),
+      rank_pos.data_ptr<int>(),
+      k_take_counts.data_ptr<int64_t>(),
+      fit_scale.data_ptr<float>(),
+      fit_bias.data_ptr<float>(),
+      probs.data_ptr<float>(),
+      rows,
+      heads,
+      indexed_count,
+      max_rank_take,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  constexpr int dims_per_block = 8;
+  const int64_t dim_tiles = (dim + dims_per_block - 1) / dims_per_block;
+  const int64_t out_blocks = rows * dim_tiles;
+  joint_base_outputs_from_probs_kernel<dims_per_block><<<
+      static_cast<unsigned int>(out_blocks), threads, 0, stream>>>(
+      probs.data_ptr<float>(),
+      values.data_ptr<float>(),
+      outputs.data_ptr<float>(),
+      rows,
+      context_len,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {probs, outputs};
+}
+
+torch::Tensor joint_vprefix_outputs_from_risk_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual,
+    torch::Tensor code_error,
+    torch::Tensor v_budgets) {
+  const auto k_count = base_outputs.size(0);
+  const auto heads = base_outputs.size(1);
+  const auto dim = base_outputs.size(2);
+  const auto context_len = probs.size(2);
+  const auto v_steps = v_budgets.size(0);
+  auto outputs = torch::empty({k_count, v_steps, heads, dim}, base_outputs.options().dtype(torch::kFloat32));
+  if (k_count == 0 || heads == 0 || dim == 0 || v_steps == 0) {
+    return outputs;
+  }
+  if (context_len == 0) {
+    return outputs.copy_(base_outputs.reshape({k_count, 1, heads, dim}).expand({k_count, v_steps, heads, dim}));
+  }
+
+  const int64_t rows = k_count * heads;
+  auto flat_opts = base_outputs.options().dtype(torch::kFloat32);
+  auto long_opts = base_outputs.options().dtype(torch::kLong);
+  auto int_opts = base_outputs.options().dtype(torch::kInt);
+  auto byte_opts = base_outputs.options().dtype(torch::kUInt8);
+  auto risk_in = torch::empty({rows, context_len}, flat_opts);
+  auto risk_out = torch::empty({rows, context_len}, flat_opts);
+  auto ids_in = torch::empty({rows, context_len}, int_opts);
+  auto ids_out = torch::empty({rows, context_len}, int_opts);
+  auto offsets = torch::empty({rows + 1}, long_opts);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int threads = 256;
+  const int64_t total = rows * context_len;
+  const int64_t fill_blocks = (total + threads - 1) / threads;
+  joint_risk_sort_inputs_kernel<<<static_cast<unsigned int>(fill_blocks), threads, 0, stream>>>(
+      probs.data_ptr<float>(),
+      code_error.data_ptr<float>(),
+      risk_in.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      rows,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const int64_t offset_blocks = ((rows + 1) + threads - 1) / threads;
+  joint_segment_offsets_kernel<<<static_cast<unsigned int>(offset_blocks), threads, 0, stream>>>(
+      offsets.data_ptr<int64_t>(),
+      rows,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  size_t temp_bytes = 0;
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      nullptr,
+      temp_bytes,
+      risk_in.data_ptr<float>(),
+      risk_out.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      ids_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  auto temp = torch::empty({static_cast<int64_t>(temp_bytes)}, byte_opts);
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      temp.data_ptr(),
+      temp_bytes,
+      risk_in.data_ptr<float>(),
+      risk_out.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      ids_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  const int64_t out_total = k_count * heads * dim;
+  const int64_t out_blocks = (out_total + threads - 1) / threads;
+  joint_vprefix_outputs_kernel<int32_t><<<static_cast<unsigned int>(out_blocks), threads, 0, stream>>>(
+      base_outputs.data_ptr<float>(),
+      probs.data_ptr<float>(),
+      residual.data_ptr<float>(),
+      ids_out.data_ptr<int32_t>(),
+      v_budgets.data_ptr<int64_t>(),
+      outputs.data_ptr<float>(),
+      k_count,
+      heads,
+      context_len,
+      context_len,
+      v_steps,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return outputs;
+}
+
+torch::Tensor joint_vprefix_outputs_from_grouped_risk_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor row_group_ids,
+    torch::Tensor v_budgets) {
+  const auto rows = base_outputs.size(0);
+  const auto dim = base_outputs.size(1);
+  const auto context_len = probs.size(1);
+  const auto v_steps = v_budgets.size(0);
+  auto outputs = torch::empty({rows, v_steps, dim}, base_outputs.options().dtype(torch::kFloat32));
+  if (rows == 0 || dim == 0 || v_steps == 0) {
+    return outputs;
+  }
+  if (context_len == 0) {
+    return outputs.copy_(base_outputs.reshape({rows, 1, dim}).expand({rows, v_steps, dim}));
+  }
+
+  auto flat_opts = base_outputs.options().dtype(torch::kFloat32);
+  auto long_opts = base_outputs.options().dtype(torch::kLong);
+  auto int_opts = base_outputs.options().dtype(torch::kInt);
+  auto byte_opts = base_outputs.options().dtype(torch::kUInt8);
+  auto risk_in = torch::empty({rows, context_len}, flat_opts);
+  auto risk_out = torch::empty({rows, context_len}, flat_opts);
+  auto ids_in = torch::empty({rows, context_len}, int_opts);
+  auto ids_out = torch::empty({rows, context_len}, int_opts);
+  auto offsets = torch::empty({rows + 1}, long_opts);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int threads = 256;
+  const int64_t total = rows * context_len;
+  const int64_t fill_blocks = (total + threads - 1) / threads;
+  joint_grouped_risk_sort_inputs_kernel<<<static_cast<unsigned int>(fill_blocks), threads, 0, stream>>>(
+      probs.data_ptr<float>(),
+      code_error_groups.data_ptr<float>(),
+      row_group_ids.data_ptr<int64_t>(),
+      risk_in.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      rows,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const int64_t offset_blocks = ((rows + 1) + threads - 1) / threads;
+  joint_segment_offsets_kernel<<<static_cast<unsigned int>(offset_blocks), threads, 0, stream>>>(
+      offsets.data_ptr<int64_t>(),
+      rows,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  size_t temp_bytes = 0;
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      nullptr,
+      temp_bytes,
+      risk_in.data_ptr<float>(),
+      risk_out.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      ids_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  auto temp = torch::empty({static_cast<int64_t>(temp_bytes)}, byte_opts);
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      temp.data_ptr(),
+      temp_bytes,
+      risk_in.data_ptr<float>(),
+      risk_out.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      ids_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  const int64_t out_total = rows * dim;
+  const int64_t out_blocks = (out_total + threads - 1) / threads;
+  joint_grouped_vprefix_outputs_kernel<int32_t><<<static_cast<unsigned int>(out_blocks), threads, 0, stream>>>(
+      base_outputs.data_ptr<float>(),
+      probs.data_ptr<float>(),
+      residual_groups.data_ptr<float>(),
+      row_group_ids.data_ptr<int64_t>(),
+      ids_out.data_ptr<int32_t>(),
+      v_budgets.data_ptr<int64_t>(),
+      outputs.data_ptr<float>(),
+      rows,
+      context_len,
+      context_len,
+      v_steps,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return outputs;
+}
+
+torch::Tensor joint_vprefix_outputs_from_grouped_risk_batched_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets) {
+  const auto groups = base_outputs.size(0);
+  const auto k_count = base_outputs.size(1);
+  const auto heads = base_outputs.size(2);
+  const auto dim = base_outputs.size(3);
+  const auto context_len = probs.size(3);
+  const auto v_steps = v_budgets.size(0);
+  const auto rows = groups * k_count * heads;
+  auto outputs = torch::empty({rows, v_steps, dim}, base_outputs.options().dtype(torch::kFloat32));
+  if (rows == 0 || dim == 0 || v_steps == 0) {
+    return outputs;
+  }
+  auto base_flat = base_outputs.reshape({rows, dim});
+  auto probs_flat = probs.reshape({rows, context_len});
+  if (context_len == 0) {
+    return outputs.copy_(base_flat.reshape({rows, 1, dim}).expand({rows, v_steps, dim}));
+  }
+
+  auto flat_opts = base_outputs.options().dtype(torch::kFloat32);
+  auto long_opts = base_outputs.options().dtype(torch::kLong);
+  auto int_opts = base_outputs.options().dtype(torch::kInt);
+  auto byte_opts = base_outputs.options().dtype(torch::kUInt8);
+  auto risk_in = torch::empty({rows, context_len}, flat_opts);
+  auto risk_out = torch::empty({rows, context_len}, flat_opts);
+  auto ids_in = torch::empty({rows, context_len}, int_opts);
+  auto ids_out = torch::empty({rows, context_len}, int_opts);
+  auto offsets = torch::empty({rows + 1}, long_opts);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int threads = 256;
+  const int64_t total = rows * context_len;
+  const int64_t fill_blocks = (total + threads - 1) / threads;
+  joint_grouped_flat_risk_sort_inputs_kernel<<<static_cast<unsigned int>(fill_blocks), threads, 0, stream>>>(
+      probs_flat.data_ptr<float>(),
+      code_error_groups.data_ptr<float>(),
+      risk_in.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      groups,
+      k_count,
+      heads,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const int64_t offset_blocks = ((rows + 1) + threads - 1) / threads;
+  joint_segment_offsets_kernel<<<static_cast<unsigned int>(offset_blocks), threads, 0, stream>>>(
+      offsets.data_ptr<int64_t>(),
+      rows,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  size_t temp_bytes = 0;
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      nullptr,
+      temp_bytes,
+      risk_in.data_ptr<float>(),
+      risk_out.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      ids_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  auto temp = torch::empty({static_cast<int64_t>(temp_bytes)}, byte_opts);
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      temp.data_ptr(),
+      temp_bytes,
+      risk_in.data_ptr<float>(),
+      risk_out.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      ids_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto interval_sums = torch::empty({rows, v_steps, dim}, flat_opts);
+  constexpr int dims_per_block = 8;
+  const int64_t dim_tiles = (dim + dims_per_block - 1) / dims_per_block;
+  const int64_t interval_blocks = rows * v_steps * dim_tiles;
+  joint_grouped_flat_vprefix_interval_sums_kernel<int32_t, dims_per_block><<<
+      static_cast<unsigned int>(interval_blocks), threads, 0, stream>>>(
+      probs_flat.data_ptr<float>(),
+      residual_groups.data_ptr<float>(),
+      ids_out.data_ptr<int32_t>(),
+      v_budgets.data_ptr<int64_t>(),
+      interval_sums.data_ptr<float>(),
+      groups,
+      k_count,
+      heads,
+      context_len,
+      context_len,
+      v_steps,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  const int64_t out_total = rows * dim;
+  const int64_t out_blocks = (out_total + threads - 1) / threads;
+  joint_grouped_flat_vprefix_prefix_intervals_kernel<<<static_cast<unsigned int>(out_blocks), threads, 0, stream>>>(
+      base_flat.data_ptr<float>(),
+      interval_sums.data_ptr<float>(),
+      v_budgets.data_ptr<int64_t>(),
+      outputs.data_ptr<float>(),
+      rows,
+      context_len,
+      context_len,
+      v_steps,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return outputs;
+}
+
+torch::Tensor joint_vprefix_outputs_from_grouped_risk_topk_batched_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    int64_t max_exact) {
+  const auto groups = base_outputs.size(0);
+  const auto k_count = base_outputs.size(1);
+  const auto heads = base_outputs.size(2);
+  const auto dim = base_outputs.size(3);
+  const auto context_len = probs.size(3);
+  const auto v_steps = v_budgets.size(0);
+  const auto rows = groups * k_count * heads;
+  auto outputs = torch::empty({rows, v_steps, dim}, base_outputs.options().dtype(torch::kFloat32));
+  if (rows == 0 || dim == 0 || v_steps == 0) {
+    return outputs;
+  }
+  auto base_flat = base_outputs.reshape({rows, dim});
+  auto probs_flat = probs.reshape({rows, context_len});
+  if (context_len == 0) {
+    return outputs.copy_(base_flat.reshape({rows, 1, dim}).expand({rows, v_steps, dim}));
+  }
+
+  max_exact = std::max<int64_t>(0, std::min<int64_t>(max_exact, context_len));
+  if (max_exact == 0) {
+    return outputs.copy_(base_flat.reshape({rows, 1, dim}).expand({rows, v_steps, dim}));
+  }
+
+  auto flat_opts = base_outputs.options().dtype(torch::kFloat32);
+  auto risk = torch::empty({rows, context_len}, flat_opts);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int threads = 256;
+  const int64_t total = rows * context_len;
+  const int64_t fill_blocks = (total + threads - 1) / threads;
+  joint_grouped_flat_risk_values_kernel<<<static_cast<unsigned int>(fill_blocks), threads, 0, stream>>>(
+      probs_flat.data_ptr<float>(),
+      code_error_groups.data_ptr<float>(),
+      risk.data_ptr<float>(),
+      groups,
+      k_count,
+      heads,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto topk = at::topk(risk, max_exact, /*dim=*/1, /*largest=*/true, /*sorted=*/true);
+  auto exact_order = std::get<1>(topk).contiguous();
+
+  auto interval_sums = torch::empty({rows, v_steps, dim}, flat_opts);
+  constexpr int dims_per_block = 8;
+  const int64_t dim_tiles = (dim + dims_per_block - 1) / dims_per_block;
+  const int64_t interval_blocks = rows * v_steps * dim_tiles;
+  joint_grouped_flat_vprefix_interval_sums_kernel<int64_t, dims_per_block><<<
+      static_cast<unsigned int>(interval_blocks), threads, 0, stream>>>(
+      probs_flat.data_ptr<float>(),
+      residual_groups.data_ptr<float>(),
+      exact_order.data_ptr<int64_t>(),
+      v_budgets.data_ptr<int64_t>(),
+      interval_sums.data_ptr<float>(),
+      groups,
+      k_count,
+      heads,
+      context_len,
+      max_exact,
+      v_steps,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  const int64_t out_total = rows * dim;
+  const int64_t out_blocks = (out_total + threads - 1) / threads;
+  joint_grouped_flat_vprefix_prefix_intervals_kernel<<<static_cast<unsigned int>(out_blocks), threads, 0, stream>>>(
+      base_flat.data_ptr<float>(),
+      interval_sums.data_ptr<float>(),
+      v_budgets.data_ptr<int64_t>(),
+      outputs.data_ptr<float>(),
+      rows,
+      context_len,
+      max_exact,
+      v_steps,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return outputs;
+}
+
+std::vector<torch::Tensor> joint_select_policy_from_grouped_risk_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    torch::Tensor k_mb,
+    torch::Tensor v_mb,
+    int64_t k_count,
+    int64_t heads,
+    double threshold,
+    int64_t policy_id) {
+  const auto rows = base_outputs.size(0);
+  const auto groups = k_mb.size(0);
+  const auto v_count = v_budgets.size(0);
+  const auto context_len = probs.size(1);
+  const auto dim = base_outputs.size(1);
+  auto final_outputs = torch::empty({groups, heads, dim}, base_outputs.options().dtype(torch::kFloat32));
+  auto final_indices = torch::empty({groups, heads, 2}, base_outputs.options().dtype(torch::kLong));
+  if (groups == 0 || k_count == 0 || v_count == 0 || heads == 0 || dim == 0) {
+    return {final_outputs, final_indices};
+  }
+  TORCH_CHECK(rows == groups * k_count * heads, "base_outputs rows must equal groups * k_count * heads");
+  TORCH_CHECK(probs.size(0) == rows, "probs rows must match base_outputs rows");
+  TORCH_CHECK(k_mb.size(1) == k_count, "k_mb second dimension must equal k_count");
+  TORCH_CHECK(v_mb.size(0) == groups, "v_mb first dimension must equal groups");
+  TORCH_CHECK(v_mb.size(1) == v_count, "v_mb second dimension must equal v_budgets length");
+  if (context_len == 0) {
+    final_outputs.copy_(base_outputs.reshape({groups, k_count, heads, dim}).select(1, 0));
+    final_indices.zero_();
+    return {final_outputs, final_indices};
+  }
+
+  auto flat_opts = base_outputs.options().dtype(torch::kFloat32);
+  auto long_opts = base_outputs.options().dtype(torch::kLong);
+  auto int_opts = base_outputs.options().dtype(torch::kInt);
+  auto byte_opts = base_outputs.options().dtype(torch::kUInt8);
+  auto risk_in = torch::empty({rows, context_len}, flat_opts);
+  auto risk_out = torch::empty({rows, context_len}, flat_opts);
+  auto ids_in = torch::empty({rows, context_len}, int_opts);
+  auto ids_out = torch::empty({rows, context_len}, int_opts);
+  auto offsets = torch::empty({rows + 1}, long_opts);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int threads = 256;
+  const int64_t total = rows * context_len;
+  const int64_t fill_blocks = (total + threads - 1) / threads;
+  joint_grouped_flat_risk_sort_inputs_kernel<<<static_cast<unsigned int>(fill_blocks), threads, 0, stream>>>(
+      probs.data_ptr<float>(),
+      code_error_groups.data_ptr<float>(),
+      risk_in.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      groups,
+      k_count,
+      heads,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const int64_t offset_blocks = ((rows + 1) + threads - 1) / threads;
+  joint_segment_offsets_kernel<<<static_cast<unsigned int>(offset_blocks), threads, 0, stream>>>(
+      offsets.data_ptr<int64_t>(),
+      rows,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  size_t temp_bytes = 0;
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      nullptr,
+      temp_bytes,
+      risk_in.data_ptr<float>(),
+      risk_out.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      ids_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  auto temp = torch::empty({static_cast<int64_t>(temp_bytes)}, byte_opts);
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      temp.data_ptr(),
+      temp_bytes,
+      risk_in.data_ptr<float>(),
+      risk_out.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      ids_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  const size_t shared_bytes = static_cast<size_t>(threads) * 4 * sizeof(double);
+  joint_select_policy_grouped_risk_kernel<int32_t><<<static_cast<unsigned int>(groups * heads), threads, shared_bytes, stream>>>(
+      base_outputs.data_ptr<float>(),
+      probs.data_ptr<float>(),
+      residual_groups.data_ptr<float>(),
+      ids_out.data_ptr<int32_t>(),
+      v_budgets.data_ptr<int64_t>(),
+      k_mb.data_ptr<float>(),
+      v_mb.data_ptr<float>(),
+      final_indices.data_ptr<int64_t>(),
+      final_outputs.data_ptr<float>(),
+      groups,
+      k_count,
+      v_count,
+      heads,
+      dim,
+      context_len,
+      threshold,
+      static_cast<int>(policy_id));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {final_outputs, final_indices};
+}
+
+std::vector<torch::Tensor> joint_select_policy_from_grouped_risk_batched_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    torch::Tensor k_mb,
+    torch::Tensor v_mb,
+    double threshold,
+    int64_t policy_id) {
+  const auto groups = base_outputs.size(0);
+  const auto k_count = base_outputs.size(1);
+  const auto heads = base_outputs.size(2);
+  const auto dim = base_outputs.size(3);
+  const auto context_len = probs.size(3);
+  const auto rows = groups * k_count * heads;
+  return joint_select_policy_from_grouped_risk_cuda(
+      base_outputs.reshape({rows, dim}),
+      probs.reshape({rows, context_len}),
+      residual_groups,
+      code_error_groups,
+      v_budgets,
+      k_mb,
+      v_mb,
+      k_count,
+      heads,
+      threshold,
+      policy_id);
+}
+
+torch::Tensor joint_select_policy_cuda(
+    torch::Tensor output_grid,
+    torch::Tensor k_mb,
+    torch::Tensor v_mb,
+    double threshold,
+    int64_t policy_id) {
+  const auto k_count = output_grid.size(0);
+  const auto v_count = output_grid.size(1);
+  const auto heads = output_grid.size(2);
+  const auto dim = output_grid.size(3);
+  auto final_indices = torch::empty({heads, 2}, output_grid.options().dtype(torch::kLong));
+  if (k_count == 0 || v_count == 0 || heads == 0 || dim == 0) {
+    return final_indices;
+  }
+  const int threads = 256;
+  const size_t shared_bytes = static_cast<size_t>(threads) * 4 * sizeof(double);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  joint_select_policy_kernel<<<static_cast<unsigned int>(heads), threads, shared_bytes, stream>>>(
+      output_grid.data_ptr<float>(),
+      k_mb.data_ptr<float>(),
+      v_mb.data_ptr<float>(),
+      final_indices.data_ptr<int64_t>(),
+      k_count,
+      v_count,
+      heads,
+      dim,
+      threshold,
+      static_cast<int>(policy_id));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return final_indices;
+}
+
+std::vector<torch::Tensor> joint_select_policy_grouped_flat_cuda(
+    torch::Tensor outputs_flat,
+    torch::Tensor k_mb,
+    torch::Tensor v_mb,
+    int64_t k_count,
+    int64_t heads,
+    double threshold,
+    int64_t policy_id) {
+  const auto groups = k_mb.size(0);
+  const auto v_count = v_mb.size(1);
+  const auto dim = outputs_flat.size(2);
+  auto final_outputs = torch::empty({groups, heads, dim}, outputs_flat.options().dtype(torch::kFloat32));
+  auto final_indices = torch::empty({groups, heads, 2}, outputs_flat.options().dtype(torch::kLong));
+  if (groups == 0 || k_count == 0 || v_count == 0 || heads == 0 || dim == 0) {
+    return {final_outputs, final_indices};
+  }
+  const int threads = 256;
+  const size_t shared_bytes = static_cast<size_t>(threads) * 4 * sizeof(double);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  joint_select_policy_grouped_flat_kernel<<<static_cast<unsigned int>(groups * heads), threads, shared_bytes, stream>>>(
+      outputs_flat.data_ptr<float>(),
+      k_mb.data_ptr<float>(),
+      v_mb.data_ptr<float>(),
+      final_indices.data_ptr<int64_t>(),
+      final_outputs.data_ptr<float>(),
+      groups,
+      k_count,
+      v_count,
+      heads,
+      dim,
+      threshold,
+      static_cast<int>(policy_id));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {final_outputs, final_indices};
+}
+
+std::vector<torch::Tensor> joint_select_policy_grouped_flat_no_mb_cuda(
+    torch::Tensor outputs_flat,
+    int64_t k_count,
+    int64_t heads,
+    double threshold,
+    int64_t policy_id) {
+  TORCH_CHECK(policy_id >= 0 && policy_id <= 3, "no-MB policy helper only supports non-MB policies");
+  TORCH_CHECK(k_count > 0, "k_count must be positive");
+  TORCH_CHECK(heads > 0, "heads must be positive");
+  const auto rows = outputs_flat.size(0);
+  const auto v_count = outputs_flat.size(1);
+  const auto dim = outputs_flat.size(2);
+  TORCH_CHECK(rows % (k_count * heads) == 0, "outputs_flat row count must be groups*k*heads");
+  const auto groups = rows / (k_count * heads);
+  auto final_outputs = torch::empty({groups, heads, dim}, outputs_flat.options().dtype(torch::kFloat32));
+  auto final_indices = torch::empty({groups, heads, 2}, outputs_flat.options().dtype(torch::kLong));
+  if (groups == 0 || v_count == 0 || dim == 0) {
+    return {final_outputs, final_indices};
+  }
+  const int threads = 256;
+  const size_t shared_bytes = static_cast<size_t>(threads) * 4 * sizeof(double);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  joint_select_policy_grouped_flat_kernel<<<static_cast<unsigned int>(groups * heads), threads, shared_bytes, stream>>>(
+      outputs_flat.data_ptr<float>(),
+      nullptr,
+      nullptr,
+      final_indices.data_ptr<int64_t>(),
+      final_outputs.data_ptr<float>(),
+      groups,
+      k_count,
+      v_count,
+      heads,
+      dim,
+      threshold,
+      static_cast<int>(policy_id));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {final_outputs, final_indices};
+}
+
+torch::Tensor joint_rank_prefix_tokens_cuda(
+    torch::Tensor scores,
+    torch::Tensor indexed_tokens,
+    int64_t max_take) {
+  const auto rows = scores.size(0);
+  const auto count = scores.size(1);
+  max_take = std::max<int64_t>(0, std::min<int64_t>(max_take, count));
+  auto out = torch::empty({rows, max_take}, indexed_tokens.options().dtype(torch::kLong));
+  if (rows == 0 || count == 0 || max_take == 0) {
+    return out;
+  }
+
+  auto float_opts = scores.options().dtype(torch::kFloat32);
+  auto int_opts = scores.options().dtype(torch::kInt);
+  auto long_opts = scores.options().dtype(torch::kLong);
+  auto byte_opts = scores.options().dtype(torch::kUInt8);
+  auto score_in = torch::empty({rows, count}, float_opts);
+  auto score_out = torch::empty({rows, count}, float_opts);
+  auto pos_in = torch::empty({rows, count}, int_opts);
+  auto pos_out = torch::empty({rows, count}, int_opts);
+  auto offsets = torch::empty({rows + 1}, long_opts);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int threads = 256;
+  const int64_t total = rows * count;
+  const int64_t fill_blocks = (total + threads - 1) / threads;
+  joint_rank_prefix_sort_inputs_kernel<<<static_cast<unsigned int>(fill_blocks), threads, 0, stream>>>(
+      scores.data_ptr<float>(),
+      score_in.data_ptr<float>(),
+      pos_in.data_ptr<int32_t>(),
+      rows,
+      count);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const int64_t offset_blocks = ((rows + 1) + threads - 1) / threads;
+  joint_segment_offsets_kernel<<<static_cast<unsigned int>(offset_blocks), threads, 0, stream>>>(
+      offsets.data_ptr<int64_t>(),
+      rows,
+      count);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  size_t temp_bytes = 0;
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      nullptr,
+      temp_bytes,
+      score_in.data_ptr<float>(),
+      score_out.data_ptr<float>(),
+      pos_in.data_ptr<int32_t>(),
+      pos_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  auto temp = torch::empty({static_cast<int64_t>(temp_bytes)}, byte_opts);
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      temp.data_ptr(),
+      temp_bytes,
+      score_in.data_ptr<float>(),
+      score_out.data_ptr<float>(),
+      pos_in.data_ptr<int32_t>(),
+      pos_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  const int64_t gather_total = rows * max_take;
+  const int64_t gather_blocks = (gather_total + threads - 1) / threads;
+  joint_rank_prefix_gather_tokens_kernel<<<static_cast<unsigned int>(gather_blocks), threads, 0, stream>>>(
+      pos_out.data_ptr<int32_t>(),
+      indexed_tokens.data_ptr<int64_t>(),
+      out.data_ptr<int64_t>(),
+      rows,
+      count,
+      max_take);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
+}
+
+static torch::Tensor joint_mixed_score_grid_cuda_impl(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    bool calibrate,
+    bool fill_exact_first) {
+  const auto heads = exact_scores.size(0);
+  const auto context_len = exact_scores.size(1);
+  const auto indexed_count = indexed_tokens.size(0);
+  const auto k_count = k_take_counts.size(0);
+  const auto max_rank_take = ranked_prefix_tokens.size(1);
+  auto outputs = torch::empty({k_count, heads, context_len}, exact_scores.options().dtype(torch::kFloat32));
+  if (k_count == 0 || heads == 0 || context_len == 0) {
+    return outputs;
+  }
+
+  const int threads = 256;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int64_t score_total = k_count * heads * context_len;
+  if (fill_exact_first) {
+    const int64_t score_blocks = (score_total + threads - 1) / threads;
+    joint_mixed_score_grid_fill_exact_kernel<<<static_cast<unsigned int>(score_blocks), threads, 0, stream>>>(
+        exact_scores.data_ptr<float>(),
+        outputs.data_ptr<float>(),
+        k_count,
+        heads,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  auto byte_opts = exact_scores.options().dtype(torch::kUInt8);
+  auto selected_mask = torch::zeros({k_count, heads, context_len}, byte_opts);
+  const int64_t base_count = base_tokens.size(0);
+  if (base_count > 0) {
+    const int64_t total = k_count * heads * base_count;
+    const int64_t blocks = (total + threads - 1) / threads;
+    joint_selected_mask_set_base_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        selected_mask.data_ptr<unsigned char>(),
+        base_tokens.data_ptr<int64_t>(),
+        k_count,
+        heads,
+        context_len,
+        base_count);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  if (max_rank_take > 0) {
+    const int64_t total = k_count * heads * max_rank_take;
+    const int64_t blocks = (total + threads - 1) / threads;
+    joint_selected_mask_set_ranked_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        selected_mask.data_ptr<unsigned char>(),
+        ranked_prefix_tokens.data_ptr<int64_t>(),
+        k_take_counts.data_ptr<int64_t>(),
+        k_count,
+        heads,
+        max_rank_take,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  auto fit_scale = torch::empty({k_count, heads}, exact_scores.options().dtype(torch::kFloat32));
+  auto fit_bias = torch::empty({k_count, heads}, exact_scores.options().dtype(torch::kFloat32));
+  const int64_t fit_blocks = k_count * heads;
+  const size_t shared_bytes = static_cast<size_t>(threads) * 5 * sizeof(float);
+  joint_affine_selected_fit_kernel<<<static_cast<unsigned int>(fit_blocks), threads, shared_bytes, stream>>>(
+      pq_logits.data_ptr<float>(),
+      y_indexed.data_ptr<float>(),
+      indexed_tokens.data_ptr<int64_t>(),
+      selected_mask.data_ptr<unsigned char>(),
+      fit_scale.data_ptr<float>(),
+      fit_bias.data_ptr<float>(),
+      k_count,
+      heads,
+      indexed_count,
+      context_len,
+      calibrate);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  if (indexed_count > 0) {
+    const int64_t total = k_count * heads * indexed_count;
+    const int64_t blocks = (total + threads - 1) / threads;
+    joint_mixed_score_grid_apply_indexed_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        exact_scores.data_ptr<float>(),
+        pq_logits.data_ptr<float>(),
+        indexed_tokens.data_ptr<int64_t>(),
+        k_take_counts.data_ptr<int64_t>(),
+        fit_scale.data_ptr<float>(),
+        fit_bias.data_ptr<float>(),
+        outputs.data_ptr<float>(),
+        k_count,
+        heads,
+        indexed_count,
+        max_rank_take,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  if (base_count > 0) {
+    const int64_t total = k_count * heads * base_count;
+    const int64_t blocks = (total + threads - 1) / threads;
+    joint_mixed_score_grid_apply_base_exact_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        exact_scores.data_ptr<float>(),
+        base_tokens.data_ptr<int64_t>(),
+        outputs.data_ptr<float>(),
+        k_count,
+        heads,
+        context_len,
+        base_count);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  if (max_rank_take > 0) {
+    const int64_t total = k_count * heads * max_rank_take;
+    const int64_t blocks = (total + threads - 1) / threads;
+    joint_mixed_score_grid_apply_ranked_exact_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        exact_scores.data_ptr<float>(),
+        ranked_prefix_tokens.data_ptr<int64_t>(),
+        k_take_counts.data_ptr<int64_t>(),
+        outputs.data_ptr<float>(),
+        k_count,
+        heads,
+        max_rank_take,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return outputs;
+}
+
+torch::Tensor joint_mixed_score_grid_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    bool calibrate) {
+  return joint_mixed_score_grid_cuda_impl(
+      exact_scores,
+      pq_logits,
+      y_indexed,
+      indexed_tokens,
+      base_tokens,
+      ranked_prefix_tokens,
+      k_take_counts,
+      calibrate,
+      true);
+}
+
+torch::Tensor joint_mixed_score_grid_rankpos_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    bool calibrate) {
+  const auto heads = exact_scores.size(0);
+  const auto context_len = exact_scores.size(1);
+  const auto indexed_count = indexed_tokens.size(0);
+  const auto k_count = k_take_counts.size(0);
+  const auto max_rank_take = ranked_prefix_tokens.size(1);
+  auto outputs = torch::empty({k_count, heads, context_len}, exact_scores.options().dtype(torch::kFloat32));
+  if (k_count == 0 || heads == 0 || context_len == 0) {
+    return outputs;
+  }
+
+  const int threads = 256;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int64_t score_total = k_count * heads * context_len;
+  const int64_t score_blocks = (score_total + threads - 1) / threads;
+  joint_mixed_score_grid_fill_exact_kernel<<<static_cast<unsigned int>(score_blocks), threads, 0, stream>>>(
+      exact_scores.data_ptr<float>(),
+      outputs.data_ptr<float>(),
+      k_count,
+      heads,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto byte_opts = exact_scores.options().dtype(torch::kUInt8);
+  auto int_opts = exact_scores.options().dtype(torch::kInt);
+  auto base_mask = torch::zeros({context_len}, byte_opts);
+  auto rank_pos = torch::full({heads, context_len}, -1, int_opts);
+  const int64_t base_count = base_tokens.size(0);
+  if (base_count > 0) {
+    const int64_t blocks = (base_count + threads - 1) / threads;
+    joint_base_mask_set_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        base_mask.data_ptr<unsigned char>(),
+        base_tokens.data_ptr<int64_t>(),
+        base_count,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  if (max_rank_take > 0) {
+    const int64_t total = heads * max_rank_take;
+    const int64_t blocks = (total + threads - 1) / threads;
+    joint_rank_position_scatter_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        rank_pos.data_ptr<int>(),
+        ranked_prefix_tokens.data_ptr<int64_t>(),
+        heads,
+        max_rank_take,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  auto fit_scale = torch::empty({k_count, heads}, exact_scores.options().dtype(torch::kFloat32));
+  auto fit_bias = torch::empty({k_count, heads}, exact_scores.options().dtype(torch::kFloat32));
+  const int64_t fit_blocks = k_count * heads;
+  const size_t shared_bytes = static_cast<size_t>(threads) * 5 * sizeof(float);
+  joint_affine_selected_fit_rankpos_kernel<<<static_cast<unsigned int>(fit_blocks), threads, shared_bytes, stream>>>(
+      pq_logits.data_ptr<float>(),
+      y_indexed.data_ptr<float>(),
+      indexed_tokens.data_ptr<int64_t>(),
+      base_mask.data_ptr<unsigned char>(),
+      rank_pos.data_ptr<int>(),
+      k_take_counts.data_ptr<int64_t>(),
+      fit_scale.data_ptr<float>(),
+      fit_bias.data_ptr<float>(),
+      k_count,
+      heads,
+      indexed_count,
+      context_len,
+      calibrate);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  if (indexed_count > 0) {
+    const int64_t total = k_count * heads * indexed_count;
+    const int64_t blocks = (total + threads - 1) / threads;
+    joint_mixed_score_grid_apply_indexed_rankpos_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        exact_scores.data_ptr<float>(),
+        pq_logits.data_ptr<float>(),
+        indexed_tokens.data_ptr<int64_t>(),
+        base_mask.data_ptr<unsigned char>(),
+        rank_pos.data_ptr<int>(),
+        k_take_counts.data_ptr<int64_t>(),
+        fit_scale.data_ptr<float>(),
+        fit_bias.data_ptr<float>(),
+        outputs.data_ptr<float>(),
+        k_count,
+        heads,
+        indexed_count,
+        max_rank_take,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  if (base_count > 0) {
+    const int64_t total = k_count * heads * base_count;
+    const int64_t blocks = (total + threads - 1) / threads;
+    joint_mixed_score_grid_apply_base_exact_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        exact_scores.data_ptr<float>(),
+        base_tokens.data_ptr<int64_t>(),
+        outputs.data_ptr<float>(),
+        k_count,
+        heads,
+        context_len,
+        base_count);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  if (max_rank_take > 0) {
+    const int64_t total = k_count * heads * max_rank_take;
+    const int64_t blocks = (total + threads - 1) / threads;
+    joint_mixed_score_grid_apply_ranked_exact_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        exact_scores.data_ptr<float>(),
+        ranked_prefix_tokens.data_ptr<int64_t>(),
+        k_take_counts.data_ptr<int64_t>(),
+        outputs.data_ptr<float>(),
+        k_count,
+        heads,
+        max_rank_take,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return outputs;
+}
+
+torch::Tensor joint_mixed_score_grid_no_exact_fill_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    bool calibrate) {
+  return joint_mixed_score_grid_cuda_impl(
+      exact_scores,
+      pq_logits,
+      y_indexed,
+      indexed_tokens,
+      base_tokens,
+      ranked_prefix_tokens,
+      k_take_counts,
+      calibrate,
+      false);
 }

@@ -37,6 +37,10 @@ from benchmark.generated_memory_hf_eval import (
     load_tokenizer,
     model_device,
 )
+from benchmark.generation_execution_profile import (
+    aggregate_execution_profiles,
+    profile_model_forward,
+)
 from benchmark.selector_eval.runners.run_hf_paged_pq_intervention_eval import (
     ApproxStats,
     greedy_dense_trace,
@@ -68,6 +72,57 @@ ANSWER_PATTERNS = (
 )
 
 
+def env_truthy(name: str, default: str = "0") -> bool:
+    return str(os.environ.get(name, default)).lower() not in {"0", "false", "no", "off", ""}
+
+
+def joint_cuda_flags_config() -> dict[str, bool | int]:
+    return {
+        "selector_pq_joint_gqa_batched": env_truthy("SELECTOR_PQ_JOINT_GQA_BATCHED", "0"),
+        "selector_pq_joint_vector_policy": env_truthy("SELECTOR_PQ_JOINT_VECTOR_POLICY", "0"),
+        "selector_pq_joint_reuse_max_topk": env_truthy("SELECTOR_PQ_JOINT_REUSE_MAX_TOPK", "0"),
+        "selector_pq_joint_grid_artifacts": env_truthy("SELECTOR_PQ_JOINT_GRID_ARTIFACTS", "0"),
+        "selector_pq_joint_allhead_precompute": env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_PRECOMPUTE", "0"),
+        "selector_pq_joint_grouped_risk_prefix": env_truthy("SELECTOR_PQ_JOINT_GROUPED_RISK_PREFIX", "0"),
+        "selector_pq_joint_native_v_prefix": env_truthy("SELECTOR_PQ_JOINT_NATIVE_V_PREFIX", "0"),
+        "selector_pq_joint_native_risk_prefix": env_truthy("SELECTOR_PQ_JOINT_NATIVE_RISK_PREFIX", "0"),
+        "selector_pq_joint_native_score_grid": env_truthy("SELECTOR_PQ_JOINT_NATIVE_SCORE_GRID", "0"),
+        "selector_pq_joint_native_policy": env_truthy("SELECTOR_PQ_JOINT_NATIVE_POLICY", "0"),
+        "selector_pq_joint_prewarm_vpq_sidecars": env_truthy("SELECTOR_PQ_JOINT_PREWARM_VPQ_SIDECARS", "0"),
+        "selector_pq_joint_persistent_vpq_cache": env_truthy("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE", "0"),
+        "selector_pq_joint_persistent_vpq_cache_grow_pad": int(
+            os.environ.get("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE_GROW_PAD", "256")
+        ),
+        "selector_pq_joint_exact_full_budget_grid": env_truthy("SELECTOR_PQ_JOINT_EXACT_FULL_BUDGET_GRID", "1"),
+        "selector_pq_joint_segmented_v_prefix": env_truthy("SELECTOR_PQ_JOINT_SEGMENTED_V_PREFIX", "0"),
+        "selector_pq_joint_unsorted_v_prefix": env_truthy("SELECTOR_PQ_JOINT_UNSORTED_V_PREFIX", "0"),
+        "selector_pq_joint_fast_affine_selected": env_truthy("SELECTOR_PQ_JOINT_FAST_AFFINE_SELECTED", "0"),
+        "selector_pq_joint_ondemand_v_prefix": env_truthy("SELECTOR_PQ_JOINT_ONDEMAND_V_PREFIX", "0"),
+        "selector_pq_joint_incremental_v_grid": env_truthy("SELECTOR_PQ_JOINT_INCREMENTAL_V_GRID", "0"),
+        "selector_pq_joint_incremental_vpq_sidecar": env_truthy(
+            "SELECTOR_PQ_JOINT_INCREMENTAL_VPQ_SIDECAR",
+            "0",
+        ),
+        "selector_pq_joint_native_lazy_policy": env_truthy("SELECTOR_PQ_JOINT_NATIVE_LAZY_POLICY", "0"),
+        "selector_pq_joint_allhead_exact_precompute": env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_EXACT_PRECOMPUTE", "0"),
+        "selector_pq_joint_allhead_rank_prefix": env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_RANK_PREFIX", "0"),
+        "selector_pq_joint_native_rank_prefix": env_truthy("SELECTOR_PQ_JOINT_NATIVE_RANK_PREFIX", "0"),
+        "selector_pq_joint_skip_full_budget_sort": env_truthy("SELECTOR_PQ_JOINT_SKIP_FULL_BUDGET_SORT", "0"),
+        "selector_pq_joint_collapse_dup_k_rows": env_truthy("SELECTOR_PQ_JOINT_COLLAPSE_DUP_K_ROWS", "0"),
+        "selector_pq_joint_collapse_dup_v_rows": env_truthy("SELECTOR_PQ_JOINT_COLLAPSE_DUP_V_ROWS", "0"),
+        "selector_pq_joint_score_grid_no_exact_fill": env_truthy("SELECTOR_PQ_JOINT_SCORE_GRID_NO_EXACT_FILL", "0"),
+        "selector_pq_joint_rankpos_score_grid": env_truthy("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID", "0"),
+        "selector_pq_joint_grouped_vpq_cache": env_truthy("SELECTOR_PQ_JOINT_GROUPED_VPQ_CACHE", "0"),
+        "selector_pq_joint_fused_risk_policy": env_truthy("SELECTOR_PQ_JOINT_FUSED_RISK_POLICY", "0"),
+        "selector_pq_joint_risk_prefix_topk": env_truthy("SELECTOR_PQ_JOINT_RISK_PREFIX_TOPK", "0"),
+        "selector_pq_joint_fast_token_layout": env_truthy("SELECTOR_PQ_JOINT_FAST_TOKEN_LAYOUT", "0"),
+        "selector_pq_joint_native_vpq_base": env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE", "0"),
+        "selector_pq_joint_native_softmax_base": env_truthy("SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE", "0"),
+        "selector_pq_joint_fused_softmax_base": env_truthy("SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE", "0"),
+        "selector_pq_joint_wall_profile": env_truthy("SELECTOR_PQ_JOINT_WALL_PROFILE", "0"),
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="HF-native LongBench v2 evaluator.")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-8B")
@@ -94,6 +149,11 @@ def parse_args():
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--streaming", action="store_true")
+    parser.add_argument(
+        "--profile_execution",
+        action="store_true",
+        help="Record CUDA-synchronized prefill/decode model.forward latency breakdown for generation.",
+    )
     parser.add_argument("--dataset_scan_limit", type=int, default=1000)
     parser.add_argument("--qwen_yarn_factor", type=float, default=0.0)
     parser.add_argument("--qwen_yarn_original_max_position_embeddings", type=int, default=32768)
@@ -120,6 +180,7 @@ def parse_args():
             "none",
             "geometric_probe_tail_switch",
             "geometric_tail_stability_switch",
+            "joint_kv_stability",
             "pq_proxy_mass_budget",
             "pq_ranked_mass_budget",
         ],
@@ -146,10 +207,31 @@ def parse_args():
     parser.add_argument("--geometric_growth", type=float, default=1.5)
     parser.add_argument("--geometric_probe_scale", type=float, default=1.5)
     parser.add_argument("--geometric_budget_granularity", type=int, default=8)
+    parser.add_argument(
+        "--joint_kv_policy",
+        choices=[
+            "k_first_priority",
+            "v_first_priority",
+            "k_first_alternating",
+            "v_first_alternating",
+            "sensitivity_greedy",
+        ],
+        default="k_first_alternating",
+    )
+    parser.add_argument("--joint_kv_k_budgets", default="4096,8192,14336,32768")
+    parser.add_argument("--joint_kv_v_budgets", default="1024,2048,4096,6144,8192,12288,16384")
+    parser.add_argument("--joint_kv_stability_threshold", type=float, default=0.001)
     parser.add_argument("--selected_value_mode", choices=["exact", "vpq_value"], default="exact")
     parser.add_argument(
         "--selected_value_exact_rule",
-        choices=["fixed", "selector_rank", "selected_mass", "selected_risk_mass", "selected_mass_or_risk"],
+        choices=[
+            "fixed",
+            "selector_rank",
+            "selected_mass",
+            "selected_risk_mass",
+            "selected_mass_or_risk",
+            "global_residual_risk",
+        ],
         default="fixed",
     )
     parser.add_argument("--selected_value_exact_top", type=int, default=0)
@@ -160,6 +242,7 @@ def parse_args():
     parser.add_argument("--selected_value_exact_all_context_max", type=int, default=0)
     parser.add_argument("--selected_value_exact_all_fraction_min", type=float, default=0.0)
     parser.add_argument("--selected_value_residual_norm_bytes", type=int, default=2)
+    parser.add_argument("--value_code_stat_bytes", type=int, default=2)
     parser.add_argument("--tail_blend", type=float, default=0.0)
     parser.add_argument("--prefill_tail_blend", type=float, default=None)
     parser.add_argument("--decode_tail_blend", type=float, default=None)
@@ -420,7 +503,8 @@ def run_one(model, tokenizer, row, args):
         generate_kwargs["temperature"] = float(args.temperature)
 
     start = time.time()
-    output_ids = model.generate(**generate_kwargs)
+    with profile_model_forward(model, enabled=bool(args.profile_execution)) as exec_profile:
+        output_ids = model.generate(**generate_kwargs)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     elapsed = float(time.time() - start)
@@ -429,7 +513,7 @@ def run_one(model, tokenizer, row, args):
     response = tokenizer.decode(new_ids, skip_special_tokens=True)
     pred = extract_answer(response)
     answer = str(row["answer"]).strip().upper()
-    return {
+    item = {
         "_id": row["_id"],
         "domain": row["domain"],
         "sub_domain": row["sub_domain"],
@@ -445,6 +529,12 @@ def run_one(model, tokenizer, row, args):
         "context_chars": int(len(str(row["context"]))),
         "generation_sec": elapsed,
     }
+    if exec_profile is not None:
+        item["execution_profile"] = exec_profile.to_dict(
+            generation_sec=elapsed,
+            generated_tokens=int(new_ids.numel()),
+        )
+    return item
 
 
 def aggregate(rows):
@@ -459,6 +549,9 @@ def aggregate(rows):
         "truncated_count": int(sum(1 for row in rows if row["truncated"])),
         "avg_generation_sec": float(sum(row["generation_sec"] for row in rows) / total) if total else 0.0,
     }
+    execution_profile = aggregate_execution_profiles(rows)
+    if execution_profile:
+        summary["execution_profile"] = execution_profile
     for key in ("difficulty", "length", "domain"):
         values = sorted({str(row[key]) for row in rows})
         summary[f"accuracy_by_{key}"] = {
@@ -495,6 +588,10 @@ def pagedpq_config(args):
         "geometric_min_budget": int(args.geometric_min_budget),
         "geometric_max_budget": int(args.geometric_max_budget),
         "geometric_budget_granularity": int(args.geometric_budget_granularity),
+        "joint_kv_policy": str(getattr(args, "joint_kv_policy", "")),
+        "joint_kv_k_budgets": str(getattr(args, "joint_kv_k_budgets", "")),
+        "joint_kv_v_budgets": str(getattr(args, "joint_kv_v_budgets", "")),
+        "joint_kv_stability_threshold": float(getattr(args, "joint_kv_stability_threshold", 0.0)),
         "tail_blend": float(args.tail_blend),
         "selected_value_mode": str(args.selected_value_mode),
         "selected_value_exact_rule": str(args.selected_value_exact_rule),
@@ -516,11 +613,12 @@ def pagedpq_config(args):
         "subbits": int(args.subbits),
         "value_subvecs": int(args.value_subvecs),
         "value_subbits": int(args.value_subbits),
+        "value_code_stat_bytes": int(getattr(args, "value_code_stat_bytes", 0)),
         "value_pq_group_pages": int(args.value_pq_group_pages),
         "kmeans_iters": int(args.kmeans_iters),
         "index_build_backend": str(args.index_build_backend),
-        "index_build_backend": str(args.index_build_backend),
         "nprobes": str(args.nprobes),
+        **joint_cuda_flags_config(),
     }
 
 
@@ -721,10 +819,23 @@ def summarize_approx_stats(stats: dict[int, ApproxStats]) -> dict[str, dict[str,
     payload: dict[str, dict[str, float | int]] = {}
     for layer, s in sorted(stats.items()):
         update_mb = float(s.index_build_read_mb + s.index_build_write_mb)
+        approx_calls = int(s.approx_attention_calls)
+        passthrough_calls = int(s.passthrough_attention_calls)
+        approx_path_fraction = float(approx_calls / max(1, approx_calls + passthrough_calls))
+        selector_active_calls = int(getattr(s, "selector_active_calls", 0))
+        tail_active_calls = int(getattr(s, "tail_active_calls", 0))
+        selector_active_fraction = (
+            float(selector_active_calls) / max(1, int(s.calls))
+            if selector_active_calls > 0
+            else approx_path_fraction
+        )
+        tail_active_fraction = (
+            float(tail_active_calls) / max(1, int(s.calls)) if tail_active_calls > 0 else approx_path_fraction
+        )
         payload[str(layer)] = {
             "calls": int(s.calls),
-            "approx_attention_calls": int(s.approx_attention_calls),
-            "passthrough_attention_calls": int(s.passthrough_attention_calls),
+            "approx_attention_calls": approx_calls,
+            "passthrough_attention_calls": passthrough_calls,
             "mean_selected_tokens": float(s.mean_selected),
             "mean_tail_samples": float(s.mean_tail_samples),
             "mean_selector_MB_per_head_query": float(s.mean_selector_mb),
@@ -740,8 +851,9 @@ def summarize_approx_stats(stats: dict[int, ApproxStats]) -> dict[str, dict[str,
             "mean_physical_gpu_exact_KV_MB_per_head_query": float(s.mean_physical_gpu_exact_kv_mb),
             "mean_physical_gpu_confidence_MB_per_head_query": float(s.mean_physical_gpu_confidence_mb),
             "mean_physical_gpu_step_MB_per_head_query": float(s.mean_physical_gpu_step_mb),
-            "selector_active_fraction": float(getattr(s, "selector_active_calls", 0)) / max(1, int(s.calls)),
-            "tail_active_fraction": float(getattr(s, "tail_active_calls", 0)) / max(1, int(s.calls)),
+            "approx_path_active_fraction": approx_path_fraction,
+            "selector_active_fraction": selector_active_fraction,
+            "tail_active_fraction": tail_active_fraction,
             "confidence_active_fraction": float(getattr(s, "confidence_active_calls", 0)) / max(1, int(s.calls)),
             "mean_update_MB_per_head_query": float(update_mb / max(1, int(s.calls))),
             "mean_total_MB_per_head_query": float(s.mean_step_mb + update_mb / max(1, int(s.calls))),
@@ -768,6 +880,31 @@ def summarize_approx_stats(stats: dict[int, ApproxStats]) -> dict[str, dict[str,
             "native_threshold_seconds": float(getattr(s, "native_threshold_seconds", 0.0)),
             "native_geometric_seconds": float(getattr(s, "native_geometric_seconds", 0.0)),
             "native_output_seconds": float(getattr(s, "native_output_seconds", 0.0)),
+            "native_joint_score_grid_seconds": float(getattr(s, "native_joint_score_grid_seconds", 0.0)),
+            "native_joint_prob_base_seconds": float(getattr(s, "native_joint_prob_base_seconds", 0.0)),
+            "native_joint_risk_prefix_seconds": float(getattr(s, "native_joint_risk_prefix_seconds", 0.0)),
+            "native_joint_policy_seconds": float(getattr(s, "native_joint_policy_seconds", 0.0)),
+            "native_joint_precompute_seconds": float(getattr(s, "native_joint_precompute_seconds", 0.0)),
+            "native_joint_layout_seconds": float(getattr(s, "native_joint_layout_seconds", 0.0)),
+            "native_joint_group_pack_seconds": float(getattr(s, "native_joint_group_pack_seconds", 0.0)),
+            "native_joint_accounting_seconds": float(getattr(s, "native_joint_accounting_seconds", 0.0)),
+            "wall_patched_attention_seconds": float(getattr(s, "wall_patched_attention_seconds", 0.0)),
+            "wall_qkv_cache_seconds": float(getattr(s, "wall_qkv_cache_seconds", 0.0)),
+            "wall_index_sidecar_seconds": float(getattr(s, "wall_index_sidecar_seconds", 0.0)),
+            "wall_output_projection_seconds": float(getattr(s, "wall_output_projection_seconds", 0.0)),
+            "wall_joint_total_seconds": float(getattr(s, "wall_joint_total_seconds", 0.0)),
+            "wall_joint_precompute_seconds": float(getattr(s, "wall_joint_precompute_seconds", 0.0)),
+            "wall_joint_selector_seconds": float(getattr(s, "wall_joint_selector_seconds", 0.0)),
+            "wall_joint_exact_logit_seconds": float(getattr(s, "wall_joint_exact_logit_seconds", 0.0)),
+            "wall_joint_vpq_sidecar_seconds": float(getattr(s, "wall_joint_vpq_sidecar_seconds", 0.0)),
+            "wall_joint_layout_seconds": float(getattr(s, "wall_joint_layout_seconds", 0.0)),
+            "wall_joint_rank_prefix_seconds": float(getattr(s, "wall_joint_rank_prefix_seconds", 0.0)),
+            "wall_joint_score_grid_seconds": float(getattr(s, "wall_joint_score_grid_seconds", 0.0)),
+            "wall_joint_prob_base_seconds": float(getattr(s, "wall_joint_prob_base_seconds", 0.0)),
+            "wall_joint_risk_prefix_seconds": float(getattr(s, "wall_joint_risk_prefix_seconds", 0.0)),
+            "wall_joint_policy_seconds": float(getattr(s, "wall_joint_policy_seconds", 0.0)),
+            "wall_joint_group_pack_seconds": float(getattr(s, "wall_joint_group_pack_seconds", 0.0)),
+            "wall_joint_accounting_seconds": float(getattr(s, "wall_joint_accounting_seconds", 0.0)),
             "output_projection_seconds": float(s.output_projection_seconds),
         }
     return payload
@@ -784,11 +921,15 @@ def aggregate_approx_stats(stats: dict[int, ApproxStats]) -> dict[str, float | i
     total_update_mb = float(sum(float(s.index_build_read_mb + s.index_build_write_mb) for s in rows))
     total_calls = int(sum(int(s.calls) for s in rows))
     total_approx_calls = int(sum(int(s.approx_attention_calls) for s in rows))
+    total_passthrough_calls = int(sum(int(s.passthrough_attention_calls) for s in rows))
+    approx_path_fraction = float(total_approx_calls / max(1, total_approx_calls + total_passthrough_calls))
+    selector_active_calls = int(sum(int(getattr(s, "selector_active_calls", 0)) for s in rows))
+    tail_active_calls = int(sum(int(getattr(s, "tail_active_calls", 0)) for s in rows))
     return {
         "layers": int(len(rows)),
         "calls_total": total_calls,
         "approx_attention_calls_total": total_approx_calls,
-        "passthrough_attention_calls_total": int(sum(int(s.passthrough_attention_calls) for s in rows)),
+        "passthrough_attention_calls_total": total_passthrough_calls,
         "mean_selected_tokens": mean_attr("mean_selected"),
         "mean_tail_samples": mean_attr("mean_tail_samples"),
         "mean_selector_MB_per_head_query": mean_attr("mean_selector_mb"),
@@ -804,11 +945,12 @@ def aggregate_approx_stats(stats: dict[int, ApproxStats]) -> dict[str, float | i
         "mean_physical_gpu_exact_KV_MB_per_head_query": mean_attr("mean_physical_gpu_exact_kv_mb"),
         "mean_physical_gpu_confidence_MB_per_head_query": mean_attr("mean_physical_gpu_confidence_mb"),
         "mean_physical_gpu_step_MB_per_head_query": mean_attr("mean_physical_gpu_step_mb"),
+        "approx_path_active_fraction": approx_path_fraction,
         "selector_active_fraction": float(
-            sum(int(getattr(s, "selector_active_calls", 0)) for s in rows) / max(1, total_calls)
+            selector_active_calls / max(1, total_calls) if selector_active_calls > 0 else approx_path_fraction
         ),
         "tail_active_fraction": float(
-            sum(int(getattr(s, "tail_active_calls", 0)) for s in rows) / max(1, total_calls)
+            tail_active_calls / max(1, total_calls) if tail_active_calls > 0 else approx_path_fraction
         ),
         "confidence_active_fraction": float(
             sum(int(getattr(s, "confidence_active_calls", 0)) for s in rows) / max(1, total_calls)
@@ -845,6 +987,81 @@ def aggregate_approx_stats(stats: dict[int, ApproxStats]) -> dict[str, float | i
             sum(float(getattr(s, "native_geometric_seconds", 0.0)) for s in rows)
         ),
         "native_output_seconds_total": float(sum(float(getattr(s, "native_output_seconds", 0.0)) for s in rows)),
+        "native_joint_score_grid_seconds_total": float(
+            sum(float(getattr(s, "native_joint_score_grid_seconds", 0.0)) for s in rows)
+        ),
+        "native_joint_prob_base_seconds_total": float(
+            sum(float(getattr(s, "native_joint_prob_base_seconds", 0.0)) for s in rows)
+        ),
+        "native_joint_risk_prefix_seconds_total": float(
+            sum(float(getattr(s, "native_joint_risk_prefix_seconds", 0.0)) for s in rows)
+        ),
+        "native_joint_policy_seconds_total": float(
+            sum(float(getattr(s, "native_joint_policy_seconds", 0.0)) for s in rows)
+        ),
+        "native_joint_precompute_seconds_total": float(
+            sum(float(getattr(s, "native_joint_precompute_seconds", 0.0)) for s in rows)
+        ),
+        "native_joint_layout_seconds_total": float(
+            sum(float(getattr(s, "native_joint_layout_seconds", 0.0)) for s in rows)
+        ),
+        "native_joint_group_pack_seconds_total": float(
+            sum(float(getattr(s, "native_joint_group_pack_seconds", 0.0)) for s in rows)
+        ),
+        "native_joint_accounting_seconds_total": float(
+            sum(float(getattr(s, "native_joint_accounting_seconds", 0.0)) for s in rows)
+        ),
+        "wall_patched_attention_seconds_total": float(
+            sum(float(getattr(s, "wall_patched_attention_seconds", 0.0)) for s in rows)
+        ),
+        "wall_qkv_cache_seconds_total": float(
+            sum(float(getattr(s, "wall_qkv_cache_seconds", 0.0)) for s in rows)
+        ),
+        "wall_index_sidecar_seconds_total": float(
+            sum(float(getattr(s, "wall_index_sidecar_seconds", 0.0)) for s in rows)
+        ),
+        "wall_output_projection_seconds_total": float(
+            sum(float(getattr(s, "wall_output_projection_seconds", 0.0)) for s in rows)
+        ),
+        "wall_joint_total_seconds_total": float(
+            sum(float(getattr(s, "wall_joint_total_seconds", 0.0)) for s in rows)
+        ),
+        "wall_joint_precompute_seconds_total": float(
+            sum(float(getattr(s, "wall_joint_precompute_seconds", 0.0)) for s in rows)
+        ),
+        "wall_joint_selector_seconds_total": float(
+            sum(float(getattr(s, "wall_joint_selector_seconds", 0.0)) for s in rows)
+        ),
+        "wall_joint_exact_logit_seconds_total": float(
+            sum(float(getattr(s, "wall_joint_exact_logit_seconds", 0.0)) for s in rows)
+        ),
+        "wall_joint_vpq_sidecar_seconds_total": float(
+            sum(float(getattr(s, "wall_joint_vpq_sidecar_seconds", 0.0)) for s in rows)
+        ),
+        "wall_joint_layout_seconds_total": float(
+            sum(float(getattr(s, "wall_joint_layout_seconds", 0.0)) for s in rows)
+        ),
+        "wall_joint_rank_prefix_seconds_total": float(
+            sum(float(getattr(s, "wall_joint_rank_prefix_seconds", 0.0)) for s in rows)
+        ),
+        "wall_joint_score_grid_seconds_total": float(
+            sum(float(getattr(s, "wall_joint_score_grid_seconds", 0.0)) for s in rows)
+        ),
+        "wall_joint_prob_base_seconds_total": float(
+            sum(float(getattr(s, "wall_joint_prob_base_seconds", 0.0)) for s in rows)
+        ),
+        "wall_joint_risk_prefix_seconds_total": float(
+            sum(float(getattr(s, "wall_joint_risk_prefix_seconds", 0.0)) for s in rows)
+        ),
+        "wall_joint_policy_seconds_total": float(
+            sum(float(getattr(s, "wall_joint_policy_seconds", 0.0)) for s in rows)
+        ),
+        "wall_joint_group_pack_seconds_total": float(
+            sum(float(getattr(s, "wall_joint_group_pack_seconds", 0.0)) for s in rows)
+        ),
+        "wall_joint_accounting_seconds_total": float(
+            sum(float(getattr(s, "wall_joint_accounting_seconds", 0.0)) for s in rows)
+        ),
         "output_projection_seconds_total": float(sum(float(s.output_projection_seconds) for s in rows)),
     }
 
@@ -932,6 +1149,7 @@ def main():
                 "use_chat_template": bool(args.use_chat_template),
                 "disable_thinking": bool(args.disable_thinking),
                 "streaming": bool(args.streaming),
+                "profile_execution": bool(args.profile_execution),
                 "dataset_scan_limit": int(args.dataset_scan_limit),
                 "scanned": int(scanned),
                 "qwen_yarn_enabled": bool(yarn_enabled),
@@ -998,6 +1216,7 @@ def main():
             "use_chat_template": bool(args.use_chat_template),
             "disable_thinking": bool(args.disable_thinking),
             "streaming": bool(args.streaming),
+            "profile_execution": bool(args.profile_execution),
             "dataset_scan_limit": int(args.dataset_scan_limit),
             "scanned": int(scanned),
             "qwen_yarn_enabled": bool(yarn_enabled),

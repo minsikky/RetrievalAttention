@@ -96,12 +96,19 @@ def parse_args():
     parser.add_argument("--layers", default="all")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--max_examples", type=int, default=4)
+    parser.add_argument(
+        "--task_offset",
+        type=int,
+        default=0,
+        help="Skip this many selected tasks before applying max_examples; used for Slurm sharding.",
+    )
     parser.add_argument("--selection", choices=["first", "random", "shortest"], default="first")
     parser.add_argument("--max_input_tokens", type=int, default=120000)
     parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--min_new_tokens", type=int, default=0)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--force_max_new_tokens", action="store_true")
     parser.add_argument("--dry_run", action="store_true", help="Load/select tasks and write args without loading a model.")
 
@@ -140,6 +147,7 @@ def parse_args():
             "none",
             "geometric_probe_tail_switch",
             "geometric_tail_stability_switch",
+            "joint_kv_stability",
             "pq_proxy_mass_budget",
             "pq_ranked_mass_budget",
         ],
@@ -162,10 +170,31 @@ def parse_args():
     parser.add_argument("--geometric_growth", type=float, default=1.5)
     parser.add_argument("--geometric_probe_scale", type=float, default=1.5)
     parser.add_argument("--geometric_budget_granularity", type=int, default=8)
+    parser.add_argument(
+        "--joint_kv_policy",
+        choices=[
+            "k_first_priority",
+            "v_first_priority",
+            "k_first_alternating",
+            "v_first_alternating",
+            "sensitivity_greedy",
+        ],
+        default="k_first_alternating",
+    )
+    parser.add_argument("--joint_kv_k_budgets", default="4096,8192,14336,32768")
+    parser.add_argument("--joint_kv_v_budgets", default="1024,2048,4096,6144,8192,12288,16384")
+    parser.add_argument("--joint_kv_stability_threshold", type=float, default=0.001)
     parser.add_argument("--selected_value_mode", choices=["exact", "vpq_value"], default="exact")
     parser.add_argument(
         "--selected_value_exact_rule",
-        choices=["fixed", "selector_rank", "selected_mass", "selected_risk_mass", "selected_mass_or_risk"],
+        choices=[
+            "fixed",
+            "selector_rank",
+            "selected_mass",
+            "selected_risk_mass",
+            "selected_mass_or_risk",
+            "global_residual_risk",
+        ],
         default="fixed",
     )
     parser.add_argument("--selected_value_exact_top", type=int, default=0)
@@ -176,6 +205,7 @@ def parse_args():
     parser.add_argument("--selected_value_exact_all_context_max", type=int, default=0)
     parser.add_argument("--selected_value_exact_all_fraction_min", type=float, default=0.0)
     parser.add_argument("--selected_value_residual_norm_bytes", type=int, default=2)
+    parser.add_argument("--value_code_stat_bytes", type=int, default=2)
     parser.add_argument("--tail_blend", type=float, default=0.0)
     parser.add_argument("--prefill_tail_blend", type=float, default=None)
     parser.add_argument("--decode_tail_blend", type=float, default=None)
@@ -235,7 +265,9 @@ def select_tasks(tasks: list[dict[str, Any]], args) -> list[dict[str, Any]]:
         rng.shuffle(tasks)
     elif args.selection == "shortest":
         tasks.sort(key=lambda row: int(row.get("prompt_chars", len(str(row.get("prompt", ""))))))
-    return tasks[: max(0, int(args.max_examples))]
+    offset = max(0, int(getattr(args, "task_offset", 0)))
+    limit = max(0, int(args.max_examples))
+    return tasks[offset : offset + limit]
 
 
 def load_aime24(args) -> list[dict[str, Any]]:
@@ -307,8 +339,14 @@ def load_livecodebench(args) -> list[dict[str, Any]]:
             start_date=args.livecodebench_start_date or None,
             end_date=args.livecodebench_end_date or None,
         )
-    except RuntimeError as exc:
-        if "Dataset scripts are no longer supported" not in str(exc):
+    except Exception as exc:
+        message = str(exc)
+        fallback_markers = (
+            "Dataset scripts are no longer supported",
+            "trust_remote_code",
+            "is not supported anymore",
+        )
+        if not any(marker in message for marker in fallback_markers):
             raise
         problems = load_livecodebench_direct_jsonl(args, CodeGenerationProblem)
     tasks = []
@@ -360,6 +398,7 @@ def load_livecodebench_direct_jsonl(args, problem_cls) -> list[Any]:
         repo_id="livecodebench/code_generation_lite",
         filename=filename,
         repo_type="dataset",
+        local_files_only=bool(args.local_files_only),
     )
     problems = [problem_cls(**row) for row in read_jsonl(Path(path))]
     if args.livecodebench_start_date:
@@ -522,6 +561,8 @@ def generation_kwargs(tokenizer, args, input_ids):
     if float(args.temperature) > 0.0:
         kwargs["temperature"] = float(args.temperature)
         kwargs["top_p"] = float(args.top_p)
+        if int(args.top_k) > 0:
+            kwargs["top_k"] = int(args.top_k)
     return kwargs
 
 
@@ -721,6 +762,8 @@ def aggregate(rows: list[dict[str, Any]], args, approx_stats: dict[int, ApproxSt
         "min_new_tokens": int(args.min_new_tokens),
         "force_max_new_tokens": bool(args.force_max_new_tokens),
         "temperature": float(args.temperature),
+        "top_p": float(args.top_p),
+        "top_k": int(args.top_k),
         "avg_prompt_tokens": float(sum(row["prompt_tokens"] for row in rows) / total) if total else 0.0,
         "avg_used_prompt_tokens": float(sum(row["used_prompt_tokens"] for row in rows) / total) if total else 0.0,
         "avg_generated_tokens": float(sum(row["generated_tokens"] for row in rows) / total) if total else 0.0,

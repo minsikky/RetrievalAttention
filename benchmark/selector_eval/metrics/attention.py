@@ -27,6 +27,96 @@ def _js_divergence(p: np.ndarray, q: np.ndarray) -> float:
     return js
 
 
+def _softmax_from_scores(scores: np.ndarray) -> np.ndarray:
+    scores64 = scores.astype(np.float64, copy=False)
+    shifted = scores64 - float(np.max(scores64))
+    probs = np.exp(shifted)
+    probs /= max(float(np.sum(probs)), 1e-20)
+    return probs.astype(np.float64, copy=False)
+
+
+def _safe_distribution(probs: np.ndarray) -> np.ndarray:
+    out = probs.astype(np.float64, copy=False)
+    total = max(float(np.sum(out)), 1e-20)
+    return out / total
+
+
+def _topk_indices(values: np.ndarray, k: int) -> np.ndarray:
+    count = min(max(1, int(k)), int(values.shape[0]))
+    if count >= int(values.shape[0]):
+        return np.arange(int(values.shape[0]), dtype=np.int64)
+    idx = np.argpartition(values, -count)[-count:]
+    return idx.astype(np.int64, copy=False)
+
+
+def _logit_error_metrics(dense_scores: np.ndarray, approx_scores: np.ndarray, *, prefix: str = "logit") -> dict[str, float]:
+    dense = dense_scores.astype(np.float64, copy=False)
+    approx = approx_scores.astype(np.float64, copy=False)
+    err = approx - dense
+    rel_denom = max(float(np.linalg.norm(dense)), 1e-20)
+    centered_dense = dense - float(np.mean(dense))
+    centered_approx = approx - float(np.mean(approx))
+    corr_denom = max(float(np.linalg.norm(centered_dense) * np.linalg.norm(centered_approx)), 1e-20)
+    return {
+        f"{prefix}_relL2": float(np.linalg.norm(err) / rel_denom),
+        f"{prefix}_mean_abs": float(np.mean(np.abs(err))),
+        f"{prefix}_max_abs": float(np.max(np.abs(err))),
+        f"{prefix}_centered_cosine": float(np.dot(centered_dense, centered_approx) / corr_denom),
+    }
+
+
+def _probability_error_metrics(
+    dense_probs: np.ndarray,
+    approx_probs: np.ndarray,
+    *,
+    topk_sizes: tuple[int, ...] = (64, 512, 2048),
+    prefix: str = "prob",
+    eps: float = 1e-12,
+) -> dict[str, float]:
+    dense = _safe_distribution(dense_probs)
+    approx = _safe_distribution(approx_probs)
+    clipped = np.maximum(approx, float(eps))
+    clipped /= max(float(np.sum(clipped)), 1e-20)
+    diff = approx - dense
+    out = {
+        f"{prefix}_KL_dense_to_approx": float(np.sum(dense * np.log(np.maximum(dense, float(eps)) / clipped))),
+        f"{prefix}_JS": float(_js_divergence(dense, approx)),
+        f"{prefix}_TV": float(0.5 * np.sum(np.abs(diff))),
+        f"{prefix}_L1": float(np.sum(np.abs(diff))),
+        f"{prefix}_L2": float(np.linalg.norm(diff)),
+        f"{prefix}_max_abs": float(np.max(np.abs(diff))),
+        f"{prefix}_missing_mass": float(np.sum(dense[approx <= 0.0])),
+        f"{prefix}_entropy_dense": float(-np.sum(dense * np.log(np.maximum(dense, float(eps))))),
+        f"{prefix}_entropy_approx": float(-np.sum(approx * np.log(np.maximum(approx, float(eps))))),
+    }
+    for k in topk_sizes:
+        kk = min(max(1, int(k)), int(dense.shape[0]))
+        dense_top = _topk_indices(dense, kk)
+        approx_top = _topk_indices(approx, kk)
+        overlap = np.intersect1d(dense_top, approx_top, assume_unique=False)
+        dense_top_mass = max(float(np.sum(dense[dense_top])), 1e-20)
+        out[f"{prefix}_top{kk}_overlap"] = float(overlap.size) / float(kk)
+        out[f"{prefix}_top{kk}_mass_recall"] = float(np.sum(dense[overlap]) / dense_top_mass)
+        out[f"{prefix}_approx_top{kk}_dense_mass"] = float(np.sum(dense[approx_top]))
+    return out
+
+
+def attention_distribution_error_metrics(
+    dense_scores: np.ndarray,
+    dense_probs: np.ndarray,
+    approx_scores: np.ndarray | None,
+    approx_probs: np.ndarray | None,
+    *,
+    topk_sizes: tuple[int, ...] = (64, 512, 2048),
+) -> dict[str, float]:
+    out: dict[str, float] = {}
+    if approx_scores is not None and dense_scores.shape == approx_scores.shape:
+        out.update(_logit_error_metrics(dense_scores, approx_scores, prefix="logit"))
+    if approx_probs is not None and dense_probs.shape == approx_probs.shape:
+        out.update(_probability_error_metrics(dense_probs, approx_probs, topk_sizes=topk_sizes, prefix="prob"))
+    return out
+
+
 def _attention_output(scores: np.ndarray, values: np.ndarray, tokens: list[int]) -> np.ndarray:
     if not tokens:
         return np.zeros((values.shape[-1],), dtype=np.float32)

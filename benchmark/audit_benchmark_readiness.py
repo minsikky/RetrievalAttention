@@ -19,12 +19,18 @@ MEAN_COST_FIELDS = (
     "mean_tail_estimator_MB_per_head_query",
     "mean_update_MB_per_head_query",
     "online_update_MB_per_head_query",
+    "mean_physical_gpu_step_MB_per_head_query",
+    "mean_physical_gpu_total_MB_per_head_query",
     "mean_selected_tokens",
+    "approx_path_active_fraction",
+    "selector_active_fraction",
 )
 
 SUM_COST_FIELDS = (
     "passthrough_attention_calls",
     "passthrough_attention_calls_total",
+    "approx_attention_calls",
+    "approx_attention_calls_total",
     "native_selector_seconds",
     "native_selector_seconds_total",
     "native_attention_seconds",
@@ -44,12 +50,15 @@ class RunSummary:
     quality_name: str
     examples: int | None
     seconds_per_example: float | None
+    decode_seconds_per_example: float | None
     step_mb: float | None
     selector_mb: float | None
     exact_kv_mb: float | None
     tail_mb: float | None
     update_mb: float | None
+    physical_step_mb: float | None
     selected_tokens: float | None
+    active_fraction: float | None
     passthrough: float | None
     warnings: list[str]
 
@@ -195,6 +204,64 @@ def _cost_value(cost: dict[str, float], *names: str) -> float | None:
     return None
 
 
+def _config_bool(config: dict[str, Any], name: str) -> bool | None:
+    value = config.get(name)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+    return None
+
+
+REQUIRED_CANONICAL_CUDA_FLAGS = (
+    "selector_pq_joint_gqa_batched",
+    "selector_pq_joint_vector_policy",
+    "selector_pq_joint_reuse_max_topk",
+    "selector_pq_joint_grid_artifacts",
+    "selector_pq_joint_allhead_precompute",
+    "selector_pq_joint_grouped_risk_prefix",
+    "selector_pq_joint_native_v_prefix",
+    "selector_pq_joint_native_risk_prefix",
+    "selector_pq_joint_native_score_grid",
+    "selector_pq_joint_native_policy",
+    "selector_pq_joint_native_softmax_base",
+    "selector_pq_joint_prewarm_vpq_sidecars",
+    "selector_pq_joint_persistent_vpq_cache",
+    "selector_pq_joint_exact_full_budget_grid",
+    "selector_pq_joint_collapse_dup_k_rows",
+    "selector_pq_joint_fast_token_layout",
+)
+
+
+DISALLOWED_DIAGNOSTIC_CUDA_FLAGS = (
+    "selector_pq_joint_segmented_v_prefix",
+    "selector_pq_joint_unsorted_v_prefix",
+    "selector_pq_joint_fast_affine_selected",
+    "selector_pq_joint_ondemand_v_prefix",
+    "selector_pq_joint_incremental_v_grid",
+    "selector_pq_joint_incremental_vpq_sidecar",
+    "selector_pq_joint_native_lazy_policy",
+    "selector_pq_joint_allhead_exact_precompute",
+    "selector_pq_joint_allhead_rank_prefix",
+    "selector_pq_joint_native_rank_prefix",
+    "selector_pq_joint_skip_full_budget_sort",
+    "selector_pq_joint_score_grid_no_exact_fill",
+    "selector_pq_joint_rankpos_score_grid",
+    "selector_pq_joint_grouped_vpq_cache",
+    "selector_pq_joint_fused_risk_policy",
+    "selector_pq_joint_risk_prefix_topk",
+    "selector_pq_joint_native_vpq_base",
+    "selector_pq_joint_fused_softmax_base",
+    "selector_pq_joint_collapse_dup_v_rows",
+)
+
+
 def _ruler_summary(label: str, path: Path) -> RunSummary:
     payload = _load_json(path)
     eval_csv = _ruler_eval_csv(path)
@@ -219,15 +286,38 @@ def _ruler_summary(label: str, path: Path) -> RunSummary:
         quality_name="score",
         examples=examples,
         seconds_per_example=_as_float(payload.get("mean_stream_total_seconds")),
+        decode_seconds_per_example=_as_float(payload.get("mean_stream_decode_seconds")),
         step_mb=cost.get("mean_step_MB_per_head_query"),
         selector_mb=cost.get("mean_selector_MB_per_head_query"),
         exact_kv_mb=cost.get("mean_exact_KV_MB_per_head_query"),
         tail_mb=cost.get("mean_tail_estimator_MB_per_head_query"),
         update_mb=_cost_value(cost, "mean_update_MB_per_head_query", "online_update_MB_per_head_query"),
+        physical_step_mb=_cost_value(
+            cost,
+            "mean_physical_gpu_step_MB_per_head_query",
+            "mean_physical_gpu_total_MB_per_head_query",
+        ),
         selected_tokens=cost.get("mean_selected_tokens"),
+        active_fraction=_cost_value(cost, "approx_path_active_fraction", "selector_active_fraction"),
         passthrough=_passthrough(cost),
         warnings=warnings,
     )
+
+
+def _public_quality(payload: dict[str, Any]) -> tuple[float | None, str]:
+    accuracy_pct = _as_float(payload.get("accuracy_pct"))
+    if accuracy_pct is not None:
+        return accuracy_pct, "accuracy_pct"
+    pass_at_1 = _as_float(payload.get("pass_at_1"))
+    if pass_at_1 is not None:
+        return 100.0 * pass_at_1, "pass@1_pct"
+    substring_once = _as_float(payload.get("mean_substring_once_acc"))
+    if substring_once is not None:
+        return 100.0 * substring_once, "substring_once_pct"
+    completion = _as_float(payload.get("mean_completion_rate"))
+    if completion is not None:
+        return 100.0 * completion, "completion_pct"
+    return None, "quality"
 
 
 def _longbench_summary(label: str, path: Path) -> RunSummary:
@@ -236,21 +326,29 @@ def _longbench_summary(label: str, path: Path) -> RunSummary:
     cost = _cost(payload)
     mode = str(payload.get("attention_mode", ""))
     warnings = _common_warnings(payload, cost, mode)
+    quality, quality_name = _public_quality(payload)
     return RunSummary(
         label=label,
-        kind="longbench-v2",
+        kind="public-longdecode" if "benchmark" in payload else "longbench-v2",
         path=summary_path,
         mode=mode,
-        quality=_as_float(payload.get("accuracy_pct")),
-        quality_name="accuracy_pct",
+        quality=quality,
+        quality_name=quality_name,
         examples=int(payload["num_examples"]) if isinstance(payload.get("num_examples"), int) else None,
         seconds_per_example=_as_float(payload.get("avg_generation_sec")),
+        decode_seconds_per_example=_as_float(payload.get("avg_generation_sec")),
         step_mb=cost.get("mean_step_MB_per_head_query"),
         selector_mb=cost.get("mean_selector_MB_per_head_query"),
         exact_kv_mb=cost.get("mean_exact_KV_MB_per_head_query"),
         tail_mb=cost.get("mean_tail_estimator_MB_per_head_query"),
         update_mb=_cost_value(cost, "mean_update_MB_per_head_query", "online_update_MB_per_head_query"),
+        physical_step_mb=_cost_value(
+            cost,
+            "mean_physical_gpu_step_MB_per_head_query",
+            "mean_physical_gpu_total_MB_per_head_query",
+        ),
         selected_tokens=cost.get("mean_selected_tokens"),
+        active_fraction=_cost_value(cost, "approx_path_active_fraction", "selector_active_fraction"),
         passthrough=_passthrough(cost),
         warnings=warnings,
     )
@@ -273,6 +371,14 @@ def _common_warnings(payload: dict[str, Any], cost: dict[str, float], mode: str)
         if not isinstance(payload.get("pagedpq_config"), dict):
             warnings.append("missing-config")
         if config:
+            if config.get("disable_cost_stats") is True:
+                warnings.append("cost-stats-disabled")
+            if config.get("frontier_canonical_gpu") in {False, 0, "0", "false", "False"}:
+                warnings.append("canonical-guard-off")
+            if config.get("approx_prefill") is True:
+                warnings.append("approx-prefill-noncanonical")
+            if config.get("selector_mode") != "fullscan":
+                warnings.append("non-fullscan-selector")
             if config.get("selector_backend") != "cuda_ext":
                 warnings.append("non-cuda-selector")
             if config.get("index_build_backend") != "torch_gpu":
@@ -282,14 +388,43 @@ def _common_warnings(payload: dict[str, Any], cost: dict[str, float], mode: str)
                 warnings.append("non-gpu-prefill-selector")
             if config.get("selected_value_mode") != "vpq_value":
                 warnings.append("selected-v-not-compressed")
+            if config.get("selected_value_exact_rule") != "global_residual_risk":
+                warnings.append("noncanonical-v-exact-rule")
             if (_as_float(config.get("selected_value_min_exact_top")) or 0.0) > 0.0:
                 warnings.append("selected-v-min-exact-fallback")
             if (_as_float(config.get("selected_value_max_exact_top")) or 0.0) > 0.0:
                 warnings.append("selected-v-max-exact-fallback")
-            if config.get("online_confidence_rule") in {None, "none"}:
-                warnings.append("no-confidence-rule")
-            if config.get("ranked_confidence_cost_mode") == "exact":
-                warnings.append("sync-cost-accounting")
+            if config.get("online_confidence_rule") != "joint_kv_stability":
+                warnings.append("noncanonical-confidence-rule")
+            if config.get("tail_score_calibration") != "affine_selected":
+                warnings.append("noncanonical-tail-calibration")
+            missing_native = [
+                name.removeprefix("selector_pq_joint_")
+                for name in REQUIRED_CANONICAL_CUDA_FLAGS
+                if _config_bool(config, name) is not True
+            ]
+            if missing_native:
+                warnings.append(f"missing-required-cuda-flags:{'|'.join(missing_native)}")
+            active_diagnostics = [
+                name.removeprefix("selector_pq_joint_")
+                for name in DISALLOWED_DIAGNOSTIC_CUDA_FLAGS
+                if _config_bool(config, name) is True
+            ]
+            if active_diagnostics:
+                warnings.append(f"diagnostic-cuda-flags:{'|'.join(active_diagnostics)}")
+        step_mb = _cost_value(
+            cost,
+            "mean_step_MB_per_head_query",
+            "mean_logical_frontier_step_MB_per_head_query",
+        )
+        if step_mb is None or float(step_mb) <= 0.0:
+            warnings.append("missing-step-cost")
+        approx_calls = _cost_value(cost, "approx_attention_calls_total", "approx_attention_calls")
+        if approx_calls is not None and float(approx_calls) <= 0.0:
+            warnings.append("approx-path-inactive")
+        selector_active = _cost_value(cost, "selector_active_fraction")
+        if selector_active is not None and float(selector_active) <= 0.0:
+            warnings.append("selector-inactive")
     return warnings
 
 
@@ -303,14 +438,18 @@ def _row(run: RunSummary) -> list[str]:
         run.kind,
         run.mode or "n/a",
         _fmt(run.quality, 2),
+        run.quality_name,
         str(run.examples) if run.examples is not None else "n/a",
         _fmt(run.seconds_per_example, 2),
+        _fmt(run.decode_seconds_per_example, 2),
         _fmt(run.step_mb),
         _fmt(run.selector_mb),
         _fmt(run.exact_kv_mb),
         _fmt(run.tail_mb),
         _fmt(run.update_mb, 6),
+        _fmt(run.physical_step_mb),
         _fmt(run.selected_tokens, 1),
+        _fmt(run.active_fraction),
         _fmt(run.passthrough, 0),
         ", ".join(run.warnings) if run.warnings else "ok",
     ]
@@ -322,14 +461,18 @@ def _markdown_table(runs: Iterable[RunSummary]) -> str:
         "kind",
         "mode",
         "quality",
+        "metric",
         "n",
         "sec/ex",
+        "decode s/ex",
         "step MB/hq",
         "selector",
         "exact KV",
         "tail",
         "update",
+        "phys step",
         "selected",
+        "active",
         "passthrough",
         "readiness",
     ]
@@ -355,6 +498,12 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, default=None, help="Optional markdown output path")
     parser.add_argument("--strict", action="store_true", help="Exit nonzero if any readiness warning is present.")
+    parser.add_argument(
+        "--max-frontier-decode-seconds",
+        type=float,
+        default=None,
+        help="Warn if a frontier run's decode seconds per example exceeds this threshold.",
+    )
     args = parser.parse_args()
 
     runs: list[RunSummary] = []
@@ -376,24 +525,61 @@ def main() -> None:
                         quality_name="n/a",
                         examples=None,
                         seconds_per_example=None,
+                        decode_seconds_per_example=None,
                         step_mb=None,
                         selector_mb=None,
                         exact_kv_mb=None,
                         tail_mb=None,
                         update_mb=None,
+                        physical_step_mb=None,
                         selected_tokens=None,
+                        active_fraction=None,
                         passthrough=None,
                         warnings=["missing-summary"],
                     )
                 )
                 continue
             for run_label, kind, summary_path in detected:
-                if kind == "longbench":
-                    runs.append(_longbench_summary(run_label, summary_path))
-                elif kind == "ruler":
-                    runs.append(_ruler_summary(run_label, summary_path))
+                try:
+                    if kind == "longbench":
+                        runs.append(_longbench_summary(run_label, summary_path))
+                    elif kind == "ruler":
+                        runs.append(_ruler_summary(run_label, summary_path))
+                except Exception as exc:
+                    runs.append(
+                        RunSummary(
+                            label=run_label,
+                            kind=kind,
+                            path=summary_path,
+                            mode="n/a",
+                            quality=None,
+                            quality_name="n/a",
+                            examples=None,
+                            seconds_per_example=None,
+                            decode_seconds_per_example=None,
+                            step_mb=None,
+                            selector_mb=None,
+                            exact_kv_mb=None,
+                            tail_mb=None,
+                            update_mb=None,
+                            physical_step_mb=None,
+                            selected_tokens=None,
+                            active_fraction=None,
+                            passthrough=None,
+                            warnings=[f"invalid-summary:{type(exc).__name__}"],
+                        )
+                    )
     if not runs:
         raise SystemExit("provide at least one --ruler or --longbench run")
+
+    if args.max_frontier_decode_seconds is not None:
+        threshold = float(args.max_frontier_decode_seconds)
+        for run in runs:
+            if run.mode in {"pagedpq", "pagedpq_batched", "pagedpq_stream"}:
+                if run.decode_seconds_per_example is None:
+                    run.warnings.append("missing-decode-latency")
+                elif float(run.decode_seconds_per_example) > threshold:
+                    run.warnings.append(f"decode>{threshold:.3f}s")
 
     text = _markdown_table(runs) + "\n"
     if args.output is not None:
