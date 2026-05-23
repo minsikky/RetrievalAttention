@@ -1,0 +1,35 @@
+# Parallel GPU Optimization Agents - 2026-05-23
+
+Base commit: `dbeeb96` (`base frontier gpu optimization state`)
+
+All worktrees are under `worktrees/` and are ignored by Git. Each worktree has local `.venv` and `.hf_cache` symlinks to the main checkout.
+
+## Active Workers
+
+| strategy | worktree | branch | agent | status |
+| --- | --- | --- | --- | --- |
+| no-exact-fill score grid | `worktrees/opt-nofill-score-grid` | `codex/opt-nofill-score-grid` | Curie `019e56da-c399-7421-a6de-ffe1aa944d16` | launched |
+| specialized top-k rank-prefix kernel | `worktrees/opt-rank-prefix-topk` | `codex/opt-rank-prefix-topk` | Huygens `019e56da-c41a-79c3-9090-b79ce29c7f75` | launched |
+| fuse PQ scoring + top-k | `worktrees/opt-pq-score-topk-fusion` | `codex/opt-pq-score-topk-fusion` | Poincare `019e56da-c4be-75c2-ad53-ef889d1d2f77` | launched |
+| fused exact-logit + mixed-score construction | `worktrees/opt-exact-mixed-fusion` | `codex/opt-exact-mixed-fusion` | Ramanujan `019e56da-c7fb-7b32-bbe9-d22fb6a8f089` | launched |
+| persistent V-PQ sealed-page append | `worktrees/opt-vpq-sealed-append` | `codex/opt-vpq-sealed-append` | Avicenna `019e56da-cd9b-7b11-aaae-af09f30cb4c1` | launched |
+| fused residual-risk + policy selection | `worktrees/opt-risk-policy-fusion` | `codex/opt-risk-policy-fusion` | Copernicus `019e56da-d619-7b70-8b60-53afada273ea` | launched |
+
+## Pending Workers
+
+The agent runtime accepted six worker threads and rejected the remaining three. Launch these as soon as worker slots free:
+
+| strategy | worktree | branch | status |
+| --- | --- | --- | --- |
+| native grouped execution across heads/layers | `worktrees/opt-grouped-native-exec` | `codex/opt-grouped-native-exec` | pending agent slot |
+| allocation/workspace reuse | `worktrees/opt-workspace-reuse` | `codex/opt-workspace-reuse` | pending agent slot |
+| custom V-PQ base aggregation by code histograms | `worktrees/opt-vpq-histogram-base` | `codex/opt-vpq-histogram-base` | pending agent slot |
+
+## Shared Contract
+
+- Preserve CPU frontier semantics exactly.
+- Add diagnostic flags first; do not promote into canonical defaults inside candidate branches.
+- Run validation jobs from the assigned worktree, not the main checkout. The repository Slurm scripts hardcode the main path, so each worker must patch/wrap validation scripts locally before submitting.
+- Use Slurm outside sandbox with `spgpu` and account `zhengya98` for builds, GPU tests, and benchmark runs.
+- Promotion requires CUDA unit tests, long saved-trace parity over `32000,64000,128000` and heads `0,8`, RULER 32k/128 timing and accounting, and sustained LongGen timing if the candidate affects long decode.
+- Do not use oracle mass, dense rankings, fixed-budget replacement, selected-mass V, hidden dense reads, or benchmark-specific knobs.
