@@ -10,7 +10,7 @@ All worktrees are under `worktrees/` and are ignored by Git. Each worktree has l
 | --- | --- | --- | --- | --- |
 | no-exact-fill score grid | `worktrees/opt-nofill-score-grid` | `codex/opt-nofill-score-grid` | Curie `019e56da-c399-7421-a6de-ffe1aa944d16` | validation pending; jobs `50736497`-`50736502` |
 | specialized top-k rank-prefix kernel | `worktrees/opt-rank-prefix-topk` | `codex/opt-rank-prefix-topk` | Huygens `019e56da-c41a-79c3-9090-b79ce29c7f75` | validation pending; jobs `50736821`, `50736831`, `50736844`, `50736847`, `50736856`, `50736857` |
-| fuse PQ scoring + top-k | `worktrees/opt-pq-score-topk-fusion` | `codex/opt-pq-score-topk-fusion` | Poincare `019e56da-c4be-75c2-ad53-ef889d1d2f77` | launched |
+| fuse PQ scoring + top-k | `worktrees/opt-pq-score-topk-fusion` | `codex/opt-pq-score-topk-fusion` | Poincare `019e56da-c4be-75c2-ad53-ef889d1d2f77` | validation pending; jobs `50736996`, `50737027`, `50737104`, `50737139`, `50737197`, `50737198` |
 | fused exact-logit + mixed-score construction | `worktrees/opt-exact-mixed-fusion` | `codex/opt-exact-mixed-fusion` | Ramanujan `019e56da-c7fb-7b32-bbe9-d22fb6a8f089` | launched |
 | persistent V-PQ sealed-page append | `worktrees/opt-vpq-sealed-append` | `codex/opt-vpq-sealed-append` | Avicenna `019e56da-cd9b-7b11-aaae-af09f30cb4c1` | validation pending; jobs `50737140`-`50737145` |
 | fused residual-risk + policy selection | `worktrees/opt-risk-policy-fusion` | `codex/opt-risk-policy-fusion` | Copernicus `019e56da-d619-7b70-8b60-53afada273ea` | validation pending; jobs `50736562`, `50736563`, `50736568`, `50736578`, `50736581`, `50736596` |
