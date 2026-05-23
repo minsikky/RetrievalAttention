@@ -30,3 +30,21 @@ All requested strategy workers have been launched. Some workers have already han
 - Use Slurm outside sandbox with `spgpu` and account `zhengya98` for builds, GPU tests, and benchmark runs.
 - Promotion requires CUDA unit tests, long saved-trace parity over `32000,64000,128000` and heads `0,8`, RULER 32k/128 timing and accounting, and sustained LongGen timing if the candidate affects long decode.
 - Do not use oracle mass, dense rankings, fixed-budget replacement, selected-mass V, hidden dense reads, or benchmark-specific knobs.
+
+## Monitor Results
+
+Monitor pass completed after submitted Slurm jobs reached terminal state. No candidate is promotable from this batch.
+
+| strategy | CUDA unit | parity | RULER 32k/128 result | LongGen result | decision |
+| --- | --- | --- | --- | --- | --- |
+| no-exact-fill score grid | pass `50736497`, `5:01` | failed before parity: missing worktree-local trace | timing `44.68s`; accounting `49.24s`, `3.8361` logical MB/hq, `8.9179` physical MB/hq, selected `11730.29` | failed before eval: missing worktree-local LongGenBench dataset | not promotable |
+| fused residual-risk + policy selection | failed immediately: `mkdir candidate_eval_result: Permission denied` | failed immediately: missing `.venv/bin/activate` | failed immediately: missing wrapper path | failed immediately: HF cache under Slurm spool | not promotable |
+| specialized top-k rank-prefix kernel | pass `50736821`, `4:26` | failed before parity: missing worktree-local trace | timing `44.12s`; accounting `46.30s`, `3.8361` logical MB/hq, `8.9179` physical MB/hq, selected `11730.29` | failed before eval: missing worktree-local LongGenBench dataset | not promotable |
+| fuse PQ scoring + top-k | pass `50736996`, `4:29` | failed before parity: missing worktree-local trace | timing `39.15s`; accounting `42.43s`, `3.83597` logical MB/hq, `8.91801` physical MB/hq, selected `11729.49` | failed before eval: missing worktree-local LongGenBench dataset | not promotable |
+| fused exact-logit + mixed-score construction | pass `50737392`, `4:18` | failed before parity: missing worktree-local trace | failed in HF path: ranked prefixes do not cover every K take count | not submitted | not promotable |
+| persistent V-PQ sealed-page append | pass `50737140`, `4:23` | failed before parity: missing worktree-local trace | no-stats failed import; accounting `49.63s`, `3.8361` logical MB/hq, `8.9179` physical MB/hq, selected `11730.34` | failed before eval: missing worktree-local LongGenBench dataset | not promotable |
+| native grouped execution across heads/layers | pass `50737670`, `4:18` | failed before parity: missing worktree-local trace | timing `56.97s`; accounting `67.32s`, `3.8365` logical MB/hq, `8.9179` physical MB/hq, selected `11732.11` | failed before eval: missing worktree-local LongGenBench dataset | not promotable |
+| allocation/workspace reuse | failed immediately: `mkdir cuda_unit_result: Permission denied` | failed immediately: missing `.venv/bin/activate` | dependent jobs canceled | dependent jobs canceled | not promotable |
+| custom V-PQ base aggregation by code histograms | failed immediately: `mkdir cuda_unit_result: Permission denied` | dependent jobs canceled | dependent jobs canceled | dependent jobs canceled | not promotable |
+
+The repeated failure mode is validation plumbing, not necessarily algorithm semantics: several worktree jobs used worktree-relative trace/dataset/cache/output paths or derived `REPO_ROOT` from Slurm's spool copy of the submitted script. Future worktree validation should either symlink shared traces/datasets/caches into each worktree or pass absolute main-checkout paths explicitly, and wrappers should prefer `SLURM_SUBMIT_DIR`/an explicit `FRONTIER_WORKTREE` over `${BASH_SOURCE[0]}` under `sbatch`.
