@@ -1,6 +1,8 @@
 ## Local experiment artifacts
+.venv
 .venv/
 .hf_pydeps/
+.hf_cache
 .hf_cache/
 __pycache__/
 **/__pycache__/
