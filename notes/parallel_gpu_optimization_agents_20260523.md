@@ -14,9 +14,9 @@ All worktrees are under `worktrees/` and are ignored by Git. Each worktree has l
 | fused exact-logit + mixed-score construction | `worktrees/opt-exact-mixed-fusion` | `codex/opt-exact-mixed-fusion` | Ramanujan `019e56da-c7fb-7b32-bbe9-d22fb6a8f089` | validation pending/incomplete; jobs `50737392`, `50737394`, `50737407`, `50737408`; LongGen not submitted |
 | persistent V-PQ sealed-page append | `worktrees/opt-vpq-sealed-append` | `codex/opt-vpq-sealed-append` | Avicenna `019e56da-cd9b-7b11-aaae-af09f30cb4c1` | validation pending; jobs `50737140`-`50737145` |
 | fused residual-risk + policy selection | `worktrees/opt-risk-policy-fusion` | `codex/opt-risk-policy-fusion` | Copernicus `019e56da-d619-7b70-8b60-53afada273ea` | validation pending; jobs `50736562`, `50736563`, `50736568`, `50736578`, `50736581`, `50736596` |
-| native grouped execution across heads/layers | `worktrees/opt-grouped-native-exec` | `codex/opt-grouped-native-exec` | Wegener `019e56eb-5e79-79a0-9433-b3b4cfc6d435` | launched |
+| native grouped execution across heads/layers | `worktrees/opt-grouped-native-exec` | `codex/opt-grouped-native-exec` | Wegener `019e56eb-5e79-79a0-9433-b3b4cfc6d435` | validation pending; jobs `50737670`, `50737717`, `50737718`, `50737719`, `50737720`, `50737721` |
 | allocation/workspace reuse | `worktrees/opt-workspace-reuse` | `codex/opt-workspace-reuse` | Carver `019e56ee-6e7d-7c11-9c6f-c740e83c1c8e` | validation pending; jobs `50737348`, `50737349`, `50737365`, `50737375`, `50737376`, `50737393` |
-| custom V-PQ base aggregation by code histograms | `worktrees/opt-vpq-histogram-base` | `codex/opt-vpq-histogram-base` | Aquinas `019e56f8-a114-7c12-9ec4-aaa74f2f1dd2` | launched |
+| custom V-PQ base aggregation by code histograms | `worktrees/opt-vpq-histogram-base` | `codex/opt-vpq-histogram-base` | Aquinas `019e56f8-a114-7c12-9ec4-aaa74f2f1dd2` | implementation done; unit job `50737780` pending; full validation not yet submitted |
 
 ## Pending Workers
 
