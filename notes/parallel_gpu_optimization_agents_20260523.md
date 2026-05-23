@@ -16,7 +16,7 @@ All worktrees are under `worktrees/` and are ignored by Git. Each worktree has l
 | fused residual-risk + policy selection | `worktrees/opt-risk-policy-fusion` | `codex/opt-risk-policy-fusion` | Copernicus `019e56da-d619-7b70-8b60-53afada273ea` | validation pending; jobs `50736562`, `50736563`, `50736568`, `50736578`, `50736581`, `50736596` |
 | native grouped execution across heads/layers | `worktrees/opt-grouped-native-exec` | `codex/opt-grouped-native-exec` | Wegener `019e56eb-5e79-79a0-9433-b3b4cfc6d435` | validation pending; jobs `50737670`, `50737717`, `50737718`, `50737719`, `50737720`, `50737721` |
 | allocation/workspace reuse | `worktrees/opt-workspace-reuse` | `codex/opt-workspace-reuse` | Carver `019e56ee-6e7d-7c11-9c6f-c740e83c1c8e` | validation pending; jobs `50737348`, `50737349`, `50737365`, `50737375`, `50737376`, `50737393` |
-| custom V-PQ base aggregation by code histograms | `worktrees/opt-vpq-histogram-base` | `codex/opt-vpq-histogram-base` | Aquinas `019e56f8-a114-7c12-9ec4-aaa74f2f1dd2` | implementation done; unit job `50737780` pending; full validation not yet submitted |
+| custom V-PQ base aggregation by code histograms | `worktrees/opt-vpq-histogram-base` | `codex/opt-vpq-histogram-base` | Aquinas `019e56f8-a114-7c12-9ec4-aaa74f2f1dd2` | validation pending; jobs `50737780`, `50737806`, `50737831`, `50737843`, `50737847`, `50737858`, `50737868` |
 
 ## Pending Workers
 
