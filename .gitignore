@@ -23,6 +23,7 @@ cuda_unit_result/
 public_longdecode_result/
 ruler_eval_result/
 slurm_out/
+slurm_logs/
 slurm-*.out
 slurm-c90-*.out
 slurm-cmp64-*.out

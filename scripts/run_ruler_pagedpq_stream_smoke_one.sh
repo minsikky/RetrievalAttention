@@ -40,9 +40,9 @@ PROFILE_NATIVE_OPS_ARG=()
 if [ "${PROFILE_NATIVE_OPS:-0}" = "1" ]; then
   PROFILE_NATIVE_OPS_ARG=(--profile_native_ops)
 fi
-DISABLE_COST_STATS_ARG=()
 if [ "${DISABLE_COST_STATS:-0}" = "1" ]; then
-  DISABLE_COST_STATS_ARG=(--disable_cost_stats)
+  echo "[ERROR] DISABLE_COST_STATS=1 is deprecated for active frontier runs; use accounting/profile artifacts instead." >&2
+  exit 2
 fi
 DISABLE_NATIVE_DECODE_FUSED_ARG=()
 if [ "${DISABLE_NATIVE_DECODE_FUSED:-1}" = "1" ]; then
@@ -82,7 +82,7 @@ fi
 
 echo "[pagedpq_stream_smoke] mode=${MODE} approx_prefill=${APPROX_PREFILL} task=${TASK_NAME} context=${CONTEXT_LEN} samples=${NUM_SAMPLES}"
 echo "[pagedpq_stream_smoke] out=${OUT_DIR}"
-echo "[pagedpq_stream_smoke] budget=${BUDGET:-4096} confidence=${ONLINE_CONFIDENCE_RULE:-none} target=${TAIL_PROXY_MASS_MIN:-0.0} geom_min=${GEOMETRIC_MIN_BUDGET:-8192} geom_max=${GEOMETRIC_MAX_BUDGET:-65536} page=${PAGE_SIZE:-5632} chunk=${PREFILL_CHUNK_SIZE:-0}"
+echo "[pagedpq_stream_smoke] budget=${BUDGET:-4096} confidence=${ONLINE_CONFIDENCE_RULE:-joint_kv_stability} target=${TAIL_PROXY_MASS_MIN:-0.0} geom_min=${GEOMETRIC_MIN_BUDGET:-8192} geom_max=${GEOMETRIC_MAX_BUDGET:-65536} page=${PAGE_SIZE:-5632} chunk=${PREFILL_CHUNK_SIZE:-0}"
 echo "[pagedpq_stream_smoke] exact_logit_backend=${FRONTIER_EXACT_LOGIT_BACKEND:-auto}"
 
 DATA_FILE="${DATA_FILE_OVERRIDE:-${DATA_DIR}/${TASK_NAME}/validation.jsonl}"
@@ -118,16 +118,15 @@ fi
   --num_samples "${NUM_SAMPLES}" \
   --max_new_tokens "${MAX_NEW_TOKENS:-0}" \
   --mode "${MODE}" \
-  $( [ "${APPROX_PREFILL}" = "1" ] && printf '%s' "--approx_prefill" ) \
   --layers "${LAYERS:-all}" \
   --device "${DEVICE:-cuda}" \
   --local_files_only \
   --selector_mode "${SELECTOR_MODE:-fullscan}" \
-  --selector_backend "${SELECTOR_BACKEND:-${SELECTOR_PAGED_PQ_BACKEND:-torch}}" \
+  --selector_backend "${SELECTOR_BACKEND:-${SELECTOR_PAGED_PQ_BACKEND:-cuda_ext}}" \
   --budget "${BUDGET:-4096}" \
   --budget_by_head "${BUDGET_BY_HEAD:-}" \
   --tail_mode "${TAIL_MODE:-vpq_value}" \
-  --online_confidence_rule "${ONLINE_CONFIDENCE_RULE:-none}" \
+  --online_confidence_rule "${ONLINE_CONFIDENCE_RULE:-joint_kv_stability}" \
   --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-affine_selected}" \
   --tail_blend "${TAIL_BLEND:-1.0}" \
   --tail_probe_rel_l2_max "${TAIL_PROBE_REL_L2_MAX:-0.020}" \
@@ -147,7 +146,7 @@ fi
   --joint_kv_v_budgets "${JOINT_KV_V_BUDGETS:-1024,2048,4096,6144,8192,12288,16384}" \
   --joint_kv_stability_threshold "${JOINT_KV_STABILITY_THRESHOLD:-0.001}" \
   --selected_value_mode "${SELECTED_VALUE_MODE:-vpq_value}" \
-  --selected_value_exact_rule "${SELECTED_VALUE_EXACT_RULE:-selected_mass}" \
+  --selected_value_exact_rule "${SELECTED_VALUE_EXACT_RULE:-global_residual_risk}" \
   --selected_value_exact_top "${SELECTED_VALUE_EXACT_TOP:-0}" \
   --selected_value_exact_mass "${SELECTED_VALUE_EXACT_MASS:-0.98}" \
   --selected_value_min_exact_top "${SELECTED_VALUE_MIN_EXACT_TOP:-0}" \
@@ -179,7 +178,6 @@ fi
   "${PREFILL_TAIL_BLEND_ARG[@]}" \
   "${DECODE_TAIL_BLEND_ARG[@]}" \
   "${PROFILE_NATIVE_OPS_ARG[@]}" \
-  "${DISABLE_COST_STATS_ARG[@]}" \
   "${DISABLE_NATIVE_DECODE_FUSED_ARG[@]}" \
   "${ENABLE_NATIVE_DECODE_FUSED_ARG[@]}" \
   "${NATIVE_DECODE_SCORELESS_FUSED_ARG[@]}" \

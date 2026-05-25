@@ -5,10 +5,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 import csv
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from benchmark.selector_eval.frontier_config import (
+    DISALLOWED_DIAGNOSTIC_ENV_FLAGS,
+    REQUIRED_CANONICAL_ENV_FLAGS,
+)
 
 
 MEAN_COST_FIELDS = (
@@ -219,47 +229,8 @@ def _config_bool(config: dict[str, Any], name: str) -> bool | None:
     return None
 
 
-REQUIRED_CANONICAL_CUDA_FLAGS = (
-    "selector_pq_joint_gqa_batched",
-    "selector_pq_joint_vector_policy",
-    "selector_pq_joint_reuse_max_topk",
-    "selector_pq_joint_grid_artifacts",
-    "selector_pq_joint_allhead_precompute",
-    "selector_pq_joint_grouped_risk_prefix",
-    "selector_pq_joint_native_v_prefix",
-    "selector_pq_joint_native_risk_prefix",
-    "selector_pq_joint_native_score_grid",
-    "selector_pq_joint_native_policy",
-    "selector_pq_joint_native_softmax_base",
-    "selector_pq_joint_prewarm_vpq_sidecars",
-    "selector_pq_joint_persistent_vpq_cache",
-    "selector_pq_joint_exact_full_budget_grid",
-    "selector_pq_joint_collapse_dup_k_rows",
-    "selector_pq_joint_fast_token_layout",
-)
-
-
-DISALLOWED_DIAGNOSTIC_CUDA_FLAGS = (
-    "selector_pq_joint_segmented_v_prefix",
-    "selector_pq_joint_unsorted_v_prefix",
-    "selector_pq_joint_fast_affine_selected",
-    "selector_pq_joint_ondemand_v_prefix",
-    "selector_pq_joint_incremental_v_grid",
-    "selector_pq_joint_incremental_vpq_sidecar",
-    "selector_pq_joint_native_lazy_policy",
-    "selector_pq_joint_allhead_exact_precompute",
-    "selector_pq_joint_allhead_rank_prefix",
-    "selector_pq_joint_native_rank_prefix",
-    "selector_pq_joint_skip_full_budget_sort",
-    "selector_pq_joint_score_grid_no_exact_fill",
-    "selector_pq_joint_rankpos_score_grid",
-    "selector_pq_joint_grouped_vpq_cache",
-    "selector_pq_joint_fused_risk_policy",
-    "selector_pq_joint_risk_prefix_topk",
-    "selector_pq_joint_native_vpq_base",
-    "selector_pq_joint_fused_softmax_base",
-    "selector_pq_joint_collapse_dup_v_rows",
-)
+REQUIRED_CANONICAL_CUDA_FLAGS = tuple(name.lower() for name in REQUIRED_CANONICAL_ENV_FLAGS)
+DISALLOWED_DIAGNOSTIC_CUDA_FLAGS = tuple(name.lower() for name in DISALLOWED_DIAGNOSTIC_ENV_FLAGS)
 
 
 def _ruler_summary(label: str, path: Path) -> RunSummary:

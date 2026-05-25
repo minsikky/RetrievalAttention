@@ -48,3 +48,31 @@ Monitor pass completed after submitted Slurm jobs reached terminal state. No can
 | custom V-PQ base aggregation by code histograms | failed immediately: `mkdir cuda_unit_result: Permission denied` | dependent jobs canceled | dependent jobs canceled | dependent jobs canceled | not promotable |
 
 The repeated failure mode is validation plumbing, not necessarily algorithm semantics: several worktree jobs used worktree-relative trace/dataset/cache/output paths or derived `REPO_ROOT` from Slurm's spool copy of the submitted script. Future worktree validation should either symlink shared traces/datasets/caches into each worktree or pass absolute main-checkout paths explicitly, and wrappers should prefer `SLURM_SUBMIT_DIR`/an explicit `FRONTIER_WORKTREE` over `${BASH_SOURCE[0]}` under `sbatch`.
+
+## Fixed-Path Reruns
+
+Rerun script: `scripts/submit_fixed_candidate_validation_reruns.sh`.
+
+The rerun passes absolute trace, X-trace, HF cache, venv, model snapshot, and LongGenBench paths into the candidate worktrees. This fixes the earlier validation-plumbing failures for the three candidates with plausible short-RULER speedups.
+
+| strategy | fixed jobs | status | current interpretation |
+| --- | --- | --- | --- |
+| fuse PQ scoring + top-k | parity `50739154`, LongGen 8192 `50739155`, LongGen 16384 `50739156` | parity passed; LongGen 8192 and 16384 completed | Not promotable: semantics are clean, but 8192 accounting is slower than canonical and 16k no-stats is only a marginal/inconsistent `~1%` timing improvement. |
+| specialized top-k rank-prefix kernel | parity `50739157`/`50740047`, LongGen 8192 `50739158`, LongGen 16384 `50739159` | parity passed; LongGen 8192 and 16384 completed | Not promotable: semantics are clean, but sustained LongGen is slower than canonical at both 8192 and 16384. |
+| no-exact-fill score grid | parity `50740123`, LongGen 8192 `50740139`, LongGen 16384 `50740140` | parity passed; LongGen 8192 and 16384 completed | Not promotable: semantics are clean, but RULER and LongGen are slower than canonical at both sustained lengths. |
+
+Low-memory parity-only duplicates were submitted to reduce queue pressure while leaving the original jobs queued: rank-prefix `50740047`, no-fill `50740048`. These only replace the parity gate if they complete cleanly; they do not replace the LongGen sustained-decode gates. Rank-prefix `50740047` passed. No-fill `50740048` failed due a wrapper variable mismatch (`RETRIEVAL_ATTENTION_WORKTREE` vs `RETRIEVAL_ATTENTION_ROOT`), so the worktree wrapper was patched and resubmitted as no-fill parity `50740123`. The stale original rank/no-fill parity jobs and stale no-fill LongGen jobs were canceled; fixed no-fill LongGen jobs were resubmitted as `50740139` and `50740140`.
+
+Completed fixed evidence:
+
+- PQ-score/top-k parity `50739154`: passed over decode lengths `32000,64000,128000`, heads `0,8`, `rows=12`, max CPU/native attention relL2 `4.25e-09`, max CPU/native o-proj relL2 `1.70e-08`, max Torch/GPU-policy attention relL2 `2.62e-06`, max Torch/GPU-policy o-proj relL2 `2.14e-06`.
+- PQ-score/top-k LongGen 8192 accounting `50739155`: generated `8192` tokens in `836.70s`; logical step `1.7620 MB/head-query`; physical step `1.8716 MB/head-query`; selected `4281.05` tokens/head-query; score-grid wall time `74.08s`; patched attention wall time `570.85s`.
+- PQ-score/top-k LongGen 16384 timing `50739156`: generated `16384` tokens in `2623.21s` with cost stats disabled. This is only marginally faster than the current canonical 16k no-stats reference (`50723400`, `2650.05s`) and does not offset the slower 8192 accounting result.
+- Rank-prefix parity `50740047`: passed over decode lengths `32000,64000,128000`, heads `0,8`, `rows=12`, max CPU/native attention relL2 `4.25e-09`, max CPU/native o-proj relL2 `1.70e-08`, max Torch/GPU-policy attention relL2 `2.62e-06`, max Torch/GPU-policy o-proj relL2 `2.14e-06`.
+- Rank-prefix LongGen 8192 accounting `50739158`: generated `8192` tokens in `861.99s`; logical step `1.7620 MB/head-query`; physical step `1.8716 MB/head-query`; selected `4281.09` tokens/head-query; rank-prefix wall time `28.99s`; score-grid wall time `78.46s`; patched attention wall time `596.39s`. This is slower than PQ-score/top-k `50739155` and the current canonical accounting baseline (`50723383`, `842.58s`).
+- Rank-prefix LongGen 16384 timing `50739159`: generated `16384` tokens in `2817.99s` with cost stats disabled. This is slower than both PQ-score/top-k `50739156` (`2623.21s`) and the current canonical no-stats reference (`50723400`, `2650.05s`).
+- No-fill parity `50740123`: passed over decode lengths `32000,64000,128000`, heads `0,8`, `rows=12`, max CPU/native attention relL2 `4.25e-09`, max CPU/native o-proj relL2 `1.70e-08`, max Torch/GPU-policy attention relL2 `2.62e-06`, max Torch/GPU-policy o-proj relL2 `2.14e-06`.
+- No-fill LongGen 8192 accounting `50740139`: generated `8192` tokens in `857.96s`; logical step `1.7620 MB/head-query`; physical step `1.8716 MB/head-query`; selected `4281.02` tokens/head-query; score-grid wall time `73.33s`; patched attention wall time `595.23s`. This is slower than the current canonical accounting baseline (`50723383`, `842.58s`).
+- No-fill LongGen 16384 timing `50740140`: generated `16384` tokens in `2908.61s` with cost stats disabled. This is slower than PQ-score/top-k `50739156` (`2623.21s`), rank-prefix `50739159` (`2817.99s`), and the current canonical no-stats reference (`50723400`, `2650.05s`).
+
+Final fixed-path conclusion: none of the three rerun candidates is promotable. The earlier "no candidate promotable" statement was partly caused by validation setup failures, but after fixing the setup the runtime evidence still rejects these candidates. PQ-score/top-k is the closest candidate, with clean parity and a marginal 16k no-stats timing improvement, but it loses on 8192 accounting and the 16k margin is too small/inconsistent to merge.

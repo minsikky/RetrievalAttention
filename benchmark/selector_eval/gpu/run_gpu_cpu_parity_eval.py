@@ -38,10 +38,12 @@ from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import (
     rank_paged_pq_batched_with_scores,
     selector_bytes_fullscan,
 )
-from benchmark.selector_eval.runners.run_hf_paged_pq_intervention_eval import (
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_geometric import (
     _gpu_gqa_dense_decode_ranked_logits_and_base_lse,
     geometric_budget_pairs,
     selected_mass_thresholds_from_logits_gpu,
+)
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_value import (
     value_vpq_pack_torch,
 )
 

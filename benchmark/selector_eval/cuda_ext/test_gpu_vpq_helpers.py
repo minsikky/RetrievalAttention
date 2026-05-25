@@ -14,15 +14,21 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import build_page_pq_gpu  # noqa: E402
-from benchmark.selector_eval.runners.run_hf_paged_pq_intervention_eval import (  # noqa: E402
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_common import (  # noqa: E402
     _choose_joint_kv_action,
+)
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_geometric import (  # noqa: E402
     _gpu_gqa_base_logsumexp_decode,
     _gpu_gqa_dense_decode_ranked_logits_and_base_lse,
     _gpu_gqa_ranked_exact_logits,
     geometric_budget_pairs,
-    reconstruct_all_vpq_values_gpu,
     select_thresholds_for_budget_counts_gpu,
     selected_mass_thresholds_from_logits_gpu,
+)
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_value import (  # noqa: E402
+    reconstruct_all_vpq_values_gpu,
+    value_vpq_code_stat_risk_torch,
+    value_vpq_pack_torch,
     vpq_values_for_tokens_gpu,
 )
 from benchmark.selector_eval.runners.run_layer_quality_eval import _vpq_values_for_tokens  # noqa: E402
@@ -59,21 +65,51 @@ def _test_native_exact_value_counts() -> None:
         gqa_fullscan_pq_topk_scores,
         joint_mixed_softmax_base_outputs,
         joint_mixed_softmax_base_outputs_rankpos,
+        joint_mixed_softmax_base_outputs_tokenfit_scaled,
         joint_mixed_score_grid,
+        joint_mixed_score_grid_workspace,
+        joint_mixed_score_grid_scaled,
         joint_mixed_score_grid_rankpos,
         joint_mixed_score_grid_no_exact_fill,
+        joint_mixed_score_grid_no_exact_fill_scaled,
+        joint_mixed_score_grid_tokenfit_scaled,
+        joint_mixed_score_grid_no_exact_fill_tokenfit_scaled,
+        joint_mixed_score_grid_sparse_exact_tokenfit_scaled,
+        joint_sparse_exact_score_table,
+        joint_grouped_accounting_sums,
         joint_rank_prefix_tokens,
+        joint_rank_prefix_sort_temp_bytes,
+        joint_rank_prefix_tokens_workspace,
+        joint_budget_prefix_tokens,
         joint_select_policy,
         joint_select_policy_grouped_flat,
         joint_select_policy_grouped_flat_no_mb,
         joint_select_policy_from_grouped_risk,
         joint_select_policy_from_grouped_risk_batched,
+        joint_select_policy_from_grouped_risk_no_mb,
+        joint_select_policy_from_grouped_risk_batched_no_mb,
+        joint_select_policy_from_grouped_risk_intervals_batched_no_mb,
+        joint_select_policy_from_grouped_scores_intervals_batched_no_mb,
+        joint_mixed_select_policy_intervals_no_mb,
         joint_vprefix_outputs,
         joint_vprefix_outputs_from_grouped_risk,
         joint_vprefix_outputs_from_grouped_risk_batched,
+        joint_vprefix_outputs_from_grouped_risk_batched_strided_workspace,
+        joint_vprefix_outputs_from_grouped_risk_batched_workspace,
         joint_vprefix_outputs_from_grouped_risk_topk_batched,
+        joint_vprefix_outputs_from_grouped_scores_batched,
+        joint_vprefix_outputs_from_grouped_scores_batched_workspace,
         joint_vprefix_outputs_from_risk,
+        joint_grouped_risk_sort_temp_bytes,
         joint_softmax_base_outputs,
+        joint_softmax_base_outputs_cublas,
+        joint_softmax_base_outputs_strided_workspace,
+        joint_softmax_base_outputs_workspace,
+        joint_softmax_base_outputs_workspace_cublas,
+        joint_softmax_base_outputs_grouped_cublas,
+        joint_vpq_append_exact_suffix,
+        joint_vpq_append_exact_suffix_grouped,
+        joint_vpq_sidecars_from_pack,
         joint_vpq_base_outputs_from_probs,
         selected_mass_thresholds_from_topk,
     )
@@ -232,6 +268,35 @@ def _test_native_exact_value_counts() -> None:
     softmax_score_grid = torch.randn((k_count, heads, base_context), device=device, dtype=torch.float32)
     softmax_values = torch.randn((base_context, base_dim), device=device, dtype=torch.float32)
     got_softmax_probs, got_softmax_base = joint_softmax_base_outputs(softmax_score_grid, softmax_values)
+    got_softmax_probs_cb, got_softmax_base_cb = joint_softmax_base_outputs_cublas(softmax_score_grid, softmax_values)
+    probs_workspace = torch.empty_like(got_softmax_probs)
+    base_workspace = torch.empty_like(got_softmax_base)
+    got_softmax_probs_ws, got_softmax_base_ws = joint_softmax_base_outputs_workspace(
+        probs_workspace,
+        base_workspace,
+        softmax_score_grid,
+        softmax_values,
+    )
+    probs_workspace_strided = torch.empty(
+        (k_count, heads, base_context + 7),
+        device=device,
+        dtype=torch.float32,
+    )
+    base_workspace_strided = torch.empty_like(got_softmax_base)
+    got_softmax_probs_strided, got_softmax_base_strided = joint_softmax_base_outputs_strided_workspace(
+        probs_workspace_strided,
+        base_workspace_strided,
+        softmax_score_grid,
+        softmax_values,
+    )
+    probs_workspace_cb = torch.empty_like(got_softmax_probs)
+    base_workspace_cb = torch.empty_like(got_softmax_base)
+    got_softmax_probs_ws_cb, got_softmax_base_ws_cb = joint_softmax_base_outputs_workspace_cublas(
+        probs_workspace_cb,
+        base_workspace_cb,
+        softmax_score_grid,
+        softmax_values,
+    )
     ref_softmax_probs = torch.softmax(softmax_score_grid, dim=2)
     ref_softmax_base = (
         ref_softmax_probs.reshape(k_count * heads, base_context) @ softmax_values
@@ -240,6 +305,108 @@ def _test_native_exact_value_counts() -> None:
         raise AssertionError("native joint softmax probabilities mismatch Torch reference")
     if not torch.allclose(got_softmax_base, ref_softmax_base, atol=2e-5, rtol=2e-5):
         raise AssertionError("native joint softmax base output mismatch Torch reference")
+    if not torch.allclose(got_softmax_probs_cb, ref_softmax_probs, atol=3e-6, rtol=3e-6):
+        raise AssertionError("cuBLAS joint softmax probabilities mismatch Torch reference")
+    if not torch.allclose(got_softmax_base_cb, ref_softmax_base, atol=2e-5, rtol=2e-5):
+        raise AssertionError("cuBLAS joint softmax base output mismatch Torch reference")
+    if got_softmax_probs_ws.data_ptr() != probs_workspace.data_ptr():
+        raise AssertionError("workspace softmax probabilities did not reuse caller workspace")
+    if got_softmax_base_ws.data_ptr() != base_workspace.data_ptr():
+        raise AssertionError("workspace softmax base output did not reuse caller workspace")
+    if not torch.allclose(got_softmax_probs_ws, ref_softmax_probs, atol=3e-6, rtol=3e-6):
+        raise AssertionError("workspace joint softmax probabilities mismatch Torch reference")
+    if not torch.allclose(got_softmax_base_ws, ref_softmax_base, atol=2e-5, rtol=2e-5):
+        raise AssertionError("workspace joint softmax base output mismatch Torch reference")
+    if got_softmax_probs_strided.data_ptr() != probs_workspace_strided.data_ptr():
+        raise AssertionError("strided workspace softmax probabilities did not reuse caller workspace")
+    if got_softmax_base_strided.data_ptr() != base_workspace_strided.data_ptr():
+        raise AssertionError("strided workspace softmax base output did not reuse caller workspace")
+    if not torch.allclose(got_softmax_probs_strided, ref_softmax_probs, atol=3e-6, rtol=3e-6):
+        raise AssertionError("strided workspace joint softmax probabilities mismatch Torch reference")
+    if not torch.allclose(got_softmax_base_strided, ref_softmax_base, atol=2e-5, rtol=2e-5):
+        raise AssertionError("strided workspace joint softmax base output mismatch Torch reference")
+    if got_softmax_probs_ws_cb.data_ptr() != probs_workspace_cb.data_ptr():
+        raise AssertionError("cuBLAS workspace softmax probabilities did not reuse caller workspace")
+    if got_softmax_base_ws_cb.data_ptr() != base_workspace_cb.data_ptr():
+        raise AssertionError("cuBLAS workspace softmax base output did not reuse caller workspace")
+    if not torch.allclose(got_softmax_probs_ws_cb, ref_softmax_probs, atol=3e-6, rtol=3e-6):
+        raise AssertionError("cuBLAS workspace joint softmax probabilities mismatch Torch reference")
+    if not torch.allclose(got_softmax_base_ws_cb, ref_softmax_base, atol=2e-5, rtol=2e-5):
+        raise AssertionError("cuBLAS workspace joint softmax base output mismatch Torch reference")
+    grouped_softmax_scores = torch.randn((kv_heads + 1, k_count, heads, base_context), device=device, dtype=torch.float32)
+    grouped_softmax_values = torch.randn((kv_heads + 1, base_context + 3, base_dim), device=device, dtype=torch.float32)
+    got_grouped_probs_cb, got_grouped_base_cb = joint_softmax_base_outputs_grouped_cublas(
+        grouped_softmax_scores,
+        grouped_softmax_values,
+    )
+    ref_grouped_probs = torch.softmax(grouped_softmax_scores, dim=3)
+    ref_grouped_base = torch.stack(
+        [
+            (
+                ref_grouped_probs[g].reshape(k_count * heads, base_context)
+                @ grouped_softmax_values[g, :base_context]
+            ).reshape(k_count, heads, base_dim)
+            for g in range(kv_heads + 1)
+        ],
+        dim=0,
+    )
+    if not torch.allclose(got_grouped_probs_cb, ref_grouped_probs, atol=3e-6, rtol=3e-6):
+        raise AssertionError("grouped cuBLAS joint softmax probabilities mismatch Torch reference")
+    if not torch.allclose(got_grouped_base_cb, ref_grouped_base, atol=2e-5, rtol=2e-5):
+        raise AssertionError("grouped cuBLAS joint softmax base output mismatch Torch reference")
+
+    append_values = torch.randn((18, dim), device=device, dtype=torch.float16).contiguous()
+    append_vhat = torch.randn((24, dim), device=device, dtype=torch.float32)
+    append_residual = torch.randn((24, dim), device=device, dtype=torch.float32)
+    append_error = torch.rand((24,), device=device, dtype=torch.float64)
+    ref_vhat = append_vhat.clone()
+    ref_residual = append_residual.clone()
+    ref_error = append_error.clone()
+    append_start, append_end = 7, 15
+    ref_vhat[append_start:append_end].copy_(append_values[append_start:append_end].float())
+    ref_residual[append_start:append_end].zero_()
+    ref_error[append_start:append_end].zero_()
+    joint_vpq_append_exact_suffix(
+        append_vhat,
+        append_residual,
+        append_error,
+        append_values,
+        append_start,
+        append_end,
+    )
+    if not torch.equal(append_vhat, ref_vhat):
+        raise AssertionError("joint_vpq_append_exact_suffix vhat mismatch")
+    if not torch.equal(append_residual, ref_residual):
+        raise AssertionError("joint_vpq_append_exact_suffix residual mismatch")
+    if not torch.equal(append_error, ref_error):
+        raise AssertionError("joint_vpq_append_exact_suffix code_error mismatch")
+
+    grouped_values = torch.randn((kv_heads + 1, 18, dim), device=device, dtype=torch.float16).contiguous()
+    grouped_vhat = torch.randn((kv_heads + 1, 24, dim), device=device, dtype=torch.float32)
+    grouped_residual_append = torch.randn((kv_heads + 1, 24, dim), device=device, dtype=torch.float32)
+    grouped_error = torch.rand((kv_heads + 1, 24), device=device, dtype=torch.float32)
+    ref_grouped_vhat = grouped_vhat.clone()
+    ref_grouped_residual = grouped_residual_append.clone()
+    ref_grouped_error = grouped_error.clone()
+    ref_grouped_vhat[:, append_start:append_end, :].copy_(
+        grouped_values[:, append_start:append_end, :].float()
+    )
+    ref_grouped_residual[:, append_start:append_end, :].zero_()
+    ref_grouped_error[:, append_start:append_end].zero_()
+    joint_vpq_append_exact_suffix_grouped(
+        grouped_vhat,
+        grouped_residual_append,
+        grouped_error,
+        grouped_values,
+        append_start,
+        append_end,
+    )
+    if not torch.equal(grouped_vhat, ref_grouped_vhat):
+        raise AssertionError("joint_vpq_append_exact_suffix_grouped vhat mismatch")
+    if not torch.equal(grouped_residual_append, ref_grouped_residual):
+        raise AssertionError("joint_vpq_append_exact_suffix_grouped residual mismatch")
+    if not torch.equal(grouped_error, ref_grouped_error):
+        raise AssertionError("joint_vpq_append_exact_suffix_grouped code_error mismatch")
 
     rank_scores = torch.tensor(
         [[0.2, 1.5, -0.1, 0.7], [3.0, 2.0, 4.0, 1.0]],
@@ -254,6 +421,65 @@ def _test_native_exact_value_counts() -> None:
     ).reshape(2, 3)
     if not torch.equal(got_rank_prefix, ref_rank_prefix):
         raise AssertionError("native joint rank-prefix tokens mismatch Torch topk reference")
+    rank_rows = int(rank_scores.shape[0])
+    rank_count = int(rank_scores.shape[1])
+    rank_take = 3
+    temp_bytes = max(1, int(joint_rank_prefix_sort_temp_bytes(rank_rows, rank_count)))
+    workspace_rank_prefix = joint_rank_prefix_tokens_workspace(
+        rank_scores,
+        rank_tokens,
+        rank_take,
+        torch.empty((rank_rows * rank_count,), device=device, dtype=torch.float32),
+        torch.empty((rank_rows * rank_count,), device=device, dtype=torch.float32),
+        torch.empty((rank_rows * rank_count,), device=device, dtype=torch.int32),
+        torch.empty((rank_rows * rank_count,), device=device, dtype=torch.int32),
+        torch.empty((rank_rows + 1,), device=device, dtype=torch.long),
+        torch.empty((temp_bytes,), device=device, dtype=torch.uint8),
+        torch.empty((rank_rows * rank_take,), device=device, dtype=torch.long),
+    )
+    if not torch.equal(workspace_rank_prefix, ref_rank_prefix):
+        raise AssertionError("workspace native joint rank-prefix tokens mismatch Torch topk reference")
+    budget_prefix = joint_budget_prefix_tokens(
+        rank_scores,
+        rank_tokens,
+        torch.tensor([1, 3], device=device, dtype=torch.long),
+        3,
+    )
+    ref_top1 = set(
+        rank_tokens.index_select(
+            0,
+            torch.topk(rank_scores, k=1, dim=1, largest=True, sorted=True).indices[0],
+        ).detach().cpu().tolist()
+    )
+    got_top1 = set(budget_prefix[0, :1].detach().cpu().tolist())
+    if got_top1 != ref_top1:
+        raise AssertionError(f"budget-prefix top1 mismatch: got={got_top1} ref={ref_top1}")
+    ref_top3 = set(ref_rank_prefix[0, :3].detach().cpu().tolist())
+    got_top3 = set(budget_prefix[0, :3].detach().cpu().tolist())
+    if got_top3 != ref_top3:
+        raise AssertionError(f"budget-prefix top3 mismatch: got={got_top3} ref={ref_top3}")
+    unique_scores = (torch.randn((3, 257), device=device, dtype=torch.float32) * 0.01) + torch.arange(
+        257,
+        device=device,
+        dtype=torch.float32,
+    ).reshape(1, -1)
+    unique_tokens = torch.arange(1000, 1257, device=device, dtype=torch.long)
+    unique_budgets = torch.tensor([7, 31, 113], device=device, dtype=torch.long)
+    got_unique_budget_prefix = joint_budget_prefix_tokens(unique_scores, unique_tokens, unique_budgets, 113)
+    for row_i in range(int(unique_scores.shape[0])):
+        for take_i in unique_budgets.detach().cpu().tolist():
+            ref_set = set(
+                unique_tokens.index_select(
+                    0,
+                    torch.topk(unique_scores[row_i], k=int(take_i), largest=True, sorted=True).indices,
+                ).detach().cpu().tolist()
+            )
+            got_set = set(got_unique_budget_prefix[row_i, : int(take_i)].detach().cpu().tolist())
+            if got_set != ref_set:
+                raise AssertionError(
+                    f"budget-prefix unique top{take_i} set mismatch row={row_i}: "
+                    f"missing={sorted(ref_set - got_set)[:5]} extra={sorted(got_set - ref_set)[:5]}"
+                )
 
     grouped_rows = 7
     grouped_groups = 3
@@ -331,6 +557,76 @@ def _test_native_exact_value_counts() -> None:
     )
     if not torch.allclose(fused_grid_batched, fused_grid_flat, atol=2e-5, rtol=2e-5):
         raise AssertionError("native batched grouped-risk V-prefix output grid mismatches flat reference")
+    score_fused_groups = 3
+    score_fused_k = 4
+    score_fused_heads = 2
+    score_fused_context = 17
+    score_fused_dim = 16
+    score_fused_v_budgets = torch.tensor([0, 2, 5, 9], device=device, dtype=torch.long)
+    score_fused_scores = torch.randn(
+        (score_fused_groups, score_fused_k, score_fused_heads, score_fused_context),
+        device=device,
+        dtype=torch.float32,
+    )
+    score_fused_probs = torch.softmax(score_fused_scores, dim=3)
+    score_fused_vhat = torch.randn(
+        (score_fused_groups, score_fused_context, score_fused_dim),
+        device=device,
+        dtype=torch.float32,
+    )
+    score_fused_residual = torch.randn_like(score_fused_vhat)
+    score_fused_error = torch.rand(
+        (score_fused_groups, score_fused_context),
+        device=device,
+        dtype=torch.float32,
+    )
+    score_fused_base = torch.einsum("gkhc,gcd->gkhd", score_fused_probs, score_fused_vhat).contiguous()
+    score_ref = joint_vprefix_outputs_from_grouped_risk_batched(
+        score_fused_base,
+        score_fused_probs.contiguous(),
+        score_fused_residual,
+        score_fused_error,
+        score_fused_v_budgets,
+    )
+    score_got = joint_vprefix_outputs_from_grouped_scores_batched(
+        score_fused_scores,
+        score_fused_vhat,
+        score_fused_residual,
+        score_fused_error,
+        score_fused_v_budgets,
+    )
+    if not torch.allclose(score_got, score_ref, atol=5e-5, rtol=5e-5):
+        max_diff = float((score_got - score_ref).abs().max().item())
+        raise AssertionError(
+            "native score-direct grouped-risk V-prefix output grid mismatches "
+            f"probability-materialized reference; max_diff={max_diff}"
+        )
+    score_rows = score_fused_groups * score_fused_k * score_fused_heads
+    score_temp_bytes = max(1, int(joint_grouped_risk_sort_temp_bytes(score_rows, score_fused_context)))
+    score_workspace_got = joint_vprefix_outputs_from_grouped_scores_batched_workspace(
+        score_fused_scores,
+        score_fused_vhat,
+        score_fused_residual,
+        score_fused_error,
+        score_fused_v_budgets,
+        torch.empty((score_rows,), device=device, dtype=torch.float32),
+        torch.empty((score_rows,), device=device, dtype=torch.float32),
+        torch.empty((score_rows, score_fused_dim), device=device, dtype=torch.float32),
+        torch.empty((score_rows, score_fused_context), device=device, dtype=torch.float32),
+        torch.empty((score_rows, score_fused_context), device=device, dtype=torch.float32),
+        torch.empty((score_rows, score_fused_context), device=device, dtype=torch.int32),
+        torch.empty((score_rows, score_fused_context), device=device, dtype=torch.int32),
+        torch.empty((score_rows + 1,), device=device, dtype=torch.long),
+        torch.empty((score_temp_bytes,), device=device, dtype=torch.uint8),
+        torch.empty((score_rows, int(score_fused_v_budgets.numel()), score_fused_dim), device=device, dtype=torch.float32),
+        torch.empty((score_rows, int(score_fused_v_budgets.numel()), score_fused_dim), device=device, dtype=torch.float32),
+    )
+    if not torch.allclose(score_workspace_got, score_ref, atol=5e-5, rtol=5e-5):
+        max_diff = float((score_workspace_got - score_ref).abs().max().item())
+        raise AssertionError(
+            "workspace native score-direct grouped-risk V-prefix output grid mismatches "
+            f"probability-materialized reference; max_diff={max_diff}"
+        )
     fused_grid_topk_batched = joint_vprefix_outputs_from_grouped_risk_topk_batched(
         fused_base.reshape(fused_groups, fused_k, fused_heads, fused_dim).contiguous(),
         fused_probs.reshape(fused_groups, fused_k, fused_heads, fused_context).contiguous(),
@@ -397,6 +693,78 @@ def _test_native_exact_value_counts() -> None:
             raise AssertionError(f"native batched grouped-risk policy indices mismatch; policy={policy_name}")
         if not torch.allclose(got_batched_outputs, ref_outputs, atol=2e-5, rtol=2e-5):
             raise AssertionError(f"native batched grouped-risk policy outputs mismatch; policy={policy_name}")
+        if policy_name != "sensitivity_greedy":
+            got_no_mb_outputs, got_no_mb_indices = joint_select_policy_from_grouped_risk_no_mb(
+                fused_base,
+                fused_probs,
+                fused_residual,
+                fused_error,
+                fused_v_budgets,
+                fused_k,
+                fused_heads,
+                0.25,
+                policy_id,
+            )
+            if not torch.equal(got_no_mb_indices, ref_indices):
+                raise AssertionError(f"native no-MB grouped-risk policy indices mismatch; policy={policy_name}")
+            if not torch.allclose(got_no_mb_outputs, ref_outputs, atol=2e-5, rtol=2e-5):
+                raise AssertionError(f"native no-MB grouped-risk policy outputs mismatch; policy={policy_name}")
+            got_batched_no_mb_outputs, got_batched_no_mb_indices = joint_select_policy_from_grouped_risk_batched_no_mb(
+                fused_base.reshape(fused_groups, fused_k, fused_heads, fused_dim).contiguous(),
+                fused_probs.reshape(fused_groups, fused_k, fused_heads, fused_context).contiguous(),
+                fused_residual,
+                fused_error,
+                fused_v_budgets,
+                0.25,
+                policy_id,
+            )
+            if not torch.equal(got_batched_no_mb_indices, ref_indices):
+                raise AssertionError(f"native batched no-MB grouped-risk policy indices mismatch; policy={policy_name}")
+            if not torch.allclose(got_batched_no_mb_outputs, ref_outputs, atol=2e-5, rtol=2e-5):
+                raise AssertionError(f"native batched no-MB grouped-risk policy outputs mismatch; policy={policy_name}")
+            got_interval_outputs, got_interval_indices = (
+                joint_select_policy_from_grouped_risk_intervals_batched_no_mb(
+                    fused_base.reshape(fused_groups, fused_k, fused_heads, fused_dim).contiguous(),
+                    fused_probs.reshape(fused_groups, fused_k, fused_heads, fused_context).contiguous(),
+                    fused_residual,
+                    fused_error,
+                    fused_v_budgets,
+                    0.25,
+                    policy_id,
+                )
+            )
+            if not torch.equal(got_interval_indices, ref_indices):
+                raise AssertionError(f"native interval no-MB grouped-risk policy indices mismatch; policy={policy_name}")
+            if not torch.allclose(got_interval_outputs, ref_outputs, atol=2e-5, rtol=2e-5):
+                raise AssertionError(f"native interval no-MB grouped-risk policy outputs mismatch; policy={policy_name}")
+            score_ref_outputs, score_ref_indices = joint_select_policy_grouped_flat_no_mb(
+                score_ref,
+                score_fused_k,
+                score_fused_heads,
+                0.25,
+                policy_id,
+            )
+            got_score_interval_outputs, got_score_interval_indices = (
+                joint_select_policy_from_grouped_scores_intervals_batched_no_mb(
+                    score_fused_scores,
+                    score_fused_vhat,
+                    score_fused_residual,
+                    score_fused_error,
+                    score_fused_v_budgets,
+                    0.25,
+                    policy_id,
+                )
+            )
+            if not torch.equal(got_score_interval_indices, score_ref_indices):
+                raise AssertionError(
+                    f"native score-interval no-MB grouped-risk policy indices mismatch; policy={policy_name}"
+                )
+            if not torch.allclose(got_score_interval_outputs, score_ref_outputs, atol=5e-5, rtol=5e-5):
+                max_diff = float((got_score_interval_outputs - score_ref_outputs).abs().max().item())
+                raise AssertionError(
+                    "native score-interval no-MB grouped-risk policy outputs mismatch; "
+                    f"policy={policy_name} max_diff={max_diff}"
+                )
 
     exact_scores = torch.randn((heads, query_context_len), device=device, dtype=torch.float32)
     indexed_tokens_score = torch.tensor([1, 2, 4, 7, 10, 13, 16, 19, 21], device=device, dtype=torch.long)
@@ -474,6 +842,80 @@ def _test_native_exact_value_counts() -> None:
         ref_score_grid = _torch_mixed_score_grid(calibrate)
         if not torch.allclose(got_score_grid, ref_score_grid, atol=2e-5, rtol=2e-5):
             raise AssertionError(f"native joint mixed score grid mismatches Torch reference; calibrate={calibrate}")
+        workspace_score = torch.empty_like(got_score_grid)
+        workspace_mask = torch.empty(got_score_grid.shape, device=device, dtype=torch.uint8)
+        workspace_fit_scale = torch.empty(
+            (int(k_take_counts.numel()), int(exact_scores.shape[0])),
+            device=device,
+            dtype=torch.float32,
+        )
+        workspace_fit_bias = torch.empty_like(workspace_fit_scale)
+        got_score_grid_workspace = joint_mixed_score_grid_workspace(
+            workspace_score,
+            workspace_mask,
+            workspace_fit_scale,
+            workspace_fit_bias,
+            exact_scores,
+            pq_logits,
+            y_indexed,
+            indexed_tokens_score,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            calibrate,
+        )
+        if got_score_grid_workspace.data_ptr() != workspace_score.data_ptr():
+            raise AssertionError("workspace score-grid helper did not return the caller-provided output tensor")
+        if not torch.allclose(got_score_grid_workspace, ref_score_grid, atol=2e-5, rtol=2e-5):
+            raise AssertionError(f"workspace joint mixed score grid mismatches Torch reference; calibrate={calibrate}")
+        pq_scale = 0.125
+        got_score_grid_scaled = joint_mixed_score_grid_scaled(
+            exact_scores,
+            pq_logits,
+            y_indexed,
+            indexed_tokens_score,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            calibrate,
+            pq_scale,
+        )
+        pq_logits_saved = pq_logits
+        pq_logits = pq_logits_saved * pq_scale
+        ref_score_grid_scaled = _torch_mixed_score_grid(calibrate)
+        pq_logits = pq_logits_saved
+        if not torch.allclose(got_score_grid_scaled, ref_score_grid_scaled, atol=2e-5, rtol=2e-5):
+            raise AssertionError(f"native scaled joint mixed score grid mismatches Torch reference; calibrate={calibrate}")
+        got_score_grid_tokenfit = joint_mixed_score_grid_tokenfit_scaled(
+            exact_scores,
+            pq_logits,
+            y_indexed,
+            indexed_tokens_score,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            calibrate,
+            1.0,
+        )
+        if not torch.allclose(got_score_grid_tokenfit, ref_score_grid, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native tokenfit joint mixed score grid mismatches Torch reference; calibrate={calibrate}"
+            )
+        got_score_grid_tokenfit_scaled = joint_mixed_score_grid_tokenfit_scaled(
+            exact_scores,
+            pq_logits,
+            y_indexed,
+            indexed_tokens_score,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            calibrate,
+            pq_scale,
+        )
+        if not torch.allclose(got_score_grid_tokenfit_scaled, ref_score_grid_scaled, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native scaled tokenfit joint mixed score grid mismatches Torch reference; calibrate={calibrate}"
+            )
         got_score_grid_rankpos = joint_mixed_score_grid_rankpos(
             exact_scores,
             pq_logits,
@@ -528,6 +970,98 @@ def _test_native_exact_value_counts() -> None:
             raise AssertionError(
                 f"native rank-position fused mixed softmax base output mismatch score-grid reference; calibrate={calibrate}"
             )
+        got_probs_tokenfit, got_base_tokenfit = joint_mixed_softmax_base_outputs_tokenfit_scaled(
+            exact_scores,
+            pq_logits,
+            y_indexed,
+            indexed_tokens_score,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            values_for_mixed,
+            calibrate,
+            1.0,
+        )
+        if not torch.allclose(got_probs_tokenfit, ref_probs, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native tokenfit fused mixed softmax probabilities mismatch score-grid reference; calibrate={calibrate}"
+            )
+        if not torch.allclose(got_base_tokenfit, ref_base, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native tokenfit fused mixed softmax base output mismatch score-grid reference; calibrate={calibrate}"
+            )
+        ref_probs_scaled, ref_base_scaled = joint_softmax_base_outputs(
+            ref_score_grid_scaled.contiguous(),
+            values_for_mixed,
+        )
+        got_probs_tokenfit_scaled, got_base_tokenfit_scaled = joint_mixed_softmax_base_outputs_tokenfit_scaled(
+            exact_scores,
+            pq_logits,
+            y_indexed,
+            indexed_tokens_score,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            values_for_mixed,
+            calibrate,
+            pq_scale,
+        )
+        if not torch.allclose(got_probs_tokenfit_scaled, ref_probs_scaled, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native scaled tokenfit fused mixed softmax probabilities mismatch score-grid reference; calibrate={calibrate}"
+            )
+        if not torch.allclose(got_base_tokenfit_scaled, ref_base_scaled, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native scaled tokenfit fused mixed softmax base output mismatch score-grid reference; calibrate={calibrate}"
+            )
+        mixed_policy_v_budgets = torch.tensor([0, 3, 8, 15], device=device, dtype=torch.long)
+        mixed_policy_residual = torch.randn((query_context_len, dim), device=device, dtype=torch.float32)
+        mixed_policy_error = torch.rand((query_context_len,), device=device, dtype=torch.float32)
+        mixed_policy_grid = joint_vprefix_outputs_from_grouped_risk_batched(
+            ref_base.reshape(1, int(k_take_counts.numel()), heads, dim).contiguous(),
+            ref_probs.reshape(1, int(k_take_counts.numel()), heads, query_context_len).contiguous(),
+            mixed_policy_residual.reshape(1, query_context_len, dim).contiguous(),
+            mixed_policy_error.reshape(1, query_context_len).contiguous(),
+            mixed_policy_v_budgets,
+        )
+        for policy_name, policy_id in policy_ids.items():
+            if policy_name == "sensitivity_greedy":
+                continue
+            ref_policy_outputs, ref_policy_indices = joint_select_policy_grouped_flat_no_mb(
+                mixed_policy_grid,
+                int(k_take_counts.numel()),
+                heads,
+                0.25,
+                policy_id,
+            )
+            got_policy_outputs, got_policy_indices = joint_mixed_select_policy_intervals_no_mb(
+                exact_scores,
+                pq_logits,
+                y_indexed,
+                indexed_tokens_score,
+                base_tokens_score,
+                ranked_prefix_score,
+                k_take_counts,
+                values_for_mixed,
+                mixed_policy_residual,
+                mixed_policy_error,
+                mixed_policy_v_budgets,
+                calibrate,
+                1.0,
+                0.25,
+                policy_id,
+            )
+            if not torch.equal(got_policy_indices, ref_policy_indices[0]):
+                raise AssertionError(
+                    "native mixed-score fused interval policy indices mismatch; "
+                    f"policy={policy_name} calibrate={calibrate}"
+                )
+            if not torch.allclose(got_policy_outputs, ref_policy_outputs[0], atol=8e-5, rtol=8e-5):
+                max_diff = float((got_policy_outputs - ref_policy_outputs[0]).abs().max().item())
+                raise AssertionError(
+                    "native mixed-score fused interval policy outputs mismatch; "
+                    f"policy={policy_name} calibrate={calibrate} max_diff={max_diff}"
+                )
 
     indexed_tokens_covered = torch.arange(1, query_context_len - 1, device=device, dtype=torch.long)
     pq_logits_covered = torch.randn(
@@ -599,6 +1133,89 @@ def _test_native_exact_value_counts() -> None:
         if not torch.allclose(got_score_grid_no_fill, ref_score_grid_no_fill, atol=2e-5, rtol=2e-5):
             raise AssertionError(
                 f"native no-fill joint mixed score grid mismatches covered Torch reference; calibrate={calibrate}"
+            )
+        pq_scale = 0.125
+        got_score_grid_no_fill_scaled = joint_mixed_score_grid_no_exact_fill_scaled(
+            exact_scores,
+            pq_logits_covered,
+            y_indexed_covered,
+            indexed_tokens_covered,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            calibrate,
+            pq_scale,
+        )
+        pq_logits_covered_saved = pq_logits_covered
+        pq_logits_covered = pq_logits_covered_saved * pq_scale
+        ref_score_grid_no_fill_scaled = _torch_mixed_score_grid_covered(calibrate)
+        pq_logits_covered = pq_logits_covered_saved
+        if not torch.allclose(got_score_grid_no_fill_scaled, ref_score_grid_no_fill_scaled, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native scaled no-fill joint mixed score grid mismatches covered Torch reference; calibrate={calibrate}"
+            )
+        got_score_grid_no_fill_tokenfit = joint_mixed_score_grid_no_exact_fill_tokenfit_scaled(
+            exact_scores,
+            pq_logits_covered,
+            y_indexed_covered,
+            indexed_tokens_covered,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            calibrate,
+            1.0,
+        )
+        if not torch.allclose(got_score_grid_no_fill_tokenfit, ref_score_grid_no_fill, atol=2e-5, rtol=2e-5):
+            raise AssertionError(
+                f"native no-fill tokenfit joint mixed score grid mismatches covered Torch reference; calibrate={calibrate}"
+            )
+        got_score_grid_no_fill_tokenfit_scaled = joint_mixed_score_grid_no_exact_fill_tokenfit_scaled(
+            exact_scores,
+            pq_logits_covered,
+            y_indexed_covered,
+            indexed_tokens_covered,
+            base_tokens_score,
+            ranked_prefix_score,
+            k_take_counts,
+            calibrate,
+            pq_scale,
+        )
+        if not torch.allclose(
+            got_score_grid_no_fill_tokenfit_scaled,
+            ref_score_grid_no_fill_scaled,
+            atol=2e-5,
+            rtol=2e-5,
+        ):
+            raise AssertionError(
+                f"native scaled no-fill tokenfit joint mixed score grid mismatches covered Torch reference; calibrate={calibrate}"
+            )
+        sparse_base_logits = exact_scores.gather(
+            1,
+            base_tokens_score.reshape(1, -1).expand(heads, -1),
+        ).contiguous()
+        sparse_ranked_logits = exact_scores.gather(1, ranked_prefix_score).contiguous()
+        got_score_grid_sparse_direct = joint_mixed_score_grid_sparse_exact_tokenfit_scaled(
+            pq_logits_covered,
+            indexed_tokens_covered,
+            base_tokens_score,
+            sparse_base_logits,
+            ranked_prefix_score,
+            sparse_ranked_logits,
+            k_take_counts,
+            query_context_len,
+            calibrate,
+            pq_scale,
+        )
+        if not torch.allclose(
+            got_score_grid_sparse_direct,
+            ref_score_grid_no_fill_scaled,
+            atol=2e-5,
+            rtol=2e-5,
+        ):
+            max_diff = float((got_score_grid_sparse_direct - ref_score_grid_no_fill_scaled).abs().max().item())
+            raise AssertionError(
+                "native sparse-exact direct tokenfit score grid mismatches covered Torch reference; "
+                f"calibrate={calibrate} max_diff={max_diff}"
             )
 
     k_take_counts_with_full_row = torch.tensor([2, 99], device=device, dtype=torch.long)
@@ -812,6 +1429,58 @@ def _test_native_exact_value_counts() -> None:
                 raise AssertionError(f"native grouped flat no-MB policy indices mismatch; policy={policy_name}")
             if not torch.allclose(got_outputs_no_mb, ref_outputs_t, atol=2e-5, rtol=2e-5):
                 raise AssertionError(f"native grouped flat no-MB policy outputs mismatch; policy={policy_name}")
+
+    final_indices = torch.tensor(
+        [[0, 0], [1, 2], [3, 1], [2, 3]],
+        dtype=torch.long,
+        device=device,
+    )
+    selected_counts = torch.tensor([128, 256, 512, 1024], dtype=torch.long, device=device)
+    accounting_v_budgets = torch.tensor([0, 64, 256, 2048], dtype=torch.long, device=device)
+    context_len = 1500
+    selector_mb = 0.125
+    codebook_mb = 0.03125
+    metadata_mb = 0.001
+    value_subvecs = 4
+    code_bytes = 1
+    got_accounting = joint_grouped_accounting_sums(
+        final_indices,
+        selected_counts,
+        accounting_v_budgets,
+        context_len,
+        dim,
+        2,
+        2,
+        selector_mb,
+        codebook_mb,
+        metadata_mb,
+        value_subvecs,
+        code_bytes,
+    ).detach().cpu().numpy()
+    got_accounting = np.asarray(got_accounting, dtype=np.float64)
+    ref_accounting = np.zeros((11,), dtype=np.float64)
+    for ki, vi in final_indices.detach().cpu().tolist():
+        selected_count = int(selected_counts[int(ki)].item())
+        exact_v = max(0, min(int(accounting_v_budgets[int(vi)].item()), context_len))
+        tail_count = max(0, context_len - exact_v)
+        exact_key_mb = float(selected_count * dim * 2) / (1024.0 * 1024.0)
+        exact_v_mb = float(exact_v * dim * 2) / (1024.0 * 1024.0)
+        tail_mb = codebook_mb + float(tail_count * value_subvecs * code_bytes) / (1024.0 * 1024.0) + metadata_mb
+        dense_physical_key_mb = float(context_len * dim * 2) / (1024.0 * 1024.0)
+        ref_accounting[0] += selected_count
+        ref_accounting[1] += tail_count
+        ref_accounting[2] += selector_mb
+        ref_accounting[3] += exact_key_mb + exact_v_mb
+        ref_accounting[4] += tail_mb
+        ref_accounting[6] += dense_physical_key_mb + exact_v_mb
+        ref_accounting[8] += 1 if selector_mb > 0.0 else 0
+        ref_accounting[9] += 1 if tail_mb > 0.0 else 0
+    accounting_max_diff = float(np.max(np.abs(got_accounting - ref_accounting)))
+    if accounting_max_diff > 1e-10:
+        raise AssertionError(
+            "native grouped accounting sums mismatch: "
+            f"max_diff={accounting_max_diff} got={got_accounting.tolist()} ref={ref_accounting.tolist()}"
+        )
 
     ref = gqa_causal_vpq_selected_tail_from_scores(
         queries,
@@ -2365,9 +3034,145 @@ def _test_dense_decode_ranked_logits_simulator() -> None:
         max_diff = float((got_base_cached - ref_base).abs().max().item()) if got_base_cached is not None else float("inf")
         raise AssertionError(f"cached dense simulator base lse mismatch: max_diff={max_diff}")
     from selector_paged_pq import (  # noqa: PLC0415
+        gqa_decode_full_exact_logits,
+        gqa_decode_full_exact_logits_grouped,
+        gqa_decode_full_exact_logits_t_cublas,
+        gqa_decode_token_exact_logits,
         gqa_decode_ranked_exact_logits,
         gqa_decode_ranked_exact_logits_with_base_lse,
+        joint_sparse_exact_score_table,
     )
+
+    ref_full = torch.empty((heads, query_context_len), device=device, dtype=torch.float32)
+    for head in range(heads):
+        kv_head = min(kv_heads - 1, head // group_size)
+        ref_full[head] = (queries[head].float().reshape(1, dim) @ keys[kv_head, :query_context_len].float().T).reshape(-1) * scale
+    got_full = gqa_decode_full_exact_logits(
+        queries,
+        keys,
+        group_size,
+        query_context_len,
+        scale,
+    )
+    if not torch.allclose(got_full, ref_full, atol=2e-3, rtol=2e-3):
+        max_diff = float((got_full - ref_full).abs().max().item())
+        raise AssertionError(f"native full exact logits mismatch: max_diff={max_diff}")
+    got_full_grouped = gqa_decode_full_exact_logits_grouped(
+        queries,
+        keys,
+        group_size,
+        query_context_len,
+        scale,
+    )
+    if not torch.allclose(got_full_grouped, ref_full, atol=2e-3, rtol=2e-3):
+        max_diff = float((got_full_grouped - ref_full).abs().max().item())
+        raise AssertionError(f"native grouped full exact logits mismatch: max_diff={max_diff}")
+    keys_t = keys.float().transpose(1, 2).contiguous()
+    got_full_cublas = gqa_decode_full_exact_logits_t_cublas(
+        queries,
+        keys_t,
+        group_size,
+        query_context_len,
+        scale,
+    )
+    if not torch.allclose(got_full_cublas, ref_full, atol=2e-3, rtol=2e-3):
+        max_diff = float((got_full_cublas - ref_full).abs().max().item())
+        raise AssertionError(f"native cuBLAS full exact logits mismatch: max_diff={max_diff}")
+    padded_keys_t = torch.empty(
+        (kv_heads, dim, query_context_len + 7),
+        device=device,
+        dtype=torch.float32,
+    )
+    padded_keys_t[:, :, :query_context_len].copy_(keys_t[:, :, :query_context_len])
+    got_full_cublas_strided = gqa_decode_full_exact_logits_t_cublas(
+        queries,
+        padded_keys_t[:, :, :query_context_len],
+        group_size,
+        query_context_len,
+        scale,
+    )
+    if not torch.allclose(got_full_cublas_strided, ref_full, atol=2e-3, rtol=2e-3):
+        max_diff = float((got_full_cublas_strided - ref_full).abs().max().item())
+        raise AssertionError(f"native cuBLAS strided full exact logits mismatch: max_diff={max_diff}")
+    token_list = torch.tensor(
+        [
+            [0, 7, 11, query_context_len - 1, query_context_len, -1],
+            [2, 5, 13, query_context_len - 2, total_tokens - 1, -4],
+            [3, 9, 17, query_context_len - 3, query_context_len + 4, -5],
+            [4, 10, 19, query_context_len - 4, total_tokens + 3, -6],
+        ],
+        device=device,
+        dtype=torch.long,
+    )
+    got_token_exact = gqa_decode_token_exact_logits(
+        queries,
+        keys,
+        token_list,
+        group_size,
+        query_context_len,
+        scale,
+    )
+    ref_token_exact = torch.full_like(got_token_exact, -float("inf"))
+    for head in range(heads):
+        kv_head = min(kv_heads - 1, head // group_size)
+        for sel, token in enumerate(token_list[head].detach().cpu().tolist()):
+            if 0 <= int(token) < int(query_context_len):
+                ref_token_exact[head, sel] = (
+                    queries[head].float().reshape(1, dim)
+                    @ keys[kv_head, int(token)].float().reshape(dim, 1)
+                ).reshape(()) * scale
+    finite = torch.isfinite(ref_token_exact)
+    if not torch.equal(torch.isfinite(got_token_exact), finite):
+        raise AssertionError("native arbitrary-token exact logits finite mask mismatch")
+    if bool(torch.any(finite)) and not torch.allclose(
+        got_token_exact[finite],
+        ref_token_exact[finite],
+        atol=2e-3,
+        rtol=2e-3,
+    ):
+        max_diff = float((got_token_exact[finite] - ref_token_exact[finite]).abs().max().item())
+        raise AssertionError(f"native arbitrary-token exact logits mismatch: max_diff={max_diff}")
+    base_tokens = torch.tensor([0, 1, query_context_len - 3, query_context_len - 1], device=device, dtype=torch.long)
+    base_token_rows = base_tokens.reshape(1, -1).expand(heads, -1).contiguous()
+    base_logits = gqa_decode_token_exact_logits(
+        queries,
+        keys,
+        base_token_rows,
+        group_size,
+        query_context_len,
+        scale,
+    )
+    table_ranked_tokens = torch.tensor(
+        [
+            [5, 9, 17, 23],
+            [6, 10, 18, 24],
+            [7, 11, 19, 25],
+            [8, 12, 20, 26],
+        ],
+        device=device,
+        dtype=torch.long,
+    )
+    ranked_logits_for_table = gqa_decode_token_exact_logits(
+        queries,
+        keys,
+        table_ranked_tokens,
+        group_size,
+        query_context_len,
+        scale,
+    )
+    sparse_table = joint_sparse_exact_score_table(
+        base_tokens,
+        base_logits,
+        table_ranked_tokens,
+        ranked_logits_for_table,
+        query_context_len,
+    )
+    ref_sparse_table = torch.zeros((heads, query_context_len), device=device, dtype=torch.float32)
+    ref_sparse_table.scatter_(1, base_token_rows, base_logits)
+    ref_sparse_table.scatter_(1, table_ranked_tokens, ranked_logits_for_table)
+    if not torch.allclose(sparse_table, ref_sparse_table, atol=2e-3, rtol=2e-3):
+        max_diff = float((sparse_table - ref_sparse_table).abs().max().item())
+        raise AssertionError(f"native sparse exact score table mismatch: max_diff={max_diff}")
 
     ranked_scores = torch.ones_like(ref_ranked)
     ref_native_ranked = gqa_decode_ranked_exact_logits(
@@ -2403,10 +3208,99 @@ def _test_dense_decode_ranked_logits_simulator() -> None:
         raise AssertionError(f"native ranked logits + base lse base mismatch: max_diff={max_diff}")
 
 
+def _test_grouped_risk_prefix_workspace() -> None:
+    from selector_paged_pq import (  # noqa: PLC0415
+        joint_grouped_risk_sort_temp_bytes,
+        joint_vprefix_outputs_from_grouped_risk_batched,
+        joint_vprefix_outputs_from_grouped_risk_batched_strided_workspace,
+        joint_vprefix_outputs_from_grouped_risk_batched_workspace,
+    )
+
+    torch.manual_seed(20260524)
+    device = torch.device("cuda")
+    groups = 2
+    k_count = 3
+    heads = 2
+    context_len = 37
+    dim = 16
+    v_steps = 4
+    base_outputs = torch.randn((groups, k_count, heads, dim), device=device, dtype=torch.float32)
+    logits = torch.randn((groups, k_count, heads, context_len), device=device, dtype=torch.float32)
+    probs = torch.softmax(logits, dim=-1).contiguous()
+    residual_groups = torch.randn((groups, context_len, dim), device=device, dtype=torch.float32)
+    code_error_groups = torch.rand((groups, context_len), device=device, dtype=torch.float32)
+    v_budgets = torch.tensor([0, 5, 17, context_len], device=device, dtype=torch.long)
+    ref = joint_vprefix_outputs_from_grouped_risk_batched(
+        base_outputs.contiguous(),
+        probs,
+        residual_groups.contiguous(),
+        code_error_groups.contiguous(),
+        v_budgets,
+    )
+    rows = groups * k_count * heads
+    total = rows * context_len
+    temp_bytes = int(joint_grouped_risk_sort_temp_bytes(rows, context_len))
+    risk_in = torch.empty((total + 11,), device=device, dtype=torch.float32)
+    risk_out = torch.empty_like(risk_in)
+    ids_in = torch.empty((total + 11,), device=device, dtype=torch.int32)
+    ids_out = torch.empty_like(ids_in)
+    offsets = torch.empty((rows + 8,), device=device, dtype=torch.long)
+    temp = torch.empty((temp_bytes + 17,), device=device, dtype=torch.uint8)
+    interval_sums = torch.empty((rows, v_steps, dim), device=device, dtype=torch.float32)
+    outputs = torch.empty_like(interval_sums)
+    got = joint_vprefix_outputs_from_grouped_risk_batched_workspace(
+        base_outputs.contiguous(),
+        probs,
+        residual_groups.contiguous(),
+        code_error_groups.contiguous(),
+        v_budgets,
+        risk_in,
+        risk_out,
+        ids_in,
+        ids_out,
+        offsets,
+        temp,
+        interval_sums,
+        outputs,
+    )
+    if int(got.data_ptr()) != int(outputs.data_ptr()):
+        raise AssertionError("workspace grouped risk-prefix did not return the provided output buffer")
+    if not torch.allclose(got, ref, atol=2e-5, rtol=2e-5):
+        max_diff = float((got - ref).abs().max().item())
+        raise AssertionError(f"workspace grouped risk-prefix mismatch: max_diff={max_diff}")
+
+    prob_capacity = context_len + 9
+    strided_probs = torch.empty((groups, k_count, heads, prob_capacity), device=device, dtype=torch.float32)
+    strided_probs[..., :context_len].copy_(probs)
+    strided_probs[..., context_len:].fill_(float("nan"))
+    strided_got = joint_vprefix_outputs_from_grouped_risk_batched_strided_workspace(
+        base_outputs.contiguous(),
+        strided_probs.contiguous(),
+        residual_groups.contiguous(),
+        code_error_groups.contiguous(),
+        v_budgets,
+        int(context_len),
+        risk_in,
+        risk_out,
+        ids_in,
+        ids_out,
+        offsets,
+        temp,
+        interval_sums,
+        outputs,
+    )
+    if not torch.allclose(strided_got, ref, atol=2e-5, rtol=2e-5):
+        max_diff = float((strided_got - ref).abs().max().item())
+        raise AssertionError(f"strided workspace grouped risk-prefix mismatch: max_diff={max_diff}")
+
+
 def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    from selector_paged_pq import joint_vpq_sidecars_from_pack  # noqa: PLC0415
+
     _test_dense_decode_ranked_logits_simulator()
+    _test_grouped_risk_prefix_workspace()
     rng = np.random.default_rng(20260514)
     page_size = 32
     pages = 3
@@ -2494,6 +3388,58 @@ def main() -> None:
     all_max_diff = float(np.max(np.abs(all_values_np - all_ref_np))) if all_values_np.size else 0.0
     if all_max_diff > 1e-5:
         raise AssertionError(f"all-token V-PQ reconstruction mismatch: max_diff={all_max_diff}")
+    pack = value_vpq_pack_torch(
+        index=index,
+        values=values,
+        value_subvecs=2,
+        value_subbits=3,
+        key_bytes=2,
+        device=torch.device("cuda"),
+    )
+    if pack is None:
+        raise AssertionError("torch V-PQ pack unexpectedly unavailable")
+    codebooks, codes, page_starts, _page_size, _actual_value_subbits = pack
+    native_vhat, native_residual, native_code_error = joint_vpq_sidecars_from_pack(
+        values,
+        codebooks,
+        codes,
+        page_starts,
+        int(total_values),
+    )
+    all_tokens = torch.arange(int(total_values), dtype=torch.long, device="cuda")
+    ref_vhat, ref_valid, ref_page_ids, _ref_bits = vpq_values_for_tokens_gpu(
+        index=index,
+        values=values,
+        values_np=None,
+        tokens=all_tokens,
+        subbits=4,
+        value_subvecs=2,
+        value_subbits=3,
+        prefer_torch=True,
+        value_bytes=2,
+    )
+    ref_residual = values.float() - ref_vhat.float()
+    ref_code_error, _ = value_vpq_code_stat_risk_torch(
+        index=index,
+        values=values,
+        vhat_all=ref_vhat,
+        residual_all=ref_residual,
+        valid=ref_valid,
+        page_ids=ref_page_ids,
+        subbits=4,
+        value_subvecs=2,
+        value_subbits=3,
+        value_bytes=2,
+    )
+    if not torch.allclose(native_vhat, ref_vhat.float(), atol=1e-5, rtol=1e-5):
+        max_diff = float((native_vhat - ref_vhat.float()).abs().max().item())
+        raise AssertionError(f"native V-PQ sidecar vhat mismatch: max_diff={max_diff}")
+    if not torch.allclose(native_residual, ref_residual.float(), atol=1e-5, rtol=1e-5):
+        max_diff = float((native_residual - ref_residual.float()).abs().max().item())
+        raise AssertionError(f"native V-PQ sidecar residual mismatch: max_diff={max_diff}")
+    if not torch.allclose(native_code_error, ref_code_error, atol=1e-6, rtol=1e-6):
+        max_diff = float((native_code_error - ref_code_error).abs().max().item())
+        raise AssertionError(f"native V-PQ sidecar code-error mismatch: max_diff={max_diff}")
     _test_native_exact_value_counts()
     print("GPU V-PQ helper matches CPU/reference reconstruction")
 

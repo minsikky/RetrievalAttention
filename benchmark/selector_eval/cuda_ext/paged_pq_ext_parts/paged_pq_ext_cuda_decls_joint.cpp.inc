@@ -1,0 +1,531 @@
+std::vector<torch::Tensor> selected_mass_thresholds_from_topk_cuda(
+    torch::Tensor top_logits,
+    torch::Tensor top_order,
+    torch::Tensor prefix_lse,
+    torch::Tensor prefix_valid_counts,
+    torch::Tensor base_lse,
+    torch::Tensor budgets,
+    double exact_mass,
+    int64_t min_top);
+
+torch::Tensor joint_vprefix_outputs_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual,
+    torch::Tensor exact_order,
+    torch::Tensor v_budgets);
+
+torch::Tensor joint_vprefix_outputs_from_risk_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual,
+    torch::Tensor code_error,
+    torch::Tensor v_budgets);
+
+torch::Tensor joint_vprefix_outputs_from_grouped_risk_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor row_group_ids,
+    torch::Tensor v_budgets);
+
+torch::Tensor joint_vprefix_outputs_from_grouped_risk_batched_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets);
+int64_t joint_grouped_risk_sort_temp_bytes_cuda(int64_t rows, int64_t context_len);
+torch::Tensor joint_vprefix_outputs_from_grouped_risk_batched_workspace_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    torch::Tensor risk_in,
+    torch::Tensor risk_out,
+    torch::Tensor ids_in,
+    torch::Tensor ids_out,
+    torch::Tensor offsets,
+    torch::Tensor temp,
+    torch::Tensor interval_sums,
+    torch::Tensor outputs);
+torch::Tensor joint_vprefix_outputs_from_grouped_risk_batched_strided_workspace_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    int64_t context_len,
+    torch::Tensor risk_in,
+    torch::Tensor risk_out,
+    torch::Tensor ids_in,
+    torch::Tensor ids_out,
+    torch::Tensor offsets,
+    torch::Tensor temp,
+    torch::Tensor interval_sums,
+    torch::Tensor outputs);
+
+torch::Tensor joint_vprefix_outputs_from_grouped_risk_topk_batched_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    int64_t max_exact);
+
+torch::Tensor joint_vprefix_outputs_from_grouped_scores_batched_cuda(
+    torch::Tensor score_grid,
+    torch::Tensor vhat_groups,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets);
+torch::Tensor joint_vprefix_outputs_from_grouped_scores_batched_workspace_cuda(
+    torch::Tensor score_grid,
+    torch::Tensor vhat_groups,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    torch::Tensor row_max,
+    torch::Tensor row_denom,
+    torch::Tensor base_flat,
+    torch::Tensor risk_in,
+    torch::Tensor risk_out,
+    torch::Tensor ids_in,
+    torch::Tensor ids_out,
+    torch::Tensor offsets,
+    torch::Tensor temp,
+    torch::Tensor interval_sums,
+    torch::Tensor outputs);
+
+torch::Tensor joint_vpq_base_outputs_from_probs_cuda(
+    torch::Tensor probs,
+    torch::Tensor values,
+    torch::Tensor value_codebooks,
+    torch::Tensor value_codes,
+    torch::Tensor page_starts,
+    torch::Tensor fallback_tokens);
+
+std::vector<torch::Tensor> joint_softmax_base_outputs_cuda(
+    torch::Tensor score_grid,
+    torch::Tensor values);
+std::vector<torch::Tensor> joint_softmax_base_outputs_workspace_cuda(
+    torch::Tensor probs,
+    torch::Tensor outputs,
+    torch::Tensor score_grid,
+    torch::Tensor values);
+std::vector<torch::Tensor> joint_softmax_base_outputs_strided_workspace_cuda(
+    torch::Tensor probs,
+    torch::Tensor outputs,
+    torch::Tensor score_grid,
+    torch::Tensor values);
+std::vector<torch::Tensor> joint_softmax_base_outputs_cublas_cuda(
+    torch::Tensor score_grid,
+    torch::Tensor values);
+std::vector<torch::Tensor> joint_softmax_base_outputs_workspace_cublas_cuda(
+    torch::Tensor probs,
+    torch::Tensor outputs,
+    torch::Tensor score_grid,
+    torch::Tensor values);
+std::vector<torch::Tensor> joint_softmax_base_outputs_grouped_cublas_cuda(
+    torch::Tensor score_grid,
+    torch::Tensor values_grouped);
+void joint_vpq_append_exact_suffix_cuda(
+    torch::Tensor vhat,
+    torch::Tensor residual,
+    torch::Tensor code_error,
+    torch::Tensor values,
+    int64_t start,
+    int64_t end);
+std::vector<torch::Tensor> joint_vpq_sidecars_from_pack_cuda(
+    torch::Tensor values,
+    torch::Tensor codebooks,
+    torch::Tensor codes,
+    torch::Tensor page_starts,
+    int64_t context_len);
+void joint_vpq_append_exact_suffix_grouped_cuda(
+    torch::Tensor vhat,
+    torch::Tensor residual,
+    torch::Tensor code_error,
+    torch::Tensor values,
+    int64_t start,
+    int64_t end);
+std::vector<torch::Tensor> joint_mixed_softmax_base_outputs_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    torch::Tensor values,
+    bool calibrate);
+std::vector<torch::Tensor> joint_mixed_softmax_base_outputs_rankpos_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    torch::Tensor values,
+    bool calibrate);
+std::vector<torch::Tensor> joint_mixed_softmax_base_outputs_tokenfit_scaled_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    torch::Tensor values,
+    bool calibrate,
+    double pq_scale);
+
+std::vector<torch::Tensor> joint_select_policy_from_grouped_risk_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    torch::Tensor k_mb,
+    torch::Tensor v_mb,
+    int64_t k_count,
+    int64_t heads,
+    double threshold,
+    int64_t policy_id);
+
+std::vector<torch::Tensor> joint_select_policy_from_grouped_risk_batched_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    torch::Tensor k_mb,
+    torch::Tensor v_mb,
+    double threshold,
+    int64_t policy_id);
+
+std::vector<torch::Tensor> joint_select_policy_from_grouped_risk_no_mb_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    int64_t k_count,
+    int64_t heads,
+    double threshold,
+    int64_t policy_id);
+
+std::vector<torch::Tensor> joint_select_policy_from_grouped_risk_batched_no_mb_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    double threshold,
+    int64_t policy_id);
+
+std::vector<torch::Tensor> joint_select_policy_from_grouped_risk_intervals_batched_no_mb_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    double threshold,
+    int64_t policy_id);
+std::vector<torch::Tensor> joint_select_policy_from_grouped_scores_intervals_batched_no_mb_cuda(
+    torch::Tensor score_grid,
+    torch::Tensor vhat_groups,
+    torch::Tensor residual_groups,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    double threshold,
+    int64_t policy_id);
+std::vector<torch::Tensor> joint_mixed_select_policy_intervals_no_mb_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    torch::Tensor vhat,
+    torch::Tensor residual,
+    torch::Tensor code_error,
+    torch::Tensor v_budgets,
+    bool calibrate,
+    double pq_scale,
+    double threshold,
+    int64_t policy_id);
+
+torch::Tensor joint_select_policy_cuda(
+    torch::Tensor output_grid,
+    torch::Tensor k_mb,
+    torch::Tensor v_mb,
+    double threshold,
+    int64_t policy_id);
+
+std::vector<torch::Tensor> joint_select_policy_grouped_flat_cuda(
+    torch::Tensor outputs_flat,
+    torch::Tensor k_mb,
+    torch::Tensor v_mb,
+    int64_t k_count,
+    int64_t heads,
+    double threshold,
+    int64_t policy_id);
+
+std::vector<torch::Tensor> joint_select_policy_grouped_flat_no_mb_cuda(
+    torch::Tensor outputs_flat,
+    int64_t k_count,
+    int64_t heads,
+    double threshold,
+    int64_t policy_id);
+
+torch::Tensor joint_grouped_accounting_sums_cuda(
+    torch::Tensor final_indices,
+    torch::Tensor selected_counts_by_ki,
+    torch::Tensor v_budgets,
+    int64_t context_len,
+    int64_t head_dim,
+    int64_t key_bytes,
+    int64_t value_bytes,
+    double selector_mb,
+    double v_pq_codebook_mb,
+    double metadata_mb,
+    int64_t actual_value_subvecs,
+    int64_t code_bytes);
+
+int64_t joint_rank_prefix_sort_temp_bytes_cuda(int64_t rows, int64_t count);
+
+torch::Tensor joint_rank_prefix_tokens_cuda(
+    torch::Tensor scores,
+    torch::Tensor indexed_tokens,
+    int64_t max_take);
+
+torch::Tensor joint_rank_prefix_tokens_workspace_cuda(
+    torch::Tensor scores,
+    torch::Tensor indexed_tokens,
+    int64_t max_take,
+    torch::Tensor score_in,
+    torch::Tensor score_out,
+    torch::Tensor pos_in,
+    torch::Tensor pos_out,
+    torch::Tensor offsets,
+    torch::Tensor temp,
+    torch::Tensor out);
+
+torch::Tensor joint_budget_prefix_tokens_cuda(
+    torch::Tensor scores,
+    torch::Tensor indexed_tokens,
+    torch::Tensor take_counts,
+    int64_t max_take);
+
+torch::Tensor joint_mixed_score_grid_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    bool calibrate);
+
+torch::Tensor joint_mixed_score_grid_workspace_cuda(
+    torch::Tensor output,
+    torch::Tensor selected_mask,
+    torch::Tensor fit_scale,
+    torch::Tensor fit_bias,
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    bool calibrate);
+
+torch::Tensor joint_mixed_score_grid_scaled_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    bool calibrate,
+    double pq_scale);
+
+torch::Tensor joint_mixed_score_grid_rankpos_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    bool calibrate);
+
+torch::Tensor joint_mixed_score_grid_no_exact_fill_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    bool calibrate);
+
+torch::Tensor joint_mixed_score_grid_no_exact_fill_scaled_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    bool calibrate,
+    double pq_scale);
+
+torch::Tensor joint_mixed_score_grid_tokenfit_scaled_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    bool calibrate,
+    double pq_scale);
+
+torch::Tensor joint_mixed_score_grid_no_exact_fill_tokenfit_scaled_cuda(
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor y_indexed,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    bool calibrate,
+    double pq_scale);
+
+torch::Tensor joint_mixed_score_grid_sparse_exact_tokenfit_scaled_cuda(
+    torch::Tensor pq_logits,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor base_logits,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor ranked_logits,
+    torch::Tensor k_take_counts,
+    int64_t context_len,
+    bool calibrate,
+    double pq_scale);
+
+torch::Tensor joint_sparse_exact_score_table_cuda(
+    torch::Tensor base_tokens,
+    torch::Tensor base_logits,
+    torch::Tensor ranked_tokens,
+    torch::Tensor ranked_logits,
+    int64_t context_len);
+
+torch::Tensor gqa_causal_geometric_accept_counts_cuda(
+    torch::Tensor queries,
+    torch::Tensor keys,
+    torch::Tensor values,
+    torch::Tensor dense_pq_scores,
+    torch::Tensor value_codebooks,
+    torch::Tensor value_codes,
+    torch::Tensor page_starts,
+    torch::Tensor ranked_tokens,
+    torch::Tensor ranked_scores,
+    int64_t group_size,
+    int64_t query_start,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    int64_t page_size,
+    int64_t min_budget,
+    int64_t max_budget,
+    int64_t granularity,
+    double growth,
+    double probe_scale,
+    double rel_l2_max,
+    double scale);
+
+torch::Tensor gqa_causal_geometric_accept_counts_vpq_cuda(
+    torch::Tensor queries,
+    torch::Tensor keys,
+    torch::Tensor values,
+    torch::Tensor dense_pq_scores,
+    torch::Tensor value_codebooks,
+    torch::Tensor value_codes,
+    torch::Tensor page_starts,
+    torch::Tensor ranked_tokens,
+    torch::Tensor ranked_scores,
+    int64_t group_size,
+    int64_t query_start,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    int64_t page_size,
+    int64_t min_budget,
+    int64_t max_budget,
+    int64_t granularity,
+    double growth,
+    double probe_scale,
+    double rel_l2_max,
+    int64_t exact_value_top,
+    double scale);
+
+torch::Tensor gqa_decode_vpq_selected_from_logits_cuda(
+    torch::Tensor queries,
+    torch::Tensor keys,
+    torch::Tensor values,
+    torch::Tensor value_codebooks,
+    torch::Tensor value_codes,
+    torch::Tensor page_starts,
+    torch::Tensor ranked_tokens,
+    torch::Tensor ranked_scores,
+    torch::Tensor ranked_logits,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    int64_t page_size,
+    torch::Tensor exact_value_counts,
+    int64_t exact_value_top,
+    double exact_value_mass,
+    double scale);
+
+torch::Tensor gqa_decode_vpq_selected_tail_agg_from_logits_cuda(
+    torch::Tensor queries,
+    torch::Tensor keys,
+    torch::Tensor values,
+    torch::Tensor dense_pq_scores,
+    torch::Tensor value_codebooks,
+    torch::Tensor value_codes,
+    torch::Tensor page_starts,
+    torch::Tensor ranked_tokens,
+    torch::Tensor ranked_scores,
+    torch::Tensor ranked_logits,
+    int64_t group_size,
+    int64_t query_context_len,
+    int64_t static_prefix,
+    int64_t static_suffix,
+    int64_t page_size,
+    torch::Tensor exact_value_counts,
+    int64_t exact_value_top,
+    double exact_value_mass,
+    double scale,
+    double tail_blend,
+    torch::Tensor exact_value_thresholds = torch::Tensor(),
+    torch::Tensor exact_value_threshold_sels = torch::Tensor());
+
+torch::Tensor gqa_exact_selected_attention_cuda(
+    torch::Tensor queries,
+    torch::Tensor keys,
+    torch::Tensor values,
+    torch::Tensor tokens,
+    int64_t group_size,
+    double scale);
+
+static bool is_float_like(torch::Tensor const& tensor) {

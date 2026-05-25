@@ -27,7 +27,7 @@ from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import (
     selector_bytes_fullscan,
 )
 from benchmark.selector_eval.metrics.attention import _output_error_metrics
-from benchmark.selector_eval.runners.run_hf_paged_pq_intervention_eval import (
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_common import (
     _joint_kv_policy_id,
     _simulate_joint_kv_policy,
     _simulate_joint_kv_policy_torch,
@@ -234,8 +234,14 @@ def _evaluate_policy_torch_gpu(
     args: argparse.Namespace,
     use_native_vprefix: bool = False,
     use_native_risk_prefix: bool = False,
+    use_native_risk_prefix_topk: bool = False,
     use_native_score_grid: bool = False,
+    use_native_pq_scale_in_kernel: bool = False,
+    use_tokenfit_score_grid: bool = False,
+    use_score_grid_workspace: bool = False,
     use_native_policy: bool = False,
+    use_interval_risk_policy: bool = False,
+    use_score_direct_interval_policy: bool = False,
 ) -> dict[str, object]:
     """Mirror the benchmark-facing Torch/GPU joint K/V policy on a saved trace.
 
@@ -323,6 +329,49 @@ def _evaluate_policy_torch_gpu(
     ranked_nonbase_t = indexed_tokens_t[nonbase_mask_t]
     ranked_nonbase_scores_t = dense_scores_t[:, nonbase_mask_t]
 
+    def native_rank_prefix_tokens(
+        scores_t: torch.Tensor,
+        tokens_t: torch.Tensor,
+        max_take_i: int,
+        take_counts_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        native = load_selector_paged_pq_ext()
+        scores_c = scores_t.to(dtype=torch.float32).contiguous()
+        tokens_c = tokens_t.to(dtype=torch.long).contiguous()
+        if (
+            _env_truthy("SELECTOR_PQ_JOINT_NATIVE_BUDGET_PREFIX", "0")
+            and take_counts_t is not None
+            and int(take_counts_t.numel()) > 0
+            and hasattr(native, "joint_budget_prefix_tokens")
+        ):
+            return native.joint_budget_prefix_tokens(
+                scores_c,
+                tokens_c,
+                take_counts_t.to(device=device, dtype=torch.long).contiguous(),
+                int(max_take_i),
+            )
+        if (
+            _env_truthy("SELECTOR_PQ_JOINT_RANK_PREFIX_WORKSPACE", "0")
+            and hasattr(native, "joint_rank_prefix_tokens_workspace")
+        ):
+            rows_i = int(scores_c.shape[0])
+            count_i = int(scores_c.shape[1])
+            take_i = max(0, min(int(max_take_i), count_i))
+            temp_bytes = max(1, int(native.joint_rank_prefix_sort_temp_bytes(rows_i, count_i)))
+            return native.joint_rank_prefix_tokens_workspace(
+                scores_c,
+                tokens_c,
+                take_i,
+                torch.empty((max(1, rows_i * count_i),), dtype=torch.float32, device=device),
+                torch.empty((max(1, rows_i * count_i),), dtype=torch.float32, device=device),
+                torch.empty((max(1, rows_i * count_i),), dtype=torch.int32, device=device),
+                torch.empty((max(1, rows_i * count_i),), dtype=torch.int32, device=device),
+                torch.empty((max(1, rows_i + 1),), dtype=torch.long, device=device),
+                torch.empty((temp_bytes,), dtype=torch.uint8, device=device),
+                torch.empty((max(1, rows_i * take_i),), dtype=torch.long, device=device),
+            )
+        return native.joint_rank_prefix_tokens(scores_c, tokens_c, int(max_take_i))
+
     all_tokens = np.arange(context_len, dtype=np.int64)
     vhat_all, _compressed_v_mb, _fallback_v_mb = _vpq_values_for_tokens(
         index=index,
@@ -344,7 +393,58 @@ def _evaluate_policy_torch_gpu(
         sensitivity=None,
     )
     exact_scores_np, _true_probs = attention_probs(keys_np, query_np)
-    exact_scores_t = torch.as_tensor(exact_scores_np, dtype=torch.float32, device=device).reshape(1, -1)
+    use_sparse_exact_score_grid = _env_truthy("SELECTOR_PQ_JOINT_SPARSE_EXACT_SCORE_GRID", "0")
+    exact_scores_t: torch.Tensor | None = None
+
+    def _dense_exact_scores_t() -> torch.Tensor:
+        native = load_selector_paged_pq_ext()
+        backend = str(os.environ.get("SELECTOR_PQ_JOINT_NATIVE_EXACT_LOGITS_BACKEND", "cublas_t")).strip().lower()
+        key_t = torch.as_tensor(keys_np[:context_len], dtype=torch.float32, device=device).reshape(1, context_len, -1)
+        scale = 1.0 / math.sqrt(float(key_t.shape[2]))
+        if _env_truthy("SELECTOR_PQ_JOINT_NATIVE_EXACT_LOGITS", "0"):
+            if backend == "cublas_t" and hasattr(native, "gqa_decode_full_exact_logits_t_cublas"):
+                return native.gqa_decode_full_exact_logits_t_cublas(
+                    query_t,
+                    key_t.transpose(1, 2).contiguous(),
+                    1,
+                    context_len,
+                    float(scale),
+                )
+            if backend == "grouped" and hasattr(native, "gqa_decode_full_exact_logits_grouped"):
+                return native.gqa_decode_full_exact_logits_grouped(
+                    query_t,
+                    key_t,
+                    1,
+                    context_len,
+                    float(scale),
+                )
+            if backend in {"custom", "native"} and hasattr(native, "gqa_decode_full_exact_logits"):
+                return native.gqa_decode_full_exact_logits(
+                    query_t,
+                    key_t,
+                    1,
+                    context_len,
+                    float(scale),
+                )
+            raise RuntimeError(
+                "SELECTOR_PQ_JOINT_NATIVE_EXACT_LOGITS requires "
+                "gqa_decode_full_exact_logits_t_cublas or gqa_decode_full_exact_logits"
+            )
+        return torch.as_tensor(exact_scores_np, dtype=torch.float32, device=device).reshape(1, -1)
+
+    if not use_sparse_exact_score_grid:
+        exact_scores_t = _dense_exact_scores_t()
+    elif not bool(use_native_score_grid):
+        raise RuntimeError("SELECTOR_PQ_JOINT_SPARSE_EXACT_SCORE_GRID requires --use_native_score_grid")
+    elif not _env_truthy("SELECTOR_PQ_JOINT_SCORE_GRID_NO_EXACT_FILL", "0"):
+        raise RuntimeError(
+            "SELECTOR_PQ_JOINT_SPARSE_EXACT_SCORE_GRID requires SELECTOR_PQ_JOINT_SCORE_GRID_NO_EXACT_FILL=1"
+        )
+    elif not bool(use_tokenfit_score_grid):
+        raise RuntimeError(
+            "SELECTOR_PQ_JOINT_SPARSE_EXACT_SCORE_GRID requires --use_tokenfit_score_grid so affine fit only reads exact selected tokens"
+        )
+
     vhat_all_t = torch.as_tensor(vhat_all, dtype=torch.float32, device=device)
     residual_t = torch.as_tensor(residual_np, dtype=torch.float32, device=device)
     code_error_t = torch.as_tensor(code_error_np, dtype=torch.float32, device=device)
@@ -378,15 +478,26 @@ def _evaluate_policy_torch_gpu(
         ]
         max_rank_take = max(partial_rank_takes, default=0)
     else:
+        partial_rank_takes = [
+            max(0, min(int(v), ranked_nonbase_count))
+            for v in active_k_budgets
+        ]
         max_rank_take = max(0, min(max(int(v) for v in active_k_budgets), ranked_nonbase_count))
+    partial_rank_takes_for_prefix = sorted({int(v) for v in partial_rank_takes if int(v) > 0})
+    partial_rank_takes_t = (
+        torch.as_tensor(partial_rank_takes_for_prefix, dtype=torch.long, device=device)
+        if partial_rank_takes_for_prefix
+        else None
+    )
+    use_unsorted_k_prefix = _env_truthy("SELECTOR_PQ_JOINT_UNSORTED_K_PREFIX", "0")
     ranked_prefix_tokens_t: torch.Tensor | None = None
-    if max_rank_take > 0:
+    if max_rank_take > 0 and not use_unsorted_k_prefix:
         if _env_truthy("SELECTOR_PQ_JOINT_NATIVE_RANK_PREFIX", "0"):
-            native = load_selector_paged_pq_ext()
-            ranked_prefix_tokens_t = native.joint_rank_prefix_tokens(
-                ranked_nonbase_scores_t.to(dtype=torch.float32).contiguous(),
-                ranked_nonbase_t.to(dtype=torch.long).contiguous(),
+            ranked_prefix_tokens_t = native_rank_prefix_tokens(
+                ranked_nonbase_scores_t,
+                ranked_nonbase_t,
                 int(max_rank_take),
+                partial_rank_takes_t,
             )
         else:
             max_order_t = torch.topk(
@@ -398,6 +509,59 @@ def _evaluate_policy_torch_gpu(
             ).indices
             ranked_prefix_tokens_t = ranked_nonbase_t.index_select(0, max_order_t.reshape(-1)).reshape(1, int(max_rank_take))
 
+    if exact_scores_t is None:
+        full_exact_row_requested = any(
+            max(0, min(int(k_budget), ranked_nonbase_count)) > int(max_rank_take)
+            for k_budget in active_k_budgets
+        )
+        if full_exact_row_requested:
+            exact_scores_t = _dense_exact_scores_t()
+        else:
+            if not bool(layout_covers_context):
+                raise RuntimeError(
+                    "SELECTOR_PQ_JOINT_SPARSE_EXACT_SCORE_GRID requires indexed tokens plus base tokens "
+                    "to cover the full context"
+                )
+            native = load_selector_paged_pq_ext()
+            if not (
+                hasattr(native, "gqa_decode_token_exact_logits")
+                and hasattr(native, "joint_sparse_exact_score_table")
+            ):
+                raise RuntimeError(
+                    "SELECTOR_PQ_JOINT_SPARSE_EXACT_SCORE_GRID requires sparse exact-logit CUDA helpers"
+                )
+            key_t = torch.as_tensor(keys_np[:context_len], dtype=torch.float32, device=device).reshape(1, context_len, -1)
+            scale = 1.0 / math.sqrt(float(key_t.shape[2]))
+            base_rows_t = base_t.reshape(1, -1) if int(base_t.numel()) > 0 else torch.empty((1, 0), dtype=torch.long, device=device)
+            ranked_for_sparse_t = (
+                ranked_prefix_tokens_t
+                if ranked_prefix_tokens_t is not None
+                else torch.empty((1, 0), dtype=torch.long, device=device)
+            )
+            base_logits_t = native.gqa_decode_token_exact_logits(
+                query_t,
+                key_t,
+                base_rows_t.to(dtype=torch.long).contiguous(),
+                1,
+                int(context_len),
+                float(scale),
+            )
+            ranked_logits_t = native.gqa_decode_token_exact_logits(
+                query_t,
+                key_t,
+                ranked_for_sparse_t.to(dtype=torch.long).contiguous(),
+                1,
+                int(context_len),
+                float(scale),
+            )
+            exact_scores_t = native.joint_sparse_exact_score_table(
+                base_t.to(dtype=torch.long).contiguous(),
+                base_logits_t.contiguous(),
+                ranked_for_sparse_t.to(dtype=torch.long).contiguous(),
+                ranked_logits_t.contiguous(),
+                int(context_len),
+            )
+
     def selected_for_budget(k_budget: int) -> torch.Tensor:
         take = max(0, min(int(k_budget), int(ranked_nonbase_t.numel())))
         if avoid_full_budget_rank and take >= ranked_nonbase_count and ranked_nonbase_count > 0:
@@ -406,21 +570,22 @@ def _evaluate_policy_torch_gpu(
             add_t = ranked_prefix_tokens_t[:, :take]
         elif take > 0:
             if _env_truthy("SELECTOR_PQ_JOINT_NATIVE_RANK_PREFIX", "0"):
-                native = load_selector_paged_pq_ext()
-                add_t = native.joint_rank_prefix_tokens(
-                    ranked_nonbase_scores_t.to(dtype=torch.float32).contiguous(),
-                    ranked_nonbase_t.to(dtype=torch.long).contiguous(),
+                take_counts_single_t = torch.as_tensor([int(take)], dtype=torch.long, device=device)
+                add_t = native_rank_prefix_tokens(
+                    ranked_nonbase_scores_t,
+                    ranked_nonbase_t,
                     int(take),
+                    take_counts_single_t,
                 )
             else:
                 order_t = torch.topk(
                     ranked_nonbase_scores_t,
-                    k=int(take),
-                    dim=1,
-                    largest=True,
-                    sorted=True,
-                ).indices
-                add_t = ranked_nonbase_t.index_select(0, order_t.reshape(-1)).reshape(1, take)
+                k=int(take),
+                dim=1,
+                largest=True,
+                sorted=not use_unsorted_k_prefix,
+            ).indices
+            add_t = ranked_nonbase_t.index_select(0, order_t.reshape(-1)).reshape(1, take)
         else:
             add_t = torch.empty((1, 0), dtype=torch.long, device=device)
         if int(base_t.numel()) == 0:
@@ -484,9 +649,14 @@ def _evaluate_policy_torch_gpu(
     native_score_grid_t: torch.Tensor | None = None
     native_probs_grid_t: torch.Tensor | None = None
     native_base_output_grid_t: torch.Tensor | None = None
-    if bool(use_native_score_grid):
+    if bool(use_native_score_grid) and not use_unsorted_k_prefix:
         native = load_selector_paged_pq_ext()
-        pq_logits_for_grid_t = dense_scores_t.to(dtype=torch.float32) / sqrt_dim
+        pq_logit_scale = float(1.0 / sqrt_dim) if bool(use_native_pq_scale_in_kernel) else 1.0
+        pq_logits_for_grid_t = (
+            dense_scores_t.to(dtype=torch.float32)
+            if bool(use_native_pq_scale_in_kernel)
+            else dense_scores_t.to(dtype=torch.float32) / sqrt_dim
+        )
         y_indexed_for_grid_t = exact_scores_t.index_select(1, indexed_tokens_t).to(dtype=torch.float32)
         ranked_prefix_for_grid_t = (
             ranked_prefix_tokens_t
@@ -509,16 +679,30 @@ def _evaluate_policy_torch_gpu(
             if use_score_grid_no_fill:
                 raise RuntimeError("SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE does not support no-fill diagnostic mode")
             use_rankpos_score_grid = _env_truthy("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID", "0")
-            fused_score_fn_name = (
-                "joint_mixed_softmax_base_outputs_rankpos"
-                if use_rankpos_score_grid
-                else "joint_mixed_softmax_base_outputs"
-            )
+            use_fused_tokenfit = _env_truthy("SELECTOR_PQ_JOINT_FUSED_TOKENFIT_SOFTMAX_BASE", "0")
+            if use_fused_tokenfit:
+                fused_score_fn_name = "joint_mixed_softmax_base_outputs_tokenfit_scaled"
+            else:
+                if bool(use_tokenfit_score_grid):
+                    raise RuntimeError(
+                        "tokenfit score grid requires SELECTOR_PQ_JOINT_FUSED_TOKENFIT_SOFTMAX_BASE "
+                        "with fused softmax/base"
+                    )
+                if bool(use_native_pq_scale_in_kernel):
+                    raise RuntimeError(
+                        "native in-kernel PQ scaling requires SELECTOR_PQ_JOINT_FUSED_TOKENFIT_SOFTMAX_BASE "
+                        "with fused softmax/base"
+                    )
+                fused_score_fn_name = (
+                    "joint_mixed_softmax_base_outputs_rankpos"
+                    if use_rankpos_score_grid
+                    else "joint_mixed_softmax_base_outputs"
+                )
             if not hasattr(native, fused_score_fn_name):
                 raise RuntimeError(
                     f"SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE requires updated CUDA extension: {fused_score_fn_name}"
                 )
-            native_probs_grid_t, native_base_output_grid_t = getattr(native, fused_score_fn_name)(
+            fused_args = (
                 exact_scores_t.to(dtype=torch.float32).contiguous(),
                 pq_logits_for_grid_t.contiguous(),
                 y_indexed_for_grid_t.contiguous(),
@@ -529,16 +713,89 @@ def _evaluate_policy_torch_gpu(
                 vhat_all_t.to(dtype=torch.float32).contiguous(),
                 bool(str(args.tail_score_calibration) == "affine_selected"),
             )
+            if use_fused_tokenfit:
+                native_probs_grid_t, native_base_output_grid_t = getattr(native, fused_score_fn_name)(
+                    *fused_args,
+                    float(pq_logit_scale),
+                )
+            else:
+                native_probs_grid_t, native_base_output_grid_t = getattr(native, fused_score_fn_name)(*fused_args)
         else:
             use_rankpos_score_grid = _env_truthy("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID", "0")
+            if bool(use_tokenfit_score_grid) and use_rankpos_score_grid:
+                raise RuntimeError("tokenfit score grid does not support rank-position score grid")
+            if bool(use_native_pq_scale_in_kernel) and use_rankpos_score_grid:
+                raise RuntimeError("native in-kernel PQ scaling does not support rank-position score grid yet")
             if use_rankpos_score_grid and use_score_grid_no_fill:
                 raise RuntimeError(
                     "SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID does not support no-fill diagnostic mode"
+                )
+            if bool(use_score_grid_workspace) and (
+                use_rankpos_score_grid
+                or bool(use_tokenfit_score_grid)
+                or use_score_grid_no_fill
+                or bool(use_native_pq_scale_in_kernel)
+            ):
+                raise RuntimeError(
+                    "--use_score_grid_workspace only supports the canonical non-rankpos, "
+                    "non-tokenfit, exact-fill score-grid path"
+                )
+            if bool(use_score_grid_workspace):
+                if not hasattr(native, "joint_mixed_score_grid_workspace"):
+                    raise RuntimeError("--use_score_grid_workspace requires updated CUDA extension")
+                score_workspace_t = torch.empty(
+                    (
+                        int(k_take_counts_t.numel()),
+                        int(exact_scores_t.shape[0]),
+                        int(context_len),
+                    ),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                mask_workspace_t = torch.empty_like(score_workspace_t, dtype=torch.uint8)
+                fit_scale_workspace_t = torch.empty(
+                    (int(k_take_counts_t.numel()), int(exact_scores_t.shape[0])),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                fit_bias_workspace_t = torch.empty_like(fit_scale_workspace_t)
+                native_score_grid_t = native.joint_mixed_score_grid_workspace(
+                    score_workspace_t,
+                    mask_workspace_t,
+                    fit_scale_workspace_t,
+                    fit_bias_workspace_t,
+                    exact_scores_t.to(dtype=torch.float32).contiguous(),
+                    pq_logits_for_grid_t.contiguous(),
+                    y_indexed_for_grid_t.contiguous(),
+                    indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                    base_t.to(dtype=torch.long).contiguous(),
+                    ranked_prefix_for_grid_t.to(dtype=torch.long).contiguous(),
+                    k_take_counts_t,
+                    bool(str(args.tail_score_calibration) == "affine_selected"),
                 )
             if use_rankpos_score_grid:
                 if not hasattr(native, "joint_mixed_score_grid_rankpos"):
                     raise RuntimeError("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID requires updated CUDA extension")
                 score_grid_fn = native.joint_mixed_score_grid_rankpos
+            elif bool(use_tokenfit_score_grid):
+                scaled_fn_name = (
+                    "joint_mixed_score_grid_no_exact_fill_tokenfit_scaled"
+                    if use_score_grid_no_fill
+                    else "joint_mixed_score_grid_tokenfit_scaled"
+                )
+                if not hasattr(native, scaled_fn_name):
+                    raise RuntimeError(f"tokenfit score grid requires {scaled_fn_name}")
+                native_score_grid_t = getattr(native, scaled_fn_name)(
+                    exact_scores_t.to(dtype=torch.float32).contiguous(),
+                    pq_logits_for_grid_t.contiguous(),
+                    y_indexed_for_grid_t.contiguous(),
+                    indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                    base_t.to(dtype=torch.long).contiguous(),
+                    ranked_prefix_for_grid_t.to(dtype=torch.long).contiguous(),
+                    k_take_counts_t,
+                    bool(str(args.tail_score_calibration) == "affine_selected"),
+                    float(pq_logit_scale),
+                )
             else:
                 score_grid_fn = (
                     getattr(native, "joint_mixed_score_grid_no_exact_fill")
@@ -546,25 +803,74 @@ def _evaluate_policy_torch_gpu(
                     and hasattr(native, "joint_mixed_score_grid_no_exact_fill")
                     else native.joint_mixed_score_grid
                 )
-            native_score_grid_t = score_grid_fn(
-                exact_scores_t.to(dtype=torch.float32).contiguous(),
-                pq_logits_for_grid_t.contiguous(),
-                y_indexed_for_grid_t.contiguous(),
-                indexed_tokens_t.to(dtype=torch.long).contiguous(),
-                base_t.to(dtype=torch.long).contiguous(),
-                ranked_prefix_for_grid_t.to(dtype=torch.long).contiguous(),
-                k_take_counts_t,
-                bool(str(args.tail_score_calibration) == "affine_selected"),
-            )
+            if native_score_grid_t is not None:
+                pass
+            elif bool(use_native_pq_scale_in_kernel):
+                scaled_fn_name = (
+                    "joint_mixed_score_grid_no_exact_fill_scaled"
+                    if use_score_grid_no_fill
+                    else "joint_mixed_score_grid_scaled"
+                )
+                if not hasattr(native, scaled_fn_name):
+                    raise RuntimeError(f"native in-kernel PQ scaling requires {scaled_fn_name}")
+                native_score_grid_t = getattr(native, scaled_fn_name)(
+                    exact_scores_t.to(dtype=torch.float32).contiguous(),
+                    pq_logits_for_grid_t.contiguous(),
+                    y_indexed_for_grid_t.contiguous(),
+                    indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                    base_t.to(dtype=torch.long).contiguous(),
+                    ranked_prefix_for_grid_t.to(dtype=torch.long).contiguous(),
+                    k_take_counts_t,
+                    bool(str(args.tail_score_calibration) == "affine_selected"),
+                    float(pq_logit_scale),
+                )
+            else:
+                native_score_grid_t = score_grid_fn(
+                    exact_scores_t.to(dtype=torch.float32).contiguous(),
+                    pq_logits_for_grid_t.contiguous(),
+                    y_indexed_for_grid_t.contiguous(),
+                    indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                    base_t.to(dtype=torch.long).contiguous(),
+                    ranked_prefix_for_grid_t.to(dtype=torch.long).contiguous(),
+                    k_take_counts_t,
+                    bool(str(args.tail_score_calibration) == "affine_selected"),
+                )
         if native_probs_grid_t is None and _env_truthy("SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE", "0"):
             if not hasattr(native, "joint_softmax_base_outputs"):
                 raise RuntimeError("SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE requires updated CUDA extension")
             if native_score_grid_t is None:
                 raise RuntimeError("missing native score grid for native softmax/base")
-            native_probs_grid_t, native_base_output_grid_t = native.joint_softmax_base_outputs(
-                native_score_grid_t.to(dtype=torch.float32).contiguous(),
-                vhat_all_t.to(dtype=torch.float32).contiguous(),
-            )
+            if _env_truthy("SELECTOR_PQ_JOINT_GROUPED_SOFTMAX_BASE_CUBLAS", "0"):
+                if not hasattr(native, "joint_softmax_base_outputs_grouped_cublas"):
+                    raise RuntimeError(
+                        "SELECTOR_PQ_JOINT_GROUPED_SOFTMAX_BASE_CUBLAS requires updated CUDA extension"
+                    )
+                grouped_probs_t, grouped_base_t = native.joint_softmax_base_outputs_grouped_cublas(
+                    native_score_grid_t.to(dtype=torch.float32).reshape(
+                        1,
+                        int(native_score_grid_t.shape[0]),
+                        int(native_score_grid_t.shape[1]),
+                        int(native_score_grid_t.shape[2]),
+                    ).contiguous(),
+                    vhat_all_t.to(dtype=torch.float32).reshape(
+                        1,
+                        int(vhat_all_t.shape[0]),
+                        int(vhat_all_t.shape[1]),
+                    ).contiguous(),
+                )
+                native_probs_grid_t = grouped_probs_t[0].contiguous()
+                native_base_output_grid_t = grouped_base_t[0].contiguous()
+            else:
+                softmax_base_fn = (
+                    getattr(native, "joint_softmax_base_outputs_cublas")
+                    if _env_truthy("SELECTOR_PQ_JOINT_SOFTMAX_BASE_CUBLAS", "0")
+                    and hasattr(native, "joint_softmax_base_outputs_cublas")
+                    else native.joint_softmax_base_outputs
+                )
+                native_probs_grid_t, native_base_output_grid_t = softmax_base_fn(
+                    native_score_grid_t.to(dtype=torch.float32).contiguous(),
+                    vhat_all_t.to(dtype=torch.float32).contiguous(),
+                )
 
     actual_value_subbits = int(args.value_subbits) if int(args.value_subbits) > 0 else int(args.subbits)
     actual_value_subvecs = int(args.value_subvecs) if int(args.value_subvecs) > 0 else int(args.subvecs)
@@ -587,11 +893,64 @@ def _evaluate_policy_torch_gpu(
         compressed_v_codes_mb = float(max(0, context_len - exact_count) * actual_value_subvecs * code_bytes) / MB
         v_mb_by_idx.append(exact_v_mb + v_pq_codebook_mb + compressed_v_codes_mb + metadata_mb)
 
+    if bool(use_score_direct_interval_policy):
+        if not (bool(use_native_score_grid) and bool(use_native_policy)):
+            raise RuntimeError("--use_score_direct_interval_policy requires --use_native_score_grid and --use_native_policy")
+        if _joint_kv_policy_id(str(policy)) > 3:
+            raise RuntimeError("--use_score_direct_interval_policy only supports non-MB policies")
+        if native_score_grid_t is None:
+            raise RuntimeError("--use_score_direct_interval_policy requires a native score grid")
+        native = load_selector_paged_pq_ext()
+        if not hasattr(native, "joint_select_policy_from_grouped_scores_intervals_batched_no_mb"):
+            raise RuntimeError("--use_score_direct_interval_policy requires updated CUDA extension")
+        selected_by_idx_direct: list[torch.Tensor] = []
+        k_mb_by_idx_direct: list[float] = []
+        for k_budget in active_k_budgets:
+            selected_t = selected_for_budget(int(k_budget))
+            selected_by_idx_direct.append(selected_t)
+            exact_key_mb = float(int(selected_t.shape[1]) * int(args.head_dim) * int(args.key_bytes)) / MB
+            k_mb_by_idx_direct.append(float(selector_mb) + exact_key_mb)
+        final_output_grouped_t, final_idx_grouped_t = native.joint_select_policy_from_grouped_scores_intervals_batched_no_mb(
+            native_score_grid_t.to(dtype=torch.float32).reshape(
+                1,
+                int(native_score_grid_t.shape[0]),
+                int(native_score_grid_t.shape[1]),
+                int(native_score_grid_t.shape[2]),
+            ).contiguous(),
+            vhat_all_t.to(dtype=torch.float32).reshape(1, context_len, int(args.head_dim)).contiguous(),
+            residual_t.to(dtype=torch.float32).reshape(1, context_len, int(args.head_dim)).contiguous(),
+            code_error_t.to(dtype=torch.float32).reshape(1, context_len).contiguous(),
+            torch.as_tensor(v_budgets, dtype=torch.long, device=device),
+            float(threshold),
+            int(_joint_kv_policy_id(str(policy))),
+        )
+        ki = int(final_idx_grouped_t[0, 0, 0].item())
+        vi = int(final_idx_grouped_t[0, 0, 1].item())
+        selected_t = selected_by_idx_direct[int(ki)]
+        out_np = final_output_grouped_t[0, 0].reshape(-1).detach().cpu().numpy().astype(np.float32, copy=False)
+        return {
+            "k_idx": int(ki),
+            "v_idx": int(vi),
+            "k_budget": int(active_k_budgets[int(ki)]),
+            "v_budget": int(v_budgets[int(vi)]),
+            "selected_count": int(selected_t.shape[1]),
+            "step_MB_per_head": float(k_mb_by_idx_direct[int(ki)] + v_mb_by_idx[int(vi)]),
+            "selector_MB_per_head": float(selector_mb),
+            "policy_steps": -1,
+            "final_k_delta": 0.0,
+            "final_v_delta": 0.0,
+            "output": out_np,
+        }
+
     outputs: dict[tuple[int, int], torch.Tensor] = {}
     selected_by_idx: list[torch.Tensor] = []
     k_mb_by_idx: list[float] = []
     max_exact_v_count = max([max(0, min(int(v_budget), context_len)) for v_budget in v_budgets], default=0)
     output_rows: list[torch.Tensor] = []
+    interval_base_rows: list[torch.Tensor] = []
+    interval_prob_rows: list[torch.Tensor] = []
+    interval_final_output_t: torch.Tensor | None = None
+    interval_final_idx_t: torch.Tensor | None = None
     for ki, k_budget in enumerate(active_k_budgets):
         selected_t = selected_for_budget(int(k_budget))
         selected_by_idx.append(selected_t)
@@ -611,19 +970,37 @@ def _evaluate_policy_torch_gpu(
             if native_base_output_grid_t is not None
             else probs_t.to(torch.float32) @ vhat_all_t.float()
         )
+        if bool(use_interval_risk_policy):
+            interval_base_rows.append(base_output_t.reshape(1, -1).to(dtype=torch.float32))
+            interval_prob_rows.append(probs_t.reshape(1, -1).to(dtype=torch.float32))
         if bool(use_native_vprefix):
+            if bool(use_interval_risk_policy):
+                continue
             if int(max_exact_v_count) > 0:
                 risk_t = (probs_t * probs_t) * code_error_t.to(dtype=prob_dtype).reshape(1, -1)
                 native = load_selector_paged_pq_ext()
                 v_budgets_t = torch.as_tensor(v_budgets, dtype=torch.long, device=device)
                 if bool(use_native_risk_prefix):
-                    grid_t = native.joint_vprefix_outputs_from_risk(
-                        base_output_t.reshape(1, 1, -1).contiguous(),
-                        probs_t.reshape(1, 1, -1).contiguous(),
-                        residual_t.contiguous(),
-                        code_error_t.to(dtype=torch.float32).contiguous(),
-                        v_budgets_t,
-                    )
+                    if bool(use_native_risk_prefix_topk):
+                        if not hasattr(native, "joint_vprefix_outputs_from_grouped_risk_topk_batched"):
+                            raise RuntimeError("native risk-prefix top-k helper is unavailable")
+                        topk_grid_t = native.joint_vprefix_outputs_from_grouped_risk_topk_batched(
+                            base_output_t.reshape(1, 1, 1, -1).contiguous(),
+                            probs_t.reshape(1, 1, 1, -1).contiguous(),
+                            residual_t.reshape(1, context_len, int(args.head_dim)).contiguous(),
+                            code_error_t.to(dtype=torch.float32).reshape(1, context_len).contiguous(),
+                            v_budgets_t,
+                            int(max_exact_v_count),
+                        )
+                        grid_t = topk_grid_t.reshape(1, len(v_budgets), 1, int(args.head_dim)).contiguous()
+                    else:
+                        grid_t = native.joint_vprefix_outputs_from_risk(
+                            base_output_t.reshape(1, 1, -1).contiguous(),
+                            probs_t.reshape(1, 1, -1).contiguous(),
+                            residual_t.contiguous(),
+                            code_error_t.to(dtype=torch.float32).contiguous(),
+                            v_budgets_t,
+                        )
                 else:
                     if int(max_exact_v_count) >= context_len:
                         exact_order_t = torch.argsort(risk_t, dim=1, descending=True, stable=True)
@@ -674,14 +1051,50 @@ def _evaluate_policy_torch_gpu(
                 outputs[(ki, vi)] = base_output_t
 
     if bool(use_native_vprefix):
-        output_grid_t = torch.stack(output_rows, dim=0)
-        for ki in range(len(active_k_budgets)):
-            for vi in range(len(v_budgets)):
-                outputs[(ki, vi)] = output_grid_t[int(ki), int(vi)]
+        if bool(use_interval_risk_policy):
+            if not bool(use_native_risk_prefix):
+                raise RuntimeError("--use_interval_risk_policy requires --use_native_risk_prefix")
+            if not bool(use_native_policy):
+                raise RuntimeError("--use_interval_risk_policy requires --use_native_policy")
+            if _joint_kv_policy_id(str(policy)) > 3:
+                raise RuntimeError("--use_interval_risk_policy only supports non-MB policies")
+            native = load_selector_paged_pq_ext()
+            if not hasattr(native, "joint_select_policy_from_grouped_risk_intervals_batched_no_mb"):
+                raise RuntimeError("--use_interval_risk_policy requires updated CUDA extension")
+            base_grouped_t = torch.stack(
+                [row.reshape(-1) for row in interval_base_rows],
+                dim=0,
+            ).reshape(1, len(active_k_budgets), 1, int(args.head_dim)).contiguous()
+            probs_grouped_t = torch.stack(
+                [row.reshape(-1) for row in interval_prob_rows],
+                dim=0,
+            ).reshape(1, len(active_k_budgets), 1, context_len).contiguous()
+            interval_final_output_grouped_t, interval_final_idx_grouped_t = (
+                native.joint_select_policy_from_grouped_risk_intervals_batched_no_mb(
+                    base_grouped_t,
+                    probs_grouped_t,
+                    residual_t.reshape(1, context_len, int(args.head_dim)).contiguous(),
+                    code_error_t.to(dtype=torch.float32).reshape(1, context_len).contiguous(),
+                    torch.as_tensor(v_budgets, dtype=torch.long, device=device),
+                    float(threshold),
+                    int(_joint_kv_policy_id(str(policy))),
+                )
+            )
+            interval_final_output_t = interval_final_output_grouped_t[0, 0].reshape(1, -1)
+            interval_final_idx_t = interval_final_idx_grouped_t[0, 0].reshape(1, 2)
+        else:
+            output_grid_t = torch.stack(output_rows, dim=0)
+            for ki in range(len(active_k_budgets)):
+                for vi in range(len(v_budgets)):
+                    outputs[(ki, vi)] = output_grid_t[int(ki), int(vi)]
 
     if bool(use_native_policy):
         native = load_selector_paged_pq_ext()
-        if bool(use_native_vprefix):
+        if bool(use_interval_risk_policy):
+            if interval_final_idx_t is None:
+                raise RuntimeError("interval risk policy did not produce final indices")
+            final_idx = interval_final_idx_t.detach().cpu().numpy()
+        elif bool(use_native_vprefix):
             output_grid_for_policy_t = output_grid_t.to(dtype=torch.float32).contiguous()
         else:
             output_grid_for_policy_t = torch.stack(
@@ -691,16 +1104,17 @@ def _evaluate_policy_torch_gpu(
                 ],
                 dim=0,
             ).to(dtype=torch.float32).contiguous()
-        k_mb_t = torch.as_tensor(k_mb_by_idx, dtype=torch.float32, device=device)
-        v_mb_t = torch.as_tensor(v_mb_by_idx, dtype=torch.float32, device=device)
-        final_idx_t = native.joint_select_policy(
-            output_grid_for_policy_t,
-            k_mb_t,
-            v_mb_t,
-            float(threshold),
-            int(_joint_kv_policy_id(str(policy))),
-        )
-        final_idx = final_idx_t.detach().cpu().numpy()
+        if not bool(use_interval_risk_policy):
+            k_mb_t = torch.as_tensor(k_mb_by_idx, dtype=torch.float32, device=device)
+            v_mb_t = torch.as_tensor(v_mb_by_idx, dtype=torch.float32, device=device)
+            final_idx_t = native.joint_select_policy(
+                output_grid_for_policy_t,
+                k_mb_t,
+                v_mb_t,
+                float(threshold),
+                int(_joint_kv_policy_id(str(policy))),
+            )
+            final_idx = final_idx_t.detach().cpu().numpy()
         ki = int(final_idx[0, 0])
         vi = int(final_idx[0, 1])
         steps = -1
@@ -717,7 +1131,13 @@ def _evaluate_policy_torch_gpu(
             v_mb_by_idx=v_mb_by_idx,
         )
     selected_t = selected_by_idx[int(ki)]
-    out_np = outputs[(int(ki), int(vi))].reshape(-1).detach().cpu().numpy().astype(np.float32, copy=False)
+    if bool(use_interval_risk_policy):
+        if interval_final_output_t is None:
+            raise RuntimeError("interval risk policy did not produce final output")
+        out_t = interval_final_output_t
+    else:
+        out_t = outputs[(int(ki), int(vi))]
+    out_np = out_t.reshape(-1).detach().cpu().numpy().astype(np.float32, copy=False)
     return {
         "k_idx": int(ki),
         "v_idx": int(vi),
@@ -781,14 +1201,50 @@ def main() -> None:
         help="When comparing Torch/GPU policy, have the native V-prefix helper sort residual-risk scores internally.",
     )
     parser.add_argument(
+        "--use_native_risk_prefix_topk",
+        action="store_true",
+        help="When comparing Torch/GPU policy, use the grouped top-k residual-risk prefix helper.",
+    )
+    parser.add_argument(
         "--use_native_score_grid",
         action="store_true",
         help="When comparing Torch/GPU policy, build the mixed exact-K/K-PQ score grid with the native CUDA helper.",
     )
     parser.add_argument(
+        "--use_native_pq_scale_in_kernel",
+        action="store_true",
+        help="When comparing Torch/GPU policy, pass unscaled PQ logits and apply the QK scale inside the native score-grid helper.",
+    )
+    parser.add_argument(
+        "--use_tokenfit_score_grid",
+        action="store_true",
+        help="When comparing Torch/GPU policy, use the mask-free token-list affine-fit native score-grid helper.",
+    )
+    parser.add_argument(
+        "--use_score_grid_workspace",
+        action="store_true",
+        help="When comparing Torch/GPU policy, pass preallocated workspace tensors to the native score-grid helper.",
+    )
+    parser.add_argument(
         "--use_native_policy",
         action="store_true",
         help="When comparing Torch/GPU policy, choose adaptive K/V budget indices with the native CUDA helper.",
+    )
+    parser.add_argument(
+        "--use_interval_risk_policy",
+        action="store_true",
+        help=(
+            "When comparing Torch/GPU policy, choose adaptive K/V budgets directly from grouped "
+            "residual-risk interval sums instead of materializing the full V-prefix output grid."
+        ),
+    )
+    parser.add_argument(
+        "--use_score_direct_interval_policy",
+        action="store_true",
+        help=(
+            "When comparing Torch/GPU policy, choose adaptive K/V budgets directly from the "
+            "native mixed-score grid, avoiding materialized probability and V-prefix grids."
+        ),
     )
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
@@ -884,12 +1340,18 @@ def main() -> None:
                     torch_gpu = (
                         _evaluate_policy_torch_gpu(
                             selector_backend="cuda_ext",
-	                            use_native_vprefix=bool(args.use_native_vprefix),
-	                            use_native_risk_prefix=bool(args.use_native_risk_prefix),
-	                            use_native_score_grid=bool(args.use_native_score_grid),
-	                            use_native_policy=bool(args.use_native_policy),
-	                            **common,
-	                        )
+                            use_native_vprefix=bool(args.use_native_vprefix),
+                            use_native_risk_prefix=bool(args.use_native_risk_prefix),
+                            use_native_risk_prefix_topk=bool(args.use_native_risk_prefix_topk),
+                            use_native_score_grid=bool(args.use_native_score_grid),
+                            use_native_pq_scale_in_kernel=bool(args.use_native_pq_scale_in_kernel),
+                            use_tokenfit_score_grid=bool(args.use_tokenfit_score_grid),
+                            use_score_grid_workspace=bool(args.use_score_grid_workspace),
+                            use_native_policy=bool(args.use_native_policy),
+                            use_interval_risk_policy=bool(args.use_interval_risk_policy),
+                            use_score_direct_interval_policy=bool(args.use_score_direct_interval_policy),
+                            **common,
+                        )
                         if bool(args.compare_torch_gpu_policy) and str(device) != "cpu"
                         else None
                     )

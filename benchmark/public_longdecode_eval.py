@@ -47,7 +47,7 @@ from benchmark.longbench_v2_hf_eval import (  # noqa: E402
     summarize_approx_stats,
     truncate_middle,
 )
-from benchmark.selector_eval.runners.run_hf_paged_pq_intervention_eval import (  # noqa: E402
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_api import (  # noqa: E402
     ApproxStats,
     patched_paged_pq_attention,
     reset_paged_pq_attention_state,
@@ -151,7 +151,7 @@ def parse_args():
             "pq_proxy_mass_budget",
             "pq_ranked_mass_budget",
         ],
-        default="pq_ranked_mass_budget",
+        default="joint_kv_stability",
     )
     parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="affine_selected")
     parser.add_argument("--tail_probe_rel_l2_max", type=float, default=float("inf"))
@@ -184,7 +184,7 @@ def parse_args():
     parser.add_argument("--joint_kv_k_budgets", default="4096,8192,14336,32768")
     parser.add_argument("--joint_kv_v_budgets", default="1024,2048,4096,6144,8192,12288,16384")
     parser.add_argument("--joint_kv_stability_threshold", type=float, default=0.001)
-    parser.add_argument("--selected_value_mode", choices=["exact", "vpq_value"], default="exact")
+    parser.add_argument("--selected_value_mode", choices=["exact", "vpq_value"], default="vpq_value")
     parser.add_argument(
         "--selected_value_exact_rule",
         choices=[
@@ -195,7 +195,7 @@ def parse_args():
             "selected_mass_or_risk",
             "global_residual_risk",
         ],
-        default="fixed",
+        default="global_residual_risk",
     )
     parser.add_argument("--selected_value_exact_top", type=int, default=0)
     parser.add_argument("--selected_value_exact_mass", type=float, default=0.0)
@@ -206,13 +206,13 @@ def parse_args():
     parser.add_argument("--selected_value_exact_all_fraction_min", type=float, default=0.0)
     parser.add_argument("--selected_value_residual_norm_bytes", type=int, default=2)
     parser.add_argument("--value_code_stat_bytes", type=int, default=2)
-    parser.add_argument("--tail_blend", type=float, default=0.0)
+    parser.add_argument("--tail_blend", type=float, default=1.0)
     parser.add_argument("--prefill_tail_blend", type=float, default=None)
     parser.add_argument("--decode_tail_blend", type=float, default=None)
     parser.add_argument("--tail_off_heads", default="")
     parser.add_argument("--static_prefix", type=int, default=128)
     parser.add_argument("--static_suffix", type=int, default=128)
-    parser.add_argument("--page_size", type=int, default=512)
+    parser.add_argument("--page_size", type=int, default=5632)
     parser.add_argument("--prefill_chunk_size", type=int, default=2048)
     parser.add_argument(
         "--prefill_selector_backend",

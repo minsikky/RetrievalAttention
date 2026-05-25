@@ -22,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from benchmark.ruler.pred.utils import load_data
 from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import parse_csv_ints
-from benchmark.selector_eval.runners.run_hf_paged_pq_intervention_eval import (
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_api import (
     ApproxStats,
     patched_paged_pq_attention,
     reset_paged_pq_attention_state,
@@ -66,19 +66,65 @@ def joint_cuda_flags_config() -> dict[str, bool | int]:
         ),
         "selector_pq_joint_native_lazy_policy": env_truthy("SELECTOR_PQ_JOINT_NATIVE_LAZY_POLICY", "0"),
         "selector_pq_joint_allhead_exact_precompute": env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_EXACT_PRECOMPUTE", "0"),
+        "selector_pq_joint_native_exact_logits": env_truthy("SELECTOR_PQ_JOINT_NATIVE_EXACT_LOGITS", "0"),
+        "selector_pq_joint_sparse_exact_score_grid": env_truthy(
+            "SELECTOR_PQ_JOINT_SPARSE_EXACT_SCORE_GRID",
+            "0",
+        ),
+        "selector_pq_joint_sparse_direct_score_grid": env_truthy(
+            "SELECTOR_PQ_JOINT_SPARSE_DIRECT_SCORE_GRID",
+            "0",
+        ),
+        "selector_pq_joint_native_exact_logits_backend": os.environ.get(
+            "SELECTOR_PQ_JOINT_NATIVE_EXACT_LOGITS_BACKEND",
+            "cublas_t",
+        ),
+        "selector_pq_native_exact_logits_tf32": env_truthy("SELECTOR_PQ_NATIVE_EXACT_LOGITS_TF32", "1"),
         "selector_pq_joint_allhead_rank_prefix": env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_RANK_PREFIX", "0"),
+        "selector_pq_joint_native_rank_prefix": env_truthy("SELECTOR_PQ_JOINT_NATIVE_RANK_PREFIX", "0"),
+        "selector_pq_joint_native_budget_prefix": env_truthy("SELECTOR_PQ_JOINT_NATIVE_BUDGET_PREFIX", "0"),
+        "selector_pq_joint_rank_prefix_workspace": env_truthy("SELECTOR_PQ_JOINT_RANK_PREFIX_WORKSPACE", "0"),
+        "selector_pq_joint_selector_topk_prefix": env_truthy("SELECTOR_PQ_JOINT_SELECTOR_TOPK_PREFIX", "0"),
+        "selector_pq_joint_unsorted_k_prefix": env_truthy("SELECTOR_PQ_JOINT_UNSORTED_K_PREFIX", "0"),
         "selector_pq_joint_skip_full_budget_sort": env_truthy("SELECTOR_PQ_JOINT_SKIP_FULL_BUDGET_SORT", "0"),
         "selector_pq_joint_collapse_dup_k_rows": env_truthy("SELECTOR_PQ_JOINT_COLLAPSE_DUP_K_ROWS", "0"),
         "selector_pq_joint_collapse_dup_v_rows": env_truthy("SELECTOR_PQ_JOINT_COLLAPSE_DUP_V_ROWS", "0"),
         "selector_pq_joint_score_grid_no_exact_fill": env_truthy("SELECTOR_PQ_JOINT_SCORE_GRID_NO_EXACT_FILL", "0"),
+        "selector_pq_joint_score_grid_workspace": env_truthy("SELECTOR_PQ_JOINT_SCORE_GRID_WORKSPACE", "0"),
+        "selector_pq_joint_grouped_score_workspace": env_truthy("SELECTOR_PQ_JOINT_GROUPED_SCORE_WORKSPACE", "0"),
         "selector_pq_joint_rankpos_score_grid": env_truthy("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID", "0"),
         "selector_pq_joint_grouped_vpq_cache": env_truthy("SELECTOR_PQ_JOINT_GROUPED_VPQ_CACHE", "0"),
+        "selector_pq_joint_score_direct_vprefix": env_truthy("SELECTOR_PQ_JOINT_SCORE_DIRECT_VPREFIX", "0"),
+        "selector_pq_joint_score_direct_interval_policy": env_truthy(
+            "SELECTOR_PQ_JOINT_SCORE_DIRECT_INTERVAL_POLICY",
+            "0",
+        ),
+        "selector_pq_joint_score_direct_workspace": env_truthy("SELECTOR_PQ_JOINT_SCORE_DIRECT_WORKSPACE", "0"),
+        "selector_pq_joint_grouped_output_workspace": env_truthy("SELECTOR_PQ_JOINT_GROUPED_OUTPUT_WORKSPACE", "0"),
         "selector_pq_joint_fused_risk_policy": env_truthy("SELECTOR_PQ_JOINT_FUSED_RISK_POLICY", "0"),
+        "selector_pq_joint_interval_risk_policy": env_truthy("SELECTOR_PQ_JOINT_INTERVAL_RISK_POLICY", "0"),
         "selector_pq_joint_risk_prefix_topk": env_truthy("SELECTOR_PQ_JOINT_RISK_PREFIX_TOPK", "0"),
+        "selector_pq_joint_risk_prefix_workspace": env_truthy("SELECTOR_PQ_JOINT_RISK_PREFIX_WORKSPACE", "0"),
         "selector_pq_joint_fast_token_layout": env_truthy("SELECTOR_PQ_JOINT_FAST_TOKEN_LAYOUT", "0"),
         "selector_pq_joint_native_vpq_base": env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE", "0"),
+        "selector_pq_joint_native_vpq_append": env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_APPEND", "0"),
+        "selector_pq_joint_native_vpq_sidecar": env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_SIDECAR", "0"),
         "selector_pq_joint_native_softmax_base": env_truthy("SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE", "0"),
+        "selector_pq_joint_native_pq_scale_in_kernel": env_truthy(
+            "SELECTOR_PQ_JOINT_NATIVE_PQ_SCALE_IN_KERNEL",
+            "0",
+        ),
+        "selector_pq_joint_native_accounting": env_truthy("SELECTOR_PQ_JOINT_NATIVE_ACCOUNTING", "0"),
+        "selector_pq_joint_native_accounting_verify": env_truthy(
+            "SELECTOR_PQ_JOINT_NATIVE_ACCOUNTING_VERIFY",
+            "0",
+        ),
+        "selector_pq_joint_tokenfit_score_grid": env_truthy("SELECTOR_PQ_JOINT_TOKENFIT_SCORE_GRID", "0"),
         "selector_pq_joint_fused_softmax_base": env_truthy("SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE", "0"),
+        "selector_pq_joint_fused_tokenfit_softmax_base": env_truthy(
+            "SELECTOR_PQ_JOINT_FUSED_TOKENFIT_SOFTMAX_BASE",
+            "0",
+        ),
         "selector_pq_joint_wall_profile": env_truthy("SELECTOR_PQ_JOINT_WALL_PROFILE", "0"),
     }
 
@@ -96,6 +142,8 @@ def task_tokens_to_generate(task: str) -> int:
 
 
 def stats_payload(stats: dict[int, ApproxStats]) -> dict[str, dict[str, float | int]]:
+    for s in stats.values():
+        s.flush_device_count_sums()
     payload = {}
     for layer, s in sorted(stats.items()):
         update_mb = float(s.index_build_read_mb + s.index_build_write_mb)
@@ -192,6 +240,8 @@ def stats_payload(stats: dict[int, ApproxStats]) -> dict[str, dict[str, float | 
 
 
 def aggregate_stats(stats: dict[int, ApproxStats]) -> dict[str, float | int]:
+    for s in stats.values():
+        s.flush_device_count_sums()
     if not stats:
         return {}
     layers = list(stats.values())
@@ -529,7 +579,7 @@ def run() -> None:
             "pq_proxy_mass_budget",
             "pq_ranked_mass_budget",
         ],
-        default="none",
+        default="joint_kv_stability",
     )
     parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="affine_selected")
     parser.add_argument("--tail_probe_rel_l2_max", type=float, default=float("inf"))
@@ -586,7 +636,7 @@ def run() -> None:
             "selected_mass_or_risk",
             "global_residual_risk",
         ],
-        default="selected_mass",
+        default="global_residual_risk",
     )
     parser.add_argument("--selected_value_exact_top", type=int, default=0)
     parser.add_argument("--selected_value_exact_mass", type=float, default=0.98)
@@ -625,7 +675,7 @@ def run() -> None:
     parser.add_argument(
         "--index_build_backend",
         choices=["numpy", "torch_gpu"],
-        default=os.environ.get("PAGEDPQ_INDEX_BUILD_BACKEND", "numpy"),
+        default=os.environ.get("PAGEDPQ_INDEX_BUILD_BACKEND", "torch_gpu"),
     )
     parser.add_argument("--nprobes", default="512")
     parser.add_argument("--router_prototypes", type=int, default=16)

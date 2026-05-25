@@ -1,0 +1,9 @@
+| label | kind | mode | quality | metric | n | sec/ex | decode s/ex | step MB/hq | selector | exact KV | tail | update | phys step | selected | active | passthrough | readiness |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| long_parity | longbench-v2 | n/a | n/a | quality | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | ok |
+| fallback_long_parity | longbench-v2 | n/a | n/a | quality | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | ok |
+| ruler32k128_no_stats/niah_single_1 | ruler | pagedpq_batched | 100.00 | score | 1 | 53.39 | 37.81 | 0.000 | 0.000 | 0.000 | 0.000 | 113.730469 | 0.000 | 0.0 | 0.992 | 32 | cost-stats-disabled, canonical-guard-off, diagnostic-cuda-flags:unsorted_k_prefix, missing-step-cost |
+| ruler32k128_accounting/niah_single_1 | ruler | pagedpq_batched | 100.00 | score | 1 | 65.98 | 50.39 | 3.043 | 0.420 | 2.543 | 0.080 | 0.027766 | 8.918 | 8481.5 | 0.992 | 32 | canonical-guard-off, diagnostic-cuda-flags:unsorted_k_prefix |
+| ruler32k128_accounting_charged/niah_single_1 | ruler | pagedpq_batched | 100.00 | score | 1 | 63.08 | 50.69 | 3.043 | 0.420 | 2.543 | 0.080 | 0.027766 | 8.918 | 8481.5 | 0.992 | 32 | canonical-guard-off, diagnostic-cuda-flags:unsorted_k_prefix |
+| ruler32k128_no_stats_selectedfallback/niah_single_1 | ruler | pagedpq_batched | 100.00 | score | 1 | 124.83 | 109.40 | 0.000 | 0.000 | 0.000 | 0.000 | 113.730469 | 0.000 | 0.0 | 0.992 | 32 | cost-stats-disabled, canonical-guard-off, diagnostic-cuda-flags:unsorted_k_prefix, missing-step-cost |
+| ruler32k128_accounting_selectedfallback/niah_single_1 | ruler | pagedpq_batched | 100.00 | score | 1 | 145.19 | 129.76 | 3.838 | 0.420 | 3.339 | 0.080 | 0.027766 | 8.919 | 11736.4 | 0.992 | 32 | canonical-guard-off, diagnostic-cuda-flags:unsorted_k_prefix |

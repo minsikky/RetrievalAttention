@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -13,10 +14,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from benchmark.selector_eval.runners.run_hf_paged_pq_intervention_eval import (  # noqa: E402
+from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import load_selector_paged_pq_ext  # noqa: E402
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_geometric import (  # noqa: E402
     _gpu_gqa_dense_decode_ranked_logits_and_base_lse,
     _gpu_gqa_ranked_exact_logits,
-    load_selector_paged_pq_ext,
 )
 
 
@@ -53,6 +54,11 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
     torch.manual_seed(int(args.seed))
     device = torch.device("cuda")
     heads = int(args.heads)
@@ -68,6 +74,43 @@ def main() -> None:
     ranked_scores = torch.randn((heads, rank), device=device, dtype=torch.float32)
     keys_t_float = keys.float().transpose(1, 2).contiguous()
     native = load_selector_paged_pq_ext()
+
+    def torch_full_exact():
+        q_grouped = queries.reshape(kv_heads, group_size, dim)
+        return (torch.bmm(q_grouped, keys_t_float[:, :, :context]) * scale).reshape(heads, context)
+
+    def native_full_exact_custom():
+        if not hasattr(native, "gqa_decode_full_exact_logits"):
+            raise RuntimeError("native extension does not expose gqa_decode_full_exact_logits")
+        return native.gqa_decode_full_exact_logits(
+            queries,
+            keys,
+            int(group_size),
+            int(context),
+            float(scale),
+        )
+
+    def native_full_exact_grouped():
+        if not hasattr(native, "gqa_decode_full_exact_logits_grouped"):
+            raise RuntimeError("native extension does not expose gqa_decode_full_exact_logits_grouped")
+        return native.gqa_decode_full_exact_logits_grouped(
+            queries,
+            keys,
+            int(group_size),
+            int(context),
+            float(scale),
+        )
+
+    def native_full_exact_cublas_t():
+        if not hasattr(native, "gqa_decode_full_exact_logits_t_cublas"):
+            raise RuntimeError("native extension does not expose gqa_decode_full_exact_logits_t_cublas")
+        return native.gqa_decode_full_exact_logits_t_cublas(
+            queries,
+            keys_t_float,
+            int(group_size),
+            int(context),
+            float(scale),
+        )
 
     def ranked_gather():
         return _gpu_gqa_ranked_exact_logits(
@@ -149,6 +192,37 @@ def main() -> None:
     ranked_out, ranked_ms = _time_cuda(ranked_gather, warmup=int(args.warmup), iters=int(args.iters))
     dense_out, dense_ms = _time_cuda(dense_sim, warmup=int(args.warmup), iters=int(args.iters))
     cached_out, cached_dense_ms = _time_cuda(dense_sim_cached, warmup=int(args.warmup), iters=int(args.iters))
+    torch_full_out, torch_full_ms = _time_cuda(torch_full_exact, warmup=int(args.warmup), iters=int(args.iters))
+    if hasattr(native, "gqa_decode_full_exact_logits"):
+        native_full_custom_out, native_full_custom_ms = _time_cuda(
+            native_full_exact_custom,
+            warmup=int(args.warmup),
+            iters=int(args.iters),
+        )
+        native_full_custom_max_diff = float((torch_full_out - native_full_custom_out).abs().max().item())
+    else:
+        native_full_custom_ms = None
+        native_full_custom_max_diff = None
+    if hasattr(native, "gqa_decode_full_exact_logits_grouped"):
+        native_full_grouped_out, native_full_grouped_ms = _time_cuda(
+            native_full_exact_grouped,
+            warmup=int(args.warmup),
+            iters=int(args.iters),
+        )
+        native_full_grouped_max_diff = float((torch_full_out - native_full_grouped_out).abs().max().item())
+    else:
+        native_full_grouped_ms = None
+        native_full_grouped_max_diff = None
+    if hasattr(native, "gqa_decode_full_exact_logits_t_cublas"):
+        native_full_cublas_out, native_full_cublas_ms = _time_cuda(
+            native_full_exact_cublas_t,
+            warmup=int(args.warmup),
+            iters=int(args.iters),
+        )
+        native_full_cublas_max_diff = float((torch_full_out - native_full_cublas_out).abs().max().item())
+    else:
+        native_full_cublas_ms = None
+        native_full_cublas_max_diff = None
     if hasattr(native, "gqa_decode_ranked_exact_logits_with_base_lse"):
         native_ref, native_ref_ms = _time_cuda(native_ranked_exact, warmup=int(args.warmup), iters=int(args.iters))
         native_result, native_ms = _time_cuda(native_ranked_with_base, warmup=int(args.warmup), iters=int(args.iters))
@@ -173,9 +247,29 @@ def main() -> None:
         "kv_heads": kv_heads,
         "group_size": group_size,
         "dim": dim,
+        "native_exact_tf32_env": os.environ.get("SELECTOR_PQ_NATIVE_EXACT_LOGITS_TF32", "1"),
         "ranked_gather_ms": ranked_ms,
         "dense_sim_ms": dense_ms,
         "dense_sim_cached_ms": cached_dense_ms,
+        "torch_full_exact_ms": torch_full_ms,
+        "native_full_exact_custom_ms": native_full_custom_ms,
+        "native_full_exact_grouped_ms": native_full_grouped_ms,
+        "native_full_exact_cublas_t_ms": native_full_cublas_ms,
+        "speedup_native_full_cublas_vs_torch_full": (
+            float(torch_full_ms / native_full_cublas_ms)
+            if native_full_cublas_ms is not None and native_full_cublas_ms > 0.0
+            else None
+        ),
+        "speedup_native_full_custom_vs_torch_full": (
+            float(torch_full_ms / native_full_custom_ms)
+            if native_full_custom_ms is not None and native_full_custom_ms > 0.0
+            else None
+        ),
+        "speedup_native_full_grouped_vs_torch_full": (
+            float(torch_full_ms / native_full_grouped_ms)
+            if native_full_grouped_ms is not None and native_full_grouped_ms > 0.0
+            else None
+        ),
         "native_ranked_exact_ms": native_ref_ms,
         "native_ranked_with_base_ms": native_ms,
         "speedup_dense_vs_ranked": float(ranked_ms / dense_ms) if dense_ms > 0.0 else float("inf"),
@@ -186,6 +280,9 @@ def main() -> None:
         ),
         "max_abs_diff": max_diff,
         "cached_max_abs_diff": cached_max_diff,
+        "native_full_exact_custom_max_abs_diff": native_full_custom_max_diff,
+        "native_full_exact_grouped_max_abs_diff": native_full_grouped_max_diff,
+        "native_full_exact_cublas_t_max_abs_diff": native_full_cublas_max_diff,
         "native_max_abs_diff": native_max_diff,
         "native_inf_mask_mismatch": native_inf_mask_mismatch,
     }

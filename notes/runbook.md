@@ -9,6 +9,9 @@ Keep this file to current commands only. Old command recipes are preserved in `n
 - Do not run heavy GPU workloads or extension builds on the login node.
 - Use the repo `.venv` and load `python/3.10.4` when needed.
 - Report logical frontier MB separately from physical GPU simulator MB.
+- Do not use `DISABLE_COST_STATS=1` / no-stats runs for optimization or promotion decisions. Use accounting/profile runs so latency, logical MB, physical MB, selected counts, and wall buckets are captured together.
+- Active Slurm wrappers should reject `DISABLE_COST_STATS=1` rather than forwarding `--disable_cost_stats`.
+- Canonical frontier defaults live in `benchmark/selector_eval/frontier_config.py`; regenerate `scripts/frontier_canonical_env.sh` and `scripts/frontier_direct_runtime_env.sh` from that module if the canonical contract changes.
 
 ## CUDA / Frontier Unit Validation
 
@@ -55,7 +58,7 @@ Canonical frontier:
 ```bash
 TASK_NAME=niah_single_1 CONTEXT_LEN=32768 NUM_SAMPLES=1 \
 OUTPUT_ROOT=ruler_eval_result/frontier_smoke \
-FRONTIER_CANONICAL_GPU=1 PROFILE_NATIVE_OPS=1 \
+FRONTIER_CANONICAL_GPU=1 PROFILE_NATIVE_OPS=1 SELECTOR_PQ_JOINT_WALL_PROFILE=1 \
 sbatch scripts/run_frontier_ruler_batched_one.sh
 ```
 
@@ -76,7 +79,7 @@ Canonical frontier:
 ```bash
 MAX_EXAMPLES=2 LENGTH_FILTER=short DIFFICULTY_FILTER=easy MAX_INPUT_TOKENS=32768 \
 OUTPUT_DIR=longbench_v2_hf_result/frontier_smoke \
-FRONTIER_CANONICAL_GPU=1 PROFILE_NATIVE_OPS=1 \
+FRONTIER_CANONICAL_GPU=1 PROFILE_NATIVE_OPS=1 SELECTOR_PQ_JOINT_WALL_PROFILE=1 \
 sbatch scripts/run_frontier_longbench_v2_one.sh
 ```
 
@@ -106,6 +109,14 @@ bash scripts/submit_public_longdecode_full_matrix.sh
 The full matrix shards AIME24, GPQA, LiveCodeBench codegen, LongGenBench SGT short/long, and LongGenBench GSM8K with dense and canonical `pagedpq` modes. Defaults are capped to fewer than 100 jobs. Override totals or shard sizes before launch, for example `LIVE_CODE_TOTAL_EXAMPLES=175`, `LONGGEN_SGT_SHORT_TOTAL_EXAMPLES=400`, or `LONGGEN_SGT_SHORT_SHARD_SIZE=8`.
 
 ## Audit / Reporting
+
+Regenerate canonical shell fragments after editing `frontier_config.py`:
+
+```bash
+module load python/3.10.4
+python -m benchmark.selector_eval.frontier_config --emit-shell > scripts/frontier_canonical_env.sh
+python -m benchmark.selector_eval.frontier_config --emit-direct-runtime-shell > scripts/frontier_direct_runtime_env.sh
+```
 
 ## KV-Compression Trace Comparison
 

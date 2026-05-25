@@ -31,6 +31,8 @@ echo "[joint_kv_policy] heads=${HEADS:-all}"
 echo "[joint_kv_policy] k_budgets=${K_BUDGETS:-4096,8192,14336,32768}"
 echo "[joint_kv_policy] v_budgets=${V_BUDGETS:-1024,2048,4096,6144,8192,12288,16384}"
 echo "[joint_kv_policy] score_proxy_variants=${SCORE_PROXY_VARIANTS:-baseline}"
+echo "[joint_kv_policy] selector_mode=${SELECTOR_MODE:-fullscan}"
+echo "[joint_kv_policy] quest_rank=${QUEST_RANK:-16}"
 
 .venv/bin/python benchmark/selector_eval/runners/run_joint_kv_budget_policy_eval.py \
   --qkv_trace "${QKV_TRACE:-attention_efficiency_result/real_qkv_llama31_l16_6838_g131072_q288_window32_graphall_s16.npz}" \
@@ -45,6 +47,8 @@ echo "[joint_kv_policy] score_proxy_variants=${SCORE_PROXY_VARIANTS:-baseline}"
   --policies "${POLICIES:-k_first_priority,v_first_priority,k_first_alternating,v_first_alternating,sensitivity_greedy}" \
   --score_proxy_variants "${SCORE_PROXY_VARIANTS:-baseline}" \
   --selector_mode "${SELECTOR_MODE:-fullscan}" \
+  --quest_rank "${QUEST_RANK:-16}" \
+  --selector_index_bytes "${SELECTOR_INDEX_BYTES:-4}" \
   --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-affine_selected}" \
   --page_size "${PAGE_SIZE:-5632}" \
   --subvecs "${SUBVECS:-4}" \

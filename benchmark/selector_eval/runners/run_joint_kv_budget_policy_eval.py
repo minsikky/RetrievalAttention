@@ -31,6 +31,7 @@ from benchmark.selector_eval.runners.run_value_exact_strategy_eval import (
     value_vpq_code_stat_risk,
 )
 from benchmark.selector_eval.runners.run_layer_quality_eval import _selected_for_budget, _vpq_values_for_tokens
+from benchmark.selector_eval.runners.run_layer_quality_eval import _rank_quest_pages, _rank_quest_pq
 
 
 MB = 1024.0 * 1024.0
@@ -590,7 +591,9 @@ def run() -> None:
             "promoted_p0p1_b8, residual_pq_m1b4_s4, bandcal_b8_p16."
         ),
     )
-    parser.add_argument("--selector_mode", choices=["fullscan", "routed"], default="fullscan")
+    parser.add_argument("--selector_mode", choices=["fullscan", "routed", "quest", "quest_pq"], default="fullscan")
+    parser.add_argument("--quest_rank", type=int, default=16)
+    parser.add_argument("--selector_index_bytes", type=int, default=4)
     parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="affine_selected")
     parser.add_argument("--static_prefix", type=int, default=128)
     parser.add_argument("--static_suffix", type=int, default=128)
@@ -701,18 +704,45 @@ def run() -> None:
                 context_len=context_len,
             )
             max_k_budget = max(k_budgets)
-            ranked_t, ranked_scores_t, _selector_seconds, selector_mb, chosen_nprobe = rank_paged_pq(
-                torch.as_tensor(query_np, dtype=torch.float32, device=device),
-                index,
-                mode=str(args.selector_mode),
-                selector_backend="torch",
-                nprobes=nprobes,
-                budget=int(max_k_budget),
-                key_bytes=int(args.key_bytes),
-                subbits=int(args.subbits),
-            )
-            ranked_cpu = ranked_t.detach().cpu().numpy().astype(np.int64, copy=False)
-            ranked_scores_cpu = ranked_scores_t.detach().cpu().numpy().astype(np.float32, copy=False)
+            query_t = torch.as_tensor(query_np, dtype=torch.float32, device=device)
+            selector_coverage = 1.0
+            if str(args.selector_mode) in {"fullscan", "routed"}:
+                ranked_t, ranked_scores_t, _selector_seconds, selector_mb, chosen_nprobe = rank_paged_pq(
+                    query_t,
+                    index,
+                    mode=str(args.selector_mode),
+                    selector_backend="torch",
+                    nprobes=nprobes,
+                    budget=int(max_k_budget),
+                    key_bytes=int(args.key_bytes),
+                    subbits=int(args.subbits),
+                )
+                ranked_cpu = ranked_t.detach().cpu().numpy().astype(np.int64, copy=False)
+                ranked_scores_cpu = ranked_scores_t.detach().cpu().numpy().astype(np.float32, copy=False)
+            elif str(args.selector_mode) == "quest":
+                ranked_cpu, ranked_scores_cpu, selector_mb, chosen_nprobe, selector_coverage = _rank_quest_pages(
+                    keys_np=keys_np,
+                    query_np=query_np,
+                    index=index,
+                    rank=int(args.quest_rank),
+                    key_bytes=int(args.key_bytes),
+                    index_bytes=int(args.selector_index_bytes),
+                )
+            elif str(args.selector_mode) == "quest_pq":
+                ranked_cpu, ranked_scores_cpu, selector_mb, chosen_nprobe, selector_coverage = _rank_quest_pq(
+                    query=query_t,
+                    keys_np=keys_np,
+                    query_np=query_np,
+                    index=index,
+                    rank=int(args.quest_rank),
+                    nprobes=nprobes,
+                    budget=int(max_k_budget),
+                    key_bytes=int(args.key_bytes),
+                    subbits=int(args.subbits),
+                    index_bytes=int(args.selector_index_bytes),
+                )
+            else:
+                raise ValueError(f"unknown selector_mode: {args.selector_mode}")
 
             all_tokens = np.arange(context_len, dtype=np.int64)
             vhat_all, _compressed_v_mb, _fallback_v_mb = _vpq_values_for_tokens(
@@ -841,6 +871,10 @@ def run() -> None:
                             "decode_length": int(decode_tokens),
                             "head": int(head),
                             "kv_head": int(kv_head),
+                            "selector_mode": str(args.selector_mode),
+                            "quest_rank": int(args.quest_rank),
+                            "chosen_nprobe": int(chosen_nprobe),
+                            "selector_coverage": float(selector_coverage),
                             "score_proxy_variant": str(score_proxy_variant),
                             "score_proxy_extra_MB": float(score_proxy_extra_mb),
                             "score_proxy_detail": str(score_proxy_meta.get("score_proxy_detail", "")),
@@ -893,7 +927,9 @@ def run() -> None:
                     "qidx": int(qidx),
                     "position": int(position),
                     "decode_length": int(decode_tokens),
+                    "selector_mode": str(args.selector_mode),
                     "score_proxy_variant": str(score_proxy_variant),
+                    "quest_rank": int(args.quest_rank),
                     "policy": str(policy),
                     "threshold": float(threshold),
                     "attn_concat_relative_L2": float(concat_metric["output_relative_l2"]),
@@ -916,6 +952,8 @@ def run() -> None:
                     "mean_k_budget": float(np.mean([float(r["k_budget"]) for r in choices])),
                     "mean_v_budget": float(np.mean([float(r["v_budget"]) for r in choices])),
                     "mean_selected_k_tokens": float(np.mean([float(r["selected_k_tokens"]) for r in choices])),
+                    "mean_selector_coverage": float(np.mean([float(r["selector_coverage"]) for r in choices])),
+                    "mean_chosen_nprobe": float(np.mean([float(r["chosen_nprobe"]) for r in choices])),
                     "mean_score_proxy_extra_MB": float(np.mean([float(r["score_proxy_extra_MB"]) for r in choices])),
                     "mean_calibration_extra_MB": float(np.mean([float(r["calibration_extra_MB"]) for r in choices])),
                     "mean_calibration_probe_tokens": float(np.mean([float(r["calibration_probe_tokens"]) for r in choices])),
@@ -949,6 +987,8 @@ def run() -> None:
         summary_rows.append(
             {
                 "score_proxy_variant": str(score_proxy_variant),
+                "selector_mode": str(rows[0].get("selector_mode", "")),
+                "quest_rank": int(rows[0].get("quest_rank", 0)),
                 "policy": str(policy),
                 "threshold": float(threshold),
                 "queries": int(len(rows)),
@@ -979,6 +1019,8 @@ def run() -> None:
                 "min_prob_top512_mass_recall": float(np.min([float(r["min_prob_top512_mass_recall"]) for r in rows])),
                 "mean_k_budget": float(np.mean([float(r["mean_k_budget"]) for r in rows])),
                 "mean_v_budget": float(np.mean([float(r["mean_v_budget"]) for r in rows])),
+                "mean_selector_coverage": float(np.mean([float(r["mean_selector_coverage"]) for r in rows])),
+                "mean_chosen_nprobe": float(np.mean([float(r["mean_chosen_nprobe"]) for r in rows])),
                 "mean_score_proxy_extra_MB": float(np.mean([float(r["mean_score_proxy_extra_MB"]) for r in rows])),
                 "mean_calibration_extra_MB": float(np.mean([float(r["mean_calibration_extra_MB"]) for r in rows])),
                 "mean_calibration_probe_tokens": float(np.mean([float(r["mean_calibration_probe_tokens"]) for r in rows])),

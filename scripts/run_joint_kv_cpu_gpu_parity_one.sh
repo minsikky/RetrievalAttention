@@ -93,7 +93,13 @@ echo "[jointkv_parity] output=${OUTPUT_DIR}"
   ${COMPARE_TORCH_GPU_POLICY:+--compare_torch_gpu_policy} \
   ${USE_NATIVE_VPREFIX:+--use_native_vprefix} \
   ${USE_NATIVE_RISK_PREFIX:+--use_native_risk_prefix} \
+  ${USE_NATIVE_RISK_PREFIX_TOPK:+--use_native_risk_prefix_topk} \
   ${USE_NATIVE_SCORE_GRID:+--use_native_score_grid} \
-  ${USE_NATIVE_POLICY:+--use_native_policy}
+  ${USE_NATIVE_PQ_SCALE_IN_KERNEL:+--use_native_pq_scale_in_kernel} \
+  ${USE_TOKENFIT_SCORE_GRID:+--use_tokenfit_score_grid} \
+  ${USE_SCORE_GRID_WORKSPACE:+--use_score_grid_workspace} \
+  ${USE_NATIVE_POLICY:+--use_native_policy} \
+  ${USE_INTERVAL_RISK_POLICY:+--use_interval_risk_policy} \
+  ${USE_SCORE_DIRECT_INTERVAL_POLICY:+--use_score_direct_interval_policy}
 
 echo "[jointkv_parity] finished=$(date --iso-8601=seconds)"
