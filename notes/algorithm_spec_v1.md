@@ -161,7 +161,13 @@ algorithm side rather than re-deriving.
 
 The algorithm side owns this file. RTL discrepancies against the golden
 model are bugs on whichever side diverges from THIS document; if the
-document is ambiguous, fix the document first. OPEN items: logit-buffer
+document is ambiguous, fix the document first.
+CALIBRATION BOUNDARY: tau=0.004 and the rung-grid fractions are
+calibrated on evidence up to ctx 134.8k; hardware targets 1M+ (issue #8).
+Interim risk assessment: `notes/ctx_scaling_1m_memo.md` (e4m3 range
+low-risk; proxy-mass clamp becomes the mainline path at 1M; boundary
+ties ~linear). Real 1M validation planned:
+`benchmark_differentiation_plan.md` Phase E. OPEN items: logit-buffer
 FORMAT (fp8-e4m3 vs absmax int8, issue #6 — semantics settled either way:
 8-bit monotone quantization, 256-bin histogram select).
 RESOLVED: M4 (8-bit logit buffer FREE at full spectrum, job 53003124:
