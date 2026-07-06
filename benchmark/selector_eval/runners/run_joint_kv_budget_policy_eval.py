@@ -1390,7 +1390,7 @@ def run() -> None:
     precision_active = precision_k_hi_frac < 1.0 or precision_v_hi_frac < 1.0
     if not (0.0 <= precision_k_hi_frac <= 1.0 and 0.0 <= precision_v_hi_frac <= 1.0):
         raise ValueError("--precision_k_hi_frac/--precision_v_hi_frac must be in [0, 1]")
-    precision_lo_bytes = 1 if precision_lo_bits <= 8 else 2
+    precision_lo_bytes = 0.5 if precision_lo_bits <= 4 else (1 if precision_lo_bits <= 8 else 2)
     if precision_active and bool(args.lookahead_diagnostic):
         raise ValueError("progressive precision is incompatible with --lookahead_diagnostic")
     page_scan_frac = float(args.page_scan_frac)
