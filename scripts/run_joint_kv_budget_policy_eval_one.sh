@@ -30,9 +30,30 @@ echo "[joint_kv_policy] decode_lengths=${DECODE_LENGTHS:-500,1000,2000,4000,8000
 echo "[joint_kv_policy] heads=${HEADS:-all}"
 echo "[joint_kv_policy] k_budgets=${K_BUDGETS:-4096,8192,14336,32768}"
 echo "[joint_kv_policy] v_budgets=${V_BUDGETS:-1024,2048,4096,6144,8192,12288,16384}"
+echo "[joint_kv_policy] k_budget_fracs=${K_BUDGET_FRACS:-0.10,0.30,0.50,0.70,0.90,1.0}"
+echo "[joint_kv_policy] v_budget_fracs=${V_BUDGET_FRACS:-0.05,0.10,0.20,0.40,0.60,0.80,1.0}"
 echo "[joint_kv_policy] score_proxy_variants=${SCORE_PROXY_VARIANTS:-baseline}"
+echo "[joint_kv_policy] start_strategies=${START_STRATEGIES:-proxy_mass_m0p9}"
+echo "[joint_kv_policy] v_selection_rules=${V_SELECTION_RULES:-global_residual_risk}"
+echo "[joint_kv_policy] v_local_block_size=${V_LOCAL_BLOCK_SIZE:-1024}"
+echo "[joint_kv_policy] include_v_selection_state_in_step_mb=${INCLUDE_V_SELECTION_STATE_IN_STEP_MB:-0}"
+echo "[joint_kv_policy] survivor_logit_bytes=${SURVIVOR_LOGIT_BYTES:-2}"
+echo "[joint_kv_policy] oracle_rel_l2_targets=${ORACLE_REL_L2_TARGETS:-}"
+echo "[joint_kv_policy] threshold_mode=${THRESHOLD_MODE:-budget_delta_frac}"
+echo "[joint_kv_policy] threshold_scale_shape=${THRESHOLD_SCALE_SHAPE:-sqrt}"
 echo "[joint_kv_policy] selector_mode=${SELECTOR_MODE:-fullscan}"
 echo "[joint_kv_policy] quest_rank=${QUEST_RANK:-16}"
+
+extra_args=()
+if [[ "${INCLUDE_V_SELECTION_STATE_IN_STEP_MB:-0}" == "1" ]]; then
+  extra_args+=(--include_v_selection_state_in_step_mb)
+fi
+if [[ "${LOOKAHEAD_DIAGNOSTIC:-0}" == "1" ]]; then
+  extra_args+=(--lookahead_diagnostic)
+fi
+if [[ -n "${LOOKAHEAD_DECISION_VARIANTS:-}" ]]; then
+  extra_args+=(--lookahead_decision_variants "${LOOKAHEAD_DECISION_VARIANTS}")
+fi
 
 .venv/bin/python benchmark/selector_eval/runners/run_joint_kv_budget_policy_eval.py \
   --qkv_trace "${QKV_TRACE:-attention_efficiency_result/real_qkv_llama31_l16_6838_g131072_q288_window32_graphall_s16.npz}" \
@@ -43,13 +64,25 @@ echo "[joint_kv_policy] quest_rank=${QUEST_RANK:-16}"
   --heads "${HEADS:-}" \
   --k_budgets "${K_BUDGETS:-4096,8192,14336,32768}" \
   --v_budgets "${V_BUDGETS:-1024,2048,4096,6144,8192,12288,16384}" \
-  --stability_thresholds "${STABILITY_THRESHOLDS:-0.0005,0.001,0.002}" \
+  --k_budget_fracs "${K_BUDGET_FRACS:-0.10,0.30,0.50,0.70,0.90,1.0}" \
+  --v_budget_fracs "${V_BUDGET_FRACS:-0.05,0.10,0.20,0.40,0.60,0.80,1.0}" \
+  --stability_thresholds "${STABILITY_THRESHOLDS:-0.002}" \
+  --oracle_rel_l2_targets "${ORACLE_REL_L2_TARGETS:-}" \
+  --threshold_mode "${THRESHOLD_MODE:-budget_delta_frac}" \
+  --threshold_reference_frac "${THRESHOLD_REFERENCE_FRAC:-0.2}" \
+  --threshold_scale_shape "${THRESHOLD_SCALE_SHAPE:-sqrt}" \
+  --threshold_min_scale "${THRESHOLD_MIN_SCALE:-0.0}" \
+  --threshold_max_scale "${THRESHOLD_MAX_SCALE:-1.5}" \
   --policies "${POLICIES:-k_first_priority,v_first_priority,k_first_alternating,v_first_alternating,sensitivity_greedy}" \
   --score_proxy_variants "${SCORE_PROXY_VARIANTS:-baseline}" \
+  --start_strategies "${START_STRATEGIES:-proxy_mass_m0p9}" \
+  --v_selection_rules "${V_SELECTION_RULES:-global_residual_risk}" \
+  --v_local_block_size "${V_LOCAL_BLOCK_SIZE:-1024}" \
+  --survivor_logit_bytes "${SURVIVOR_LOGIT_BYTES:-2}" \
   --selector_mode "${SELECTOR_MODE:-fullscan}" \
   --quest_rank "${QUEST_RANK:-16}" \
   --selector_index_bytes "${SELECTOR_INDEX_BYTES:-4}" \
-  --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-affine_selected}" \
+  --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-none}" \
   --page_size "${PAGE_SIZE:-5632}" \
   --subvecs "${SUBVECS:-4}" \
   --subbits "${SUBBITS:-8}" \
@@ -62,6 +95,7 @@ echo "[joint_kv_policy] quest_rank=${QUEST_RANK:-16}"
   --nprobes "${NPROBES:-512}" \
   --static_prefix "${STATIC_PREFIX:-128}" \
   --static_suffix "${STATIC_SUFFIX:-128}" \
+  "${extra_args[@]}" \
   --device cpu
 
 echo "[joint_kv_policy] finished=$(date --iso-8601=seconds)"

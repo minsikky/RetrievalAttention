@@ -25,7 +25,6 @@ from benchmark.selector_eval.metrics.attention import _output_error_metrics, att
 from benchmark.selector_eval.runners.run_value_exact_strategy_eval import (
     dense_attention_output,
     mixed_scores,
-    output_from_exact_mask,
     project_head_subset,
     top_mask,
     value_vpq_code_stat_risk,
@@ -36,9 +35,55 @@ from benchmark.selector_eval.runners.run_layer_quality_eval import _rank_quest_p
 
 MB = 1024.0 * 1024.0
 
+# Lookahead-bound diagnostic variants: `charge_all` models naive hardware that
+# pays exact reads for every confidence lookahead; `cs` is a strict
+# Cauchy-Schwarz bound on the K-logit upgrade error; `rms<lambda>` are
+# calibrated typical-case estimates (|q.r| ~ ||q||*||r||/sqrt(d) scaled by
+# lambda) with a shared strict L1 V-band bound. `var<lambda>` are
+# second-moment concentration estimates, sqrt(sum(p^2 * err^2)) * lambda:
+# L1-style bounds scale with band token count while the true delta cancels
+# like sqrt(n), so at long contexts only the variance form can certify.
+LOOKAHEAD_VARIANTS = ("charge_all", "cs", "rms1", "rms2", "rms4", "var1", "var2", "var4")
+
+
+def _lookahead_x_factors(*, q_norm: float, k_resid_norm: np.ndarray, head_dim: int) -> dict[str, np.ndarray]:
+    sqrt_d = math.sqrt(max(1.0, float(head_dim)))
+    base = float(q_norm) * np.asarray(k_resid_norm, dtype=np.float64)
+    return {
+        "cs": base / sqrt_d,
+        "rms1": 1.0 * base / float(head_dim),
+        "rms2": 2.0 * base / float(head_dim),
+        "rms4": 4.0 * base / float(head_dim),
+    }
+
 
 def parse_csv_floats(text: str) -> list[float]:
     return [float(part.strip()) for part in str(text).split(",") if part.strip()]
+
+
+def parse_csv_ratios(text: str) -> list[float]:
+    ratios: list[float] = []
+    for part in str(text).split(","):
+        token = part.strip().lower()
+        if not token:
+            continue
+        is_percent = token.endswith("%")
+        if is_percent:
+            token = token[:-1]
+        value = float(token.replace("p", "."))
+        ratios.append(value / 100.0 if is_percent else value)
+    return ratios
+
+
+def budgets_from_fracs(context_len: int, fracs: list[float]) -> list[int]:
+    budgets = {
+        max(1, min(int(context_len), int(math.ceil(float(context_len) * float(frac)))))
+        for frac in fracs
+        if float(frac) > 0.0
+    }
+    if not budgets:
+        raise ValueError("relative budget fractions produced no positive budgets")
+    return sorted(budgets)
 
 
 def load_weight_index(model_dir: Path) -> dict[str, str]:
@@ -485,12 +530,16 @@ def choose_action(
     k_can: bool,
     v_can: bool,
     threshold: float,
+    k_threshold: float | None = None,
+    v_threshold: float | None = None,
     turn: int,
     extra_k_mb: float,
     extra_v_mb: float,
 ) -> str:
-    k_bad = bool(k_can and k_delta > threshold)
-    v_bad = bool(v_can and v_delta > threshold)
+    k_limit = float(threshold) if k_threshold is None else float(k_threshold)
+    v_limit = float(threshold) if v_threshold is None else float(v_threshold)
+    k_bad = bool(k_can and k_delta > k_limit)
+    v_bad = bool(v_can and v_delta > v_limit)
     if not k_bad and not v_bad:
         return "stop"
     if str(policy) == "k_first_priority":
@@ -527,9 +576,21 @@ def simulate_policy(
     threshold: float,
     k_mb_by_idx: list[float],
     v_mb_by_idx: list[float],
+    context_len: int,
+    threshold_mode: str = "fixed",
+    threshold_reference_frac: float = 0.2,
+    threshold_scale_shape: str = "linear",
+    threshold_min_scale: float = 0.0,
+    threshold_max_scale: float = 1.0,
+    start_ki: int = 0,
+    start_vi: int = 0,
+    step_mb_by_idx: dict[tuple[int, int], float] | None = None,
+    test_log: list[tuple[int, int, bool, bool, float, float, float, float]] | None = None,
+    k_bound_by_pair: dict[tuple[int, int], float] | None = None,
+    v_bound_by_pair: dict[tuple[int, int], float] | None = None,
 ) -> tuple[int, int, int, float, float, list[str]]:
-    ki = 0
-    vi = 0
+    ki = min(max(0, int(start_ki)), max(0, len(k_budgets) - 1))
+    vi = min(max(0, int(start_vi)), max(0, len(v_budgets) - 1))
     steps = 0
     trace: list[str] = []
     while steps < (len(k_budgets) + len(v_budgets) + 4):
@@ -538,20 +599,68 @@ def simulate_policy(
         v_can = vi + 1 < len(v_budgets)
         k_delta = rel_l2(cur, outputs[(ki + 1, vi)]) if k_can else 0.0
         v_delta = rel_l2(cur, outputs[(ki, vi + 1)]) if v_can else 0.0
-        extra_k_mb = float(k_mb_by_idx[ki + 1] - k_mb_by_idx[ki]) if k_can else float("inf")
-        extra_v_mb = float(v_mb_by_idx[vi + 1] - v_mb_by_idx[vi]) if v_can else float("inf")
+        if step_mb_by_idx is None:
+            extra_k_mb = float(k_mb_by_idx[ki + 1] - k_mb_by_idx[ki]) if k_can else float("inf")
+            extra_v_mb = float(v_mb_by_idx[vi + 1] - v_mb_by_idx[vi]) if v_can else float("inf")
+        else:
+            cur_mb = float(step_mb_by_idx[(ki, vi)])
+            extra_k_mb = float(step_mb_by_idx[(ki + 1, vi)] - cur_mb) if k_can else float("inf")
+            extra_v_mb = float(step_mb_by_idx[(ki, vi + 1)] - cur_mb) if v_can else float("inf")
+        k_threshold = float(threshold)
+        v_threshold = float(threshold)
+        if str(threshold_mode) == "budget_delta_frac":
+            if k_can:
+                k_frac = float(max(0, int(k_budgets[ki + 1]) - int(k_budgets[ki]))) / max(float(context_len), 1.0)
+                k_threshold = scaled_threshold(
+                    base_threshold=float(threshold),
+                    budget_delta_frac=k_frac,
+                    reference_frac=float(threshold_reference_frac),
+                    shape=str(threshold_scale_shape),
+                    min_scale=float(threshold_min_scale),
+                    max_scale=float(threshold_max_scale),
+                )
+            if v_can:
+                v_frac = float(max(0, int(v_budgets[vi + 1]) - int(v_budgets[vi]))) / max(float(context_len), 1.0)
+                v_threshold = scaled_threshold(
+                    base_threshold=float(threshold),
+                    budget_delta_frac=v_frac,
+                    reference_frac=float(threshold_reference_frac),
+                    shape=str(threshold_scale_shape),
+                    min_scale=float(threshold_min_scale),
+                    max_scale=float(threshold_max_scale),
+                )
+        elif str(threshold_mode) != "fixed":
+            raise ValueError(f"unknown threshold_mode: {threshold_mode}")
+        if test_log is not None:
+            test_log.append(
+                (int(ki), int(vi), bool(k_can), bool(v_can), float(k_delta), float(v_delta), float(k_threshold), float(v_threshold))
+            )
+        # Decision mode: a certified axis is treated as stable without reading
+        # the lookahead band; the recorded raw deltas above still allow
+        # false-certify auditing.
+        k_delta_used = k_delta
+        v_delta_used = v_delta
+        if k_bound_by_pair is not None and k_can and float(k_bound_by_pair.get((ki, vi), float("inf"))) <= k_threshold:
+            k_delta_used = 0.0
+        if v_bound_by_pair is not None and v_can and float(v_bound_by_pair.get((ki, vi), float("inf"))) <= v_threshold:
+            v_delta_used = 0.0
         action = choose_action(
             policy=policy,
-            k_delta=k_delta,
-            v_delta=v_delta,
+            k_delta=k_delta_used,
+            v_delta=v_delta_used,
             k_can=k_can,
             v_can=v_can,
             threshold=float(threshold),
+            k_threshold=k_threshold,
+            v_threshold=v_threshold,
             turn=steps,
             extra_k_mb=extra_k_mb,
             extra_v_mb=extra_v_mb,
         )
-        trace.append(f"{action}:k{ki}/v{vi}:dk={k_delta:.4g}:dv={v_delta:.4g}")
+        trace.append(
+            f"{action}:k{ki}/v{vi}:dk={k_delta:.4g}:dv={v_delta:.4g}:"
+            f"tk={k_threshold:.4g}:tv={v_threshold:.4g}"
+        )
         if action == "stop":
             break
         if action == "k" and k_can:
@@ -562,6 +671,359 @@ def simulate_policy(
             break
         steps += 1
     return ki, vi, steps, float(k_delta), float(v_delta), trace
+
+
+def find_oracle_budget(
+    *,
+    outputs: dict[tuple[int, int], np.ndarray],
+    dense: np.ndarray,
+    k_budgets: list[int],
+    v_budgets: list[int],
+    k_mb_by_idx: list[float],
+    v_mb_by_idx: list[float],
+    target_rel_l2: float,
+    step_mb_by_idx: dict[tuple[int, int], float] | None = None,
+) -> dict[str, object]:
+    best_satisfied: dict[str, object] | None = None
+    best_error: dict[str, object] | None = None
+    for ki, k_budget in enumerate(k_budgets):
+        for vi, v_budget in enumerate(v_budgets):
+            err = rel_l2(dense, outputs[(ki, vi)])
+            total_mb = (
+                float(k_mb_by_idx[ki] + v_mb_by_idx[vi])
+                if step_mb_by_idx is None
+                else float(step_mb_by_idx[(ki, vi)])
+            )
+            row = {
+                "oracle_ki": int(ki),
+                "oracle_vi": int(vi),
+                "oracle_k_budget": int(k_budget),
+                "oracle_v_budget": int(v_budget),
+                "oracle_step_MB_per_head": float(total_mb),
+                "oracle_head_attention_relative_L2": float(err),
+                "oracle_target_satisfied": bool(err <= float(target_rel_l2)),
+            }
+            if best_error is None or float(err) < float(best_error["oracle_head_attention_relative_L2"]):
+                best_error = row
+            if err <= float(target_rel_l2):
+                if best_satisfied is None or total_mb < float(best_satisfied["oracle_step_MB_per_head"]):
+                    best_satisfied = row
+    return best_satisfied if best_satisfied is not None else dict(best_error or {})
+
+
+def _budget_index_at_least(budgets: list[int], target: float) -> int:
+    if not budgets:
+        return 0
+    for idx, budget in enumerate(budgets):
+        if int(budget) >= float(target):
+            return int(idx)
+    return len(budgets) - 1
+
+
+def _parse_fraction_suffix(name: str, prefix: str, default: float) -> float:
+    match = re.search(rf"(?:^|_){re.escape(prefix)}([0-9p.]+)", str(name))
+    if not match:
+        return float(default)
+    return float(match.group(1).replace("p", "."))
+
+
+def _softmax_prefix_count(scores: np.ndarray, *, mass: float, scale: float) -> int:
+    if scores.size == 0:
+        return 0
+    # Some Slurm nodes expose a brittle NumPy reduction path in this venv. This
+    # initializer is not a hot path, so keep it on plain Python reductions.
+    logits = [float(score) * float(scale) for score in scores.reshape(-1).tolist()]
+    max_logit = max(logits)
+    weights = [math.exp(logit - max_logit) for logit in logits]
+    total = float(sum(weights))
+    if total <= 0.0 or not np.isfinite(total):
+        return int(scores.size)
+    running = 0.0
+    target = float(mass) * total
+    for idx, weight in enumerate(weights):
+        running += float(weight)
+        if running >= target:
+            return int(idx + 1)
+    return int(scores.size)
+
+
+def _softmax_normalized_entropy(scores: np.ndarray, *, scale: float) -> float:
+    if scores.size <= 1:
+        return 0.0
+    logits = [float(score) * float(scale) for score in scores.reshape(-1).tolist()]
+    max_logit = max(logits)
+    weights = [math.exp(logit - max_logit) for logit in logits]
+    total = float(sum(weights))
+    if total <= 0.0 or not np.isfinite(total):
+        return 1.0
+    entropy = 0.0
+    for weight in weights:
+        prob = float(weight) / total
+        if prob > 0.0:
+            entropy -= prob * math.log(prob)
+    return min(max(float(entropy / math.log(float(len(weights)))), 0.0), 1.0)
+
+
+def scaled_threshold(
+    *,
+    base_threshold: float,
+    budget_delta_frac: float,
+    reference_frac: float,
+    shape: str,
+    min_scale: float,
+    max_scale: float,
+) -> float:
+    ref = max(float(reference_frac), 1e-12)
+    ratio = max(float(budget_delta_frac), 0.0) / ref
+    mode = str(shape).strip().lower()
+    if mode == "linear":
+        scale = ratio
+    elif mode == "sqrt":
+        scale = math.sqrt(ratio)
+    elif mode == "log":
+        scale = math.log1p(ratio) / math.log(2.0)
+    else:
+        raise ValueError(f"unknown threshold scaling shape: {shape}")
+    scale = min(max(float(scale), float(min_scale)), float(max_scale))
+    return float(base_threshold) * scale
+
+
+def _v_selection_block_size(rule: str, default: int) -> int:
+    name = str(rule).strip().lower()
+    match = re.search(r"(?:^|_)b(\d+)", name)
+    if match:
+        return max(1, int(match.group(1)))
+    return max(1, int(default))
+
+
+def exact_v_mask_for_rule(
+    *,
+    rule: str,
+    risk_scores: np.ndarray,
+    value_scores: np.ndarray,
+    exact_count: int,
+    block_size: int,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Return exact-V mask for probability-weighted or V-error-only selection."""
+
+    name = str(rule).strip().lower()
+    risk_scores = np.asarray(risk_scores, dtype=np.float64).reshape(-1)
+    value_scores = np.asarray(value_scores, dtype=np.float64).reshape(-1)
+    context_len = int(risk_scores.shape[0])
+    if int(value_scores.shape[0]) != context_len:
+        raise ValueError("value_scores must have the same length as risk_scores")
+    count = max(0, min(int(exact_count), context_len))
+    if name in {"", "global", "global_residual_risk", "residual_risk"}:
+        return top_mask(risk_scores, count), {
+            "v_selection_rule": "global_residual_risk",
+            "v_selection_block_size": 0,
+            "v_selection_exact_target": int(count),
+        }
+    if name in {"v_error_only", "global_v_error", "value_error", "code_error", "v_code_error"}:
+        return top_mask(value_scores, count), {
+            "v_selection_rule": "v_error_only",
+            "v_selection_block_size": 0,
+            "v_selection_exact_target": int(count),
+        }
+    if name.startswith("local_block"):
+        block = _v_selection_block_size(name, int(block_size))
+        mask = np.zeros((context_len,), dtype=bool)
+        for start in range(0, context_len, block):
+            end = min(context_len, start + block)
+            # Proportional deterministic quota: each block commits immediately,
+            # while the row-level exact-V count remains exactly `count`.
+            local_start = int(math.floor(float(count) * float(start) / max(float(context_len), 1.0)))
+            local_end = int(math.floor(float(count) * float(end) / max(float(context_len), 1.0)))
+            local_count = max(0, min(end - start, local_end - local_start))
+            if local_count <= 0:
+                continue
+            local_mask = top_mask(risk_scores[start:end], local_count)
+            mask[start:end] |= local_mask
+        return mask, {
+            "v_selection_rule": f"local_block_b{block}",
+            "v_selection_block_size": int(block),
+            "v_selection_exact_target": int(count),
+        }
+    if name.startswith("local_v_error") or name.startswith("local_value_error") or name.startswith("local_code_error"):
+        block = _v_selection_block_size(name, int(block_size))
+        mask = np.zeros((context_len,), dtype=bool)
+        for start in range(0, context_len, block):
+            end = min(context_len, start + block)
+            local_start = int(math.floor(float(count) * float(start) / max(float(context_len), 1.0)))
+            local_end = int(math.floor(float(count) * float(end) / max(float(context_len), 1.0)))
+            local_count = max(0, min(end - start, local_end - local_start))
+            if local_count <= 0:
+                continue
+            local_mask = top_mask(value_scores[start:end], local_count)
+            mask[start:end] |= local_mask
+        return mask, {
+            "v_selection_rule": f"local_v_error_b{block}",
+            "v_selection_block_size": int(block),
+            "v_selection_exact_target": int(count),
+        }
+    if name.startswith("streaming_global_risk"):
+        block = _v_selection_block_size(name, int(block_size))
+        mask, exact_reads = streaming_topk_mask_and_reads(risk_scores, count=count, block_size=block)
+        return mask, {
+            "v_selection_rule": f"streaming_global_risk_b{block}",
+            "v_selection_block_size": int(block),
+            "v_selection_exact_target": int(count),
+            "v_selection_exact_reads": int(exact_reads),
+        }
+    raise ValueError(f"unknown V selection rule: {rule}")
+
+
+def streaming_topk_mask_and_reads(
+    scores: np.ndarray,
+    *,
+    count: int,
+    block_size: int,
+) -> tuple[np.ndarray, int]:
+    return streaming_topk_masks_and_reads_for_counts(
+        scores,
+        counts=[int(count)],
+        block_size=int(block_size),
+    )[max(0, min(int(count), int(np.asarray(scores).reshape(-1).shape[0])))]
+
+
+def streaming_topk_masks_and_reads_for_counts(
+    scores: np.ndarray,
+    *,
+    counts: list[int],
+    block_size: int,
+) -> dict[int, tuple[np.ndarray, int]]:
+    """Exact-read union masks for FlashAttention-style running top-k V risk.
+
+    For a fixed V budget k, a token is read exactly if it belongs to the
+    top-k risk set at the end of its block. The exact correction is retained
+    even if a later block evicts the token from the running top-k set.
+    """
+
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    context_len = int(scores.shape[0])
+    clipped_counts = [max(0, min(int(count), context_len)) for count in counts]
+    unique_counts = sorted(set(clipped_counts))
+    results: dict[int, tuple[np.ndarray, int]] = {}
+    for count in unique_counts:
+        if count <= 0:
+            results[count] = (np.zeros((context_len,), dtype=bool), 0)
+        elif count >= context_len:
+            mask = np.ones((context_len,), dtype=bool)
+            results[count] = (mask, context_len)
+
+    active_counts = [count for count in unique_counts if 0 < count < context_len]
+    if not active_counts:
+        return results
+    block = max(1, int(block_size))
+    n_blocks = int(math.ceil(float(context_len) / float(block)))
+    token_idx = np.arange(context_len, dtype=np.int64)
+    block_ids = (token_idx // block).astype(np.int32, copy=False)
+    order = np.argsort(-scores)
+    inverse_order = np.empty((context_len,), dtype=np.int64)
+    inverse_order[order] = np.arange(context_len, dtype=np.int64)
+    ordered_blocks = block_ids[order]
+    prefix_rank_at_block = np.empty((context_len,), dtype=np.int32)
+    for block_id in range(n_blocks):
+        start = int(block_id * block)
+        end = min(context_len, start + block)
+        ranks_for_prefix = np.cumsum(ordered_blocks <= block_id, dtype=np.int32)
+        prefix_rank_at_block[start:end] = ranks_for_prefix[inverse_order[start:end]]
+    for count in active_counts:
+        mask = prefix_rank_at_block <= int(count)
+        results[count] = (mask, int(np.count_nonzero(mask)))
+    return results
+
+
+def output_from_base_and_exact_mask(
+    *,
+    base_output: np.ndarray,
+    probs: np.ndarray,
+    residual: np.ndarray,
+    exact_mask: np.ndarray,
+) -> np.ndarray:
+    out = base_output.astype(np.float64, copy=True)
+    if bool(np.any(exact_mask)):
+        out += probs[exact_mask].astype(np.float64, copy=False) @ residual[exact_mask].astype(np.float64, copy=False)
+    return out.astype(np.float32, copy=False)
+
+
+def v_selection_state_mb(
+    *,
+    rule: str,
+    exact_count: int,
+    index_bytes: int,
+    logit_bytes: int,
+    include_state: bool,
+) -> float:
+    if not bool(include_state):
+        return 0.0
+    name = str(rule).strip().lower()
+    if name.startswith("two_pass_risk"):
+        # Pass 1 keeps only a running cutoff heap of log-risk values; pass 2
+        # commits tile-locally against the scalar cutoff, so no survivor
+        # index/logit list is retained across blocks.
+        mult = _parse_fraction_suffix(name, "f", 1.0)
+        heap = int(round(float(max(0, int(exact_count))) * float(mult)))
+        return float(heap * int(logit_bytes)) / MB
+    if (
+        name.startswith("local_block")
+        or name in {"v_error_only", "global_v_error", "value_error", "code_error", "v_code_error"}
+        or name.startswith("local_v_error")
+        or name.startswith("local_value_error")
+        or name.startswith("local_code_error")
+        or name.startswith("streaming_global_risk")
+    ):
+        return 0.0
+    count = max(0, int(exact_count))
+    return float(count * (int(index_bytes) + int(logit_bytes))) / MB
+
+
+def initial_budget_indices(
+    *,
+    strategy: str,
+    context_len: int,
+    ranked_scores_cpu: np.ndarray,
+    query_dim: int,
+    k_budgets: list[int],
+    v_budgets: list[int],
+    previous_fraction: tuple[float, float] | None,
+) -> tuple[int, int]:
+    name = str(strategy).strip().lower()
+    if name in {"", "min", "zero"}:
+        return 0, 0
+    if name.startswith("fixed_f"):
+        frac = _parse_fraction_suffix(name, "f", 0.05)
+        k_target = max(float(k_budgets[0]), float(context_len) * float(frac))
+        v_target = max(float(v_budgets[0]), k_target * 0.25)
+        return _budget_index_at_least(k_budgets, k_target), _budget_index_at_least(v_budgets, v_target)
+    if name.startswith("proxy_mass_m"):
+        mass = _parse_fraction_suffix(name, "m", 0.5)
+        count = _softmax_prefix_count(
+            ranked_scores_cpu,
+            mass=min(max(float(mass), 0.0), 0.999999),
+            scale=1.0 / math.sqrt(max(1.0, float(query_dim))),
+        )
+        k_target = max(float(k_budgets[0]), float(count))
+        v_target = max(float(v_budgets[0]), k_target * 0.25)
+        return _budget_index_at_least(k_budgets, k_target), _budget_index_at_least(v_budgets, v_target)
+    if name.startswith("proxy_entropy"):
+        max_frac = _parse_fraction_suffix(name, "f", 0.25)
+        entropy = _softmax_normalized_entropy(
+            ranked_scores_cpu,
+            scale=1.0 / math.sqrt(max(1.0, float(query_dim))),
+        )
+        k_target = max(float(k_budgets[0]), float(context_len) * float(max_frac) * float(entropy))
+        v_target = max(float(v_budgets[0]), k_target * 0.25)
+        return _budget_index_at_least(k_budgets, k_target), _budget_index_at_least(v_budgets, v_target)
+    if name.startswith("temporal_prev"):
+        if previous_fraction is None:
+            return 0, 0
+        scale = 0.5 if name.endswith("_low") else 1.0
+        k_frac, v_frac = previous_fraction
+        k_target = max(float(k_budgets[0]), float(context_len) * float(k_frac) * float(scale))
+        v_target = max(float(v_budgets[0]), float(context_len) * float(v_frac) * float(scale))
+        return _budget_index_at_least(k_budgets, k_target), _budget_index_at_least(v_budgets, v_target)
+    raise ValueError(f"unknown start strategy: {strategy}")
 
 
 def run() -> None:
@@ -578,7 +1040,27 @@ def run() -> None:
     parser.add_argument("--heads", default="")
     parser.add_argument("--k_budgets", default="4096,8192,14336,32768")
     parser.add_argument("--v_budgets", default="1024,2048,4096,6144,8192,12288,16384")
+    parser.add_argument(
+        "--k_budget_fracs",
+        default="",
+        help="Optional comma-separated K budget fractions, e.g. 0.005,0.01,0.02 or 0.5%,1%,2%. Overrides --k_budgets per query.",
+    )
+    parser.add_argument(
+        "--v_budget_fracs",
+        default="",
+        help="Optional comma-separated V budget fractions. Overrides --v_budgets per query.",
+    )
     parser.add_argument("--stability_thresholds", default="0.0005,0.001,0.002")
+    parser.add_argument(
+        "--oracle_rel_l2_targets",
+        default="",
+        help="Optional offline-only head-output relL2 targets for cheapest-grid oracle budget diagnostics.",
+    )
+    parser.add_argument("--threshold_mode", choices=["fixed", "budget_delta_frac"], default="fixed")
+    parser.add_argument("--threshold_reference_frac", type=float, default=0.2)
+    parser.add_argument("--threshold_scale_shape", choices=["linear", "sqrt", "log"], default="linear")
+    parser.add_argument("--threshold_min_scale", type=float, default=0.0)
+    parser.add_argument("--threshold_max_scale", type=float, default=1.0)
     parser.add_argument(
         "--policies",
         default="k_first_priority,v_first_priority,k_first_alternating,v_first_alternating,sensitivity_greedy",
@@ -591,10 +1073,57 @@ def run() -> None:
             "promoted_p0p1_b8, residual_pq_m1b4_s4, bandcal_b8_p16."
         ),
     )
+    parser.add_argument(
+        "--start_strategies",
+        default="min",
+        help=(
+            "Comma-separated initial budget strategies before adaptive confidence: "
+            "min, fixed_f0p05, proxy_mass_m0p7, temporal_prev, temporal_prev_low."
+        ),
+    )
+    parser.add_argument(
+        "--v_selection_rules",
+        default="global_residual_risk",
+        help=(
+            "Comma-separated exact-V selection rules. Use global_residual_risk "
+            "for p^2*V-error ranking, v_error_only for query-independent V-error "
+            "ranking, local_block_b<size> for local p^2*V-error block commit, "
+            "local_v_error_b<size> for local query-independent V-error block commit, "
+            "streaming_global_risk_b<size> for block-streaming global top-risk "
+            "with immediate exact-V reads and eviction waste accounting, "
+            "or two_pass_risk[_f<mult>] for pass-1 PQ-domain risk-cutoff estimation "
+            "with tile-local pass-2 threshold commits (f scales the cutoff rank, "
+            "e.g. two_pass_risk_f1p25)."
+        ),
+    )
+    parser.add_argument("--v_local_block_size", type=int, default=1024)
+    parser.add_argument(
+        "--lookahead_diagnostic",
+        action="store_true",
+        help=(
+            "Record hardware-style confidence-lookahead accounting alongside the "
+            "canonical trajectory: per-test certification by compressed-domain "
+            "delta bounds (charge_all/cs/rms<lambda>), false-certify counts, and "
+            "wasted lookahead-band MB. Does not change policy decisions. Only "
+            "active for the global_residual_risk V rule."
+        ),
+    )
+    parser.add_argument(
+        "--lookahead_decision_variants",
+        default="",
+        help=(
+            "Comma-separated lookahead bound variants (e.g. var4) that also run "
+            "in decision mode: the bound gates escalation instead of only being "
+            "audited. Emits extra result rows with v_selection_rule suffixed "
+            "'+la_<variant>'. Requires --lookahead_diagnostic."
+        ),
+    )
+    parser.add_argument("--include_v_selection_state_in_step_mb", action="store_true")
+    parser.add_argument("--survivor_logit_bytes", type=int, default=2)
     parser.add_argument("--selector_mode", choices=["fullscan", "routed", "quest", "quest_pq"], default="fullscan")
     parser.add_argument("--quest_rank", type=int, default=16)
     parser.add_argument("--selector_index_bytes", type=int, default=4)
-    parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="affine_selected")
+    parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="none")
     parser.add_argument("--static_prefix", type=int, default=128)
     parser.add_argument("--static_suffix", type=int, default=128)
     parser.add_argument("--page_size", type=int, default=5632)
@@ -621,7 +1150,10 @@ def run() -> None:
     (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True), encoding="utf-8")
 
     trace = load_trace(args.qkv_trace)
-    q_indices = trace.q_indices_for_decodes(parse_csv_ints(args.decode_lengths))
+    if str(args.decode_lengths).strip().lower() == "all":
+        q_indices = list(range(int(trace.positions.shape[0])))
+    else:
+        q_indices = trace.q_indices_for_decodes(parse_csv_ints(args.decode_lengths))
     if int(args.max_qidx_per_decode) > 0:
         limited: list[int] = []
         counts: dict[int, int] = {}
@@ -636,11 +1168,24 @@ def run() -> None:
         raise ValueError("no query indices selected")
 
     heads = parse_csv_ints(args.heads) if str(args.heads).strip() else list(range(int(trace.num_heads)))
-    k_budgets = sorted(set(parse_csv_ints(args.k_budgets)))
-    v_budgets = sorted(set(parse_csv_ints(args.v_budgets)))
+    base_k_budgets = sorted(set(parse_csv_ints(args.k_budgets)))
+    base_v_budgets = sorted(set(parse_csv_ints(args.v_budgets)))
+    k_budget_fracs = parse_csv_ratios(args.k_budget_fracs)
+    v_budget_fracs = parse_csv_ratios(args.v_budget_fracs)
+    if bool(k_budget_fracs) != bool(v_budget_fracs):
+        raise ValueError("--k_budget_fracs and --v_budget_fracs must be provided together")
     thresholds = parse_csv_floats(args.stability_thresholds)
+    oracle_rel_l2_targets = parse_csv_floats(args.oracle_rel_l2_targets)
     policies = [part.strip() for part in str(args.policies).split(",") if part.strip()]
     score_proxy_variants = parse_csv_names(args.score_proxy_variants)
+    start_strategies = parse_csv_names(args.start_strategies)
+    v_selection_rules = parse_csv_names(args.v_selection_rules)
+    lookahead_decision_variants = parse_csv_names(args.lookahead_decision_variants)
+    for dv in lookahead_decision_variants:
+        if dv not in LOOKAHEAD_VARIANTS or dv == "charge_all":
+            raise ValueError(f"unknown lookahead decision variant: {dv}")
+    if lookahead_decision_variants and not bool(args.lookahead_diagnostic):
+        raise ValueError("--lookahead_decision_variants requires --lookahead_diagnostic")
     nprobes = parse_csv_ints(args.nprobes)
 
     x_data = np.load(args.x_trace, mmap_mode="r")
@@ -652,12 +1197,16 @@ def run() -> None:
 
     head_rows: list[dict[str, object]] = []
     layer_rows: list[dict[str, object]] = []
+    oracle_rows: list[dict[str, object]] = []
+    previous_fraction: dict[tuple[str, str, str, float, str, int], tuple[float, float]] = {}
     t0 = time.perf_counter()
 
     for qidx in q_indices:
         position = int(trace.positions[int(qidx)])
         decode_tokens = int(trace.decode_tokens_for_qidx(int(qidx)))
         context_len = int(position) + 1
+        k_budgets = budgets_from_fracs(context_len, k_budget_fracs) if k_budget_fracs else base_k_budgets
+        v_budgets = budgets_from_fracs(context_len, v_budget_fracs) if v_budget_fracs else base_v_budgets
         dynamic_start = min(max(0, int(args.static_prefix)), int(trace.input_len))
         indexed_end = max(
             min(max(0, int(args.static_prefix)), int(trace.input_len)),
@@ -665,6 +1214,7 @@ def run() -> None:
         )
         needed_kv_heads = sorted({int(trace.kv_head_for(h)) for h in heads})
         index_cache = {}
+        k_resid_norm_cache: dict[int, np.ndarray] = {}
         for kv_head in needed_kv_heads:
             keys_np = trace.keys[kv_head, :context_len].astype(np.float32, copy=False)
             index_cache[kv_head] = build_page_pq_gpu(
@@ -684,10 +1234,21 @@ def run() -> None:
                 router_max_groups=int(args.router_max_groups),
                 device=device,
             )
+            if bool(args.lookahead_diagnostic):
+                # Query-independent K-PQ reconstruction residual norms, the
+                # sidecar stat the hardware K-delta bound would store per token.
+                resid_norm = np.zeros((context_len,), dtype=np.float64)
+                for page in index_cache[kv_head].pages:
+                    start = int(page.start)
+                    size = int(page.size)
+                    khat = _page_full_reconstruct(page)
+                    diff = keys_np[start : start + size].astype(np.float64, copy=False) - khat.astype(np.float64, copy=False)
+                    resid_norm[start : start + size] = np.linalg.norm(diff, axis=1)
+                k_resid_norm_cache[kv_head] = resid_norm
 
         dense_heads: dict[int, np.ndarray] = {}
-        selected_heads: dict[tuple[str, str, float], dict[int, np.ndarray]] = defaultdict(dict)
-        head_choices: dict[tuple[str, str, float], list[dict[str, object]]] = defaultdict(list)
+        selected_heads: dict[tuple[str, str, str, float, str], dict[int, np.ndarray]] = defaultdict(dict)
+        head_choices: dict[tuple[str, str, str, float, str], list[dict[str, object]]] = defaultdict(list)
 
         for head in heads:
             kv_head = int(trace.kv_head_for(int(head)))
@@ -755,6 +1316,20 @@ def run() -> None:
                 value_bytes=int(args.value_bytes),
             )
             residual = values_np.astype(np.float32, copy=False) - vhat_all.astype(np.float32, copy=False)
+            la_x_factors: dict[str, np.ndarray] | None = None
+            la_v_norm: np.ndarray | None = None
+            la_v_resid_norm: np.ndarray | None = None
+            if bool(args.lookahead_diagnostic):
+                la_x_factors = _lookahead_x_factors(
+                    q_norm=float(np.linalg.norm(query_np.astype(np.float64, copy=False))),
+                    k_resid_norm=k_resid_norm_cache[kv_head],
+                    head_dim=int(trace.head_dim),
+                )
+                la_v_norm = np.maximum(
+                    np.linalg.norm(values_np.astype(np.float64, copy=False), axis=1),
+                    np.linalg.norm(vhat_all.astype(np.float64, copy=False), axis=1),
+                )
+                la_v_resid_norm = np.linalg.norm(residual.astype(np.float64, copy=False), axis=1)
             code_error = value_vpq_code_stat_risk(
                 index=index,
                 values_np=values_np,
@@ -786,6 +1361,12 @@ def run() -> None:
                 compressed_v_codes_mb = float(max(0, context_len - exact_count) * actual_value_subvecs * code_bytes) / MB
                 v_mb_by_idx.append(exact_v_mb + v_pq_codebook_mb + compressed_v_codes_mb + metadata_mb)
 
+            def v_path_mb_for_exact_reads(exact_reads: int) -> float:
+                reads = max(0, min(int(exact_reads), int(context_len)))
+                exact_v_mb = float(reads * int(trace.head_dim) * int(args.value_bytes)) / MB
+                compressed_v_codes_mb = float(max(0, context_len - reads) * actual_value_subvecs * code_bytes) / MB
+                return float(exact_v_mb + v_pq_codebook_mb + compressed_v_codes_mb + metadata_mb)
+
             for score_proxy_variant in score_proxy_variants:
                 variant_ranked_cpu, variant_ranked_scores_cpu, score_proxy_extra_mb, score_proxy_meta = apply_score_proxy_variant(
                     variant=str(score_proxy_variant),
@@ -800,11 +1381,12 @@ def run() -> None:
                     seed=2025 + 4093 * int(kv_head) + 31 * int(head) + int(context_len),
                 )
 
-                outputs: dict[tuple[int, int], np.ndarray] = {}
                 k_mb_by_idx: list[float] = []
                 selected_counts_by_idx: list[int] = []
+                selected_by_k: dict[int, np.ndarray] = {}
                 probs_by_k: dict[int, np.ndarray] = {}
                 scores_by_k: dict[int, np.ndarray] = {}
+                base_output_by_k: dict[int, np.ndarray] = {}
                 calibration_extra_mb_by_idx: list[float] = []
                 calibration_probe_count_by_idx: list[int] = []
                 for ki, k_budget in enumerate(k_budgets):
@@ -815,6 +1397,7 @@ def run() -> None:
                         context_len=context_len,
                     )
                     selected_counts_by_idx.append(int(selected_cpu.size))
+                    selected_by_k[ki] = selected_cpu
                     score_vec, _missing, _scale, _bias, calibration_extra_mb, calibration_probe_count = mixed_scores_for_variant(
                         variant=str(score_proxy_variant),
                         context_len=context_len,
@@ -830,75 +1413,597 @@ def run() -> None:
                     probs /= max(float(probs.sum()), 1e-20)
                     scores_by_k[ki] = score_vec.astype(np.float32, copy=False)
                     probs_by_k[ki] = probs.astype(np.float64, copy=False)
+                    base_output_by_k[ki] = (
+                        probs.astype(np.float64, copy=False) @ vhat_all.astype(np.float64, copy=False)
+                    ).astype(np.float32, copy=False)
                     exact_key_mb = float(selected_cpu.size * int(trace.head_dim) * int(args.key_bytes)) / MB
                     calibration_extra_mb_by_idx.append(float(calibration_extra_mb))
                     calibration_probe_count_by_idx.append(int(calibration_probe_count))
                     k_mb_by_idx.append(float(selector_mb) + float(score_proxy_extra_mb) + exact_key_mb + float(calibration_extra_mb))
+
+                for v_selection_rule_raw in v_selection_rules:
+                    outputs: dict[tuple[int, int], np.ndarray] = {}
+                    v_state_mb_by_idx: list[float] = []
+                    v_rule_meta_by_idx: list[dict[str, object]] = []
+                    v_rule_meta_by_pair: dict[tuple[int, int], dict[str, object]] = {}
+                    v_mb_by_pair: dict[tuple[int, int], float] = {}
+                    v_state_mb_by_pair: dict[tuple[int, int], float] = {}
+                    step_mb_by_pair: dict[tuple[int, int], float] = {}
                     for vi, v_budget in enumerate(v_budgets):
                         exact_count = max(0, min(int(v_budget), int(context_len)))
-                        exact_mask = top_mask((probs * probs) * code_error, exact_count)
-                        outputs[(ki, vi)] = output_from_exact_mask(
-                            probs=probs,
-                            vhat_all=vhat_all,
-                            residual=residual,
-                            exact_mask=exact_mask,
+                        v_state_mb_by_idx.append(
+                            v_selection_state_mb(
+                                rule=str(v_selection_rule_raw),
+                                exact_count=int(exact_count),
+                                index_bytes=int(args.selector_index_bytes),
+                                logit_bytes=int(args.survivor_logit_bytes),
+                                include_state=bool(args.include_v_selection_state_in_step_mb),
+                            )
                         )
-
-                for threshold in thresholds:
-                    for policy in policies:
-                        ki, vi, steps, final_k_delta, final_v_delta, policy_trace = simulate_policy(
-                            outputs=outputs,
-                            k_budgets=k_budgets,
-                            v_budgets=v_budgets,
-                            policy=str(policy),
-                            threshold=float(threshold),
-                            k_mb_by_idx=k_mb_by_idx,
-                            v_mb_by_idx=v_mb_by_idx,
+                        v_rule_meta_by_idx.append({})
+                    rule_name_lower = str(v_selection_rule_raw).strip().lower()
+                    two_pass_active = rule_name_lower.startswith("two_pass_risk")
+                    two_pass_cutoffs: list[float] = []
+                    two_pass_cutoff_ranks: list[int] = []
+                    log_code_error: np.ndarray | None = None
+                    if two_pass_active:
+                        # Pass 1 models the selector fullscan stream: PQ logits for
+                        # non-resident tokens plus exact logits for resident base
+                        # tokens, ranked in unnormalized log-risk space
+                        # (2*logit + log V-error). Only the per-V-budget cutoff
+                        # value survives to pass 2, so tile-local commits need no
+                        # survivor list and no stored probability row.
+                        two_pass_rank_mult = _parse_fraction_suffix(rule_name_lower, "f", 1.0)
+                        pass1_scores, _p1_missing, _p1_scale, _p1_bias = mixed_scores(
+                            context_len=context_len,
+                            selected_cpu=np.asarray(base, dtype=np.int64),
+                            ranked_cpu=variant_ranked_cpu,
+                            ranked_scores_cpu=variant_ranked_scores_cpu,
+                            exact_scores_np=scores_np,
+                            query_dim=int(trace.head_dim),
+                            calibrate=str(args.tail_score_calibration) == "affine_selected",
                         )
-                        approx = outputs[(ki, vi)]
-                        selected_heads[(str(score_proxy_variant), policy, float(threshold))][int(head)] = approx
-                        metric = _output_error_metrics(dense_head, approx)
-                        dist_metric = attention_distribution_error_metrics(
-                            scores_np,
-                            _true_probs,
-                            scores_by_k[ki],
-                            probs_by_k[ki],
-                        )
-                        total_mb = float(k_mb_by_idx[ki] + v_mb_by_idx[vi])
-                        row = {
-                            "qidx": int(qidx),
-                            "position": int(position),
-                            "decode_length": int(decode_tokens),
-                            "head": int(head),
-                            "kv_head": int(kv_head),
-                            "selector_mode": str(args.selector_mode),
-                            "quest_rank": int(args.quest_rank),
-                            "chosen_nprobe": int(chosen_nprobe),
-                            "selector_coverage": float(selector_coverage),
-                            "score_proxy_variant": str(score_proxy_variant),
-                            "score_proxy_extra_MB": float(score_proxy_extra_mb),
-                            "score_proxy_detail": str(score_proxy_meta.get("score_proxy_detail", "")),
-                            "calibration_extra_MB": float(calibration_extra_mb_by_idx[ki]),
-                            "calibration_probe_tokens": int(calibration_probe_count_by_idx[ki]),
-                            "policy": str(policy),
-                            "threshold": float(threshold),
-                            "k_budget": int(k_budgets[ki]),
-                            "v_budget": int(v_budgets[vi]),
-                            "selected_k_tokens": int(selected_counts_by_idx[ki]),
-                            "iterations": int(steps),
-                            "final_k_delta": float(final_k_delta),
-                            "final_v_delta": float(final_v_delta),
-                            "selector_plus_exact_k_MB": float(k_mb_by_idx[ki]),
-                            "v_path_MB": float(v_mb_by_idx[vi]),
-                            "step_MB_per_head": float(total_mb),
-                            "head_attention_relative_L2": float(metric["output_relative_l2"]),
-                            "head_attention_cosine": float(metric["output_cosine"]),
-                            "policy_trace": " | ".join(policy_trace),
+                        code_error_f64 = np.asarray(code_error, dtype=np.float64).reshape(-1)
+                        log_code_error = np.full((context_len,), -np.inf, dtype=np.float64)
+                        positive_err = code_error_f64 > 0.0
+                        log_code_error[positive_err] = np.log(code_error_f64[positive_err])
+                        pass1_log_risk = 2.0 * np.asarray(pass1_scores, dtype=np.float64) + log_code_error
+                        pass1_finite_sorted = np.sort(pass1_log_risk[np.isfinite(pass1_log_risk)])[::-1]
+                        for v_budget in v_budgets:
+                            exact_count = max(0, min(int(v_budget), int(context_len)))
+                            cutoff_rank = min(
+                                int(context_len),
+                                int(round(float(exact_count) * float(two_pass_rank_mult))),
+                            )
+                            if exact_count <= 0 or cutoff_rank <= 0 or pass1_finite_sorted.size == 0:
+                                two_pass_cutoffs.append(float("inf"))
+                            else:
+                                two_pass_cutoffs.append(
+                                    float(pass1_finite_sorted[min(int(cutoff_rank), int(pass1_finite_sorted.size)) - 1])
+                                )
+                            two_pass_cutoff_ranks.append(int(cutoff_rank))
+                    la_active = bool(args.lookahead_diagnostic) and rule_name_lower in {
+                        "",
+                        "global",
+                        "global_residual_risk",
+                        "residual_risk",
+                    }
+                    la_k_s0: dict[str, dict[int, float]] = {v: {} for v in ("cs", "rms1", "rms2", "rms4")}
+                    la_k_s1: dict[str, dict[int, float]] = {v: {} for v in ("cs", "rms1", "rms2", "rms4")}
+                    la_k_t0: dict[int, float] = {}
+                    la_k_t1: dict[int, float] = {}
+                    la_k_band_tokens: dict[int, int] = {}
+                    la_v_band_abs: dict[tuple[int, int], float] = {}
+                    la_v_band_sq: dict[tuple[int, int], float] = {}
+                    la_v_band_tokens: dict[tuple[int, int], int] = {}
+                    for ki in range(len(k_budgets)):
+                        probs = probs_by_k[ki]
+                        risk_scores = (probs * probs) * code_error
+                        la_masks: list[np.ndarray] = []
+                        if la_active and ki + 1 < len(k_budgets):
+                            # Tokens whose logits upgrade from PQ to exact when the
+                            # K budget escalates one step.
+                            band = np.setdiff1d(selected_by_k[ki + 1], selected_by_k[ki], assume_unique=False)
+                            la_k_band_tokens[ki] = int(band.size)
+                            if band.size:
+                                p_band = probs[band]
+                                vn_band = la_v_norm[band]
+                                for variant, x_all in la_x_factors.items():
+                                    f_band = np.expm1(np.minimum(x_all[band], 50.0))
+                                    la_k_s0[variant][ki] = float(np.sum(p_band * f_band))
+                                    la_k_s1[variant][ki] = float(np.sum(p_band * f_band * vn_band))
+                                px_band = p_band * la_x_factors["rms1"][band]
+                                la_k_t0[ki] = float(np.sum(px_band * px_band))
+                                la_k_t1[ki] = float(np.sum(px_band * px_band * vn_band * vn_band))
+                            else:
+                                for variant in la_k_s0:
+                                    la_k_s0[variant][ki] = 0.0
+                                    la_k_s1[variant][ki] = 0.0
+                                la_k_t0[ki] = 0.0
+                                la_k_t1[ki] = 0.0
+                        two_pass_true_log_risk: np.ndarray | None = None
+                        if two_pass_active:
+                            two_pass_true_log_risk = (
+                                2.0 * scores_by_k[ki].astype(np.float64, copy=False) + log_code_error
+                            )
+                        streaming_v_results: dict[int, tuple[np.ndarray, int]] | None = None
+                        streaming_v_block = _v_selection_block_size(str(v_selection_rule_raw), int(args.v_local_block_size))
+                        if str(v_selection_rule_raw).strip().lower().startswith("streaming_global_risk"):
+                            streaming_v_results = streaming_topk_masks_and_reads_for_counts(
+                                risk_scores,
+                                counts=[
+                                    max(0, min(int(v_budget), int(context_len)))
+                                    for v_budget in v_budgets
+                                ],
+                                block_size=int(streaming_v_block),
+                            )
+                        for vi, v_budget in enumerate(v_budgets):
+                            exact_count = max(0, min(int(v_budget), int(context_len)))
+                            if two_pass_active:
+                                if exact_count >= int(context_len):
+                                    exact_mask = np.ones((int(context_len),), dtype=bool)
+                                else:
+                                    exact_mask = np.isfinite(two_pass_true_log_risk) & (
+                                        two_pass_true_log_risk >= float(two_pass_cutoffs[vi])
+                                    )
+                                rule_meta = {
+                                    "v_selection_rule": str(rule_name_lower),
+                                    "v_selection_block_size": 0,
+                                    "v_selection_exact_target": int(exact_count),
+                                    "v_selection_exact_reads": int(np.count_nonzero(exact_mask)),
+                                    "v_selection_cutoff_rank": int(two_pass_cutoff_ranks[vi]),
+                                }
+                            elif streaming_v_results is None:
+                                exact_mask, rule_meta = exact_v_mask_for_rule(
+                                    rule=str(v_selection_rule_raw),
+                                    risk_scores=risk_scores,
+                                    value_scores=code_error,
+                                    exact_count=int(exact_count),
+                                    block_size=int(args.v_local_block_size),
+                                )
+                            else:
+                                exact_mask, exact_reads = streaming_v_results[int(exact_count)]
+                                rule_meta = {
+                                    "v_selection_rule": f"streaming_global_risk_b{int(streaming_v_block)}",
+                                    "v_selection_block_size": int(streaming_v_block),
+                                    "v_selection_exact_target": int(exact_count),
+                                    "v_selection_exact_reads": int(exact_reads),
+                                }
+                            if ki == 0:
+                                v_rule_meta_by_idx[vi] = rule_meta
+                            actual_exact_reads = int(rule_meta.get("v_selection_exact_reads", int(np.count_nonzero(exact_mask))))
+                            actual_v_mb = v_path_mb_for_exact_reads(actual_exact_reads)
+                            if two_pass_active:
+                                # Pass 1 re-reads per-token V-PQ error metadata to
+                                # estimate the risk cutoffs before pass 2 commits.
+                                actual_v_mb += float(metadata_mb)
+                            state_mb = float(v_state_mb_by_idx[vi])
+                            v_rule_meta_by_pair[(ki, vi)] = rule_meta
+                            v_mb_by_pair[(ki, vi)] = float(actual_v_mb)
+                            v_state_mb_by_pair[(ki, vi)] = float(state_mb)
+                            step_mb_by_pair[(ki, vi)] = float(k_mb_by_idx[ki] + actual_v_mb + state_mb)
+                            outputs[(ki, vi)] = output_from_base_and_exact_mask(
+                                base_output=base_output_by_k[ki],
+                                probs=probs,
+                                residual=residual,
+                                exact_mask=exact_mask,
+                            )
+                            if la_active:
+                                la_masks.append(np.asarray(exact_mask, dtype=bool))
+                        if la_active:
+                            for vi in range(len(v_budgets) - 1):
+                                band_mask = la_masks[vi + 1] & ~la_masks[vi]
+                                la_v_band_tokens[(ki, vi)] = int(np.count_nonzero(band_mask))
+                                pr_band = probs[band_mask] * la_v_resid_norm[band_mask]
+                                la_v_band_abs[(ki, vi)] = float(np.sum(pr_band))
+                                la_v_band_sq[(ki, vi)] = float(np.sum(pr_band * pr_band))
+                    canonical_v_rule = str(v_rule_meta_by_idx[0].get("v_selection_rule", v_selection_rule_raw))
+                    la_k_bound: dict[str, dict[tuple[int, int], float]] = {}
+                    la_v_bound: dict[str, dict[tuple[int, int], float]] = {}
+                    if la_active:
+                        out_norm = {
+                            pair: float(np.linalg.norm(out.astype(np.float64, copy=False)))
+                            for pair, out in outputs.items()
                         }
-                        row.update({f"score_proxy_meta_{k}": v for k, v in score_proxy_meta.items() if isinstance(v, (str, int, float, bool))})
-                        row.update({key: float(value) for key, value in dist_metric.items()})
-                        head_rows.append(row)
-                        head_choices[(str(score_proxy_variant), policy, float(threshold))].append(row)
+                        for variant in la_k_s0:
+                            la_k_bound[variant] = {}
+                            for ki in la_k_band_tokens:
+                                s0 = la_k_s0[variant][ki]
+                                s1 = la_k_s1[variant][ki]
+                                for vi in range(len(v_budgets)):
+                                    norm_o = out_norm[(ki, vi)]
+                                    if s0 >= 1.0:
+                                        la_k_bound[variant][(ki, vi)] = float("inf")
+                                        continue
+                                    abs_bound = (s1 + s0 * norm_o) / max(1.0 - s0, 1e-9)
+                                    la_k_bound[variant][(ki, vi)] = float(
+                                        abs_bound / max(norm_o - abs_bound, 1e-20)
+                                    )
+                        la_v_strict: dict[tuple[int, int], float] = {}
+                        for (ki, vi), abs_bound in la_v_band_abs.items():
+                            norm_o = out_norm[(ki, vi)]
+                            la_v_strict[(ki, vi)] = float(abs_bound / max(norm_o - abs_bound, 1e-20))
+                        for variant in ("cs", "rms1", "rms2", "rms4"):
+                            la_v_bound[variant] = la_v_strict
+                        for variant in ("var1", "var2", "var4"):
+                            lam = float(variant[3:])
+                            la_k_bound[variant] = {}
+                            la_v_bound[variant] = {}
+                            for ki in la_k_band_tokens:
+                                t0_root = math.sqrt(max(la_k_t0[ki], 0.0))
+                                t1_root = math.sqrt(max(la_k_t1[ki], 0.0))
+                                for vi in range(len(v_budgets)):
+                                    norm_o = out_norm[(ki, vi)]
+                                    est = lam * (t1_root + t0_root * norm_o)
+                                    la_k_bound[variant][(ki, vi)] = float(est / max(norm_o - est, 1e-20))
+                            for (ki, vi), sq_sum in la_v_band_sq.items():
+                                norm_o = out_norm[(ki, vi)]
+                                est = lam * math.sqrt(max(sq_sum, 0.0))
+                                la_v_bound[variant][(ki, vi)] = float(est / max(norm_o - est, 1e-20))
+
+                    if oracle_rel_l2_targets:
+                        for oracle_target in oracle_rel_l2_targets:
+                            oracle = find_oracle_budget(
+                                outputs=outputs,
+                                dense=dense_head,
+                                k_budgets=k_budgets,
+                                v_budgets=v_budgets,
+                                k_mb_by_idx=k_mb_by_idx,
+                                v_mb_by_idx=v_mb_by_idx,
+                                target_rel_l2=float(oracle_target),
+                                step_mb_by_idx=step_mb_by_pair,
+                            )
+                            if not oracle:
+                                continue
+                            oracle_ki = int(oracle["oracle_ki"])
+                            oracle_vi = int(oracle["oracle_vi"])
+                            oracle_mb = float(oracle["oracle_step_MB_per_head"])
+                            for start_strategy in start_strategies:
+                                if str(start_strategy).startswith("temporal_prev"):
+                                    continue
+                                start_ki, start_vi = initial_budget_indices(
+                                    strategy=str(start_strategy),
+                                    context_len=int(context_len),
+                                    ranked_scores_cpu=variant_ranked_scores_cpu,
+                                    query_dim=int(trace.head_dim),
+                                    k_budgets=k_budgets,
+                                    v_budgets=v_budgets,
+                                    previous_fraction=None,
+                                )
+                                start_mb = float(step_mb_by_pair[(start_ki, start_vi)])
+                                oracle_rows.append(
+                                    {
+                                        "qidx": int(qidx),
+                                        "position": int(position),
+                                        "decode_length": int(decode_tokens),
+                                        "head": int(head),
+                                        "kv_head": int(kv_head),
+                                        "selector_mode": str(args.selector_mode),
+                                        "score_proxy_variant": str(score_proxy_variant),
+                                        "score_proxy_detail": str(score_proxy_meta.get("score_proxy_detail", "")),
+                                        "v_selection_rule": str(canonical_v_rule),
+                                        "threshold_mode": str(args.threshold_mode),
+                                        "threshold_reference_frac": float(args.threshold_reference_frac),
+                                        "threshold_scale_shape": str(args.threshold_scale_shape),
+                                        "threshold_min_scale": float(args.threshold_min_scale),
+                                        "threshold_max_scale": float(args.threshold_max_scale),
+                                        "start_strategy": str(start_strategy),
+                                        "budget_mode": "relative" if k_budget_fracs else "absolute",
+                                        "oracle_target_rel_l2": float(oracle_target),
+                                        "start_ki": int(start_ki),
+                                        "start_vi": int(start_vi),
+                                        "start_k_budget": int(k_budgets[start_ki]),
+                                        "start_v_budget": int(v_budgets[start_vi]),
+                                        "start_selected_k_tokens": int(selected_counts_by_idx[start_ki]),
+                                        "start_step_MB_per_head": float(start_mb),
+                                        **oracle,
+                                        "oracle_selected_k_tokens": int(selected_counts_by_idx[oracle_ki]),
+                                        "start_minus_oracle_MB": float(start_mb - oracle_mb),
+                                        "start_over_oracle_MB_ratio": float(start_mb / max(oracle_mb, 1e-12)),
+                                        "start_k_over_oracle_ratio": float(
+                                            int(k_budgets[start_ki]) / max(float(oracle["oracle_k_budget"]), 1.0)
+                                        ),
+                                        "start_v_over_oracle_ratio": float(
+                                            int(v_budgets[start_vi]) / max(float(oracle["oracle_v_budget"]), 1.0)
+                                        ),
+                                        "start_covers_oracle_k": bool(int(start_ki) >= oracle_ki),
+                                        "start_covers_oracle_v": bool(int(start_vi) >= oracle_vi),
+                                        "start_covers_oracle_both": bool(int(start_ki) >= oracle_ki and int(start_vi) >= oracle_vi),
+                                    }
+                                )
+
+                    for threshold in thresholds:
+                        for policy in policies:
+                            for start_strategy in start_strategies:
+                                prev_key = (
+                                    str(score_proxy_variant),
+                                    str(canonical_v_rule),
+                                    str(policy),
+                                    float(threshold),
+                                    str(start_strategy),
+                                    int(head),
+                                )
+                                start_ki, start_vi = initial_budget_indices(
+                                    strategy=str(start_strategy),
+                                    context_len=int(context_len),
+                                    ranked_scores_cpu=variant_ranked_scores_cpu,
+                                    query_dim=int(trace.head_dim),
+                                    k_budgets=k_budgets,
+                                    v_budgets=v_budgets,
+                                    previous_fraction=previous_fraction.get(prev_key),
+                                )
+                                la_test_log: list[tuple[int, int, bool, bool, float, float, float, float]] | None = (
+                                    [] if la_active else None
+                                )
+                                ki, vi, steps, final_k_delta, final_v_delta, policy_trace = simulate_policy(
+                                    outputs=outputs,
+                                    k_budgets=k_budgets,
+                                    v_budgets=v_budgets,
+                                    policy=str(policy),
+                                    threshold=float(threshold),
+                                    k_mb_by_idx=k_mb_by_idx,
+                                    v_mb_by_idx=v_mb_by_idx,
+                                    context_len=int(context_len),
+                                    threshold_mode=str(args.threshold_mode),
+                                    threshold_reference_frac=float(args.threshold_reference_frac),
+                                    threshold_scale_shape=str(args.threshold_scale_shape),
+                                    threshold_min_scale=float(args.threshold_min_scale),
+                                    threshold_max_scale=float(args.threshold_max_scale),
+                                    start_ki=int(start_ki),
+                                    start_vi=int(start_vi),
+                                    step_mb_by_idx=step_mb_by_pair,
+                                    test_log=la_test_log,
+                                )
+                                previous_fraction[prev_key] = (
+                                    float(k_budgets[ki]) / max(float(context_len), 1.0),
+                                    float(v_budgets[vi]) / max(float(context_len), 1.0),
+                                )
+                                approx = outputs[(ki, vi)]
+                                key = (str(score_proxy_variant), str(canonical_v_rule), policy, float(threshold), str(start_strategy))
+                                selected_heads[key][int(head)] = approx
+                                metric = _output_error_metrics(dense_head, approx)
+                                dist_metric = attention_distribution_error_metrics(
+                                    scores_np,
+                                    _true_probs,
+                                    scores_by_k[ki],
+                                    probs_by_k[ki],
+                                )
+                                v_path_mb = float(v_mb_by_pair[(ki, vi)])
+                                v_state_mb = float(v_state_mb_by_pair[(ki, vi)])
+                                total_mb_no_state = float(k_mb_by_idx[ki] + v_path_mb)
+                                total_mb = float(step_mb_by_pair[(ki, vi)])
+                                v_rule_meta = v_rule_meta_by_pair[(ki, vi)]
+                                la_fields: dict[str, object] = {}
+                                if la_active and la_test_log is not None:
+                                    # Hardware-style lookahead accounting along the
+                                    # canonical trajectory: a confidence test either
+                                    # certifies via a compressed-domain bound (free)
+                                    # or pays the marginal band's exact reads; band
+                                    # reads beyond the final accepted budget are
+                                    # wasted lookahead.
+                                    la_stat_mb = float(context_len * 2) / MB
+                                    la_fields["la_stat_MB"] = la_stat_mb
+                                    head_row_bytes = float(int(trace.head_dim))
+                                    for variant in LOOKAHEAD_VARIANTS:
+                                        k_tests = k_cert = k_false = 0
+                                        v_tests = v_cert = v_false = 0
+                                        k_charged: set[int] = set()
+                                        v_charged: set[tuple[int, int]] = set()
+                                        for tki, tvi, k_can, v_can, k_delta, v_delta, k_thr, v_thr in la_test_log:
+                                            if k_can:
+                                                k_tests += 1
+                                                bound = (
+                                                    float("inf")
+                                                    if variant == "charge_all"
+                                                    else la_k_bound[variant].get((tki, tvi), float("inf"))
+                                                )
+                                                if bound <= k_thr:
+                                                    k_cert += 1
+                                                    if k_delta > k_thr:
+                                                        k_false += 1
+                                                else:
+                                                    k_charged.add(tki)
+                                            if v_can:
+                                                v_tests += 1
+                                                bound = (
+                                                    float("inf")
+                                                    if variant == "charge_all"
+                                                    else la_v_bound[variant].get((tki, tvi), float("inf"))
+                                                )
+                                                if bound <= v_thr:
+                                                    v_cert += 1
+                                                    if v_delta > v_thr:
+                                                        v_false += 1
+                                                else:
+                                                    v_charged.add((tki, tvi))
+                                        wasted_mb = 0.0
+                                        for band_ki in k_charged:
+                                            if band_ki + 1 > ki:
+                                                wasted_mb += (
+                                                    float(la_k_band_tokens.get(band_ki, 0))
+                                                    * head_row_bytes
+                                                    * float(int(args.key_bytes))
+                                                ) / MB
+                                        for band_ki, band_vi in v_charged:
+                                            if not (band_ki == ki and band_vi + 1 <= vi):
+                                                wasted_mb += (
+                                                    float(la_v_band_tokens.get((band_ki, band_vi), 0))
+                                                    * head_row_bytes
+                                                    * float(int(args.value_bytes))
+                                                ) / MB
+                                        stat_extra = 0.0 if variant == "charge_all" else la_stat_mb
+                                        la_fields[f"la_{variant}_wasted_MB"] = float(wasted_mb)
+                                        la_fields[f"la_{variant}_hw_step_MB"] = float(total_mb + wasted_mb + stat_extra)
+                                        la_fields[f"la_{variant}_k_tests"] = int(k_tests)
+                                        la_fields[f"la_{variant}_k_certified"] = int(k_cert)
+                                        la_fields[f"la_{variant}_k_false_certified"] = int(k_false)
+                                        la_fields[f"la_{variant}_v_tests"] = int(v_tests)
+                                        la_fields[f"la_{variant}_v_certified"] = int(v_cert)
+                                        la_fields[f"la_{variant}_v_false_certified"] = int(v_false)
+                                row = {
+                                    "qidx": int(qidx),
+                                    "position": int(position),
+                                    "decode_length": int(decode_tokens),
+                                    "head": int(head),
+                                    "kv_head": int(kv_head),
+                                    "selector_mode": str(args.selector_mode),
+                                    "quest_rank": int(args.quest_rank),
+                                    "chosen_nprobe": int(chosen_nprobe),
+                                    "selector_coverage": float(selector_coverage),
+                                    "score_proxy_variant": str(score_proxy_variant),
+                                    "score_proxy_extra_MB": float(score_proxy_extra_mb),
+                                    "score_proxy_detail": str(score_proxy_meta.get("score_proxy_detail", "")),
+                                    "v_selection_rule": str(canonical_v_rule),
+                                    "v_selection_block_size": int(v_rule_meta.get("v_selection_block_size", 0)),
+                                    "v_exact_reads": int(v_rule_meta.get("v_selection_exact_reads", int(v_rule_meta.get("v_selection_exact_target", v_budgets[vi])))),
+                                    "v_selection_state_MB": float(v_state_mb),
+                                    "calibration_extra_MB": float(calibration_extra_mb_by_idx[ki]),
+                                    "calibration_probe_tokens": int(calibration_probe_count_by_idx[ki]),
+                                    "policy": str(policy),
+                                    "threshold": float(threshold),
+                                    "threshold_mode": str(args.threshold_mode),
+                                    "threshold_reference_frac": float(args.threshold_reference_frac),
+                                    "threshold_scale_shape": str(args.threshold_scale_shape),
+                                    "threshold_min_scale": float(args.threshold_min_scale),
+                                    "threshold_max_scale": float(args.threshold_max_scale),
+                                    "start_strategy": str(start_strategy),
+                                    "budget_mode": "relative" if k_budget_fracs else "absolute",
+                                    "start_k_budget": int(k_budgets[start_ki]),
+                                    "start_v_budget": int(v_budgets[start_vi]),
+                                    "k_budget": int(k_budgets[ki]),
+                                    "v_budget": int(v_budgets[vi]),
+                                    "selected_k_tokens": int(selected_counts_by_idx[ki]),
+                                    "iterations": int(steps),
+                                    "final_k_delta": float(final_k_delta),
+                                    "final_v_delta": float(final_v_delta),
+                                    "selector_plus_exact_k_MB": float(k_mb_by_idx[ki]),
+                                    "v_path_MB": float(v_path_mb),
+                                    "step_MB_no_v_state_per_head": float(total_mb_no_state),
+                                    "step_MB_with_v_state_per_head": float(total_mb),
+                                    "step_MB_per_head": float(total_mb),
+                                    "head_attention_relative_L2": float(metric["output_relative_l2"]),
+                                    "head_attention_cosine": float(metric["output_cosine"]),
+                                    "policy_trace": " | ".join(policy_trace),
+                                }
+                                row.update({f"score_proxy_meta_{k}": v for k, v in score_proxy_meta.items() if isinstance(v, (str, int, float, bool))})
+                                row.update({key: float(value) for key, value in dist_metric.items()})
+                                row.update(la_fields)
+                                head_rows.append(row)
+                                head_choices[key].append(row)
+
+                                if la_active:
+                                    for dv in lookahead_decision_variants:
+                                        dv_test_log: list[tuple[int, int, bool, bool, float, float, float, float]] = []
+                                        dki, dvi, dsteps, d_k_delta, d_v_delta, d_trace = simulate_policy(
+                                            outputs=outputs,
+                                            k_budgets=k_budgets,
+                                            v_budgets=v_budgets,
+                                            policy=str(policy),
+                                            threshold=float(threshold),
+                                            k_mb_by_idx=k_mb_by_idx,
+                                            v_mb_by_idx=v_mb_by_idx,
+                                            context_len=int(context_len),
+                                            threshold_mode=str(args.threshold_mode),
+                                            threshold_reference_frac=float(args.threshold_reference_frac),
+                                            threshold_scale_shape=str(args.threshold_scale_shape),
+                                            threshold_min_scale=float(args.threshold_min_scale),
+                                            threshold_max_scale=float(args.threshold_max_scale),
+                                            start_ki=int(start_ki),
+                                            start_vi=int(start_vi),
+                                            step_mb_by_idx=step_mb_by_pair,
+                                            test_log=dv_test_log,
+                                            k_bound_by_pair=la_k_bound[dv],
+                                            v_bound_by_pair=la_v_bound[dv],
+                                        )
+                                        d_approx = outputs[(dki, dvi)]
+                                        d_rule_label = f"{canonical_v_rule}+la_{dv}"
+                                        d_key = (str(score_proxy_variant), d_rule_label, policy, float(threshold), str(start_strategy))
+                                        selected_heads[d_key][int(head)] = d_approx
+                                        d_metric = _output_error_metrics(dense_head, d_approx)
+                                        d_dist = attention_distribution_error_metrics(
+                                            scores_np, _true_probs, scores_by_k[dki], probs_by_k[dki]
+                                        )
+                                        d_k_charged: set[int] = set()
+                                        d_v_charged: set[tuple[int, int]] = set()
+                                        d_k_tests = d_k_cert = d_k_false = 0
+                                        d_v_tests = d_v_cert = d_v_false = 0
+                                        for tki, tvi, k_can, v_can, kd, vd, kthr, vthr in dv_test_log:
+                                            if k_can:
+                                                d_k_tests += 1
+                                                if la_k_bound[dv].get((tki, tvi), float("inf")) <= kthr:
+                                                    d_k_cert += 1
+                                                    if kd > kthr:
+                                                        d_k_false += 1
+                                                else:
+                                                    d_k_charged.add(tki)
+                                            if v_can:
+                                                d_v_tests += 1
+                                                if la_v_bound[dv].get((tki, tvi), float("inf")) <= vthr:
+                                                    d_v_cert += 1
+                                                    if vd > vthr:
+                                                        d_v_false += 1
+                                                else:
+                                                    d_v_charged.add((tki, tvi))
+                                        d_wasted = 0.0
+                                        for band_ki in d_k_charged:
+                                            if band_ki + 1 > dki:
+                                                d_wasted += (
+                                                    float(la_k_band_tokens.get(band_ki, 0))
+                                                    * float(int(trace.head_dim))
+                                                    * float(int(args.key_bytes))
+                                                ) / MB
+                                        for band_ki, band_vi in d_v_charged:
+                                            if not (band_ki == dki and band_vi + 1 <= dvi):
+                                                d_wasted += (
+                                                    float(la_v_band_tokens.get((band_ki, band_vi), 0))
+                                                    * float(int(trace.head_dim))
+                                                    * float(int(args.value_bytes))
+                                                ) / MB
+                                        d_stat_mb = float(context_len * 2) / MB
+                                        d_total_mb = float(step_mb_by_pair[(dki, dvi)])
+                                        d_v_rule_meta = v_rule_meta_by_pair[(dki, dvi)]
+                                        d_row = dict(row)
+                                        d_row.update(
+                                            {
+                                                "v_selection_rule": d_rule_label,
+                                                "v_selection_block_size": int(d_v_rule_meta.get("v_selection_block_size", 0)),
+                                                "v_exact_reads": int(
+                                                    d_v_rule_meta.get(
+                                                        "v_selection_exact_reads",
+                                                        int(d_v_rule_meta.get("v_selection_exact_target", v_budgets[dvi])),
+                                                    )
+                                                ),
+                                                "v_selection_state_MB": float(v_state_mb_by_pair[(dki, dvi)]),
+                                                "calibration_extra_MB": float(calibration_extra_mb_by_idx[dki]),
+                                                "calibration_probe_tokens": int(calibration_probe_count_by_idx[dki]),
+                                                "k_budget": int(k_budgets[dki]),
+                                                "v_budget": int(v_budgets[dvi]),
+                                                "selected_k_tokens": int(selected_counts_by_idx[dki]),
+                                                "iterations": int(dsteps),
+                                                "final_k_delta": float(d_k_delta),
+                                                "final_v_delta": float(d_v_delta),
+                                                "selector_plus_exact_k_MB": float(k_mb_by_idx[dki]),
+                                                "v_path_MB": float(v_mb_by_pair[(dki, dvi)]),
+                                                "step_MB_no_v_state_per_head": float(k_mb_by_idx[dki] + v_mb_by_pair[(dki, dvi)]),
+                                                "step_MB_with_v_state_per_head": float(d_total_mb),
+                                                "step_MB_per_head": float(d_total_mb),
+                                                "head_attention_relative_L2": float(d_metric["output_relative_l2"]),
+                                                "head_attention_cosine": float(d_metric["output_cosine"]),
+                                                "policy_trace": " | ".join(d_trace),
+                                                "la_decision_variant": str(dv),
+                                                "la_decision_wasted_MB": float(d_wasted),
+                                                "la_decision_hw_step_MB": float(d_total_mb + d_wasted + d_stat_mb),
+                                                "la_decision_k_tests": int(d_k_tests),
+                                                "la_decision_k_certified": int(d_k_cert),
+                                                "la_decision_k_false_certified": int(d_k_false),
+                                                "la_decision_v_tests": int(d_v_tests),
+                                                "la_decision_v_certified": int(d_v_cert),
+                                                "la_decision_v_false_certified": int(d_v_false),
+                                            }
+                                        )
+                                        d_row.update({key2: float(value) for key2, value in d_dist.items()})
+                                        head_rows.append(d_row)
+                                        head_choices[d_key].append(d_row)
 
         dense_concat = np.concatenate([dense_heads[int(head)] for head in heads], axis=0).astype(np.float32, copy=False)
         dense_proj = project_head_subset(
@@ -909,7 +2014,7 @@ def run() -> None:
             wo=wo,
             device=device,
         )
-        for (score_proxy_variant, policy, threshold), by_head in selected_heads.items():
+        for (score_proxy_variant, v_selection_rule, policy, threshold, start_strategy), by_head in selected_heads.items():
             approx_concat = np.concatenate([by_head[int(head)] for head in heads], axis=0).astype(np.float32, copy=False)
             approx_proj = project_head_subset(
                 concat_subset=approx_concat,
@@ -921,7 +2026,7 @@ def run() -> None:
             )
             concat_metric = _output_error_metrics(dense_concat, approx_concat)
             proj_metric = _output_error_metrics(dense_proj, approx_proj)
-            choices = head_choices[(score_proxy_variant, policy, threshold)]
+            choices = head_choices[(score_proxy_variant, v_selection_rule, policy, threshold, start_strategy)]
             layer_rows.append(
                 {
                     "qidx": int(qidx),
@@ -929,9 +2034,16 @@ def run() -> None:
                     "decode_length": int(decode_tokens),
                     "selector_mode": str(args.selector_mode),
                     "score_proxy_variant": str(score_proxy_variant),
+                    "v_selection_rule": str(v_selection_rule),
                     "quest_rank": int(args.quest_rank),
                     "policy": str(policy),
                     "threshold": float(threshold),
+                    "threshold_mode": str(args.threshold_mode),
+                    "threshold_reference_frac": float(args.threshold_reference_frac),
+                    "threshold_scale_shape": str(args.threshold_scale_shape),
+                    "threshold_min_scale": float(args.threshold_min_scale),
+                    "threshold_max_scale": float(args.threshold_max_scale),
+                    "start_strategy": str(start_strategy),
                     "attn_concat_relative_L2": float(concat_metric["output_relative_l2"]),
                     "attn_o_proj_relative_L2": float(proj_metric["output_relative_l2"]),
                     "attn_o_proj_cosine": float(proj_metric["output_cosine"]),
@@ -951,6 +2063,7 @@ def run() -> None:
                     "min_prob_top512_mass_recall": float(np.min([float(r["prob_top512_mass_recall"]) for r in choices])),
                     "mean_k_budget": float(np.mean([float(r["k_budget"]) for r in choices])),
                     "mean_v_budget": float(np.mean([float(r["v_budget"]) for r in choices])),
+                    "mean_v_exact_reads": float(np.mean([float(r["v_exact_reads"]) for r in choices])),
                     "mean_selected_k_tokens": float(np.mean([float(r["selected_k_tokens"]) for r in choices])),
                     "mean_selector_coverage": float(np.mean([float(r["selector_coverage"]) for r in choices])),
                     "mean_chosen_nprobe": float(np.mean([float(r["chosen_nprobe"]) for r in choices])),
@@ -958,15 +2071,23 @@ def run() -> None:
                     "mean_calibration_extra_MB": float(np.mean([float(r["calibration_extra_MB"]) for r in choices])),
                     "mean_calibration_probe_tokens": float(np.mean([float(r["calibration_probe_tokens"]) for r in choices])),
                     "mean_iterations": float(np.mean([float(r["iterations"]) for r in choices])),
+                    "mean_start_k_budget": float(np.mean([float(r["start_k_budget"]) for r in choices])),
+                    "mean_start_v_budget": float(np.mean([float(r["start_v_budget"]) for r in choices])),
+                    "mean_v_selection_state_MB": float(np.mean([float(r["v_selection_state_MB"]) for r in choices])),
+                    "mean_step_MB_no_v_state_per_head": float(np.mean([float(r["step_MB_no_v_state_per_head"]) for r in choices])),
+                    "mean_step_MB_with_v_state_per_head": float(np.mean([float(r["step_MB_with_v_state_per_head"]) for r in choices])),
                     "mean_step_MB_per_head": float(np.mean([float(r["step_MB_per_head"]) for r in choices])),
                     "max_step_MB_per_head": float(np.max([float(r["step_MB_per_head"]) for r in choices])),
                 }
             )
 
-    for filename, rows in [
+    output_tables = [
         ("per_head_joint_policy.csv", head_rows),
         ("layer_joint_policy.csv", layer_rows),
-    ]:
+    ]
+    if oracle_rows:
+        output_tables.append(("oracle_budget_diagnostic.csv", oracle_rows))
+    for filename, rows in output_tables:
         with (out_dir / filename).open("w", newline="", encoding="utf-8") as f:
             fieldnames = list(rows[0].keys())
             seen = set(fieldnames)
@@ -979,18 +2100,30 @@ def run() -> None:
             writer.writeheader()
             writer.writerows(rows)
 
-    grouped: dict[tuple[str, str, float], list[dict[str, object]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, float, str], list[dict[str, object]]] = defaultdict(list)
     for row in layer_rows:
-        grouped[(str(row["score_proxy_variant"]), str(row["policy"]), float(row["threshold"]))].append(row)
+        grouped[
+            (
+                str(row["score_proxy_variant"]),
+                str(row["v_selection_rule"]),
+                str(row["policy"]),
+                float(row["threshold"]),
+                str(row["start_strategy"]),
+            )
+        ].append(row)
     summary_rows = []
-    for (score_proxy_variant, policy, threshold), rows in sorted(grouped.items(), key=lambda item: (item[0][2], item[0][0], item[0][1])):
+    for (score_proxy_variant, v_selection_rule, policy, threshold, start_strategy), rows in sorted(
+        grouped.items(), key=lambda item: (item[0][3], item[0][0], item[0][1], item[0][2], item[0][4])
+    ):
         summary_rows.append(
             {
                 "score_proxy_variant": str(score_proxy_variant),
+                "v_selection_rule": str(v_selection_rule),
                 "selector_mode": str(rows[0].get("selector_mode", "")),
                 "quest_rank": int(rows[0].get("quest_rank", 0)),
                 "policy": str(policy),
                 "threshold": float(threshold),
+                "start_strategy": str(start_strategy),
                 "queries": int(len(rows)),
                 "attn_o_proj_relative_L2_mean": float(np.mean([float(r["attn_o_proj_relative_L2"]) for r in rows])),
                 "attn_o_proj_relative_L2_max": float(np.max([float(r["attn_o_proj_relative_L2"]) for r in rows])),
@@ -1019,12 +2152,18 @@ def run() -> None:
                 "min_prob_top512_mass_recall": float(np.min([float(r["min_prob_top512_mass_recall"]) for r in rows])),
                 "mean_k_budget": float(np.mean([float(r["mean_k_budget"]) for r in rows])),
                 "mean_v_budget": float(np.mean([float(r["mean_v_budget"]) for r in rows])),
+                "mean_v_exact_reads": float(np.mean([float(r["mean_v_exact_reads"]) for r in rows])),
                 "mean_selector_coverage": float(np.mean([float(r["mean_selector_coverage"]) for r in rows])),
                 "mean_chosen_nprobe": float(np.mean([float(r["mean_chosen_nprobe"]) for r in rows])),
                 "mean_score_proxy_extra_MB": float(np.mean([float(r["mean_score_proxy_extra_MB"]) for r in rows])),
                 "mean_calibration_extra_MB": float(np.mean([float(r["mean_calibration_extra_MB"]) for r in rows])),
                 "mean_calibration_probe_tokens": float(np.mean([float(r["mean_calibration_probe_tokens"]) for r in rows])),
                 "mean_iterations": float(np.mean([float(r["mean_iterations"]) for r in rows])),
+                "mean_start_k_budget": float(np.mean([float(r["mean_start_k_budget"]) for r in rows])),
+                "mean_start_v_budget": float(np.mean([float(r["mean_start_v_budget"]) for r in rows])),
+                "mean_v_selection_state_MB": float(np.mean([float(r["mean_v_selection_state_MB"]) for r in rows])),
+                "mean_step_MB_no_v_state_per_head": float(np.mean([float(r["mean_step_MB_no_v_state_per_head"]) for r in rows])),
+                "mean_step_MB_with_v_state_per_head": float(np.mean([float(r["mean_step_MB_with_v_state_per_head"]) for r in rows])),
                 "mean_step_MB_per_head": float(np.mean([float(r["mean_step_MB_per_head"]) for r in rows])),
                 "max_step_MB_per_head": float(np.max([float(r["max_step_MB_per_head"]) for r in rows])),
             }
@@ -1033,9 +2172,23 @@ def run() -> None:
         "elapsed_seconds": float(time.perf_counter() - t0),
         "decode_lengths": str(args.decode_lengths),
         "heads": [int(h) for h in heads],
-        "k_budgets": [int(x) for x in k_budgets],
-        "v_budgets": [int(x) for x in v_budgets],
+        "budget_mode": "relative" if k_budget_fracs else "absolute",
+        "k_budgets": [int(x) for x in base_k_budgets],
+        "v_budgets": [int(x) for x in base_v_budgets],
+        "k_budget_fracs": [float(x) for x in k_budget_fracs],
+        "v_budget_fracs": [float(x) for x in v_budget_fracs],
         "thresholds": [float(x) for x in thresholds],
+        "oracle_rel_l2_targets": [float(x) for x in oracle_rel_l2_targets],
+        "threshold_mode": str(args.threshold_mode),
+        "threshold_reference_frac": float(args.threshold_reference_frac),
+        "threshold_scale_shape": str(args.threshold_scale_shape),
+        "threshold_min_scale": float(args.threshold_min_scale),
+        "threshold_max_scale": float(args.threshold_max_scale),
+        "start_strategies": [str(x) for x in start_strategies],
+        "v_selection_rules": [str(x) for x in v_selection_rules],
+        "v_local_block_size": int(args.v_local_block_size),
+        "include_v_selection_state_in_step_mb": bool(args.include_v_selection_state_in_step_mb),
+        "survivor_logit_bytes": int(args.survivor_logit_bytes),
         "summary": summary_rows,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
