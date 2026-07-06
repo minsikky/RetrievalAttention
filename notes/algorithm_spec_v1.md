@@ -161,10 +161,13 @@ algorithm side rather than re-deriving.
 
 The algorithm side owns this file. RTL discrepancies against the golden
 model are bugs on whichever side diverges from THIS document; if the
-document is ambiguous, fix the document first. OPEN items: M4 (8-bit logit
-buffer — smoke says free, confirmation job 53003124 in flight), M5
-(histogram select — agreed on issue #4, pinned pending M4 commit).
-RESOLVED: OPEN-1 (tau=0.004 frozen); OPEN-2 (int8 dual-plane storage, Sec.
+document is ambiguous, fix the document first. OPEN items: logit-buffer
+FORMAT (fp8-e4m3 vs absmax int8, issue #6 — semantics settled either way:
+8-bit monotone quantization, 256-bin histogram select).
+RESOLVED: M4 (8-bit logit buffer FREE at full spectrum, job 53003124:
+±0.05% MB, relL2 identical; buffer is 1 B/token); M5 (256-bin histogram
+select + exact boundary-bin refine, exact fractional prefix counts, golden
+CSVs authoritative — issue #4); OPEN-1 (tau=0.004 frozen); OPEN-2 (int8 dual-plane storage, Sec.
 6 — fp16-equivalent capacity, +0.13% MB, quality identical); M2 (GQA union
 factors: K 0.35-0.44, V 0.49-0.57 across the 4-head group, rising with
 context); M3 (deesc x precision composition golden run

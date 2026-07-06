@@ -96,6 +96,9 @@ fi
 if [[ -n "${LOGIT_BUFFER_WINDOW:-}" ]]; then
   extra_args+=(--logit_buffer_window "${LOGIT_BUFFER_WINDOW}")
 fi
+if [[ -n "${LOGIT_BUFFER_FORMAT:-}" ]]; then
+  extra_args+=(--logit_buffer_format "${LOGIT_BUFFER_FORMAT}")
+fi
 if [[ -n "${KV_STORAGE_FORMAT:-}" ]]; then
   extra_args+=(--kv_storage_format "${KV_STORAGE_FORMAT}")
 fi

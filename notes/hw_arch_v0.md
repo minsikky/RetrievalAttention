@@ -98,12 +98,12 @@ page (5632 x 128 fp16), V-PQ codebook, err + int8-err sidecars. Amortized over
 |---|---|---|
 | PQ LUT | 2 KB x 4 q-heads | rebuilt per page |
 | Codebook staging | 64 KB double-buffered = 128 KB | stream from DRAM |
-| Logit buffer | 2 B x 128k = 256 KB x 4 q-heads = 1 MB | the big one; scales with ctx |
+| Logit buffer | 1 B x 128k = 128 KB x 4 q-heads = 512 KB | M4 DONE: 8-bit is free (job 53003124); e4m3 format pending #6 |
 | Rank histogram | 1 KB | 256 bins x 4B |
 | Band partials | ~6 KB x 4 q-heads | <=12 rungs x (max,sum,acc[128] fp32) |
 | Output/accum | ~2 KB x 4 q-heads | |
 | Sidecar staging | 32 KB | err values for selected tokens |
-| **Total / lane** | **~1.3 MB** | x 8 lanes ~= **10.5 MB** chip-wide |
+| **Total / lane** | **~0.8 MB** | x 8 lanes ~= **6.5 MB** chip-wide |
 
 The logit buffer dominates and is the main context-length scaling limit; a
 1 MB/lane buffer caps at 128k ctx per resident query. Options if 256k+ needed:
@@ -184,12 +184,20 @@ competitor is a *tier*, not an alternative.
   per-head bytes x union factor; ~5x system-level reduction at 128k.
 - **M3 DONE (job 52987561)**: composition holds; precision remains free on
   top of de-escalation at both thresholds.
-- **M4**: logit-buffer precision — can tail logits live at 1B in SRAM?
-  (affects the dominant SRAM buffer; one CPU trace experiment).
+- **M4 — DONE (2026-07-06, job 53003124)**: 8-bit logit buffer is FREE at
+  full spectrum — 5.4202/4.2667 MB vs fp16-buffer golden 5.4224/4.2644 at
+  tau=0.002/0.004 (±0.05%), max relL2 identical (0.00338) / better (0.00864
+  vs 0.00870). Quantization is monotone so ranking is unchanged; noise is
+  common to both rungs of every stability delta. Logit buffer = 1 B/token,
+  512 KB/lane at 128k. Format: fp8-e4m3 arm in flight (issue #6) — scale-free
+  write-during-scan; absmax int8 is the validated fallback.
 - **M5.5 (was implicit)**: M6 below folded here.
 - **M6 — DONE (2026-07-06)**: fp16-MSB-plane lo tier FAILS (relL2 0.087); int8 dual-plane storage validated at full spectrum (job 53003123: +0.13% MB, quality identical). DRAM layout in Sec. 2 is final; see algorithm_spec_v1.md Sec. 6.
-- **M5**: rank-select rung granularity for the histogram select vs the
-  budget grid (hardware wants power-of-2 bins; grid is fractional).
+- **M5 — DONE (2026-07-06, by argument + #4 agreement)**: N-bit-quantized
+  ranking ≡ 2^N-bin histogram select + exact boundary-bin refine pass; with
+  M4's 8-bit buffer this is a 256-bin counting sort with exact fractional
+  prefix counts (option 1 on issue #4). Golden CSVs stay authoritative;
+  bit-exactness vs them is the S3 signoff test. No spec change.
 - **RTL order**: S2 scan + S3 rank first (fixed-function, testable against
   trace CSVs bit-exactly), then S5 partials + controller FSM (the novel
   part), then gather engines, seal unit last (host can seal in v0).

@@ -1050,6 +1050,21 @@ def _quantize_rows_symmetric(x: np.ndarray, bits: int) -> np.ndarray:
     return (np.round(x / scale) * scale).astype(np.float32, copy=False)
 
 
+def _quantize_e4m3(x: np.ndarray) -> np.ndarray:
+    """Round fp32 values to the OCP fp8-e4m3 grid (round-nearest-even),
+    saturating to +-448. Scale-free: no per-step statistic, so hardware can
+    write the buffer during the scan (issue #6). Subnormal floor 2^-9."""
+    x32 = np.asarray(x, dtype=np.float32)
+    out = np.clip(x32, -448.0, 448.0)
+    absx = np.abs(out)
+    with np.errstate(divide="ignore"):
+        e = np.floor(np.log2(np.maximum(absx, np.float32(1e-45))))
+    e = np.clip(e, -6.0, 8.0)
+    step = np.exp2(e - 3.0)
+    q = np.round(out / step) * step
+    return np.clip(q, -448.0, 448.0).astype(np.float32, copy=False)
+
+
 def _int8_dualplane_rows(x: np.ndarray) -> np.ndarray:
     """Reconstruct rows from a two-plane int8 storage format: plane A =
     per-row absmax int8 of x, plane B = per-row absmax int8 of the residual
@@ -1411,6 +1426,30 @@ def run() -> None:
         ),
     )
     parser.add_argument(
+        "--logit_buffer_format",
+        type=str,
+        default="absmax_int",
+        choices=["absmax_int", "e4m3"],
+        help=(
+            "Quantizer for the logit buffer (with --logit_buffer_bits 8). "
+            "absmax_int = per-step symmetric absmax int (the M4 arm). "
+            "e4m3 = OCP fp8-e4m3, scale-free (no per-step statistic, so "
+            "hardware can write during the scan) and the monotone code "
+            "doubles as the 256-bin histogram index (issue #6)."
+        ),
+    )
+    parser.add_argument(
+        "--golden_dump_dir",
+        default="",
+        help=(
+            "If set, write per-(qidx, head) npz golden vectors for the S2 "
+            "scan + S3 rank RTL blocks: ranked token order, raw fp32 PQ "
+            "logits (post-scale fp16 = raw/sqrt(d)), query vector, page "
+            "state, rung budget tables, and the proxy_mass_m0p9 start rung. "
+            "Dumped after the selector, before any policy simulation."
+        ),
+    )
+    parser.add_argument(
         "--kv_storage_format",
         choices=["fp16", "int8_dualplane"],
         default="fp16",
@@ -1558,6 +1597,12 @@ def run() -> None:
     if logit_buffer_bits < 0 or logit_buffer_bits == 1 or logit_buffer_bits > 16:
         raise ValueError("--logit_buffer_bits must be 0 (off) or in [2, 16]")
     logit_buffer_window = float(args.logit_buffer_window)
+    logit_buffer_format = str(args.logit_buffer_format)
+    if logit_buffer_format == "e4m3":
+        if logit_buffer_bits != 8:
+            raise ValueError("--logit_buffer_format e4m3 is a 1 B format; requires --logit_buffer_bits 8")
+        if logit_buffer_window > 0.0:
+            raise ValueError("--logit_buffer_format e4m3 is scale-free; incompatible with --logit_buffer_window")
     kv_storage_dualplane = str(args.kv_storage_format) == "int8_dualplane"
     temporal_reuse_max_stale = int(args.temporal_reuse_max_stale)
     temporal_cache_stats = bool(args.temporal_cache_stats)
@@ -1873,7 +1918,9 @@ def run() -> None:
                     (float(x) for x in ranked_scores_cpu.tolist()), dtype=np.float32, count=len(ranked_scores_cpu)
                 )
                 if ranked_scores_cpu.size:
-                    if logit_buffer_window > 0.0:
+                    if logit_buffer_format == "e4m3":
+                        ranked_scores_cpu = _quantize_e4m3(ranked_scores_cpu)
+                    elif logit_buffer_window > 0.0:
                         # Fixed window below the step max, in post-scale logit
                         # units (tail logits divide by sqrt(d) downstream):
                         # softmax cannot resolve entries further below the max,
@@ -1894,6 +1941,43 @@ def run() -> None:
                             ranked_scores_cpu = (
                                 np.round(ranked_scores_cpu / lb_scale) * lb_scale
                             ).astype(np.float32, copy=False)
+
+            if str(args.golden_dump_dir):
+                gd = Path(str(args.golden_dump_dir))
+                gd.mkdir(parents=True, exist_ok=True)
+                g_ranked = np.fromiter((int(x) for x in ranked_cpu.tolist()), dtype=np.int64, count=len(ranked_cpu))
+                g_scores = np.fromiter(
+                    (float(x) for x in ranked_scores_cpu.tolist()), dtype=np.float32, count=len(ranked_scores_cpu)
+                )
+                g_ki, g_vi = initial_budget_indices(
+                    strategy="proxy_mass_m0p9",
+                    context_len=int(context_len),
+                    ranked_scores_cpu=g_scores,
+                    query_dim=int(trace.head_dim),
+                    k_budgets=k_budgets,
+                    v_budgets=v_budgets,
+                    previous_fraction=None,
+                )
+                np.savez_compressed(
+                    gd / f"golden_q{int(qidx)}_h{int(head)}.npz",
+                    qidx=int(qidx),
+                    head=int(head),
+                    kv_head=int(kv_head),
+                    position=int(position),
+                    context_len=int(context_len),
+                    dynamic_start=int(dynamic_start),
+                    sealed_end=int(sealed_end_geom),
+                    page_size=int(args.page_size),
+                    head_dim=int(trace.head_dim),
+                    query_fp32=query_np.astype(np.float32, copy=False),
+                    ranked_idx=g_ranked,
+                    ranked_scores_raw_fp32=g_scores,
+                    ranked_scores_postscale_fp16=(g_scores / math.sqrt(float(trace.head_dim))).astype(np.float16),
+                    k_budgets=np.asarray(k_budgets, dtype=np.int64),
+                    v_budgets=np.asarray(v_budgets, dtype=np.int64),
+                    proxy_mass_start_ki=int(g_ki),
+                    proxy_mass_start_vi=int(g_vi),
+                )
 
             page_unscanned_mask: np.ndarray | None = None
             page_centroid_logit: np.ndarray | None = None
