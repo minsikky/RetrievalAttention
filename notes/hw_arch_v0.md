@@ -136,17 +136,19 @@ Chip-level corrections to the trace numbers [derived]:
 - Adaptive floor: short contexts settle near the behavioral floor (~10% K /
   5% V), so the reduction ratio *grows* with context — the engine gets more
   valuable exactly where decode is most bandwidth-bound.
-- **K-code re-stream adder** (issue #2 follow-up, 2026-07-06): the RTL lane
-  does NOT keep per-token logits resident (SRAM); it re-streams the 4 B/tok
-  K-code stream and recomputes logits per selection sweep (per-page LUTs
-  resident; recompute bit-identical). Code reads per step = 2 + #K-escalations
-  vs the 1 the trace numbers charge. Measured on `deesc_precision_compose`:
-  mean K-escalations/step = 0.244 at tau=0.004 (0.576 at 0.002), max 2. At
-  128k that is ~132 KB/head-query per extra pass (527 KB codes / 4 q-heads):
-  **mean +5.7%, worst-case +13.8%** on the 2.857 MB/head-query operating
-  point. V-escalations and de-escalation steps do NOT re-stream (V works
-  over resident survivor logits; down-steps shrink an already-materialized
-  prefix). Detail: hw/docs/s2_s3_microarch_v1.md rev v1.1 (RTL side).
+- **Selection-sweep spill adder** (issue #2 follow-up, 2026-07-06, rev 2 —
+  bandwidth-first redesign, target ctx 1M+): the RTL lane keeps no per-token
+  logits resident. Pass 1 spills the per-token sort keys to DRAM (4 B/token
+  per kv-lane, write once = +4.6% on the trace-MB accounting); each selection
+  sweep reads the spill back (+4.6%/sweep); the stability pair (rungs k, k+1)
+  is fused into ONE multi-threshold sweep; no codebook re-streams. Adder is a
+  context-INDEPENDENT ratio. With measured K-escalations/step on
+  `deesc_precision_compose` (mean 0.244 at tau=0.004 / 0.576 at 0.002, max 2;
+  V-escalations and de-escalation steps do not sweep): **typical +9.2%
+  (write + one sweep), mean +10.3%, worst-case +18.4%** on the 2.857
+  MB/head-query operating point. Recompute-from-codes mode survives as a
+  short-ctx option when the page-LUT cache covers all pages (zero writes).
+  Detail: hw/docs/s2_s3_microarch_v1.md §6/§8 (RTL side).
 
 Energy sanity check [estimate]: at 7.5 MB/step/q-head x 32 q-heads x 32
 layers ~= 7.7 GB per generated token... this is wrong by construction — the
