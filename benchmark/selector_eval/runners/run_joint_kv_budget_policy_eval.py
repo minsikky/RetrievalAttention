@@ -1593,8 +1593,23 @@ def run() -> None:
                         if int(page.start) < cached_sealed_end:
                             continue
                         p_tokens, p_scores = pq_page_scores(query_t, page)
-                        new_tok_chunks.append(p_tokens.detach().cpu().numpy().astype(np.int64, copy=False))
-                        new_score_chunks.append(p_scores.detach().cpu().numpy().astype(np.float32, copy=False))
+                        # tensor.numpy() arrays come from torch's bundled numpy
+                        # in this venv and cannot mix with native numpy ops;
+                        # round-trip through tolist.
+                        new_tok_chunks.append(
+                            np.fromiter(
+                                (int(x) for x in p_tokens.detach().cpu().tolist()),
+                                dtype=np.int64,
+                                count=int(p_tokens.numel()),
+                            )
+                        )
+                        new_score_chunks.append(
+                            np.fromiter(
+                                (float(x) for x in p_scores.detach().cpu().tolist()),
+                                dtype=np.float32,
+                                count=int(p_scores.numel()),
+                            )
+                        )
                         selector_mb += float(
                             int(page.codebooks.numel()) * int(args.key_bytes)
                             + int(page.codes.numel()) * (1 if int(args.subbits) <= 8 else 2)
