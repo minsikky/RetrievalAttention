@@ -31,6 +31,9 @@ cd /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttentio
 
 export HF_VENV_DIR="${HF_VENV_DIR:-.venv_cu128}"
 export HF_EXTRA_PYTHONPATH="${PWD}/.hf_pydeps_cu128:${PWD}/.hf_pydeps_cu128_scipy"
+# scipy's bundled BLAS needs libgfortran from numpy.libs (same fix as the
+# noise-calibration script); without it transformers' import chain dies.
+export LD_LIBRARY_PATH="${PWD}/.venv/lib/python3.10/site-packages/numpy.libs:${PWD}/.hf_pydeps_cu128_scipy/scipy.libs:${LD_LIBRARY_PATH:-}"
 export PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-16384}"
 export FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK="${FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK:-1}"
 
