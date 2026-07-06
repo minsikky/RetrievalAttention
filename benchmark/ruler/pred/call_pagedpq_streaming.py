@@ -22,6 +22,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from benchmark.ruler.pred.utils import load_data
 from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import parse_csv_ints
+from benchmark.selector_eval.runners.hf_attn_output_noise import (
+    maybe_attn_output_noise_patch,
+)
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_api import (
     ApproxStats,
     patched_paged_pq_attention,
@@ -35,6 +38,28 @@ def log(msg: str) -> None:
 
 def env_truthy(name: str, default: str = "0") -> bool:
     return str(os.environ.get(name, default)).lower() not in {"0", "false", "no", "off", ""}
+
+
+def log_cuda_memory(label: str, device: torch.device, *, reset_peak: bool = False) -> None:
+    if not env_truthy("SELECTOR_PQ_JOINT_MEMORY_TRACE", "0"):
+        return
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    if reset_peak:
+        torch.cuda.reset_peak_memory_stats(device)
+    allocated = float(torch.cuda.memory_allocated(device)) / (1024.0 * 1024.0)
+    reserved = float(torch.cuda.memory_reserved(device)) / (1024.0 * 1024.0)
+    peak = float(torch.cuda.max_memory_allocated(device)) / (1024.0 * 1024.0)
+    peak_reserved = float(torch.cuda.max_memory_reserved(device)) / (1024.0 * 1024.0)
+    free, total = torch.cuda.mem_get_info(device)
+    print(
+        f"[pagedpq-memory] {label}: allocated={allocated:.1f}MiB "
+        f"reserved={reserved:.1f}MiB peak={peak:.1f}MiB "
+        f"peak_reserved={peak_reserved:.1f}MiB "
+        f"free={float(free) / (1024.0 * 1024.0):.1f}MiB "
+        f"total={float(total) / (1024.0 * 1024.0):.1f}MiB",
+        flush=True,
+    )
 
 
 def joint_cuda_flags_config() -> dict[str, bool | int]:
@@ -92,11 +117,23 @@ def joint_cuda_flags_config() -> dict[str, bool | int]:
         "selector_pq_joint_score_grid_no_exact_fill": env_truthy("SELECTOR_PQ_JOINT_SCORE_GRID_NO_EXACT_FILL", "0"),
         "selector_pq_joint_score_grid_workspace": env_truthy("SELECTOR_PQ_JOINT_SCORE_GRID_WORKSPACE", "0"),
         "selector_pq_joint_grouped_score_workspace": env_truthy("SELECTOR_PQ_JOINT_GROUPED_SCORE_WORKSPACE", "0"),
+        "selector_pq_joint_nocalib_scatter_score_grid": env_truthy(
+            "SELECTOR_PQ_JOINT_NOCALIB_SCATTER_SCORE_GRID",
+            "0",
+        ),
         "selector_pq_joint_rankpos_score_grid": env_truthy("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID", "0"),
         "selector_pq_joint_grouped_vpq_cache": env_truthy("SELECTOR_PQ_JOINT_GROUPED_VPQ_CACHE", "0"),
         "selector_pq_joint_score_direct_vprefix": env_truthy("SELECTOR_PQ_JOINT_SCORE_DIRECT_VPREFIX", "0"),
         "selector_pq_joint_score_direct_interval_policy": env_truthy(
             "SELECTOR_PQ_JOINT_SCORE_DIRECT_INTERVAL_POLICY",
+            "0",
+        ),
+        "selector_pq_joint_score_prob_interval_policy": env_truthy(
+            "SELECTOR_PQ_JOINT_SCORE_PROB_INTERVAL_POLICY",
+            "0",
+        ),
+        "selector_pq_joint_score_direct_topk_interval_policy": env_truthy(
+            "SELECTOR_PQ_JOINT_SCORE_DIRECT_TOPK_INTERVAL_POLICY",
             "0",
         ),
         "selector_pq_joint_score_direct_workspace": env_truthy("SELECTOR_PQ_JOINT_SCORE_DIRECT_WORKSPACE", "0"),
@@ -106,15 +143,24 @@ def joint_cuda_flags_config() -> dict[str, bool | int]:
         "selector_pq_joint_risk_prefix_topk": env_truthy("SELECTOR_PQ_JOINT_RISK_PREFIX_TOPK", "0"),
         "selector_pq_joint_risk_prefix_workspace": env_truthy("SELECTOR_PQ_JOINT_RISK_PREFIX_WORKSPACE", "0"),
         "selector_pq_joint_fast_token_layout": env_truthy("SELECTOR_PQ_JOINT_FAST_TOKEN_LAYOUT", "0"),
+        "selector_pq_joint_compact_vpq_risk_prefix": env_truthy(
+            "SELECTOR_PQ_JOINT_COMPACT_VPQ_RISK_PREFIX",
+            "0",
+        ),
         "selector_pq_joint_native_vpq_base": env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE", "0"),
         "selector_pq_joint_native_vpq_append": env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_APPEND", "0"),
         "selector_pq_joint_native_vpq_sidecar": env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_SIDECAR", "0"),
         "selector_pq_joint_native_softmax_base": env_truthy("SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE", "0"),
+        "selector_pq_joint_grouped_softmax_base": env_truthy("SELECTOR_PQ_JOINT_GROUPED_SOFTMAX_BASE", "0"),
         "selector_pq_joint_native_pq_scale_in_kernel": env_truthy(
             "SELECTOR_PQ_JOINT_NATIVE_PQ_SCALE_IN_KERNEL",
             "0",
         ),
         "selector_pq_joint_native_accounting": env_truthy("SELECTOR_PQ_JOINT_NATIVE_ACCOUNTING", "0"),
+        "selector_pq_joint_fused_policy_accounting": env_truthy(
+            "SELECTOR_PQ_JOINT_FUSED_POLICY_ACCOUNTING",
+            "0",
+        ),
         "selector_pq_joint_native_accounting_verify": env_truthy(
             "SELECTOR_PQ_JOINT_NATIVE_ACCOUNTING_VERIFY",
             "0",
@@ -217,6 +263,13 @@ def stats_payload(stats: dict[int, ApproxStats]) -> dict[str, dict[str, float | 
             "native_joint_layout_seconds": float(getattr(s, "native_joint_layout_seconds", 0.0)),
             "native_joint_group_pack_seconds": float(getattr(s, "native_joint_group_pack_seconds", 0.0)),
             "native_joint_accounting_seconds": float(getattr(s, "native_joint_accounting_seconds", 0.0)),
+            "joint_staged_kv_groups": int(getattr(s, "joint_staged_kv_groups", 0)),
+            "joint_staged_kv_accepted_groups": int(getattr(s, "joint_staged_kv_accepted_groups", 0)),
+            "joint_staged_kv_boundary_groups": int(getattr(s, "joint_staged_kv_boundary_groups", 0)),
+            "joint_staged_kv_accept_fraction": float(
+                int(getattr(s, "joint_staged_kv_accepted_groups", 0))
+                / max(1, int(getattr(s, "joint_staged_kv_groups", 0)))
+            ),
             "wall_patched_attention_seconds": float(getattr(s, "wall_patched_attention_seconds", 0.0)),
             "wall_qkv_cache_seconds": float(getattr(s, "wall_qkv_cache_seconds", 0.0)),
             "wall_index_sidecar_seconds": float(getattr(s, "wall_index_sidecar_seconds", 0.0)),
@@ -346,6 +399,17 @@ def aggregate_stats(stats: dict[int, ApproxStats]) -> dict[str, float | int]:
         "native_joint_accounting_seconds_total": float(
             sum(float(getattr(s, "native_joint_accounting_seconds", 0.0)) for s in layers)
         ),
+        "joint_staged_kv_groups_total": int(sum(int(getattr(s, "joint_staged_kv_groups", 0)) for s in layers)),
+        "joint_staged_kv_accepted_groups_total": int(
+            sum(int(getattr(s, "joint_staged_kv_accepted_groups", 0)) for s in layers)
+        ),
+        "joint_staged_kv_boundary_groups_total": int(
+            sum(int(getattr(s, "joint_staged_kv_boundary_groups", 0)) for s in layers)
+        ),
+        "joint_staged_kv_accept_fraction": float(
+            sum(int(getattr(s, "joint_staged_kv_accepted_groups", 0)) for s in layers)
+            / max(1, sum(int(getattr(s, "joint_staged_kv_groups", 0)) for s in layers))
+        ),
         "wall_patched_attention_seconds_total": float(
             sum(float(getattr(s, "wall_patched_attention_seconds", 0.0)) for s in layers)
         ),
@@ -416,10 +480,21 @@ def sync_cuda_if_needed(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def set_pagedpq_prefill_sidecar_warm_deferred(model: LlamaForCausalLM, enabled: bool) -> None:
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if layers is None:
+        return
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        if attn is not None:
+            setattr(attn, "_pagedpq_defer_prefill_sidecar_warm", bool(enabled))
+
+
 def warm_pagedpq_decode_sidecars(model: LlamaForCausalLM, past_key_values, device: torch.device) -> None:
     """Build paged-PQ decode sidecars after dense prefill, before decode timing."""
     if past_key_values is None:
         return
+    log_cuda_memory("sidecar_warm.start", device)
     layers = getattr(getattr(model, "model", None), "layers", None)
     if layers is None:
         return
@@ -429,6 +504,70 @@ def warm_pagedpq_decode_sidecars(model: LlamaForCausalLM, past_key_values, devic
         if callable(warm):
             warm(past_key_values)
     sync_cuda_if_needed(device)
+    log_cuda_memory("sidecar_warm.done", device)
+
+
+def maybe_empty_cache_after_prefill(device: torch.device) -> None:
+    if not env_truthy("FRONTIER_EMPTY_CACHE_AFTER_PREFILL", "0"):
+        return
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    torch.cuda.empty_cache()
+    log_cuda_memory("prefill.empty_cache.done", device)
+
+
+def maybe_empty_cache_after_prefill_chunk(device: torch.device, label: str) -> None:
+    if not env_truthy("FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK", "0"):
+        return
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    torch.cuda.empty_cache()
+    log_cuda_memory(label, device)
+
+
+def prefill_batched(
+    model: LlamaForCausalLM,
+    input_ids: torch.Tensor,
+    *,
+    device: torch.device,
+    prefill_chunk_size: int,
+):
+    prompt_len = int(input_ids.shape[1])
+    chunk_size = int(prefill_chunk_size)
+    if chunk_size <= 0 or chunk_size >= prompt_len:
+        log_cuda_memory("prefill.oneshot.start", device, reset_peak=True)
+        out = model_forward_last_logits(model, input_ids.to(device), use_cache=True)
+        sync_cuda_if_needed(device)
+        log_cuda_memory("prefill.oneshot.forward_done", device)
+        return out
+
+    log_cuda_memory(f"prefill.chunked.start.chunk{chunk_size}", device, reset_peak=True)
+    out = None
+    past_key_values = None
+    set_pagedpq_prefill_sidecar_warm_deferred(model, True)
+    try:
+        for start in range(0, prompt_len, chunk_size):
+            stop = min(prompt_len, start + chunk_size)
+            chunk = input_ids[:, start:stop].to(device)
+            out = model_forward_last_logits(
+                model,
+                chunk,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = out.past_key_values
+            sync_cuda_if_needed(device)
+            log_cuda_memory(f"prefill.chunk.{start}_{stop}.done", device)
+            maybe_empty_cache_after_prefill_chunk(
+                device,
+                f"prefill.chunk.{start}_{stop}.empty_cache.done",
+            )
+    finally:
+        set_pagedpq_prefill_sidecar_warm_deferred(model, False)
+    if out is None:
+        raise RuntimeError("empty prompt")
+    log_cuda_memory("prefill.chunked.forward_done", device)
+    return out
 
 
 @torch.inference_mode()
@@ -439,20 +578,28 @@ def generate_batched(
     max_new_tokens: int,
     *,
     device: torch.device,
+    prefill_chunk_size: int | None = None,
 ) -> tuple[list[int], dict[str, float | int]]:
     if input_ids.ndim != 2 or int(input_ids.shape[0]) != 1:
         raise ValueError("batched runner currently expects batch size 1")
     prompt_len = int(input_ids.shape[1])
+    prefill_chunk_size_i = (
+        int(os.environ.get("PREFILL_CHUNK_SIZE", "0") or "0")
+        if prefill_chunk_size is None
+        else int(prefill_chunk_size)
+    )
     sync_cuda_if_needed(device)
     prompt_start = time.perf_counter()
-    out = model_forward_last_logits(model, input_ids.to(device), use_cache=True)
+    out = prefill_batched(model, input_ids, device=device, prefill_chunk_size=prefill_chunk_size_i)
     sync_cuda_if_needed(device)
     past_key_values = out.past_key_values
     warm_pagedpq_decode_sidecars(model, past_key_values, device)
+    maybe_empty_cache_after_prefill(device)
     next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
     prompt_seconds = time.perf_counter() - prompt_start
 
     generated: list[int] = []
+    log_cuda_memory("decode.start", device, reset_peak=True)
     sync_cuda_if_needed(device)
     decode_start = time.perf_counter()
     for _ in range(int(max_new_tokens)):
@@ -463,6 +610,7 @@ def generate_batched(
         next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
     sync_cuda_if_needed(device)
     decode_seconds = time.perf_counter() - decode_start
+    log_cuda_memory("decode.done", device)
     return generated, {
         "prompt_tokens": int(prompt_len),
         "generated_tokens": int(len(generated)),
@@ -482,6 +630,7 @@ def generate_streaming(
     max_new_tokens: int,
     *,
     device: torch.device,
+    prefill_chunk_size: int | None = None,
 ) -> tuple[list[int], dict[str, float | int]]:
     if input_ids.ndim != 2 or int(input_ids.shape[0]) != 1:
         raise ValueError("streaming runner currently expects batch size 1")
@@ -581,7 +730,7 @@ def run() -> None:
         ],
         default="joint_kv_stability",
     )
-    parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="affine_selected")
+    parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="none")
     parser.add_argument("--tail_probe_rel_l2_max", type=float, default=float("inf"))
     parser.add_argument("--tail_proxy_mass_min", type=float, default=0.0)
     parser.add_argument("--tail_proxy_mass_max", type=float, default=1.0)
@@ -620,7 +769,15 @@ def run() -> None:
     )
     parser.add_argument("--joint_kv_k_budgets", default="4096,8192,14336,32768")
     parser.add_argument("--joint_kv_v_budgets", default="1024,2048,4096,6144,8192,12288,16384")
-    parser.add_argument("--joint_kv_stability_threshold", type=float, default=0.001)
+    parser.add_argument("--joint_kv_k_budget_fracs", default="0.10,0.30,0.50,0.70,0.90,1.0")
+    parser.add_argument("--joint_kv_v_budget_fracs", default="0.05,0.10,0.20,0.40,0.60,0.80,1.0")
+    parser.add_argument("--joint_kv_stability_threshold", type=float, default=0.002)
+    parser.add_argument("--joint_kv_threshold_mode", choices=["fixed", "budget_delta_frac"], default="budget_delta_frac")
+    parser.add_argument("--joint_kv_threshold_reference_frac", type=float, default=0.2)
+    parser.add_argument("--joint_kv_threshold_scale_shape", choices=["linear", "sqrt", "log"], default="sqrt")
+    parser.add_argument("--joint_kv_threshold_min_scale", type=float, default=0.0)
+    parser.add_argument("--joint_kv_threshold_max_scale", type=float, default=1.5)
+    parser.add_argument("--joint_kv_start_strategy", default="proxy_mass_m0p9")
     parser.add_argument("--tail_blend", type=float, default=1.0)
     parser.add_argument("--prefill_tail_blend", type=float, default=None)
     parser.add_argument("--decode_tail_blend", type=float, default=None)
@@ -740,6 +897,7 @@ def run() -> None:
         model = model.to(device)
     model.eval()
     model_load_seconds = time.perf_counter() - model_load_start
+    log_cuda_memory("model.load.done", device, reset_peak=True)
 
     if str(args.layers) == "all":
         layer_ids = list(range(len(model.model.layers)))
@@ -749,20 +907,18 @@ def run() -> None:
     results = []
     start_all = time.perf_counter()
 
-    context = (
-        patched_paged_pq_attention(model, layer_ids, args, approx_stats)
-        if str(args.mode) in {"pagedpq_stream", "pagedpq_batched"}
-        else None
-    )
-    if context is None:
-        class NullContext:
-            def __enter__(self):
-                return None
-            def __exit__(self, exc_type, exc, tb):
-                return False
-        context = NullContext()
+    attn_noise_counters = None
+    attn_noise_config = None
+    if str(args.mode) in {"pagedpq_stream", "pagedpq_batched"}:
+        context = patched_paged_pq_attention(model, layer_ids, args, approx_stats)
+    else:
+        context, attn_noise_config = maybe_attn_output_noise_patch(model)
+        if attn_noise_config is not None:
+            log(f"attn_output_noise active: {attn_noise_config}")
 
-    with context:
+    with context as context_value:
+        if attn_noise_config is not None:
+            attn_noise_counters = context_value
         with out_path.open("w", encoding="utf-8", buffering=1) as fout:
             for sample in tqdm(rows, desc=f"{args.mode}:{args.task}"):
                 if str(args.mode) in {"pagedpq_stream", "pagedpq_batched"}:
@@ -775,6 +931,7 @@ def run() -> None:
                     input_ids=input_ids,
                     max_new_tokens=max_new_tokens,
                     device=device,
+                    prefill_chunk_size=int(args.prefill_chunk_size),
                 )
                 pred = tokenizer.decode(generated, skip_special_tokens=True)
                 item = {
@@ -799,6 +956,11 @@ def run() -> None:
     summary = {
         "mode": str(args.mode),
         "approx_prefill": bool(args.approx_prefill),
+        "attn_output_noise": (
+            {**attn_noise_config, **(attn_noise_counters or {})}
+            if attn_noise_config is not None
+            else None
+        ),
         "task": str(args.task),
         "samples": int(len(results)),
         "layers": layer_ids,
@@ -841,7 +1003,15 @@ def run() -> None:
             "joint_kv_policy": str(getattr(args, "joint_kv_policy", "")),
             "joint_kv_k_budgets": str(getattr(args, "joint_kv_k_budgets", "")),
             "joint_kv_v_budgets": str(getattr(args, "joint_kv_v_budgets", "")),
+            "joint_kv_k_budget_fracs": str(getattr(args, "joint_kv_k_budget_fracs", "")),
+            "joint_kv_v_budget_fracs": str(getattr(args, "joint_kv_v_budget_fracs", "")),
             "joint_kv_stability_threshold": float(getattr(args, "joint_kv_stability_threshold", 0.0)),
+            "joint_kv_threshold_mode": str(getattr(args, "joint_kv_threshold_mode", "")),
+            "joint_kv_threshold_reference_frac": float(getattr(args, "joint_kv_threshold_reference_frac", 0.0)),
+            "joint_kv_threshold_scale_shape": str(getattr(args, "joint_kv_threshold_scale_shape", "")),
+            "joint_kv_threshold_min_scale": float(getattr(args, "joint_kv_threshold_min_scale", 0.0)),
+            "joint_kv_threshold_max_scale": float(getattr(args, "joint_kv_threshold_max_scale", 0.0)),
+            "joint_kv_start_strategy": str(getattr(args, "joint_kv_start_strategy", "")),
             "tail_blend": float(args.tail_blend),
             "selected_value_mode": str(args.selected_value_mode),
             "selected_value_exact_rule": str(args.selected_value_exact_rule),
@@ -853,6 +1023,13 @@ def run() -> None:
             "selector_mode": str(args.selector_mode),
             "selector_backend": str(args.selector_backend),
             "page_size": int(args.page_size),
+            "subvecs": int(args.subvecs),
+            "subbits": int(args.subbits),
+            "value_subvecs": int(args.value_subvecs),
+            "value_subbits": int(args.value_subbits),
+            "value_pq_group_pages": int(args.value_pq_group_pages),
+            "kmeans_iters": int(args.kmeans_iters),
+            "nprobes": str(args.nprobes),
             "prefill_chunk_size": int(args.prefill_chunk_size),
             "prefill_selector_backend": str(args.prefill_selector_backend),
             "prefill_selector_tile_size": int(args.prefill_selector_tile_size),

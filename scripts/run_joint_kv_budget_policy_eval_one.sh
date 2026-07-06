@@ -54,6 +54,30 @@ fi
 if [[ -n "${LOOKAHEAD_DECISION_VARIANTS:-}" ]]; then
   extra_args+=(--lookahead_decision_variants "${LOOKAHEAD_DECISION_VARIANTS}")
 fi
+if [[ "${TEMPORAL_CACHE_STATS:-0}" == "1" ]]; then
+  extra_args+=(--temporal_cache_stats)
+fi
+if [[ -n "${TEMPORAL_REUSE_MAX_STALE:-}" ]]; then
+  extra_args+=(--temporal_reuse_max_stale "${TEMPORAL_REUSE_MAX_STALE}")
+fi
+if [[ -n "${TEMPORAL_REUSE_MODE:-}" ]]; then
+  extra_args+=(--temporal_reuse_mode "${TEMPORAL_REUSE_MODE}")
+fi
+if [[ -n "${PRECISION_K_HI_FRAC:-}" ]]; then
+  extra_args+=(--precision_k_hi_frac "${PRECISION_K_HI_FRAC}")
+fi
+if [[ -n "${PRECISION_V_HI_FRAC:-}" ]]; then
+  extra_args+=(--precision_v_hi_frac "${PRECISION_V_HI_FRAC}")
+fi
+if [[ -n "${PRECISION_LO_BITS:-}" ]]; then
+  extra_args+=(--precision_lo_bits "${PRECISION_LO_BITS}")
+fi
+if [[ -n "${PAGE_SCAN_FRAC:-}" ]]; then
+  extra_args+=(--page_scan_frac "${PAGE_SCAN_FRAC}")
+fi
+if [[ "${GLOBAL_PQ_CODEBOOK:-0}" == "1" ]]; then
+  extra_args+=(--global_pq_codebook)
+fi
 
 .venv/bin/python benchmark/selector_eval/runners/run_joint_kv_budget_policy_eval.py \
   --qkv_trace "${QKV_TRACE:-attention_efficiency_result/real_qkv_llama31_l16_6838_g131072_q288_window32_graphall_s16.npz}" \

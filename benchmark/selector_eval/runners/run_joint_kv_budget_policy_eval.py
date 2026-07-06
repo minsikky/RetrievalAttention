@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import json
 import math
 import re
@@ -20,7 +21,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from benchmark.selector_eval.data.trace import attention_probs, load_trace, static_tokens, unique_tokens
-from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import build_page_pq_gpu, parse_csv_ints, rank_paged_pq
+from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import (
+    build_page_pq_gpu,
+    parse_csv_ints,
+    pq_page_scores,
+    rank_paged_pq,
+)
 from benchmark.selector_eval.metrics.attention import _output_error_metrics, attention_distribution_error_metrics
 from benchmark.selector_eval.runners.run_value_exact_strategy_eval import (
     dense_attention_output,
@@ -947,6 +953,95 @@ def output_from_base_and_exact_mask(
     return out.astype(np.float32, copy=False)
 
 
+def _apply_global_pq_codebook(
+    index,
+    keys_np: np.ndarray,
+    *,
+    dynamic_start: int,
+    subvecs: int,
+    subbits: int,
+    kmeans_iters: int,
+    seed: int,
+    sample_rows: int = 16384,
+) -> None:
+    """Replace per-page PQ codebooks with one shared codebook.
+
+    Models a chip keeping a single SRAM-resident codebook: the scan then reads
+    only per-token codes (4B/token) instead of re-reading 64KB of codebooks
+    per page. Codes are re-assigned by nearest-centroid against the shared
+    codebook; ranking fidelity loss is what the experiment measures.
+    """
+    if not index.pages:
+        return
+    from benchmark.attention_efficiency_threeway_eval import build_pq_index
+
+    sealed_end = max(int(p.start) + int(p.size) for p in index.pages)
+    block = keys_np[int(dynamic_start):sealed_end].astype(np.float32, copy=False)
+    rng = np.random.default_rng(int(seed))
+    if block.shape[0] > int(sample_rows):
+        sample = block[rng.choice(block.shape[0], size=int(sample_rows), replace=False)]
+    else:
+        sample = block
+    codebooks_np, _codes, _sv, _c = build_pq_index(
+        sample, 0, sample.shape[0], subvecs=int(subvecs), subbits=int(subbits), seed=int(seed), max_iter=int(kmeans_iters)
+    )
+    device = index.pages[0].codebooks.device
+    shared = torch.as_tensor(np.ascontiguousarray(codebooks_np), dtype=torch.float32, device=device)
+    subdim = codebooks_np.shape[-1]
+    c_sq = np.sum(codebooks_np.astype(np.float64) ** 2, axis=2)
+    for page in index.pages:
+        pb = keys_np[int(page.start): int(page.start) + int(page.size)].astype(np.float64, copy=False)
+        codes = np.zeros((pb.shape[0], int(subvecs)), dtype=np.uint16)
+        for sub in range(int(subvecs)):
+            part = pb[:, sub * subdim: (sub + 1) * subdim]
+            dists = -2.0 * (part @ codebooks_np[sub].astype(np.float64).T) + c_sq[sub][None, :]
+            codes[:, sub] = np.argmin(dists, axis=1).astype(np.uint16)
+        page.codebooks = shared
+        page.codes = torch.as_tensor(codes.astype(np.int64), dtype=torch.long, device=device)
+    index.native_codebooks = None
+    index.native_codes = None
+    index.native_page_starts = None
+
+
+def _quantize_rows_symmetric(x: np.ndarray, bits: int) -> np.ndarray:
+    """Per-row symmetric absmax quantization: MSB-plane read proxy."""
+    levels = float((1 << (max(2, int(bits)) - 1)) - 1)
+    scale = np.max(np.abs(x), axis=1, keepdims=True) / levels
+    scale = np.maximum(scale, 1e-12)
+    return (np.round(x / scale) * scale).astype(np.float32, copy=False)
+
+
+def _precision_lo_tokens(
+    base: list[int],
+    ranked_cpu: np.ndarray,
+    budget: int,
+    context_len: int,
+    hi_frac: float,
+) -> np.ndarray:
+    """Ranked-prefix tokens beyond the hi-precision fraction (base excluded)."""
+    base_set = set(int(tok) for tok in base)
+    add = [int(tok) for tok in ranked_cpu.tolist() if int(tok) < int(context_len) and int(tok) not in base_set][: int(budget)]
+    hi_count = int(math.ceil(len(add) * float(hi_frac)))
+    return np.asarray(add[hi_count:], dtype=np.int64)
+
+
+def output_from_base_and_split_masks(
+    *,
+    base_output: np.ndarray,
+    probs: np.ndarray,
+    residual: np.ndarray,
+    residual_lo: np.ndarray,
+    hi_mask: np.ndarray,
+    lo_mask: np.ndarray,
+) -> np.ndarray:
+    out = base_output.astype(np.float64, copy=True)
+    if bool(np.any(hi_mask)):
+        out += probs[hi_mask].astype(np.float64, copy=False) @ residual[hi_mask].astype(np.float64, copy=False)
+    if bool(np.any(lo_mask)):
+        out += probs[lo_mask].astype(np.float64, copy=False) @ residual_lo[lo_mask].astype(np.float64, copy=False)
+    return out.astype(np.float32, copy=False)
+
+
 def v_selection_state_mb(
     *,
     rule: str,
@@ -1118,6 +1213,109 @@ def run() -> None:
             "'+la_<variant>'. Requires --lookahead_diagnostic."
         ),
     )
+    parser.add_argument(
+        "--temporal_reuse_max_stale",
+        type=int,
+        default=0,
+        help=(
+            "Frozen-selection temporal reuse: while the current position is at "
+            "most this many tokens past the last full selector rescan for a "
+            "head, reuse that rescan's ranked list, PQ logits, and page index "
+            "unchanged. Newly appended tokens stay resident (exact) in an "
+            "extended base until the next rescan. Reuse steps charge a stale "
+            "logit-row reread (2B/token) plus a ranked-index reread "
+            "(4B/candidate) instead of the PQ fullscan. 0 disables (canonical "
+            "rescan every step)."
+        ),
+    )
+    parser.add_argument(
+        "--temporal_reuse_mode",
+        choices=["frozen", "incremental"],
+        default="frozen",
+        help=(
+            "frozen: reuse the last rescan's page index unchanged; tokens "
+            "appended since stay resident (costs extra exact-K on page-seal "
+            "boundary crossings). incremental: keep the current page index, "
+            "PQ-score only pages sealed since the last rescan with the "
+            "current query, and merge them into the stale ranking - no "
+            "resident growth beyond canonical pending."
+        ),
+    )
+    parser.add_argument(
+        "--temporal_cache_stats",
+        action="store_true",
+        help=(
+            "Record accepted-set overlap between consecutive same-head queries "
+            "(whatever their position gap in the trace): new-token counts for "
+            "the accepted exact-K and exact-V sets. Measures the hit rate a "
+            "token-keyed on-chip K/V row cache would see; does not change "
+            "behavior."
+        ),
+    )
+    parser.add_argument(
+        "--precision_k_hi_frac",
+        type=float,
+        default=1.0,
+        help=(
+            "Progressive-precision exact-K reads: this fraction of the ranked "
+            "selection prefix (by PQ-score rank; base/resident tokens always "
+            "full precision) is read at full key_bytes, the rest at the "
+            "precision_lo_bits MSB plane. 1.0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--precision_v_hi_frac",
+        type=float,
+        default=1.0,
+        help=(
+            "Progressive-precision exact-V reads: this fraction of the exact-V "
+            "set (by residual-risk rank) is read at full value_bytes, the rest "
+            "at the precision_lo_bits MSB plane. 1.0 disables."
+        ),
+    )
+    parser.add_argument("--precision_lo_bits", type=int, default=8)
+    parser.add_argument("--global_pq_subbits", type=int, default=0, help="Bits for the shared codebook (0 = same as --subbits). Larger shared codebooks recover ranking fidelity at negligible amortized read cost.")
+    parser.add_argument("--global_pq_sample_rows", type=int, default=16384)
+    parser.add_argument(
+        "--global_pq_codebook",
+        action="store_true",
+        help=(
+            "Replace per-page K-PQ codebooks with one shared codebook trained "
+            "on a sample of the sealed region (SRAM-resident on a chip). The "
+            "selector scan then charges the codebook once per head-query "
+            "instead of per page; codes are re-assigned to the shared "
+            "codebook. Measures the ranking-fidelity cost of dropping "
+            "page-local codebooks."
+        ),
+    )
+    parser.add_argument(
+        "--page_coarse_block",
+        type=int,
+        default=512,
+        help=(
+            "Block size for the coarse tier inside unscanned pages: tokens get "
+            "their block's mean reconstructed logit and mean V-PQ value "
+            "(stored block stats, 2*d*2B per block). Page-level means (block = "
+            "page size) were strongly negative at 32k."
+        ),
+    )
+    parser.add_argument(
+        "--page_scan_frac",
+        type=float,
+        default=1.0,
+        help=(
+            "Page-bound scan pruning: process sealed pages best-first by their "
+            "max PQ score (oracle page order = tight envelope of any stored "
+            "per-page bound) and PQ-scan only enough pages to cover this "
+            "fraction of indexed tokens. Unscanned pages contribute at page "
+            "granularity: every token gets its page's centroid logit "
+            "(q . mean_khat == mean member PQ logit, exact by linearity) and "
+            "the page-mean V-PQ value in the base output; their tokens cannot "
+            "be selected for exact-K or exact-V. Charges per-page stat reads "
+            "(MBR + mean_khat + mean_vhat, 4*d*2B/page) plus codes+codebooks "
+            "for scanned pages only. 1.0 disables."
+        ),
+    )
     parser.add_argument("--include_v_selection_state_in_step_mb", action="store_true")
     parser.add_argument("--survivor_logit_bytes", type=int, default=2)
     parser.add_argument("--selector_mode", choices=["fullscan", "routed", "quest", "quest_pq"], default="fullscan")
@@ -1186,6 +1384,40 @@ def run() -> None:
             raise ValueError(f"unknown lookahead decision variant: {dv}")
     if lookahead_decision_variants and not bool(args.lookahead_diagnostic):
         raise ValueError("--lookahead_decision_variants requires --lookahead_diagnostic")
+    precision_k_hi_frac = float(args.precision_k_hi_frac)
+    precision_v_hi_frac = float(args.precision_v_hi_frac)
+    precision_lo_bits = int(args.precision_lo_bits)
+    precision_active = precision_k_hi_frac < 1.0 or precision_v_hi_frac < 1.0
+    if not (0.0 <= precision_k_hi_frac <= 1.0 and 0.0 <= precision_v_hi_frac <= 1.0):
+        raise ValueError("--precision_k_hi_frac/--precision_v_hi_frac must be in [0, 1]")
+    precision_lo_bytes = 1 if precision_lo_bits <= 8 else 2
+    if precision_active and bool(args.lookahead_diagnostic):
+        raise ValueError("progressive precision is incompatible with --lookahead_diagnostic")
+    page_scan_frac = float(args.page_scan_frac)
+    if not (0.0 < page_scan_frac <= 1.0):
+        raise ValueError("--page_scan_frac must be in (0, 1]")
+    if page_scan_frac < 1.0:
+        if str(args.selector_mode) != "fullscan":
+            raise ValueError("--page_scan_frac requires selector_mode=fullscan")
+        if bool(args.lookahead_diagnostic):
+            raise ValueError("--page_scan_frac is incompatible with --lookahead_diagnostic")
+        if int(args.temporal_reuse_max_stale) > 0:
+            raise ValueError("--page_scan_frac and --temporal_reuse_max_stale are separate experiments")
+    temporal_reuse_max_stale = int(args.temporal_reuse_max_stale)
+    temporal_cache_stats = bool(args.temporal_cache_stats)
+    if temporal_reuse_max_stale > 0:
+        if str(args.selector_mode) != "fullscan":
+            raise ValueError("--temporal_reuse_max_stale requires selector_mode=fullscan")
+        if bool(args.lookahead_diagnostic):
+            raise ValueError("--temporal_reuse_max_stale is incompatible with --lookahead_diagnostic")
+        if score_proxy_variants != ["baseline"]:
+            raise ValueError("--temporal_reuse_max_stale requires score_proxy_variants=baseline")
+        for rule in v_selection_rules:
+            if str(rule).strip().lower() not in {"", "global", "global_residual_risk", "residual_risk"}:
+                raise ValueError(
+                    "--temporal_reuse_max_stale only supports the global_residual_risk "
+                    "V rule (two-pass pass-1 rides the fullscan that reuse skips)"
+                )
     nprobes = parse_csv_ints(args.nprobes)
 
     x_data = np.load(args.x_trace, mmap_mode="r")
@@ -1199,6 +1431,14 @@ def run() -> None:
     layer_rows: list[dict[str, object]] = []
     oracle_rows: list[dict[str, object]] = []
     previous_fraction: dict[tuple[str, str, str, float, str, int], tuple[float, float]] = {}
+    # Temporal reuse/cache state across the qidx loop. Ranked-list reuse is
+    # per q-head (query-dependent); the frozen page index is per kv-head; the
+    # sealed-page build cache avoids re-running k-means when the sealed page
+    # set is unchanged between steps (bit-exact: same key prefix, same seed).
+    temporal_ranked_cache: dict[int, dict[str, object]] = {}
+    temporal_index_cache: dict[int, dict[str, object]] = {}
+    temporal_prev_sets: dict[tuple, dict[str, object]] = {}
+    page_index_build_cache: dict[int, dict[str, object]] = {}
     t0 = time.perf_counter()
 
     for qidx in q_indices:
@@ -1213,10 +1453,46 @@ def run() -> None:
             min(context_len - max(0, int(args.static_suffix)), trace.keys.shape[1]),
         )
         needed_kv_heads = sorted({int(trace.kv_head_for(h)) for h in heads})
+        temporal_reuse_now = False
+        temporal_stale_tokens = 0
+        if temporal_reuse_max_stale > 0 and all(kv in temporal_index_cache for kv in needed_kv_heads):
+            cache_positions = {int(temporal_index_cache[kv]["position"]) for kv in needed_kv_heads}
+            if len(cache_positions) == 1:
+                stale = int(position) - cache_positions.pop()
+                if 0 < stale <= temporal_reuse_max_stale:
+                    temporal_reuse_now = True
+                    temporal_stale_tokens = int(stale)
         index_cache = {}
         k_resid_norm_cache: dict[int, np.ndarray] = {}
+        sealed_end_geom = int(dynamic_start) + (
+            (max(0, int(indexed_end) - int(dynamic_start)) // max(1, int(args.page_size))) * max(1, int(args.page_size))
+        )
+        temporal_incremental = str(args.temporal_reuse_mode) == "incremental"
         for kv_head in needed_kv_heads:
             keys_np = trace.keys[kv_head, :context_len].astype(np.float32, copy=False)
+            if temporal_reuse_now and not temporal_incremental:
+                # Frozen between rescans: same pages, same pending metadata.
+                index_cache[kv_head] = temporal_index_cache[kv_head]["index"]
+                continue
+            build_entry = page_index_build_cache.get(int(kv_head))
+            if (
+                build_entry is not None
+                and int(build_entry["dynamic_start"]) == int(dynamic_start)
+                and int(build_entry["sealed_end"]) == int(sealed_end_geom)
+                and str(args.selector_mode) != "routed"
+                and not bool(args.lookahead_diagnostic)
+            ):
+                # Same sealed prefix and seed => bit-identical pages; only the
+                # pending/indexed extent moved with the context.
+                index_cache[kv_head] = dataclasses.replace(
+                    build_entry["index"], indexed_end=int(indexed_end)
+                )
+                if temporal_reuse_max_stale > 0 and not temporal_reuse_now:
+                    temporal_index_cache[kv_head] = {
+                        "position": int(position),
+                        "index": index_cache[kv_head],
+                    }
+                continue
             index_cache[kv_head] = build_page_pq_gpu(
                 keys_np,
                 dynamic_start=dynamic_start,
@@ -1234,6 +1510,28 @@ def run() -> None:
                 router_max_groups=int(args.router_max_groups),
                 device=device,
             )
+            if bool(args.global_pq_codebook):
+                _apply_global_pq_codebook(
+                    index_cache[kv_head],
+                    keys_np,
+                    dynamic_start=int(dynamic_start),
+                    subvecs=int(args.subvecs),
+                    subbits=int(args.global_pq_subbits) or int(args.subbits),
+                    kmeans_iters=int(args.kmeans_iters),
+                    seed=4099 + 2027 * int(kv_head),
+                    sample_rows=int(args.global_pq_sample_rows),
+                )
+            if str(args.selector_mode) != "routed":
+                page_index_build_cache[int(kv_head)] = {
+                    "dynamic_start": int(dynamic_start),
+                    "sealed_end": int(sealed_end_geom),
+                    "index": index_cache[kv_head],
+                }
+            if temporal_reuse_max_stale > 0 and not temporal_reuse_now:
+                temporal_index_cache[kv_head] = {
+                    "position": int(position),
+                    "index": index_cache[kv_head],
+                }
             if bool(args.lookahead_diagnostic):
                 # Query-independent K-PQ reconstruction residual norms, the
                 # sidecar stat the hardware K-delta bound would store per token.
@@ -1260,6 +1558,12 @@ def run() -> None:
             dense_heads[int(head)] = dense_head
 
             pending = list(range(max(0, int(index.pending_start)), max(0, min(int(index.indexed_end), context_len))))
+            if temporal_reuse_now and not temporal_incremental:
+                # Frozen mode: everything unsealed at the last rescan (old
+                # pending, old suffix, and tokens appended since) stays
+                # resident until the next rescan; exact-K reads for it are
+                # charged via the selected count as usual.
+                pending = list(range(max(0, int(index.pending_start)), context_len))
             base = unique_tokens(
                 static_tokens(position, int(args.static_prefix), int(args.static_suffix)) + pending,
                 context_len=context_len,
@@ -1267,7 +1571,46 @@ def run() -> None:
             max_k_budget = max(k_budgets)
             query_t = torch.as_tensor(query_np, dtype=torch.float32, device=device)
             selector_coverage = 1.0
-            if str(args.selector_mode) in {"fullscan", "routed"}:
+            if temporal_reuse_now and int(head) in temporal_ranked_cache:
+                cached_rank = temporal_ranked_cache[int(head)]
+                ranked_cpu = cached_rank["ranked_cpu"]
+                ranked_scores_cpu = cached_rank["ranked_scores_cpu"]
+                # Reuse charges rereading the stored stale PQ logit row
+                # (2B/token over the scanned extent) plus the ranked candidate
+                # index list (4B each) instead of the codebook+code fullscan.
+                selector_mb = float(
+                    int(ranked_scores_cpu.shape[0]) * 2 + int(ranked_cpu.shape[0]) * 4
+                ) / MB
+                chosen_nprobe = 0
+                if temporal_incremental:
+                    # Score pages sealed since the last rescan with the
+                    # current query and merge them into the stale ranking;
+                    # charge their codes+codebooks only.
+                    cached_sealed_end = int(cached_rank.get("sealed_end", 0))
+                    new_tok_chunks: list[np.ndarray] = []
+                    new_score_chunks: list[np.ndarray] = []
+                    for page in index.pages:
+                        if int(page.start) < cached_sealed_end:
+                            continue
+                        p_tokens, p_scores = pq_page_scores(query_t, page)
+                        new_tok_chunks.append(p_tokens.detach().cpu().numpy().astype(np.int64, copy=False))
+                        new_score_chunks.append(p_scores.detach().cpu().numpy().astype(np.float32, copy=False))
+                        selector_mb += float(
+                            int(page.codebooks.numel()) * int(args.key_bytes)
+                            + int(page.codes.numel()) * (1 if int(args.subbits) <= 8 else 2)
+                        ) / MB
+                    if new_tok_chunks:
+                        merged_tokens = np.concatenate([np.asarray(ranked_cpu, dtype=np.int64)] + new_tok_chunks)
+                        merged_scores = np.concatenate(
+                            [np.asarray(ranked_scores_cpu, dtype=np.float32)] + new_score_chunks
+                        )
+                        merge_order = np.argsort(-merged_scores.astype(np.float64, copy=False), kind="stable")
+                        ranked_cpu = merged_tokens[merge_order]
+                        ranked_scores_cpu = merged_scores[merge_order]
+                        cached_rank["ranked_cpu"] = ranked_cpu
+                        cached_rank["ranked_scores_cpu"] = ranked_scores_cpu
+                        cached_rank["sealed_end"] = int(sealed_end_geom)
+            elif str(args.selector_mode) in {"fullscan", "routed"}:
                 ranked_t, ranked_scores_t, _selector_seconds, selector_mb, chosen_nprobe = rank_paged_pq(
                     query_t,
                     index,
@@ -1280,6 +1623,28 @@ def run() -> None:
                 )
                 ranked_cpu = ranked_t.detach().cpu().numpy().astype(np.int64, copy=False)
                 ranked_scores_cpu = ranked_scores_t.detach().cpu().numpy().astype(np.float32, copy=False)
+                if bool(args.global_pq_codebook) and index.pages:
+                    # One shared codebook read per head-query + per-token codes.
+                    global_bits = int(args.global_pq_subbits) or int(args.subbits)
+                    selector_mb = float(
+                        int(index.pages[0].codebooks.numel()) * int(args.key_bytes)
+                        + sum(
+                            int(p.codes.numel()) * (1 if global_bits <= 8 else 2)
+                            for p in index.pages
+                        )
+                    ) / MB
+                if temporal_reuse_max_stale > 0:
+                    temporal_ranked_cache[int(head)] = {
+                        "ranked_cpu": np.fromiter(
+                            (int(x) for x in ranked_cpu.tolist()), dtype=np.int64, count=len(ranked_cpu)
+                        ),
+                        "ranked_scores_cpu": np.fromiter(
+                            (float(x) for x in ranked_scores_cpu.tolist()),
+                            dtype=np.float32,
+                            count=len(ranked_scores_cpu),
+                        ),
+                        "sealed_end": int(sealed_end_geom),
+                    }
             elif str(args.selector_mode) == "quest":
                 ranked_cpu, ranked_scores_cpu, selector_mb, chosen_nprobe, selector_coverage = _rank_quest_pages(
                     keys_np=keys_np,
@@ -1305,6 +1670,62 @@ def run() -> None:
             else:
                 raise ValueError(f"unknown selector_mode: {args.selector_mode}")
 
+            page_unscanned_mask: np.ndarray | None = None
+            page_centroid_logit: np.ndarray | None = None
+            pages_scanned_count = len(index.pages)
+            if page_scan_frac < 1.0 and len(index.pages) > 1:
+                # ranked_cpu can arrive as an object-dtype array in this venv
+                # (torch->numpy interop); coerce before fancy indexing.
+                ranked_cpu = np.fromiter((int(x) for x in ranked_cpu.tolist()), dtype=np.int64, count=len(ranked_cpu))
+                ranked_scores_cpu = np.fromiter(
+                    (float(x) for x in ranked_scores_cpu.tolist()), dtype=np.float32, count=len(ranked_scores_cpu)
+                )
+                scores_full = np.full((context_len,), -np.inf, dtype=np.float64)
+                scores_full[ranked_cpu] = ranked_scores_cpu.astype(np.float64, copy=False)
+                page_spans = [(int(p.start), int(p.start) + int(p.size)) for p in index.pages]
+                page_max = np.asarray([float(np.max(scores_full[s:e])) for s, e in page_spans])
+                page_mean = np.asarray([float(np.mean(scores_full[s:e])) for s, e in page_spans])
+                page_sizes = np.asarray([e - s for s, e in page_spans], dtype=np.int64)
+                indexed_total = int(page_sizes.sum())
+                order_pages = np.argsort(-page_max, kind="stable")
+                target_tokens = float(page_scan_frac) * float(indexed_total)
+                cum = np.cumsum(page_sizes[order_pages])
+                pages_scanned_count = int(np.searchsorted(cum, target_tokens, side="left")) + 1
+                pages_scanned_count = min(pages_scanned_count, len(index.pages))
+                scanned_pages = set(order_pages[:pages_scanned_count].tolist())
+                coarse_block = max(1, int(args.page_coarse_block))
+                page_unscanned_mask = np.zeros((context_len,), dtype=bool)
+                page_centroid_logit = np.zeros((context_len,), dtype=np.float32)
+                coarse_block_count = 0
+                for pid, (s, e) in enumerate(page_spans):
+                    if pid not in scanned_pages:
+                        page_unscanned_mask[s:e] = True
+                        for bs in range(s, e, coarse_block):
+                            be = min(e, bs + coarse_block)
+                            # Match mixed_scores' tail logit scaling (raw/sqrt(d)).
+                            page_centroid_logit[bs:be] = np.float32(
+                                np.mean(scores_full[bs:be]) / math.sqrt(float(trace.head_dim))
+                            )
+                            coarse_block_count += 1
+                if not bool(np.any(page_unscanned_mask)):
+                    page_unscanned_mask = None
+                    page_centroid_logit = None
+                else:
+                    keep = ~page_unscanned_mask[ranked_cpu]
+                    ranked_cpu = ranked_cpu[keep]
+                    ranked_scores_cpu = ranked_scores_cpu[keep]
+                    # Page-level MBR bounds for ordering + block-level mean
+                    # khat/vhat stats for the coarse tier of unscanned pages.
+                    stats_bytes = float(len(index.pages) * 2 * int(trace.head_dim) * int(args.key_bytes))
+                    stats_bytes += float(coarse_block_count * 2 * int(trace.head_dim) * int(args.key_bytes))
+                    scanned_bytes = float(
+                        sum(
+                            int(index.pages[pid].codebooks.numel()) * int(args.key_bytes)
+                            + int(index.pages[pid].codes.numel()) * (1 if int(args.subbits) <= 8 else 2)
+                            for pid in scanned_pages
+                        )
+                    )
+                    selector_mb = float(stats_bytes + scanned_bytes) / MB
             all_tokens = np.arange(context_len, dtype=np.int64)
             vhat_all, _compressed_v_mb, _fallback_v_mb = _vpq_values_for_tokens(
                 index=index,
@@ -1316,6 +1737,25 @@ def run() -> None:
                 value_bytes=int(args.value_bytes),
             )
             residual = values_np.astype(np.float32, copy=False) - vhat_all.astype(np.float32, copy=False)
+            scores_lo_np: np.ndarray | None = None
+            residual_lo: np.ndarray | None = None
+            if precision_k_hi_frac < 1.0:
+                keys_lo = _quantize_rows_symmetric(keys_np, precision_lo_bits)
+                scores_lo_np = (
+                    (keys_lo @ query_np.astype(np.float32, copy=False))
+                    / math.sqrt(float(trace.head_dim))
+                ).astype(np.float32, copy=False)
+            precision_v_lo_err: np.ndarray | None = None
+            if precision_v_hi_frac < 1.0:
+                values_lo = _quantize_rows_symmetric(values_np, precision_lo_bits)
+                residual_lo = (values_lo - vhat_all.astype(np.float32, copy=False)).astype(np.float32, copy=False)
+                # Per-token squared error of the MSB-plane read, comparable to
+                # code_error: an int8 exact read only pays off where it beats
+                # the V-PQ reconstruction it would replace.
+                precision_v_lo_err = np.sum(
+                    np.square(values_np.astype(np.float64, copy=False) - values_lo.astype(np.float64, copy=False)),
+                    axis=1,
+                )
             la_x_factors: dict[str, np.ndarray] | None = None
             la_v_norm: np.ndarray | None = None
             la_v_resid_norm: np.ndarray | None = None
@@ -1339,6 +1779,12 @@ def run() -> None:
                 value_subbits=int(args.value_subbits),
                 sensitivity=None,
             )
+            # Page pruning coarse-tiers only the tail LOGITS of unscanned
+            # pages (block-mean khat logits). Per-token V-PQ values and the
+            # exact-V rule are untouched: V codes are ~1B/token, not the scan
+            # cost; collapsing V directions to block means was strongly
+            # negative (relL2 ~0.13-0.18 at 32k).
+            vhat_for_base = vhat_all
             actual_value_subbits = int(args.value_subbits) if int(args.value_subbits) > 0 else int(args.subbits)
             actual_value_subvecs = int(args.value_subvecs) if int(args.value_subvecs) > 0 else int(args.subvecs)
             code_bytes = 1 if actual_value_subbits <= 8 else 2
@@ -1383,6 +1829,7 @@ def run() -> None:
 
                 k_mb_by_idx: list[float] = []
                 selected_counts_by_idx: list[int] = []
+                k_lo_counts_by_idx: list[int] = []
                 selected_by_k: dict[int, np.ndarray] = {}
                 probs_by_k: dict[int, np.ndarray] = {}
                 scores_by_k: dict[int, np.ndarray] = {}
@@ -1409,20 +1856,46 @@ def run() -> None:
                         calibrate=str(args.tail_score_calibration) == "affine_selected",
                         key_bytes=int(args.key_bytes),
                     )
+                    k_lo_tokens_count = 0
+                    if precision_k_hi_frac < 1.0 and scores_lo_np is not None:
+                        lo_tokens = _precision_lo_tokens(
+                            base=base,
+                            ranked_cpu=variant_ranked_cpu,
+                            budget=int(k_budget),
+                            context_len=context_len,
+                            hi_frac=precision_k_hi_frac,
+                        )
+                        if lo_tokens.size:
+                            score_vec = score_vec.astype(np.float32, copy=True)
+                            score_vec[lo_tokens] = scores_lo_np[lo_tokens]
+                        k_lo_tokens_count = int(lo_tokens.size)
+                    k_lo_counts_by_idx.append(int(k_lo_tokens_count))
+                    if page_unscanned_mask is not None and page_centroid_logit is not None:
+                        score_vec = score_vec.astype(np.float32, copy=True)
+                        score_vec[page_unscanned_mask] = page_centroid_logit[page_unscanned_mask]
                     probs = np.exp(score_vec - float(np.max(score_vec)))
                     probs /= max(float(probs.sum()), 1e-20)
                     scores_by_k[ki] = score_vec.astype(np.float32, copy=False)
                     probs_by_k[ki] = probs.astype(np.float64, copy=False)
                     base_output_by_k[ki] = (
-                        probs.astype(np.float64, copy=False) @ vhat_all.astype(np.float64, copy=False)
+                        probs.astype(np.float64, copy=False) @ vhat_for_base.astype(np.float64, copy=False)
                     ).astype(np.float32, copy=False)
                     exact_key_mb = float(selected_cpu.size * int(trace.head_dim) * int(args.key_bytes)) / MB
+                    if k_lo_tokens_count > 0:
+                        exact_key_mb -= float(
+                            k_lo_tokens_count
+                            * int(trace.head_dim)
+                            * (int(args.key_bytes) - int(precision_lo_bytes))
+                        ) / MB
                     calibration_extra_mb_by_idx.append(float(calibration_extra_mb))
                     calibration_probe_count_by_idx.append(int(calibration_probe_count))
                     k_mb_by_idx.append(float(selector_mb) + float(score_proxy_extra_mb) + exact_key_mb + float(calibration_extra_mb))
 
                 for v_selection_rule_raw in v_selection_rules:
                     outputs: dict[tuple[int, int], np.ndarray] = {}
+                    exact_mask_by_pair: dict[tuple[int, int], np.ndarray] = {}
+                    v_lo_by_pair: dict[tuple[int, int], int] = {}
+                    v_dropped_by_pair: dict[tuple[int, int], int] = {}
                     v_state_mb_by_idx: list[float] = []
                     v_rule_meta_by_idx: list[dict[str, object]] = []
                     v_rule_meta_by_pair: dict[tuple[int, int], dict[str, object]] = {}
@@ -1577,17 +2050,66 @@ def run() -> None:
                                 # Pass 1 re-reads per-token V-PQ error metadata to
                                 # estimate the risk cutoffs before pass 2 commits.
                                 actual_v_mb += float(metadata_mb)
+                            v_lo_reads = 0
+                            v_dropped_reads = 0
+                            v_hi_mask: np.ndarray | None = None
+                            v_lo_mask: np.ndarray | None = None
+                            if precision_v_hi_frac < 1.0 and residual_lo is not None and bool(np.any(exact_mask)):
+                                exact_idx = np.flatnonzero(exact_mask)
+                                hi_target = int(math.ceil(float(exact_idx.size) * precision_v_hi_frac))
+                                risk_order = exact_idx[
+                                    np.argsort(-risk_scores[exact_idx].astype(np.float64, copy=False), kind="stable")
+                                ]
+                                lo_candidates = risk_order[hi_target:]
+                                # Commit the MSB-plane read only where it beats the
+                                # V-PQ reconstruction it replaces; otherwise skip
+                                # the read and keep the V-PQ value (per-token
+                                # stored int8-error stat vs code-error stat).
+                                commit = lo_candidates[
+                                    precision_v_lo_err[lo_candidates]
+                                    < code_error[lo_candidates].astype(np.float64, copy=False)
+                                ]
+                                v_hi_mask = np.zeros((int(context_len),), dtype=bool)
+                                v_lo_mask = np.zeros((int(context_len),), dtype=bool)
+                                v_hi_mask[risk_order[:hi_target]] = True
+                                v_lo_mask[commit] = True
+                                v_lo_reads = int(commit.size)
+                                v_dropped_reads = int(lo_candidates.size - commit.size)
+                                effective_reads = int(hi_target + v_lo_reads)
+                                actual_v_mb = v_path_mb_for_exact_reads(effective_reads)
+                                if two_pass_active:
+                                    actual_v_mb += float(metadata_mb)
+                                actual_v_mb -= float(
+                                    v_lo_reads
+                                    * int(trace.head_dim)
+                                    * (int(args.value_bytes) - int(precision_lo_bytes))
+                                ) / MB
+                                exact_mask = v_hi_mask | v_lo_mask
+                            v_lo_by_pair[(ki, vi)] = int(v_lo_reads)
+                            v_dropped_by_pair[(ki, vi)] = int(v_dropped_reads)
                             state_mb = float(v_state_mb_by_idx[vi])
                             v_rule_meta_by_pair[(ki, vi)] = rule_meta
                             v_mb_by_pair[(ki, vi)] = float(actual_v_mb)
                             v_state_mb_by_pair[(ki, vi)] = float(state_mb)
                             step_mb_by_pair[(ki, vi)] = float(k_mb_by_idx[ki] + actual_v_mb + state_mb)
-                            outputs[(ki, vi)] = output_from_base_and_exact_mask(
-                                base_output=base_output_by_k[ki],
-                                probs=probs,
-                                residual=residual,
-                                exact_mask=exact_mask,
-                            )
+                            if v_hi_mask is not None and v_lo_mask is not None:
+                                outputs[(ki, vi)] = output_from_base_and_split_masks(
+                                    base_output=base_output_by_k[ki],
+                                    probs=probs,
+                                    residual=residual,
+                                    residual_lo=residual_lo,
+                                    hi_mask=v_hi_mask,
+                                    lo_mask=v_lo_mask,
+                                )
+                            else:
+                                outputs[(ki, vi)] = output_from_base_and_exact_mask(
+                                    base_output=base_output_by_k[ki],
+                                    probs=probs,
+                                    residual=residual,
+                                    exact_mask=exact_mask,
+                                )
+                            if temporal_cache_stats:
+                                exact_mask_by_pair[(ki, vi)] = np.asarray(exact_mask, dtype=bool)
                             if la_active:
                                 la_masks.append(np.asarray(exact_mask, dtype=bool))
                         if la_active:
@@ -1840,6 +2362,49 @@ def run() -> None:
                                         la_fields[f"la_{variant}_v_tests"] = int(v_tests)
                                         la_fields[f"la_{variant}_v_certified"] = int(v_cert)
                                         la_fields[f"la_{variant}_v_false_certified"] = int(v_false)
+                                temporal_fields: dict[str, object] = {
+                                    "temporal_reuse_max_stale": int(temporal_reuse_max_stale),
+                                    "temporal_rescan": bool(not temporal_reuse_now),
+                                    "temporal_stale_tokens": int(temporal_stale_tokens),
+                                }
+                                if temporal_cache_stats:
+                                    tkey = (
+                                        int(head),
+                                        str(score_proxy_variant),
+                                        str(canonical_v_rule),
+                                        str(policy),
+                                        float(threshold),
+                                        str(start_strategy),
+                                    )
+                                    t_k_set = np.asarray(selected_by_k[ki], dtype=np.int64)
+                                    t_v_set = np.flatnonzero(exact_mask_by_pair[(ki, vi)]).astype(np.int64)
+                                    t_prev = temporal_prev_sets.get(tkey)
+                                    if t_prev is not None:
+                                        t_gap = int(position) - int(t_prev["position"])
+                                        t_k_new = int(np.setdiff1d(t_k_set, t_prev["k_set"]).size)
+                                        t_v_new = int(np.setdiff1d(t_v_set, t_prev["v_set"]).size)
+                                        temporal_fields.update(
+                                            {
+                                                "temporal_gap_tokens": int(t_gap),
+                                                "temporal_k_tokens": int(t_k_set.size),
+                                                "temporal_k_new_tokens": int(t_k_new),
+                                                "temporal_k_prev_overlap_frac": float(
+                                                    1.0 - float(t_k_new) / max(float(t_k_set.size), 1.0)
+                                                ),
+                                                "temporal_v_tokens": int(t_v_set.size),
+                                                "temporal_v_new_tokens": int(t_v_new),
+                                                "temporal_v_prev_overlap_frac": float(
+                                                    1.0 - float(t_v_new) / max(float(t_v_set.size), 1.0)
+                                                ),
+                                            }
+                                        )
+                                    else:
+                                        temporal_fields["temporal_gap_tokens"] = -1
+                                    temporal_prev_sets[tkey] = {
+                                        "position": int(position),
+                                        "k_set": t_k_set,
+                                        "v_set": t_v_set,
+                                    }
                                 row = {
                                     "qidx": int(qidx),
                                     "position": int(position),
@@ -1873,6 +2438,20 @@ def run() -> None:
                                     "k_budget": int(k_budgets[ki]),
                                     "v_budget": int(v_budgets[vi]),
                                     "selected_k_tokens": int(selected_counts_by_idx[ki]),
+                                    "precision_k_hi_frac": float(precision_k_hi_frac),
+                                    "precision_v_hi_frac": float(precision_v_hi_frac),
+                                    "precision_lo_bits": int(precision_lo_bits),
+                                    "precision_k_lo_tokens": int(k_lo_counts_by_idx[ki]),
+                                    "precision_v_lo_reads": int(v_lo_by_pair.get((ki, vi), 0)),
+                                    "precision_v_dropped_reads": int(v_dropped_by_pair.get((ki, vi), 0)),
+                                    "page_scan_frac": float(page_scan_frac),
+                                    "pages_total": int(len(index.pages)),
+                                    "pages_scanned": int(pages_scanned_count),
+                                    "page_unscanned_tokens": int(
+                                        np.count_nonzero(page_unscanned_mask)
+                                        if page_unscanned_mask is not None
+                                        else 0
+                                    ),
                                     "iterations": int(steps),
                                     "final_k_delta": float(final_k_delta),
                                     "final_v_delta": float(final_v_delta),
@@ -1888,6 +2467,7 @@ def run() -> None:
                                 row.update({f"score_proxy_meta_{k}": v for k, v in score_proxy_meta.items() if isinstance(v, (str, int, float, bool))})
                                 row.update({key: float(value) for key, value in dist_metric.items()})
                                 row.update(la_fields)
+                                row.update(temporal_fields)
                                 head_rows.append(row)
                                 head_choices[key].append(row)
 
