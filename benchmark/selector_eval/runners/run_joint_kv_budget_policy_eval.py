@@ -594,6 +594,7 @@ def simulate_policy(
     test_log: list[tuple[int, int, bool, bool, float, float, float, float]] | None = None,
     k_bound_by_pair: dict[tuple[int, int], float] | None = None,
     v_bound_by_pair: dict[tuple[int, int], float] | None = None,
+    deescalate: bool = False,
 ) -> tuple[int, int, int, float, float, list[str]]:
     ki = min(max(0, int(start_ki)), max(0, len(k_budgets) - 1))
     vi = min(max(0, int(start_vi)), max(0, len(v_budgets) - 1))
@@ -676,6 +677,44 @@ def simulate_policy(
         else:
             break
         steps += 1
+    if deescalate:
+        # Down-walk any axis whose adjacent-band delta is within its scaled
+        # threshold. The same pair-delta governs escalation across a band and
+        # de-escalation back across it, so this cannot oscillate: a band that
+        # forced an escalation above will fail this probe.
+        def _band_threshold(lo_budget: int, hi_budget: int) -> float:
+            if str(threshold_mode) != "budget_delta_frac":
+                return float(threshold)
+            frac = float(max(0, int(hi_budget) - int(lo_budget))) / max(float(context_len), 1.0)
+            return scaled_threshold(
+                base_threshold=float(threshold),
+                budget_delta_frac=frac,
+                reference_frac=float(threshold_reference_frac),
+                shape=str(threshold_scale_shape),
+                min_scale=float(threshold_min_scale),
+                max_scale=float(threshold_max_scale),
+            )
+
+        while True:
+            moved = False
+            if ki > 0:
+                d = rel_l2(outputs[(ki - 1, vi)], outputs[(ki, vi)])
+                thr_k = _band_threshold(k_budgets[ki - 1], k_budgets[ki])
+                if d <= thr_k:
+                    trace.append(f"kd:k{ki}->k{ki - 1}:d={d:.4g}:t={thr_k:.4g}")
+                    ki -= 1
+                    steps += 1
+                    moved = True
+            if vi > 0:
+                d = rel_l2(outputs[(ki, vi - 1)], outputs[(ki, vi)])
+                thr_v = _band_threshold(v_budgets[vi - 1], v_budgets[vi])
+                if d <= thr_v:
+                    trace.append(f"vd:v{vi}->v{vi - 1}:d={d:.4g}:t={thr_v:.4g}")
+                    vi -= 1
+                    steps += 1
+                    moved = True
+            if not moved:
+                break
     return ki, vi, steps, float(k_delta), float(v_delta), trace
 
 
@@ -1239,6 +1278,18 @@ def run() -> None:
             "PQ-score only pages sealed since the last rescan with the "
             "current query, and merge them into the stale ranking - no "
             "resident growth beyond canonical pending."
+        ),
+    )
+    parser.add_argument(
+        "--budget_deescalate",
+        action="store_true",
+        help=(
+            "After the escalate-only walk stops, greedily step DOWN any axis "
+            "whose adjacent-band output delta is within its scaled threshold. "
+            "With proxy_mass start this is a predict-then-verify controller "
+            "(settle near the predicted rung, correct over-prediction); with "
+            "temporal_prev start it is a warm-start hysteresis controller "
+            "(carry the previous budget but re-earn it via down-probes)."
         ),
     )
     parser.add_argument(
@@ -2321,6 +2372,7 @@ def run() -> None:
                                         start_vi=int(start_vi),
                                         step_mb_by_idx=step_mb_by_pair,
                                         test_log=la_test_log,
+                                        deescalate=bool(args.budget_deescalate),
                                     )
                                 if not temporal_reuse_now:
                                     temporal_budget_cache[prev_key] = (int(ki), int(vi))
