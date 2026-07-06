@@ -1242,6 +1242,18 @@ def run() -> None:
         ),
     )
     parser.add_argument(
+        "--temporal_reuse_budget",
+        choices=["ladder", "frozen"],
+        default="ladder",
+        help=(
+            "ladder: run the stability ladder on reuse steps as usual (it "
+            "over-escalates K on stale rankings). frozen: on reuse steps skip "
+            "the ladder and reuse the (k,v) budget rungs settled at this "
+            "head's last rescan step; quality on reuse steps is unguarded "
+            "until the next rescan."
+        ),
+    )
+    parser.add_argument(
         "--temporal_cache_stats",
         action="store_true",
         help=(
@@ -1405,6 +1417,9 @@ def run() -> None:
             raise ValueError("--page_scan_frac and --temporal_reuse_max_stale are separate experiments")
     temporal_reuse_max_stale = int(args.temporal_reuse_max_stale)
     temporal_cache_stats = bool(args.temporal_cache_stats)
+    temporal_budget_frozen = str(args.temporal_reuse_budget) == "frozen"
+    if temporal_budget_frozen and temporal_reuse_max_stale <= 0:
+        raise ValueError("--temporal_reuse_budget frozen requires --temporal_reuse_max_stale > 0")
     if temporal_reuse_max_stale > 0:
         if str(args.selector_mode) != "fullscan":
             raise ValueError("--temporal_reuse_max_stale requires selector_mode=fullscan")
@@ -1438,6 +1453,9 @@ def run() -> None:
     temporal_ranked_cache: dict[int, dict[str, object]] = {}
     temporal_index_cache: dict[int, dict[str, object]] = {}
     temporal_prev_sets: dict[tuple, dict[str, object]] = {}
+    # Settled (ki, vi) rung indices from each head's last rescan step, keyed
+    # like previous_fraction; consumed on reuse steps in frozen-budget mode.
+    temporal_budget_cache: dict[tuple[str, str, str, float, str, int], tuple[int, int]] = {}
     page_index_build_cache: dict[int, dict[str, object]] = {}
     t0 = time.perf_counter()
 
@@ -2272,25 +2290,40 @@ def run() -> None:
                                 la_test_log: list[tuple[int, int, bool, bool, float, float, float, float]] | None = (
                                     [] if la_active else None
                                 )
-                                ki, vi, steps, final_k_delta, final_v_delta, policy_trace = simulate_policy(
-                                    outputs=outputs,
-                                    k_budgets=k_budgets,
-                                    v_budgets=v_budgets,
-                                    policy=str(policy),
-                                    threshold=float(threshold),
-                                    k_mb_by_idx=k_mb_by_idx,
-                                    v_mb_by_idx=v_mb_by_idx,
-                                    context_len=int(context_len),
-                                    threshold_mode=str(args.threshold_mode),
-                                    threshold_reference_frac=float(args.threshold_reference_frac),
-                                    threshold_scale_shape=str(args.threshold_scale_shape),
-                                    threshold_min_scale=float(args.threshold_min_scale),
-                                    threshold_max_scale=float(args.threshold_max_scale),
-                                    start_ki=int(start_ki),
-                                    start_vi=int(start_vi),
-                                    step_mb_by_idx=step_mb_by_pair,
-                                    test_log=la_test_log,
+                                frozen_budget = (
+                                    temporal_budget_cache.get(prev_key)
+                                    if temporal_budget_frozen and temporal_reuse_now
+                                    else None
                                 )
+                                if frozen_budget is not None:
+                                    ki = min(int(frozen_budget[0]), len(k_budgets) - 1)
+                                    vi = min(int(frozen_budget[1]), len(v_budgets) - 1)
+                                    steps = 0
+                                    final_k_delta = 0.0
+                                    final_v_delta = 0.0
+                                    policy_trace = ["frozen_budget"]
+                                else:
+                                    ki, vi, steps, final_k_delta, final_v_delta, policy_trace = simulate_policy(
+                                        outputs=outputs,
+                                        k_budgets=k_budgets,
+                                        v_budgets=v_budgets,
+                                        policy=str(policy),
+                                        threshold=float(threshold),
+                                        k_mb_by_idx=k_mb_by_idx,
+                                        v_mb_by_idx=v_mb_by_idx,
+                                        context_len=int(context_len),
+                                        threshold_mode=str(args.threshold_mode),
+                                        threshold_reference_frac=float(args.threshold_reference_frac),
+                                        threshold_scale_shape=str(args.threshold_scale_shape),
+                                        threshold_min_scale=float(args.threshold_min_scale),
+                                        threshold_max_scale=float(args.threshold_max_scale),
+                                        start_ki=int(start_ki),
+                                        start_vi=int(start_vi),
+                                        step_mb_by_idx=step_mb_by_pair,
+                                        test_log=la_test_log,
+                                    )
+                                if not temporal_reuse_now:
+                                    temporal_budget_cache[prev_key] = (int(ki), int(vi))
                                 previous_fraction[prev_key] = (
                                     float(k_budgets[ki]) / max(float(context_len), 1.0),
                                     float(v_budgets[vi]) / max(float(context_len), 1.0),
@@ -2381,6 +2414,7 @@ def run() -> None:
                                     "temporal_reuse_max_stale": int(temporal_reuse_max_stale),
                                     "temporal_rescan": bool(not temporal_reuse_now),
                                     "temporal_stale_tokens": int(temporal_stale_tokens),
+                                    "temporal_budget_frozen": bool(frozen_budget is not None),
                                 }
                                 if temporal_cache_stats:
                                     tkey = (

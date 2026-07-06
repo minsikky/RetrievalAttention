@@ -63,6 +63,9 @@ fi
 if [[ -n "${TEMPORAL_REUSE_MODE:-}" ]]; then
   extra_args+=(--temporal_reuse_mode "${TEMPORAL_REUSE_MODE}")
 fi
+if [[ -n "${TEMPORAL_REUSE_BUDGET:-}" ]]; then
+  extra_args+=(--temporal_reuse_budget "${TEMPORAL_REUSE_BUDGET}")
+fi
 if [[ -n "${PRECISION_K_HI_FRAC:-}" ]]; then
   extra_args+=(--precision_k_hi_frac "${PRECISION_K_HI_FRAC}")
 fi
