@@ -326,7 +326,7 @@ def run() -> None:
     parser.add_argument("--selector_mode", choices=["fullscan", "routed"], default="fullscan")
     parser.add_argument("--k_budget", type=int, default=14336)
     parser.add_argument("--prob_sources", default="dense,mixed")
-    parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="affine_selected")
+    parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="none")
     parser.add_argument("--selected_value_exact_mass", type=float, default=0.99)
     parser.add_argument("--selected_value_min_exact_top", type=int, default=0)
     parser.add_argument("--selected_value_max_exact_top", type=int, default=0)

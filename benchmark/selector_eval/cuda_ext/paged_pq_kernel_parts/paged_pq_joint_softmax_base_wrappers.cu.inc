@@ -337,6 +337,112 @@ std::vector<torch::Tensor> joint_softmax_base_outputs_strided_workspace_cuda(
   return {probs_view, outputs};
 }
 
+template <int DIMS_PER_BLOCK>
+__global__ void joint_grouped_base_outputs_from_probs_kernel(
+    const float* __restrict__ probs,
+    const float* __restrict__ values_grouped,
+    float* __restrict__ outputs,
+    int64_t groups,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len,
+    int64_t value_stride_tokens,
+    int64_t dim) {
+  constexpr int THREADS = 256;
+  constexpr int TOKEN_LANES = THREADS / DIMS_PER_BLOCK;
+  __shared__ float partial[DIMS_PER_BLOCK][TOKEN_LANES];
+
+  const int64_t rows = groups * k_count * heads;
+  const int64_t dim_tiles = (dim + DIMS_PER_BLOCK - 1) / DIMS_PER_BLOCK;
+  const int64_t block = static_cast<int64_t>(blockIdx.x);
+  const int64_t dim_tile = block % dim_tiles;
+  const int64_t row = block / dim_tiles;
+  if (row >= rows) {
+    return;
+  }
+
+  const int lane_dim = static_cast<int>(threadIdx.x % DIMS_PER_BLOCK);
+  const int lane_token = static_cast<int>(threadIdx.x / DIMS_PER_BLOCK);
+  const int64_t d = dim_tile * DIMS_PER_BLOCK + lane_dim;
+  const int64_t group = row / (k_count * heads);
+  float acc = 0.0f;
+  if (d < dim) {
+    const int64_t prob_offset = row * context_len;
+    const int64_t value_offset = group * value_stride_tokens * dim;
+    for (int64_t token = lane_token; token < context_len; token += TOKEN_LANES) {
+      acc += probs[prob_offset + token] * values_grouped[value_offset + token * dim + d];
+    }
+  }
+
+  partial[lane_dim][lane_token] = acc;
+  __syncthreads();
+  for (int stride = TOKEN_LANES >> 1; stride > 0; stride >>= 1) {
+    if (lane_token < stride) {
+      partial[lane_dim][lane_token] += partial[lane_dim][lane_token + stride];
+    }
+    __syncthreads();
+  }
+  if (lane_token == 0 && d < dim) {
+    outputs[row * dim + d] = partial[lane_dim][0];
+  }
+}
+
+std::vector<torch::Tensor> joint_softmax_base_outputs_grouped_cuda(
+    torch::Tensor score_grid,
+    torch::Tensor values_grouped) {
+  TORCH_CHECK(score_grid.is_cuda(), "score_grid must be CUDA");
+  TORCH_CHECK(values_grouped.is_cuda(), "values_grouped must be CUDA");
+  TORCH_CHECK(score_grid.scalar_type() == torch::kFloat32, "score_grid must be float32");
+  TORCH_CHECK(values_grouped.scalar_type() == torch::kFloat32, "values_grouped must be float32");
+  TORCH_CHECK(score_grid.dim() == 4, "score_grid shape must be [groups, k_count, heads, context_len]");
+  TORCH_CHECK(values_grouped.dim() == 3, "values_grouped shape must be [groups, context_len, dim]");
+  const auto groups = score_grid.size(0);
+  const auto k_count = score_grid.size(1);
+  const auto heads = score_grid.size(2);
+  const auto context_len = score_grid.size(3);
+  const auto value_stride_tokens = values_grouped.size(1);
+  const auto dim = values_grouped.size(2);
+  TORCH_CHECK(values_grouped.size(0) == groups, "values_grouped group count mismatch");
+  TORCH_CHECK(values_grouped.size(1) >= context_len, "values_grouped length must cover score_grid context_len");
+
+  auto scores_c = score_grid.contiguous();
+  auto values_c = values_grouped.contiguous();
+  auto probs = torch::empty_like(scores_c, scores_c.options().dtype(torch::kFloat32));
+  auto outputs = torch::empty({groups, k_count, heads, dim}, scores_c.options().dtype(torch::kFloat32));
+  if (groups == 0 || k_count == 0 || heads == 0 || context_len == 0 || dim == 0) {
+    if (context_len == 0 && groups > 0 && k_count > 0 && heads > 0 && dim > 0) {
+      outputs.zero_();
+    }
+    return {probs, outputs};
+  }
+
+  const int threads = 256;
+  const int64_t rows = groups * k_count * heads;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  joint_softmax_rows_kernel<<<static_cast<unsigned int>(rows), threads, threads * sizeof(float), stream>>>(
+      scores_c.data_ptr<float>(),
+      probs.data_ptr<float>(),
+      rows,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  constexpr int dims_per_block = 8;
+  const int64_t dim_tiles = (dim + dims_per_block - 1) / dims_per_block;
+  joint_grouped_base_outputs_from_probs_kernel<dims_per_block><<<
+      static_cast<unsigned int>(rows * dim_tiles), threads, 0, stream>>>(
+      probs.data_ptr<float>(),
+      values_c.data_ptr<float>(),
+      outputs.data_ptr<float>(),
+      groups,
+      k_count,
+      heads,
+      context_len,
+      value_stride_tokens,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {probs, outputs};
+}
+
 std::vector<torch::Tensor> joint_softmax_base_outputs_cublas_cuda(
     torch::Tensor score_grid,
     torch::Tensor values) {
@@ -558,4 +664,3 @@ std::vector<torch::Tensor> joint_softmax_base_outputs_grouped_cublas_cuda(
       "cublasSgemmStridedBatched joint_softmax_base_outputs_grouped_cublas");
   return {probs, outputs};
 }
-

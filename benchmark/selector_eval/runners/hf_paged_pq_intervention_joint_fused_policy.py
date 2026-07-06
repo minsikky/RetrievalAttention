@@ -69,7 +69,11 @@ def try_process_fused_mixed_policy(runtime: JointFusedPolicyRuntime) -> bool:
         raise RuntimeError("SELECTOR_PQ_JOINT_FUSED_MIXED_POLICY requires exact score rows")
 
     native = load_selector_paged_pq_ext()
-    if not hasattr(native, "joint_mixed_select_policy_intervals_no_mb"):
+    use_rankpos_nocalib = (
+        str(args.tail_score_calibration) == "none"
+        and hasattr(native, "joint_mixed_select_policy_intervals_rankpos_no_calib_no_mb")
+    )
+    if not use_rankpos_nocalib and not hasattr(native, "joint_mixed_select_policy_intervals_no_mb"):
         raise RuntimeError(
             "SELECTOR_PQ_JOINT_FUSED_MIXED_POLICY requires joint_mixed_select_policy_intervals_no_mb"
         )
@@ -88,34 +92,51 @@ def try_process_fused_mixed_policy(runtime: JointFusedPolicyRuntime) -> bool:
         else torch.empty((runtime.group_heads, 0), dtype=torch.long, device=device)
     )
     k_take_counts_t = torch.as_tensor(grid_take_counts, dtype=torch.long, device=device)
-    y_for_grid_t = (
-        runtime.y_indexed_prob_t.to(dtype=torch.float32)
-        if runtime.y_indexed_prob_t is not None
-        else torch.empty_like(runtime.pq_logits_t, dtype=torch.float32)
-    )
     fused_policy_wall_t0 = time.perf_counter() if runtime.wall_profile_enabled else 0.0
     if bool(getattr(args, "profile_native_ops", False)):
         _sync_if_cuda(device)
         fused_policy_t0 = time.perf_counter()
     else:
         fused_policy_t0 = 0.0
-    final_output_t, final_idx_t = native.joint_mixed_select_policy_intervals_no_mb(
-        runtime.exact_scores_h.to(dtype=torch.float32).contiguous(),
-        runtime.pq_logits_t.to(dtype=torch.float32).contiguous(),
-        y_for_grid_t.contiguous(),
-        runtime.indexed_tokens_t.to(dtype=torch.long).contiguous(),
-        runtime.base_t.to(dtype=torch.long).contiguous(),
-        ranked_prefix_tokens_for_fused_t.to(dtype=torch.long).contiguous(),
-        k_take_counts_t,
-        runtime.vhat_all_t.to(dtype=torch.float32).contiguous(),
-        runtime.residual_t.to(dtype=torch.float32).contiguous(),
-        runtime.code_error_t.to(dtype=torch.float32).contiguous(),
-        runtime.joint_v_budgets_t,
-        bool(str(args.tail_score_calibration) == "affine_selected"),
-        float(runtime.pq_logit_scale),
-        float(getattr(args, "joint_kv_stability_threshold", 0.001)),
-        int(runtime.policy_id),
-    )
+    if use_rankpos_nocalib:
+        final_output_t, final_idx_t = native.joint_mixed_select_policy_intervals_rankpos_no_calib_no_mb(
+            runtime.exact_scores_h.to(dtype=torch.float32).contiguous(),
+            runtime.pq_logits_t.to(dtype=torch.float32).contiguous(),
+            runtime.indexed_tokens_t.to(dtype=torch.long).contiguous(),
+            runtime.base_t.to(dtype=torch.long).contiguous(),
+            ranked_prefix_tokens_for_fused_t.to(dtype=torch.long).contiguous(),
+            k_take_counts_t,
+            runtime.vhat_all_t.to(dtype=torch.float32).contiguous(),
+            runtime.residual_t.to(dtype=torch.float32).contiguous(),
+            runtime.code_error_t.to(dtype=torch.float32).contiguous(),
+            runtime.joint_v_budgets_t,
+            float(runtime.pq_logit_scale),
+            float(getattr(args, "joint_kv_stability_threshold", 0.001)),
+            int(runtime.policy_id),
+        )
+    else:
+        y_for_grid_t = (
+            runtime.y_indexed_prob_t.to(dtype=torch.float32)
+            if runtime.y_indexed_prob_t is not None
+            else torch.empty_like(runtime.pq_logits_t, dtype=torch.float32)
+        )
+        final_output_t, final_idx_t = native.joint_mixed_select_policy_intervals_no_mb(
+            runtime.exact_scores_h.to(dtype=torch.float32).contiguous(),
+            runtime.pq_logits_t.to(dtype=torch.float32).contiguous(),
+            y_for_grid_t.contiguous(),
+            runtime.indexed_tokens_t.to(dtype=torch.long).contiguous(),
+            runtime.base_t.to(dtype=torch.long).contiguous(),
+            ranked_prefix_tokens_for_fused_t.to(dtype=torch.long).contiguous(),
+            k_take_counts_t,
+            runtime.vhat_all_t.to(dtype=torch.float32).contiguous(),
+            runtime.residual_t.to(dtype=torch.float32).contiguous(),
+            runtime.code_error_t.to(dtype=torch.float32).contiguous(),
+            runtime.joint_v_budgets_t,
+            bool(str(args.tail_score_calibration) == "affine_selected"),
+            float(runtime.pq_logit_scale),
+            float(getattr(args, "joint_kv_stability_threshold", 0.001)),
+            int(runtime.policy_id),
+        )
     if bool(getattr(args, "profile_native_ops", False)):
         _sync_if_cuda(device)
         runtime.stats[runtime.layer_id].add_joint_detail_timing(

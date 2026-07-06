@@ -227,6 +227,132 @@ __global__ void joint_grouped_flat_vprefix_interval_sums_strided_kernel(
   }
 }
 
+template <typename value_t, typename code_t>
+__device__ __forceinline__ float joint_grouped_vpq_residual_value(
+    const value_t* __restrict__ values,
+    const float* __restrict__ value_codebooks,
+    const code_t* __restrict__ value_codes,
+    const int64_t* __restrict__ page_starts,
+    int64_t group,
+    int64_t token,
+    int64_t d,
+    int64_t context_len,
+    int64_t dim,
+    int64_t pages,
+    int64_t page_size,
+    int64_t value_subvecs,
+    int64_t code_count) {
+  if (token < 0 || token >= context_len || pages <= 0 || page_size <= 0 ||
+      value_subvecs != 1 || code_count <= 0) {
+    return 0.0f;
+  }
+  int64_t first_start = page_starts[0];
+  int64_t page = (token - first_start) / page_size;
+  if (token < first_start || page < 0 || page >= pages) {
+    return 0.0f;
+  }
+  int64_t page_start = page_starts[page];
+  int64_t row_in_page = token - page_start;
+  if (row_in_page < 0 || row_in_page >= page_size) {
+    return 0.0f;
+  }
+  int64_t code = static_cast<int64_t>(
+      value_codes[((group * pages + page) * page_size + row_in_page) * value_subvecs]);
+  code = max(static_cast<int64_t>(0), min(code, code_count - 1));
+  float exact = load_as_float(values, (group * context_len + token) * dim + d);
+  float approx = value_codebooks[((((group * pages + page) * value_subvecs) * code_count + code) * dim) + d];
+  return exact - approx;
+}
+
+template <typename order_t, typename value_t, typename code_t, int DIMS_PER_BLOCK>
+__global__ void joint_grouped_flat_vprefix_interval_sums_vpq_kernel(
+    const float* __restrict__ probs,
+    const value_t* __restrict__ values,
+    const float* __restrict__ value_codebooks,
+    const code_t* __restrict__ value_codes,
+    const int64_t* __restrict__ page_starts,
+    const order_t* __restrict__ exact_order,
+    const int64_t* __restrict__ v_budgets,
+    float* __restrict__ interval_sums,
+    int64_t groups,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len,
+    int64_t max_exact,
+    int64_t v_steps,
+    int64_t dim,
+    int64_t pages,
+    int64_t page_size,
+    int64_t value_subvecs,
+    int64_t code_count) {
+  constexpr int THREADS = 256;
+  constexpr int TOKEN_LANES = THREADS / DIMS_PER_BLOCK;
+  __shared__ float partial[DIMS_PER_BLOCK][TOKEN_LANES];
+
+  int64_t rows = groups * k_count * heads;
+  int64_t dim_tiles = (dim + DIMS_PER_BLOCK - 1) / DIMS_PER_BLOCK;
+  int64_t block = static_cast<int64_t>(blockIdx.x);
+  int64_t dim_tile = block % dim_tiles;
+  block /= dim_tiles;
+  int64_t vi = block % v_steps;
+  int64_t row = block / v_steps;
+  if (row >= rows || vi >= v_steps) {
+    return;
+  }
+
+  int lane_dim = static_cast<int>(threadIdx.x % DIMS_PER_BLOCK);
+  int lane_token = static_cast<int>(threadIdx.x / DIMS_PER_BLOCK);
+  int64_t d = dim_tile * DIMS_PER_BLOCK + lane_dim;
+  float acc = 0.0f;
+
+  int64_t exact_count = v_budgets[vi];
+  exact_count = max(static_cast<int64_t>(0), min(exact_count, context_len));
+  exact_count = min(exact_count, max_exact);
+  int64_t prev_count = 0;
+  if (vi > 0) {
+    prev_count = v_budgets[vi - 1];
+    prev_count = max(static_cast<int64_t>(0), min(prev_count, context_len));
+    prev_count = min(prev_count, max_exact);
+  }
+  int64_t start_count = exact_count < prev_count ? 0 : prev_count;
+
+  if (d < dim) {
+    int64_t group = row / (k_count * heads);
+    for (int64_t j = start_count + lane_token; j < exact_count; j += TOKEN_LANES) {
+      int64_t token = static_cast<int64_t>(exact_order[row * max_exact + j]);
+      if (token >= 0 && token < context_len) {
+        float residual = joint_grouped_vpq_residual_value<value_t, code_t>(
+            values,
+            value_codebooks,
+            value_codes,
+            page_starts,
+            group,
+            token,
+            d,
+            context_len,
+            dim,
+            pages,
+            page_size,
+            value_subvecs,
+            code_count);
+        acc += probs[row * context_len + token] * residual;
+      }
+    }
+  }
+
+  partial[lane_dim][lane_token] = acc;
+  __syncthreads();
+  for (int stride = TOKEN_LANES >> 1; stride > 0; stride >>= 1) {
+    if (lane_token < stride) {
+      partial[lane_dim][lane_token] += partial[lane_dim][lane_token + stride];
+    }
+    __syncthreads();
+  }
+  if (lane_token == 0 && d < dim) {
+    interval_sums[(row * v_steps + vi) * dim + d] = partial[lane_dim][0];
+  }
+}
+
 __global__ void joint_grouped_flat_vprefix_prefix_intervals_kernel(
     const float* __restrict__ base_outputs,
     const float* __restrict__ interval_sums,
@@ -439,4 +565,3 @@ __global__ void joint_select_policy_kernel(
     final_indices[head * 2 + 1] = vi_shared;
   }
 }
-

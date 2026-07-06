@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -9,11 +11,6 @@ from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-
-import torch
-from huggingface_hub import hf_hub_download
-from tqdm import tqdm
-from transformers import AutoConfig
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_HF_CACHE_DIR = PROJECT_ROOT / ".hf_cache"
@@ -33,31 +30,16 @@ for _cache_dir in (
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from benchmark.generated_memory_hf_eval import (  # noqa: E402
-    dtype_from_name,
-    load_hf_model,
-    load_tokenizer,
-    model_device,
-)
-from benchmark.longbench_v2_hf_eval import (  # noqa: E402
-    aggregate_approx_stats,
-    maybe_apply_qwen_yarn,
-    pagedpq_config,
-    parse_layer_ids,
-    summarize_approx_stats,
-    truncate_middle,
-)
-from benchmark.selector_eval.runners.hf_paged_pq_intervention_api import (  # noqa: E402
-    ApproxStats,
-    patched_paged_pq_attention,
-    reset_paged_pq_attention_state,
-)
-
 
 BENCHMARK_CHOICES = (
     "aime24",
     "gpqa",
+    "helmet_longqa",
+    "helmet_rag",
+    "helmet_recall",
     "livecodebench_codegen",
+    "longproc_2k",
+    "longproc_8k",
     "longgenbench_sgt_short",
     "longgenbench_sgt_long",
     "longgenbench_gsm8k",
@@ -112,6 +94,27 @@ def parse_args():
     parser.add_argument("--force_max_new_tokens", action="store_true")
     parser.add_argument("--dry_run", action="store_true", help="Load/select tasks and write args without loading a model.")
 
+    # HELMET controls. RAG/Recall require the official HELMET data directory
+    # prepared from princeton-nlp/HELMET's data.tar.gz.
+    parser.add_argument("--helmet_repo", type=str, default="third_party/benchmarks/HELMET")
+    parser.add_argument("--helmet_data_dir", type=str, default="third_party/benchmarks/HELMET/data")
+    parser.add_argument(
+        "--helmet_dataset_filter",
+        type=str,
+        default="",
+        help="Comma-separated HELMET dataset names to keep within a category, e.g. kilt_nq or infbench_qa_eng_130862.",
+    )
+
+    # LongProc controls.
+    parser.add_argument("--longproc_repo", type=str, default="third_party/benchmarks/LongProc")
+    parser.add_argument("--longproc_data_dir", type=str, default="third_party/benchmarks/LongProc/data")
+    parser.add_argument(
+        "--longproc_datasets",
+        type=str,
+        default="",
+        help="Comma-separated LongProc datasets. Defaults depend on longproc_2k vs longproc_8k.",
+    )
+
     parser.add_argument("--qwen_yarn_factor", type=float, default=0.0)
     parser.add_argument("--qwen_yarn_original_max_position_embeddings", type=int, default=32768)
 
@@ -153,7 +156,7 @@ def parse_args():
         ],
         default="joint_kv_stability",
     )
-    parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="affine_selected")
+    parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="none")
     parser.add_argument("--tail_probe_rel_l2_max", type=float, default=float("inf"))
     parser.add_argument("--tail_proxy_mass_min", type=float, default=0.97)
     parser.add_argument("--tail_proxy_mass_max", type=float, default=1.0)
@@ -183,7 +186,15 @@ def parse_args():
     )
     parser.add_argument("--joint_kv_k_budgets", default="4096,8192,14336,32768")
     parser.add_argument("--joint_kv_v_budgets", default="1024,2048,4096,6144,8192,12288,16384")
-    parser.add_argument("--joint_kv_stability_threshold", type=float, default=0.001)
+    parser.add_argument("--joint_kv_k_budget_fracs", default="0.10,0.30,0.50,0.70,0.90,1.0")
+    parser.add_argument("--joint_kv_v_budget_fracs", default="0.05,0.10,0.20,0.40,0.60,0.80,1.0")
+    parser.add_argument("--joint_kv_stability_threshold", type=float, default=0.002)
+    parser.add_argument("--joint_kv_threshold_mode", choices=["fixed", "budget_delta_frac"], default="budget_delta_frac")
+    parser.add_argument("--joint_kv_threshold_reference_frac", type=float, default=0.2)
+    parser.add_argument("--joint_kv_threshold_scale_shape", choices=["linear", "sqrt", "log"], default="sqrt")
+    parser.add_argument("--joint_kv_threshold_min_scale", type=float, default=0.0)
+    parser.add_argument("--joint_kv_threshold_max_scale", type=float, default=1.5)
+    parser.add_argument("--joint_kv_start_strategy", default="proxy_mass_m0p9")
     parser.add_argument("--selected_value_mode", choices=["exact", "vpq_value"], default="vpq_value")
     parser.add_argument(
         "--selected_value_exact_rule",
@@ -393,6 +404,8 @@ def livecodebench_filename(release: str) -> str:
 
 
 def load_livecodebench_direct_jsonl(args, problem_cls) -> list[Any]:
+    from huggingface_hub import hf_hub_download
+
     filename = livecodebench_filename(str(args.livecodebench_release))
     path = hf_hub_download(
         repo_id="livecodebench/code_generation_lite",
@@ -514,13 +527,592 @@ def extract_gsm8k_answer(text: str) -> str:
     return matches[-1] if matches else ""
 
 
+def split_csv(value: str) -> list[str]:
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+def project_path(path: str | Path) -> Path:
+    path = Path(path)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def interleave_task_groups(groups: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    tasks = []
+    max_len = max((len(group) for group in groups), default=0)
+    for idx in range(max_len):
+        for group in groups:
+            if idx < len(group):
+                tasks.append(group[idx])
+    return tasks
+
+
+def normalize_answer(text: str) -> str:
+    text = (text or "").lower()
+    text = re.sub(r"\b(a|an|the)\b", " ", text)
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    return " ".join(text.split())
+
+
+def qa_metrics(prediction: str, answers: Any) -> dict[str, float]:
+    if isinstance(answers, str):
+        answer_list = [answers]
+    elif answers and isinstance(answers[0], list):
+        answer_list = [item for group in answers for item in group]
+    else:
+        answer_list = list(answers or [])
+    pred_norm = normalize_answer(prediction)
+    exact = 0.0
+    sub_em = 0.0
+    best_f1 = 0.0
+    for answer in answer_list:
+        ans_norm = normalize_answer(str(answer))
+        if not ans_norm:
+            continue
+        exact = max(exact, float(pred_norm == ans_norm))
+        sub_em = max(sub_em, float(ans_norm in pred_norm))
+        pred_toks = pred_norm.split()
+        ans_toks = ans_norm.split()
+        common = {}
+        for tok in pred_toks:
+            common[tok] = min(pred_toks.count(tok), ans_toks.count(tok))
+        overlap = sum(common.values())
+        if overlap:
+            precision = overlap / max(1, len(pred_toks))
+            recall = overlap / max(1, len(ans_toks))
+            best_f1 = max(best_f1, (2.0 * precision * recall) / max(1e-12, precision + recall))
+    return {
+        "exact_match": exact,
+        "f1": best_f1,
+        "substring_exact_match": sub_em,
+    }
+
+
+def parse_answer_prefixed_output(text: str) -> str:
+    match = re.search(r"(?:answer\s*:)(.*?)(?:\n|$)", text or "", flags=re.I | re.S)
+    if match:
+        return match.group(1).strip()
+    return (text or "").strip().splitlines()[0].strip() if (text or "").strip() else ""
+
+
+def helmet_path(args, configured_path: str) -> Path:
+    raw = str(configured_path or "").strip().strip("'\"")
+    if not raw:
+        return Path("")
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    repo = project_path(args.helmet_repo)
+    data_dir = project_path(args.helmet_data_dir)
+    candidates = [repo / path]
+    if path.parts and path.parts[0] == "data":
+        candidates.append(data_dir / Path(*path.parts[1:]))
+    candidates.append(data_dir / path)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    if path.parts and path.parts[0] == "data" and len(path.parts) >= 2:
+        parent = data_dir / Path(*path.parts[1:-1])
+        pattern = re.sub(r"_k\d+_", "_k*_", path.name)
+        matches = sorted(parent.glob(pattern))
+        if matches:
+            return matches[-1]
+    return candidates[0]
+
+
+def read_helmet_config(args, name: str) -> dict[str, Any]:
+    import yaml
+
+    path = project_path(args.helmet_repo) / "configs" / f"{name}.yaml"
+    if not path.exists():
+        raise FileNotFoundError(f"HELMET config not found: {path}")
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def helmet_category_config(args) -> tuple[str, dict[str, Any], list[str]]:
+    if args.benchmark == "helmet_rag":
+        return "rag", read_helmet_config(args, "rag"), ["kilt_nq"]
+    if args.benchmark == "helmet_recall":
+        return "recall", read_helmet_config(args, "recall"), ["ruler_niah_mk_2"]
+    if args.benchmark == "helmet_longqa":
+        # Use InfiniteBench QA as the default LongQA representative. It keeps
+        # this small validation suite practical and avoids pulling the full
+        # NarrativeQA path unless explicitly requested later.
+        return "longqa", read_helmet_config(args, "longqa"), ["infbench_qa_eng_130862"]
+    raise ValueError(f"unsupported HELMET benchmark: {args.benchmark}")
+
+
+def helmet_config_rows(config: dict[str, Any]) -> list[dict[str, str]]:
+    datasets = split_csv(config.get("datasets", ""))
+    test_files = split_csv(config.get("test_files", ""))
+    demo_files = split_csv(config.get("demo_files", ""))
+    gen_lengths = split_csv(config.get("generation_max_length", ""))
+    rows = []
+    for idx, dataset in enumerate(datasets):
+        rows.append(
+            {
+                "dataset": dataset,
+                "test_file": test_files[idx] if idx < len(test_files) else "",
+                "demo_file": demo_files[idx] if idx < len(demo_files) else "",
+                "generation_max_length": gen_lengths[idx] if idx < len(gen_lengths) else "",
+            }
+        )
+    return rows
+
+
+def format_helmet_documents(ctxs: list[dict[str, Any]]) -> str:
+    docs = []
+    for ctx in ctxs:
+        title = str(ctx.get("title", "")).strip()
+        text = str(ctx.get("text", "")).strip()
+        docs.append(f"Document (Title: {title}): {text}" if title else f"Document: {text}")
+    return "\n\n".join(docs)
+
+
+def read_helmet_json_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"HELMET data file not found: {path}. Prepare HELMET data with "
+            "`bash third_party/benchmarks/HELMET/scripts/download_data.sh` from the HELMET repo, "
+            "or set HELMET_DATA_DIR to an existing unpacked data directory."
+        )
+    if path.suffix == ".jsonl":
+        return read_jsonl(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and "data" in payload:
+        return list(payload["data"])
+    if isinstance(payload, list):
+        return payload
+    raise ValueError(f"Unsupported HELMET data format: {path}")
+
+
+def build_helmet_qa_demo(row: dict[str, Any]) -> str:
+    answer = row.get("answer")
+    if answer is None:
+        answers = row.get("answers") or []
+        answer = answers[0] if answers else ""
+    return (
+        f"{format_helmet_documents(list(row.get('ctxs') or []))}\n\n"
+        f"Question: {row.get('question', '')}\n"
+        f"Answer: {answer}"
+    )
+
+
+def load_helmet_rag_dataset(args, dataset: str, test_file: str, demo_file: str) -> list[dict[str, Any]]:
+    rows = read_helmet_json_rows(helmet_path(args, test_file))
+    demos = []
+    demo_path = helmet_path(args, demo_file)
+    if str(demo_file).strip().strip("'\"") and demo_path.exists():
+        demos = read_helmet_json_rows(demo_path)[: max(0, int(getattr(args, "shots", 2)))]
+    demo_text = ("\n\n".join(build_helmet_qa_demo(row) for row in demos) + "\n\n") if demos else ""
+    tasks = []
+    for idx, row in enumerate(rows):
+        context = format_helmet_documents(list(row.get("ctxs") or []))
+        prompt = (
+            "Use the given documents to write a concise and short answer to the question.\n"
+            "Write your answer in the following format:\n"
+            "Answer: [answer]\n\n"
+            f"{demo_text}{context}\n\n"
+            f"Question: {row.get('question', '')}\n"
+            "Answer:"
+        )
+        tasks.append(
+            {
+                "id": f"helmet_rag_{dataset}_{row.get('id', idx)}",
+                "suite": "helmet_rag",
+                "prompt": prompt,
+                "answer": row.get("answers") or row.get("answer") or [],
+                "prompt_chars": len(prompt),
+                "metadata": {"helmet_dataset": dataset, "metric_family": "helmet_qa"},
+            }
+        )
+    return tasks
+
+
+def load_helmet_recall_dataset(args, dataset: str, test_file: str) -> list[dict[str, Any]]:
+    rows = read_helmet_json_rows(helmet_path(args, test_file))
+    tasks = []
+    for idx, row in enumerate(rows):
+        if dataset == "json_kv":
+            demos = row.get("demos") or []
+            demo_text = "\n\n".join(
+                f"Key: {key}\nCorresponding value: {value}" for key, value in demos[:2]
+            )
+            if demo_text:
+                demo_text += "\n\n"
+            question = row.get("question") or row.get("key") or row.get("query") or ""
+            prompt = (
+                f"{row.get('context', '')}\n\n"
+                "Extract the value corresponding to the specified key in the JSON object below.\n\n"
+                f"{demo_text}Key: {question}\n"
+                "Corresponding value:"
+            )
+            answer = row.get("answer") or row.get("value") or []
+            metric_family = "helmet_qa"
+        else:
+            type_needle = row.get("type_needle_v", "value")
+            query = row.get("query") or row.get("question") or ""
+            if "niah_mv" in dataset or "niah_mq" in dataset:
+                prompt = (
+                    f"Some special magic {type_needle} are hidden within the following text. "
+                    f"Make sure to memorize it. I will quiz you about the {type_needle} afterwards.\n"
+                    f"{row.get('context', '')}\n"
+                    f"What are all the special magic {type_needle} for {query} mentioned in the provided text?\n"
+                    f"The special magic {type_needle} for {query} mentioned in the provided text are"
+                )
+            else:
+                prompt = (
+                    f"A special magic {type_needle} is hidden within the following text. "
+                    f"Make sure to memorize it. I will quiz you about the {type_needle} afterwards.\n"
+                    f"{row.get('context', '')}\n"
+                    f"What is the special magic {type_needle} for {query} mentioned in the provided text?\n"
+                    f"The special magic {type_needle} for {query} mentioned in the provided text is"
+                )
+            answer = row.get("answer") or row.get("outputs") or []
+            metric_family = "helmet_recall"
+        tasks.append(
+            {
+                "id": f"helmet_recall_{dataset}_{row.get('id', idx)}",
+                "suite": "helmet_recall",
+                "prompt": prompt,
+                "answer": answer,
+                "prompt_chars": len(prompt),
+                "metadata": {"helmet_dataset": dataset, "metric_family": metric_family},
+            }
+        )
+    return tasks
+
+
+def load_helmet_longqa_dataset(args, dataset: str) -> list[dict[str, Any]]:
+    if not dataset.startswith("infbench_"):
+        raise NotImplementedError(
+            f"Local HELMET LongQA harness currently supports InfiniteBench QA/choice datasets, got {dataset!r}."
+        )
+    if "qa_eng" in dataset:
+        filename = "longbook_qa_eng.jsonl"
+        metric_family = "helmet_qa"
+    elif "choice_eng" in dataset:
+        filename = "longbook_choice_eng.jsonl"
+        metric_family = "helmet_choice"
+    else:
+        raise NotImplementedError(f"Unsupported HELMET LongQA dataset: {dataset}")
+    local_path = project_path(args.helmet_data_dir) / "infbench" / filename
+    if not local_path.exists():
+        from huggingface_hub import hf_hub_download
+
+        local_path = Path(
+            hf_hub_download(
+                repo_id="xinrongzhang2022/InfiniteBench",
+                filename=filename,
+                repo_type="dataset",
+                local_files_only=bool(args.local_files_only),
+            )
+        )
+    rows = read_jsonl(local_path)
+    tasks = []
+    for idx, row in enumerate(rows):
+        if metric_family == "helmet_choice":
+            options = list(row["options"])
+            labels = "ABCD"
+            option_text = "\n".join(f"{labels[i]}. {option}" for i, option in enumerate(options))
+            answer_idx = options.index(row["answer"][0])
+            answer = labels[answer_idx]
+            prompt = (
+                "You are given a story and a question with multiple choices. Choose the best answer from the options provided. "
+                "Only one of the following options is correct, output the answer using one single letter (A, B, C, or D). "
+                "Don't say anything else.\n\n"
+                f"{row['context']}\n\nQuestion: {row['input']}\nOptions:\n{option_text}\n\nAnswer:"
+            )
+        else:
+            answer = list(row["answer"])
+            prompt = (
+                "You are given a story and a question. Answer the question as concisely as you can, using a single phrase if possible.\n\n"
+                f"{row['context']}\n\nQuestion: {row['input']}\n\nAnswer:"
+            )
+        tasks.append(
+            {
+                "id": f"helmet_longqa_{dataset}_{row.get('id', idx)}",
+                "suite": "helmet_longqa",
+                "prompt": prompt,
+                "answer": answer,
+                "prompt_chars": len(prompt),
+                "metadata": {"helmet_dataset": dataset, "metric_family": metric_family},
+            }
+        )
+    return tasks
+
+
+def load_helmet(args) -> list[dict[str, Any]]:
+    category, config, default_filter = helmet_category_config(args)
+    requested = set(split_csv(args.helmet_dataset_filter) or default_filter)
+    groups = []
+    for row in helmet_config_rows(config):
+        dataset = row["dataset"]
+        if dataset not in requested:
+            continue
+        if category == "rag":
+            groups.append(load_helmet_rag_dataset(args, dataset, row["test_file"], row["demo_file"]))
+        elif category == "recall":
+            groups.append(load_helmet_recall_dataset(args, dataset, row["test_file"]))
+        elif category == "longqa":
+            groups.append(load_helmet_longqa_dataset(args, dataset))
+    if not groups:
+        raise ValueError(f"No HELMET datasets selected for {args.benchmark}; requested={sorted(requested)}")
+    return select_tasks(interleave_task_groups(groups), args)
+
+
+def default_longproc_datasets(args) -> list[str]:
+    if args.longproc_datasets:
+        return split_csv(args.longproc_datasets)
+    if args.benchmark == "longproc_2k":
+        return [
+            "path_traversal_2k",
+            "countdown_2k",
+            "tom_tracking_2k",
+            "travel_planning_2k",
+        ]
+    if args.benchmark == "longproc_8k":
+        return [
+            "path_traversal_8k",
+            "countdown_8k",
+            "tom_tracking_8k",
+            "travel_planning_8k",
+        ]
+    raise ValueError(f"unsupported LongProc benchmark: {args.benchmark}")
+
+
+def load_longproc(args) -> list[dict[str, Any]]:
+    repo = project_path(args.longproc_repo)
+    if not repo.exists():
+        raise FileNotFoundError(f"LongProc repo not found: {repo}")
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
+    data_dir = project_path(args.longproc_data_dir)
+    groups = []
+    for dataset in default_longproc_datasets(args):
+        rows, eval_func = load_longproc_dataset_lightweight(repo, data_dir, dataset)
+        group = []
+        for idx, row in enumerate(rows):
+            prompt = str(row["input_prompt"])
+            group.append(
+                {
+                    "id": f"{args.benchmark}_{dataset}_{idx}",
+                    "suite": args.benchmark,
+                    "prompt": prompt,
+                    "answer": row.get("reference_output"),
+                    "prompt_chars": len(prompt),
+                    "metadata": {"longproc_dataset": dataset},
+                    "_longproc_eval_func": eval_func,
+                    "_longproc_example": row,
+                }
+            )
+        groups.append(group)
+    return select_tasks(interleave_task_groups(groups), args)
+
+
+def read_longproc_prompt(data_dir: Path, task_name: str) -> str:
+    import yaml
+
+    prompt_path = data_dir / task_name / "prompts.yaml"
+    if not prompt_path.exists():
+        raise FileNotFoundError(f"LongProc prompt file not found: {prompt_path}")
+    with prompt_path.open("r", encoding="utf-8") as f:
+        return str(yaml.safe_load(f)["USER_PROMPT"])
+
+
+def extract_tagged_text(text: str, tag: str) -> str | None:
+    start = text.find(f"<{tag}>")
+    end = text.find(f"</{tag}>")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return text[start + len(tag) + 2 : end].strip()
+
+
+def eval_longproc_path_traversal(prediction: str, example: dict) -> tuple[dict[str, float], dict[str, Any]]:
+    gt = str(example["reference_output"]).strip()
+    parsed = extract_tagged_text(prediction, "Route")
+    if parsed is None:
+        return {"accuracy": 0.0, "partial_accuracy": 0.0, "extraction_rate": 0.0}, {"parsed_output": None, "error_report": "Parsing error"}
+    parsed = parsed.strip()
+    if parsed == gt:
+        return {"accuracy": 1.0, "partial_accuracy": 1.0, "extraction_rate": 1.0}, {"parsed_output": parsed, "error_report": None}
+    gt_lines = gt.splitlines()
+    pred_lines = parsed.splitlines()
+    first_diff = 0
+    for first_diff, (gt_line, pred_line) in enumerate(zip(gt_lines, pred_lines, strict=False)):
+        if gt_line != pred_line:
+            break
+    else:
+        first_diff = min(len(gt_lines), len(pred_lines))
+    partial = float(first_diff / max(1, len(gt_lines)))
+    return {
+        "accuracy": 0.0,
+        "partial_accuracy": partial,
+        "extraction_rate": 1.0,
+    }, {"parsed_output": parsed, "error_report": {"line": first_diff}}
+
+
+def load_longproc_dataset_lightweight(repo: Path, data_dir: Path, dataset: str) -> tuple[list[dict[str, Any]], Any]:
+    task_name = dataset.rsplit("_", 1)[0]
+    prompt = read_longproc_prompt(data_dir, task_name)
+    task_dir = data_dir / task_name
+    if dataset.startswith("path_traversal_"):
+        rows = json.loads((task_dir / f"{dataset}.json").read_text(encoding="utf-8"))
+        data = [
+            {
+                "input_prompt": prompt.format(
+                    city_context=row["context_nl"],
+                    src_city=row["question_repr"][0],
+                    dst_city=row["question_repr"][1],
+                ),
+                "reference_output": row["answer_nl"],
+                "item": row,
+            }
+            for row in rows
+        ]
+        return data, eval_longproc_path_traversal
+    if dataset.startswith("tom_tracking_"):
+        from longproc.tom_tracking_evaluator import evaluate_tom_trace
+
+        def eval_tom(prediction: str, example: dict) -> tuple[dict[str, float], dict[str, Any]]:
+            parsed_pred = "\n".join(line for line in prediction.splitlines() if line.strip().startswith("-"))
+            parsed_gt = "\n".join(line for line in str(example["reference_output"]).splitlines() if line.strip().startswith("-"))
+            strict_acc, partial_acc, error_report = evaluate_tom_trace(parsed_pred, parsed_gt)
+            return {
+                "accuracy": float(strict_acc),
+                "partial_accuracy": float(partial_acc),
+                "extraction_rate": 1.0,
+            }, {"parsed_output": parsed_pred, "error_report": error_report}
+
+        rows = json.loads((task_dir / f"{dataset}.json").read_text(encoding="utf-8"))
+        data = [
+            {
+                "input_prompt": prompt.format(story=row["story"], question=row["question"]),
+                "reference_output": row["solution"],
+                "item": row,
+            }
+            for row in rows
+        ]
+        return data, eval_tom
+    if dataset.startswith("countdown_"):
+        from longproc.countdown_evaluator import (
+            build_countdown_demonstration,
+            evaluate_countdown_final_solution,
+            evaluate_countdown_search_procedure,
+        )
+
+        def build_icl_demonstration() -> str:
+            demos = [{"nums": [40, 19, 23, 7], "target": 29}, {"nums": [9, 16, 6, 18], "target": 12}]
+            parts = []
+            for demo in demos:
+                _, demonstration = build_countdown_demonstration(demo["nums"], demo["target"])
+                parts.append(f"# Example\nNumbers: {demo['nums']}\nTarget: {demo['target']}\n\n{demonstration}")
+            return "\n\n".join(parts)
+
+        user_prompt = prompt.format(demonstration=build_icl_demonstration(), nums="{nums}", target="{target}")
+
+        def eval_countdown(prediction: str, example: dict) -> tuple[dict[str, float], dict[str, Any]]:
+            item = example["item"]
+            pred_solution = extract_tagged_text(prediction, "Solution")
+            nums = list(item["nums"])
+            target = int(item["target"])
+            if pred_solution is not None and evaluate_countdown_final_solution(nums, target, pred_solution):
+                return {"accuracy": 1.0, "partial_accuracy": 1.0, "extraction_rate": 1.0}, {"parsed_output": pred_solution}
+            extraction_rate = 1.0 if pred_solution is not None else 0.0
+            if "# Search Procedure" not in prediction:
+                return {"accuracy": 0.0, "partial_accuracy": 0.0, "extraction_rate": extraction_rate}, {"parsed_output": pred_solution}
+            pred_procedure = prediction.split("# Search Procedure")[-1].strip()
+            gt_procedure = str(example["reference_output"]).split("# Search Procedure")[-1].split("Now we have found the target")[0].strip()
+            partial, error_report = evaluate_countdown_search_procedure(nums, target, pred_procedure, gt_procedure)
+            return {
+                "accuracy": 0.0,
+                "partial_accuracy": float(partial),
+                "extraction_rate": extraction_rate,
+            }, {"parsed_output": pred_solution, "error_report": error_report}
+
+        rows = json.loads((task_dir / f"{dataset}.json").read_text(encoding="utf-8"))
+        data = []
+        for row in rows:
+            solution, demonstration = build_countdown_demonstration(list(row["nums"]), int(row["target"]))
+            data.append(
+                {
+                    "input_prompt": user_prompt.format(nums=row["nums"], target=row["target"]),
+                    "reference_output": demonstration,
+                    "item": {**row, "solution": solution, "reference_output": demonstration},
+                }
+            )
+        return data, eval_countdown
+    if dataset.startswith("travel_planning_"):
+        from longproc.travel_planning_evaluator import (
+            build_travel_plan_demonstration,
+            evaluate_travel_plan_search_procedure,
+            evaluate_travel_plan_solution,
+        )
+
+        def build_icl_demonstration() -> str:
+            demo_path = task_dir / "travel_planning_icl_examples.json"
+            demos = json.loads(demo_path.read_text(encoding="utf-8"))
+            return "\n\n".join(
+                f"# Example\n{row['disambig_question_text']}\n\n{build_travel_plan_demonstration(row)}"
+                for row in demos
+            )
+
+        user_prompt = prompt.format(demonstration=build_icl_demonstration(), problem="{problem}")
+
+        def eval_travel(prediction: str, example: dict) -> tuple[dict[str, float], dict[str, Any]]:
+            item = example["item"]
+            plan_text = extract_tagged_text(prediction, "Plan")
+            extraction_rate = 1.0 if plan_text is not None else 0.0
+            accuracy = (
+                evaluate_travel_plan_solution(item["ground_truth_cities"], item["ground_truth_durations"], plan_text.strip())
+                if plan_text is not None
+                else 0.0
+            )
+            if accuracy == 1.0:
+                partial = 1.0
+                error_report = None
+            else:
+                partial, error_report = evaluate_travel_plan_search_procedure(item, prediction, example["reference_output"])
+            return {
+                "accuracy": float(accuracy),
+                "partial_accuracy": float(partial),
+                "extraction_rate": extraction_rate,
+            }, {"parsed_output": plan_text, "error_report": error_report}
+
+        output_range = (0, 2048) if dataset.endswith("_2k") else (4096, 8192)
+        rows = json.loads((task_dir / "travel_planning_all.json").read_text(encoding="utf-8"))
+        rows = [row for row in rows if output_range[0] <= int(row["estimated_output_tokens"]) < output_range[1]]
+        data = []
+        for row in rows:
+            reference = build_travel_plan_demonstration(row)
+            data.append(
+                {
+                    "input_prompt": user_prompt.format(problem=row["disambig_question_text"]),
+                    "reference_output": reference,
+                    "item": {
+                        **row,
+                        "problem": row["disambig_question_text"],
+                        "reference_output": reference,
+                    },
+                }
+            )
+        return data, eval_travel
+    raise NotImplementedError(
+        f"LongProc dataset {dataset!r} is not in the lightweight default loader. "
+        "Use path_traversal/countdown/tom_tracking/travel_planning, or add the task-specific loader before benchmarking it."
+    )
+
+
 def load_tasks(args) -> list[dict[str, Any]]:
     if args.benchmark == "aime24":
         return load_aime24(args)
     if args.benchmark == "gpqa":
         return load_gpqa(args)
+    if args.benchmark.startswith("helmet_"):
+        return load_helmet(args)
     if args.benchmark == "livecodebench_codegen":
         return load_livecodebench(args)
+    if args.benchmark in {"longproc_2k", "longproc_8k"}:
+        return load_longproc(args)
     if args.benchmark == "longgenbench_sgt_short":
         return load_longgenbench_sgt(args, long=False)
     if args.benchmark == "longgenbench_sgt_long":
@@ -544,6 +1136,8 @@ def maybe_apply_chat_template(tokenizer, prompt: str, args) -> str:
 
 
 def generation_kwargs(tokenizer, args, input_ids):
+    import torch
+
     kwargs = {
         "input_ids": input_ids,
         "attention_mask": torch.ones_like(input_ids),
@@ -567,6 +1161,11 @@ def generation_kwargs(tokenizer, args, input_ids):
 
 
 def generate_one(model, tokenizer, task, args) -> dict[str, Any]:
+    import torch
+
+    from benchmark.generated_memory_hf_eval import model_device
+    from benchmark.longbench_v2_hf_eval import truncate_middle
+
     device = model_device(model)
     prompt = maybe_apply_chat_template(tokenizer, str(task["prompt"]), args)
     enc = tokenizer(prompt, return_tensors="pt", add_special_tokens=not bool(args.use_chat_template))
@@ -712,6 +1311,29 @@ def score_rows(rows: list[dict[str, Any]], tasks: list[dict[str, Any]], args) ->
             )
         elif task["suite"].startswith("longgenbench_sgt_"):
             item.update(score_longgenbench_sgt({**row, "metadata": task.get("metadata", {})}))
+        elif task["suite"].startswith("helmet_"):
+            family = str(task.get("metadata", {}).get("metric_family", "helmet_qa"))
+            if family == "helmet_recall":
+                answers = task.get("answer") or []
+                if isinstance(answers, str):
+                    answers = [answers]
+                hits = sum(str(answer).lower() in str(row["response"]).lower() for answer in answers)
+                recall = float(hits / max(1, len(answers)))
+                item.update({"ruler_recall": recall, "judge": bool(recall >= 1.0), "answer": task.get("answer")})
+            elif family == "helmet_choice":
+                pred = extract_choice_answer(row["response"]) or parse_answer_prefixed_output(row["response"]).strip().upper()[:1]
+                item.update({"pred": pred, "answer": task["answer"], "judge": bool(pred == task["answer"])})
+            else:
+                parsed = parse_answer_prefixed_output(row["response"])
+                mets = qa_metrics(row["response"], task.get("answer"))
+                parsed_mets = qa_metrics(parsed, task.get("answer"))
+                mets = {key: max(float(mets[key]), float(parsed_mets[key])) for key in mets}
+                item.update({**mets, "parsed_output": parsed, "answer": task.get("answer"), "judge": bool(mets["substring_exact_match"])})
+        elif task["suite"] in {"longproc_2k", "longproc_8k"}:
+            eval_func = task["_longproc_eval_func"]
+            metrics, extra = eval_func(str(row["response"]), task["_longproc_example"])
+            item.update({**metrics, **extra})
+            item["judge"] = bool(float(metrics.get("accuracy", 0.0)) >= 1.0)
         scored.append(item)
     if args.benchmark == "livecodebench_codegen" and bool(args.evaluate_code):
         add_livecodebench_path(args)
@@ -761,6 +1383,9 @@ def aggregate(rows: list[dict[str, Any]], args, approx_stats: dict[int, ApproxSt
         "max_new_tokens": int(args.max_new_tokens),
         "min_new_tokens": int(args.min_new_tokens),
         "force_max_new_tokens": bool(args.force_max_new_tokens),
+        "use_chat_template": bool(args.use_chat_template),
+        "disable_thinking": bool(args.disable_thinking),
+        "hf_language_model_only": bool(args.hf_language_model_only),
         "temperature": float(args.temperature),
         "top_p": float(args.top_p),
         "top_k": int(args.top_k),
@@ -768,6 +1393,12 @@ def aggregate(rows: list[dict[str, Any]], args, approx_stats: dict[int, ApproxSt
         "avg_used_prompt_tokens": float(sum(row["used_prompt_tokens"] for row in rows) / total) if total else 0.0,
         "avg_generated_tokens": float(sum(row["generated_tokens"] for row in rows) / total) if total else 0.0,
         "max_generated_tokens": int(max((row["generated_tokens"] for row in rows), default=0)),
+        "max_new_token_hit_count": int(sum(1 for row in rows if int(row["generated_tokens"]) >= int(args.max_new_tokens))),
+        "max_new_token_hit_fraction": float(
+            sum(1 for row in rows if int(row["generated_tokens"]) >= int(args.max_new_tokens)) / total
+        )
+        if total
+        else 0.0,
         "avg_generation_sec": float(sum(row["generation_sec"] for row in rows) / total) if total else 0.0,
         "truncated_count": int(sum(1 for row in rows if row.get("truncated"))),
     }
@@ -785,6 +1416,27 @@ def aggregate(rows: list[dict[str, Any]], args, approx_stats: dict[int, ApproxSt
             vals = [row[key] for row in rows if row.get(key) is not None]
             if vals:
                 summary[f"mean_{key}"] = float(sum(float(v) for v in vals) / len(vals))
+    if args.benchmark.startswith("helmet_"):
+        for key in ("exact_match", "f1", "substring_exact_match", "ruler_recall"):
+            vals = [row[key] for row in rows if row.get(key) is not None]
+            if vals:
+                summary[f"mean_{key}"] = float(sum(float(v) for v in vals) / len(vals))
+                summary[f"mean_{key}_pct"] = float(100.0 * summary[f"mean_{key}"])
+    if args.benchmark in {"longproc_2k", "longproc_8k"}:
+        metric_keys = sorted(
+            {
+                key
+                for row in rows
+                for key, value in row.items()
+                if key in {"accuracy", "partial_accuracy", "extraction_rate", "f1", "precision", "recall"}
+                and isinstance(value, (int, float, bool))
+            }
+        )
+        for key in metric_keys:
+            vals = [float(row[key]) for row in rows if row.get(key) is not None]
+            if vals:
+                summary[f"mean_{key}"] = float(sum(vals) / len(vals))
+                summary[f"mean_{key}_pct"] = float(100.0 * summary[f"mean_{key}"])
     if args.benchmark == "livecodebench_codegen":
         metrics = next((row.get("_livecodebench_metrics") for row in rows if row.get("_livecodebench_metrics")), None)
         if metrics:
@@ -792,6 +1444,8 @@ def aggregate(rows: list[dict[str, Any]], args, approx_stats: dict[int, ApproxSt
             if "pass@1" in metrics:
                 summary["pass_at_1"] = float(metrics["pass@1"])
     if approx_stats is not None:
+        from benchmark.longbench_v2_hf_eval import aggregate_approx_stats, summarize_approx_stats
+
         summary["cost_proxy"] = summarize_approx_stats(approx_stats)
         summary["cost_proxy_aggregate"] = aggregate_approx_stats(approx_stats)
     return summary
@@ -819,14 +1473,6 @@ def jsonable(obj):
 def main():
     args = parse_args()
     random.seed(int(args.seed))
-    torch.manual_seed(int(args.seed))
-    if bool(args.allow_tf32_selector):
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        try:
-            torch.set_float32_matmul_precision("high")
-        except Exception:
-            pass
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -848,6 +1494,27 @@ def main():
         (output_dir / "summary.json").write_text(json.dumps(jsonable(summary), indent=2, sort_keys=True), encoding="utf-8")
         print("[public_longdecode_eval] summary=" + json.dumps(jsonable(summary), sort_keys=True))
         return
+
+    import torch
+    from tqdm import tqdm
+    from transformers import AutoConfig
+
+    from benchmark.generated_memory_hf_eval import dtype_from_name, load_hf_model, load_tokenizer
+    from benchmark.longbench_v2_hf_eval import maybe_apply_qwen_yarn, pagedpq_config, parse_layer_ids
+    from benchmark.selector_eval.runners.hf_paged_pq_intervention_api import (
+        ApproxStats,
+        patched_paged_pq_attention,
+        reset_paged_pq_attention_state,
+    )
+
+    torch.manual_seed(int(args.seed))
+    if bool(args.allow_tf32_selector):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 
     config = AutoConfig.from_pretrained(
         args.model_name,

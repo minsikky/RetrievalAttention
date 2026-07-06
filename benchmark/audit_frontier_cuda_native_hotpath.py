@@ -240,10 +240,19 @@ def _read_cuda_extension_text() -> str:
     return "\n".join(chunks)
 
 
+def _read_runner_text() -> str:
+    runners = _repo_path("benchmark/selector_eval/runners")
+    chunks: list[str] = []
+    for path in sorted(runners.glob("hf_paged_pq_intervention*.py")):
+        chunks.append(path.read_text(encoding="utf-8"))
+    chunks.append(_read("benchmark/selector_eval/runners/run_hf_paged_pq_intervention_eval.py"))
+    return "\n".join(chunks)
+
+
 def _check_expected_patterns() -> list[str]:
     """Return missing evidence patterns that would make the audit stale."""
 
-    runner = _read("benchmark/selector_eval/runners/run_hf_paged_pq_intervention_eval.py")
+    runner = _read_runner_text()
     ext = _read_cuda_extension_text()
     missing: list[str] = []
     expected = {
@@ -254,6 +263,7 @@ def _check_expected_patterns() -> list[str]:
             "_pagedpq_joint_grouped_score_grid_workspace_cache",
             "_pagedpq_joint_score_grid_workspace_cache",
             "SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE",
+            "SELECTOR_PQ_JOINT_GROUPED_SOFTMAX_BASE",
             "SELECTOR_PQ_JOINT_SOFTMAX_BASE_WORKSPACE",
             "_pagedpq_joint_softmax_base_workspace_cache",
             "SELECTOR_PQ_JOINT_NATIVE_RANK_PREFIX",
@@ -267,6 +277,9 @@ def _check_expected_patterns() -> list[str]:
             "SELECTOR_PQ_JOINT_RISK_PREFIX_WORKSPACE",
             "SELECTOR_PQ_JOINT_SCORE_DIRECT_VPREFIX",
             "SELECTOR_PQ_JOINT_SCORE_DIRECT_INTERVAL_POLICY",
+            "SELECTOR_PQ_JOINT_SCORE_PROB_INTERVAL_POLICY",
+            "SELECTOR_PQ_JOINT_SCORE_DIRECT_TOPK_INTERVAL_POLICY",
+            "SELECTOR_PQ_JOINT_MERGE_RISK_POLICY",
             "SELECTOR_PQ_JOINT_NATIVE_ACCOUNTING",
             "joint_vpq_sidecars_for",
             "grouped_risk_records",
@@ -277,10 +290,12 @@ def _check_expected_patterns() -> list[str]:
         "ext": (
             "joint_mixed_score_grid_cuda",
             "joint_softmax_base_outputs_cuda",
+            "joint_softmax_base_outputs_grouped_cuda",
             "joint_softmax_base_outputs_workspace_cuda",
             "joint_vprefix_outputs_from_grouped_risk_batched_cuda",
             "joint_vprefix_outputs_from_grouped_scores_batched_cuda",
             "joint_select_policy_from_grouped_scores_intervals_batched_no_mb_cuda",
+            "joint_mixed_select_policy_merge_rankpos_no_calib_no_mb_cuda",
             "joint_vprefix_outputs_from_grouped_risk_batched_workspace_cuda",
             "joint_select_policy_from_grouped_risk_intervals_batched_no_mb_cuda",
             "joint_select_policy_grouped_flat_no_mb_cuda",

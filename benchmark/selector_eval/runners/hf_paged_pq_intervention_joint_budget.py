@@ -6,7 +6,11 @@ from typing import Any
 
 import torch
 
-from benchmark.selector_eval.runners.hf_paged_pq_intervention_common import _env_truthy, _parse_budget_schedule
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_common import (
+    _budgets_from_fraction_schedule,
+    _env_truthy,
+    _parse_budget_schedule,
+)
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_common import MB
 
 
@@ -36,9 +40,16 @@ def joint_kv_budget_schedule_for(
 ) -> JointKVBudgetSchedule:
     k_budget_text = str(getattr(args, "joint_kv_k_budgets", ""))
     v_budget_text = str(getattr(args, "joint_kv_v_budgets", ""))
+    k_budget_frac_text = str(getattr(args, "joint_kv_k_budget_fracs", "")).strip()
+    v_budget_frac_text = str(getattr(args, "joint_kv_v_budget_fracs", "")).strip()
+    if bool(k_budget_frac_text) != bool(v_budget_frac_text):
+        raise ValueError("joint_kv_k_budget_fracs and joint_kv_v_budget_fracs must be provided together")
     budget_cache_key = (
         k_budget_text,
         v_budget_text,
+        k_budget_frac_text,
+        v_budget_frac_text,
+        int(context_len),
         str(device.type),
         int(device.index) if device.index is not None else -1,
     )
@@ -48,8 +59,20 @@ def joint_kv_budget_schedule_for(
         setattr(args, "_pagedpq_joint_budget_cache", budget_cache)
     cached_budgets = budget_cache.get(budget_cache_key)
     if cached_budgets is None:
-        parsed_k_budgets = _parse_budget_schedule(k_budget_text, name="joint_kv_k_budgets")
-        parsed_v_budgets = _parse_budget_schedule(v_budget_text, name="joint_kv_v_budgets")
+        if k_budget_frac_text:
+            parsed_k_budgets = _budgets_from_fraction_schedule(
+                k_budget_frac_text,
+                name="joint_kv_k_budget_fracs",
+                context_len=int(context_len),
+            )
+            parsed_v_budgets = _budgets_from_fraction_schedule(
+                v_budget_frac_text,
+                name="joint_kv_v_budget_fracs",
+                context_len=int(context_len),
+            )
+        else:
+            parsed_k_budgets = _parse_budget_schedule(k_budget_text, name="joint_kv_k_budgets")
+            parsed_v_budgets = _parse_budget_schedule(v_budget_text, name="joint_kv_v_budgets")
         cached_budgets = (
             tuple(int(v) for v in parsed_k_budgets),
             tuple(int(v) for v in parsed_v_budgets),

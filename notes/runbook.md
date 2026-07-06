@@ -8,8 +8,10 @@ Keep this file to current commands only. Old command recipes are preserved in `n
 - Prefer partition `spgpu` and account `zhengya98`.
 - Do not run heavy GPU workloads or extension builds on the login node.
 - Use the repo `.venv` and load `python/3.10.4` when needed.
+- For Blackwell / RTX6000 validation, use local `.venv_cu128` plus `.hf_pydeps_cu128`; do not rely on module PyTorch.
 - Report logical frontier MB separately from physical GPU simulator MB.
 - Do not use `DISABLE_COST_STATS=1` / no-stats runs for optimization or promotion decisions. Use accounting/profile runs so latency, logical MB, physical MB, selected counts, and wall buckets are captured together.
+- For benchmark-runtime gates, prefer `SELECTOR_PQ_JOINT_WALL_PROFILE=1 PROFILE_NATIVE_OPS=0`: this keeps MB accounting and coarse wall buckets without adding per-op CUDA synchronization. Use `PROFILE_NATIVE_OPS=1` only for focused bottleneck attribution, not headline runtime.
 - Active Slurm wrappers should reject `DISABLE_COST_STATS=1` rather than forwarding `--disable_cost_stats`.
 - Canonical frontier defaults live in `benchmark/selector_eval/frontier_config.py`; regenerate `scripts/frontier_canonical_env.sh` and `scripts/frontier_direct_runtime_env.sh` from that module if the canonical contract changes.
 
@@ -18,6 +20,26 @@ Keep this file to current commands only. Old command recipes are preserved in `n
 ```bash
 sbatch scripts/run_frontier_cuda_unit_tests.sh
 ```
+
+Multi-architecture local PyTorch path for A100/MIG, A40, and RTX6000:
+
+```bash
+sbatch scripts/run_install_torch_cu128_venv.sh
+HF_VENV_DIR=.venv_cu128 TORCH_CUDA_ARCH_LIST='8.0;8.6;12.0' \
+  OUTPUT_DIR=cuda_unit_result/frontier_cuda_ext_build_cu128 \
+  sbatch scripts/run_frontier_cuda_ext_build_only.sh
+HF_VENV_DIR=.venv_cu128 TORCH_CUDA_ARCH_LIST='8.0;8.6;12.0' \
+  OUTPUT_DIR=cuda_unit_result/frontier_cuda_unit_cu128_spgpu \
+  sbatch -p spgpu scripts/run_frontier_cuda_unit_tests.sh
+HF_VENV_DIR=.venv_cu128 TORCH_CUDA_ARCH_LIST='8.0;8.6;12.0' \
+  OUTPUT_DIR=cuda_unit_result/frontier_cuda_unit_cu128_mig40 \
+  sbatch -p gpu_mig40 scripts/run_frontier_cuda_unit_tests.sh
+HF_VENV_DIR=.venv_cu128 TORCH_CUDA_ARCH_LIST='8.0;8.6;12.0' \
+  OUTPUT_DIR=cuda_unit_result/frontier_cuda_unit_cu128_rtx6000 \
+  sbatch -p gpu-rtx6000 scripts/run_frontier_cuda_unit_tests.sh
+```
+
+Use `HF_EXTRA_PYTHONPATH=.hf_pydeps_cu128` with benchmark wrappers when using `.venv_cu128`.
 
 ## Joint K/V Trace Parity
 
@@ -58,7 +80,7 @@ Canonical frontier:
 ```bash
 TASK_NAME=niah_single_1 CONTEXT_LEN=32768 NUM_SAMPLES=1 \
 OUTPUT_ROOT=ruler_eval_result/frontier_smoke \
-FRONTIER_CANONICAL_GPU=1 PROFILE_NATIVE_OPS=1 SELECTOR_PQ_JOINT_WALL_PROFILE=1 \
+FRONTIER_CANONICAL_GPU=1 PROFILE_NATIVE_OPS=0 SELECTOR_PQ_JOINT_WALL_PROFILE=1 \
 sbatch scripts/run_frontier_ruler_batched_one.sh
 ```
 
@@ -79,11 +101,19 @@ Canonical frontier:
 ```bash
 MAX_EXAMPLES=2 LENGTH_FILTER=short DIFFICULTY_FILTER=easy MAX_INPUT_TOKENS=32768 \
 OUTPUT_DIR=longbench_v2_hf_result/frontier_smoke \
-FRONTIER_CANONICAL_GPU=1 PROFILE_NATIVE_OPS=1 SELECTOR_PQ_JOINT_WALL_PROFILE=1 \
+FRONTIER_CANONICAL_GPU=1 PROFILE_NATIVE_OPS=0 SELECTOR_PQ_JOINT_WALL_PROFILE=1 \
 sbatch scripts/run_frontier_longbench_v2_one.sh
 ```
 
 ## Public Long-Decode Suite
+
+Supported HF model presets for the generic LongBench-v2 and public long-decode runners:
+
+```bash
+bash scripts/list_hf_model_presets.sh
+```
+
+Current presets are `qwen3_8b`, `qwen3_14b`, `qwen3_5_9b`, `llama31_8b` / `llama3_1_8b`, `mistral_nemo_12b`, `glm4_9b`, and `phi4_reasoning_14b`. RULER streaming is still Llama-oriented; use LongBench-v2/public-longdecode first when validating non-Llama architectures.
 
 Smoke matrix, launches separate dense/frontier jobs:
 
@@ -108,6 +138,55 @@ bash scripts/submit_public_longdecode_full_matrix.sh
 
 The full matrix shards AIME24, GPQA, LiveCodeBench codegen, LongGenBench SGT short/long, and LongGenBench GSM8K with dense and canonical `pagedpq` modes. Defaults are capped to fewer than 100 jobs. Override totals or shard sizes before launch, for example `LIVE_CODE_TOTAL_EXAMPLES=175`, `LONGGEN_SGT_SHORT_TOTAL_EXAMPLES=400`, or `LONGGEN_SGT_SHORT_SHARD_SIZE=8`.
 
+For Qwen3 public task-quality runs, the submitters default to the Qwen3 technical-report generation style: thinking mode with `TEMPERATURE=0.6`, `TOP_P=0.95`, `TOP_K=20`; AIME uses `MAX_NEW_TOKENS=38912`, and GPQA/LiveCodeBench use `MAX_NEW_TOKENS=32768`. Set `QWEN3_EVAL_MODE=nonthinking` for the report's non-thinking sampling defaults. LongGenBench remains forced-length/deterministic because it is a long-decode stress benchmark rather than a Qwen3 report benchmark. Coalesced public jobs default to `PUBLIC_TIME=3-00:00:00`; the old one-day limit is too short for full AIME24 Qwen3 thinking-mode dense+frontier shards.
+
+HELMET and LongProc support is wired into the same public-longdecode runner:
+
+```bash
+sbatch scripts/prepare_helmet_data.sh
+sbatch scripts/prepare_helmet_longqa_data.sh
+```
+
+HELMET RAG/Recall use the official HELMET JSONL data under `third_party/benchmarks/HELMET/data`; LongQA uses local InfiniteBench JSONL files in `data/infbench` when available. LongProc data is vendored under `third_party/benchmarks/LongProc/data`.
+
+Small HELMET/LongProc matrix, dry-run by default:
+
+```bash
+RUN_PUBLIC=1 RUN_RULER=0 RUN_LONGBENCH=0 \
+INCLUDE_AIME=0 INCLUDE_GPQA=0 INCLUDE_LIVE_CODE=0 \
+INCLUDE_LONGGEN_SGT_SHORT=0 INCLUDE_LONGGEN_SGT_LONG=0 INCLUDE_LONGGEN_GSM8K=0 \
+INCLUDE_HELMET=1 INCLUDE_LONGPROC=1 \
+SUBMIT=0 .venv/bin/python scripts/submit_coalesced_benchmark_suite.py
+```
+
+Small LongProc 2K/8K dense-vs-frontier smoke:
+
+```bash
+RUN_PUBLIC=1 RUN_RULER=0 RUN_LONGBENCH=0 \
+INCLUDE_AIME=0 INCLUDE_GPQA=0 INCLUDE_LIVE_CODE=0 \
+INCLUDE_LONGGEN_SGT_SHORT=0 INCLUDE_LONGGEN_SGT_LONG=0 INCLUDE_LONGGEN_GSM8K=0 \
+INCLUDE_HELMET=0 INCLUDE_LONGPROC=1 \
+LONGPROC_2K_TOTAL_EXAMPLES=1 LONGPROC_2K_SHARD_SIZE=1 \
+LONGPROC_8K_TOTAL_EXAMPLES=1 LONGPROC_8K_SHARD_SIZE=1 \
+PUBLIC_MODES=dense,pagedpq PUBLIC_GROUP_SIZE=4 \
+PARTITIONS=gpu-rtx6000,spgpu,gpu_mig40 \
+SUBMIT=1 .venv/bin/python scripts/submit_coalesced_benchmark_suite.py
+```
+
+Active-path validation is also dry-run by default:
+
+```bash
+HF_MODEL_PRESET=mistral_nemo_12b \
+bash scripts/submit_public_longdecode_active_validation.sh
+```
+
+Launch only when the queue is usable:
+
+```bash
+SUBMIT=1 HF_MODEL_PRESET=mistral_nemo_12b \
+bash scripts/submit_public_longdecode_active_validation.sh
+```
+
 ## Audit / Reporting
 
 Regenerate canonical shell fragments after editing `frontier_config.py`:
@@ -122,7 +201,7 @@ python -m benchmark.selector_eval.frontier_config --emit-direct-runtime-shell > 
 
 ```bash
 RUN_NAME=kvcomp_full_scalar_YYYYMMDD \
-METHODS=dense,kivi_like_b2_w128,kivi_like_b3_w128,kivi_like_b4_w128 \
+METHODS=dense,kivi_b2_g32_w128,kivi_b4_g32_w128,kivi_b2_g32_w2048,kivi_b4_g32_w2048 \
 sbatch scripts/run_kv_compression_rel_l2_eval_one.sh
 ```
 
@@ -172,8 +251,20 @@ MPLCONFIGDIR=/tmp/matplotlib-frontier-pareto \
 ```
 
 ```bash
+.venv/bin/python benchmark/audit_benchmark_pairs.py \
+  --root <benchmark_suite_result/root> \
+  --manifest <manifest.tsv> \
+  --output-md notes/archive/benchmark_audits_2026-05/benchmark_pair_audit_latest.md \
+  --output-json notes/archive/benchmark_audits_2026-05/benchmark_pair_audit_latest.json
+```
+
+```bash
 bash scripts/check_frontier_benchmark_readiness.sh
 ```
+
+## Slurm Export Caveat
+
+Do not pass comma-containing values directly through `sbatch --export`; Slurm splits the export string on commas. For parity runs, prefer wrapper presets such as `PARITY_PRESET=long` over `DECODE_LENGTHS=32000,64000,128000` or `HEADS=0,8` in `--export`. If a comma list is unavoidable, put it inside a wrapper script or use an environment file sourced by the job.
 
 ## HuggingFace Cache
 

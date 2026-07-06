@@ -131,11 +131,23 @@ def joint_cuda_flags_config() -> dict[str, bool | int]:
         "selector_pq_joint_score_grid_no_exact_fill": env_truthy("SELECTOR_PQ_JOINT_SCORE_GRID_NO_EXACT_FILL", "0"),
         "selector_pq_joint_score_grid_workspace": env_truthy("SELECTOR_PQ_JOINT_SCORE_GRID_WORKSPACE", "0"),
         "selector_pq_joint_grouped_score_workspace": env_truthy("SELECTOR_PQ_JOINT_GROUPED_SCORE_WORKSPACE", "0"),
+        "selector_pq_joint_nocalib_scatter_score_grid": env_truthy(
+            "SELECTOR_PQ_JOINT_NOCALIB_SCATTER_SCORE_GRID",
+            "0",
+        ),
         "selector_pq_joint_rankpos_score_grid": env_truthy("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID", "0"),
         "selector_pq_joint_grouped_vpq_cache": env_truthy("SELECTOR_PQ_JOINT_GROUPED_VPQ_CACHE", "0"),
         "selector_pq_joint_score_direct_vprefix": env_truthy("SELECTOR_PQ_JOINT_SCORE_DIRECT_VPREFIX", "0"),
         "selector_pq_joint_score_direct_interval_policy": env_truthy(
             "SELECTOR_PQ_JOINT_SCORE_DIRECT_INTERVAL_POLICY",
+            "0",
+        ),
+        "selector_pq_joint_score_prob_interval_policy": env_truthy(
+            "SELECTOR_PQ_JOINT_SCORE_PROB_INTERVAL_POLICY",
+            "0",
+        ),
+        "selector_pq_joint_score_direct_topk_interval_policy": env_truthy(
+            "SELECTOR_PQ_JOINT_SCORE_DIRECT_TOPK_INTERVAL_POLICY",
             "0",
         ),
         "selector_pq_joint_score_direct_workspace": env_truthy("SELECTOR_PQ_JOINT_SCORE_DIRECT_WORKSPACE", "0"),
@@ -145,15 +157,24 @@ def joint_cuda_flags_config() -> dict[str, bool | int]:
         "selector_pq_joint_risk_prefix_topk": env_truthy("SELECTOR_PQ_JOINT_RISK_PREFIX_TOPK", "0"),
         "selector_pq_joint_risk_prefix_workspace": env_truthy("SELECTOR_PQ_JOINT_RISK_PREFIX_WORKSPACE", "0"),
         "selector_pq_joint_fast_token_layout": env_truthy("SELECTOR_PQ_JOINT_FAST_TOKEN_LAYOUT", "0"),
+        "selector_pq_joint_compact_vpq_risk_prefix": env_truthy(
+            "SELECTOR_PQ_JOINT_COMPACT_VPQ_RISK_PREFIX",
+            "0",
+        ),
         "selector_pq_joint_native_vpq_base": env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE", "0"),
         "selector_pq_joint_native_vpq_append": env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_APPEND", "0"),
         "selector_pq_joint_native_vpq_sidecar": env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_SIDECAR", "0"),
         "selector_pq_joint_native_softmax_base": env_truthy("SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE", "0"),
+        "selector_pq_joint_grouped_softmax_base": env_truthy("SELECTOR_PQ_JOINT_GROUPED_SOFTMAX_BASE", "0"),
         "selector_pq_joint_native_pq_scale_in_kernel": env_truthy(
             "SELECTOR_PQ_JOINT_NATIVE_PQ_SCALE_IN_KERNEL",
             "0",
         ),
         "selector_pq_joint_native_accounting": env_truthy("SELECTOR_PQ_JOINT_NATIVE_ACCOUNTING", "0"),
+        "selector_pq_joint_fused_policy_accounting": env_truthy(
+            "SELECTOR_PQ_JOINT_FUSED_POLICY_ACCOUNTING",
+            "0",
+        ),
         "selector_pq_joint_native_accounting_verify": env_truthy(
             "SELECTOR_PQ_JOINT_NATIVE_ACCOUNTING_VERIFY",
             "0",
@@ -232,7 +253,7 @@ def parse_args():
         ],
         default="joint_kv_stability",
     )
-    parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="affine_selected")
+    parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="none")
     parser.add_argument("--tail_probe_rel_l2_max", type=float, default=float("inf"))
     parser.add_argument("--tail_proxy_mass_min", type=float, default=0.97)
     parser.add_argument("--tail_proxy_mass_max", type=float, default=1.0)
@@ -266,7 +287,15 @@ def parse_args():
     )
     parser.add_argument("--joint_kv_k_budgets", default="4096,8192,14336,32768")
     parser.add_argument("--joint_kv_v_budgets", default="1024,2048,4096,6144,8192,12288,16384")
-    parser.add_argument("--joint_kv_stability_threshold", type=float, default=0.001)
+    parser.add_argument("--joint_kv_k_budget_fracs", default="0.10,0.30,0.50,0.70,0.90,1.0")
+    parser.add_argument("--joint_kv_v_budget_fracs", default="0.05,0.10,0.20,0.40,0.60,0.80,1.0")
+    parser.add_argument("--joint_kv_stability_threshold", type=float, default=0.002)
+    parser.add_argument("--joint_kv_threshold_mode", choices=["fixed", "budget_delta_frac"], default="budget_delta_frac")
+    parser.add_argument("--joint_kv_threshold_reference_frac", type=float, default=0.2)
+    parser.add_argument("--joint_kv_threshold_scale_shape", choices=["linear", "sqrt", "log"], default="sqrt")
+    parser.add_argument("--joint_kv_threshold_min_scale", type=float, default=0.0)
+    parser.add_argument("--joint_kv_threshold_max_scale", type=float, default=1.5)
+    parser.add_argument("--joint_kv_start_strategy", default="proxy_mass_m0p9")
     parser.add_argument("--selected_value_mode", choices=["exact", "vpq_value"], default="vpq_value")
     parser.add_argument(
         "--selected_value_exact_rule",
@@ -637,7 +666,15 @@ def pagedpq_config(args):
         "joint_kv_policy": str(getattr(args, "joint_kv_policy", "")),
         "joint_kv_k_budgets": str(getattr(args, "joint_kv_k_budgets", "")),
         "joint_kv_v_budgets": str(getattr(args, "joint_kv_v_budgets", "")),
+        "joint_kv_k_budget_fracs": str(getattr(args, "joint_kv_k_budget_fracs", "")),
+        "joint_kv_v_budget_fracs": str(getattr(args, "joint_kv_v_budget_fracs", "")),
         "joint_kv_stability_threshold": float(getattr(args, "joint_kv_stability_threshold", 0.0)),
+        "joint_kv_threshold_mode": str(getattr(args, "joint_kv_threshold_mode", "")),
+        "joint_kv_threshold_reference_frac": float(getattr(args, "joint_kv_threshold_reference_frac", 0.0)),
+        "joint_kv_threshold_scale_shape": str(getattr(args, "joint_kv_threshold_scale_shape", "")),
+        "joint_kv_threshold_min_scale": float(getattr(args, "joint_kv_threshold_min_scale", 0.0)),
+        "joint_kv_threshold_max_scale": float(getattr(args, "joint_kv_threshold_max_scale", 0.0)),
+        "joint_kv_start_strategy": str(getattr(args, "joint_kv_start_strategy", "")),
         "tail_blend": float(args.tail_blend),
         "selected_value_mode": str(args.selected_value_mode),
         "selected_value_exact_rule": str(args.selected_value_exact_rule),

@@ -14,14 +14,15 @@ set -euo pipefail
 cd /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention
 
 OUTPUT_DIR="${OUTPUT_DIR:-cuda_unit_result/frontier_cuda_ext_build_only_$(date +%Y%m%d_%H%M%S)}"
+HF_VENV_DIR="${HF_VENV_DIR:-.venv}"
 mkdir -p "${OUTPUT_DIR}"
 
 module purge
 module load python/3.10.4
 module load cuda/12.8.1
-source .venv/bin/activate
+source "${HF_VENV_DIR}/bin/activate"
 
-export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.10/site-packages/torch/lib:/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$PWD/${HF_VENV_DIR}/lib/python3.10/site-packages/torch/lib:/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.6}"
 export PYTHONPATH="$PWD/benchmark/selector_eval/cuda_ext:${PYTHONPATH:-}"
 export MAX_JOBS="${MAX_JOBS:-${SLURM_CPUS_PER_TASK:-4}}"
@@ -54,7 +55,7 @@ if [ "${rc}" -ne 0 ]; then
 fi
 end_ts="$(date +%s)"
 
-.venv/bin/python - <<PY
+"${HF_VENV_DIR}/bin/python" - <<PY
 import json
 from pathlib import Path
 

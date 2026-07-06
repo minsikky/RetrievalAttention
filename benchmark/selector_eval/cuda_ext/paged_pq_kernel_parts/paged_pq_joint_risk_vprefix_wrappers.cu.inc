@@ -320,6 +320,157 @@ torch::Tensor joint_vprefix_outputs_from_grouped_risk_batched_cuda(
   return outputs;
 }
 
+torch::Tensor joint_vprefix_outputs_from_grouped_risk_batched_vpq_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor values,
+    torch::Tensor value_codebooks,
+    torch::Tensor value_codes,
+    torch::Tensor page_starts,
+    torch::Tensor code_error_groups,
+    torch::Tensor v_budgets,
+    int64_t page_size) {
+  const auto groups = base_outputs.size(0);
+  const auto k_count = base_outputs.size(1);
+  const auto heads = base_outputs.size(2);
+  const auto dim = base_outputs.size(3);
+  const auto context_len = probs.size(3);
+  const auto v_steps = v_budgets.size(0);
+  const auto rows = groups * k_count * heads;
+  const auto pages = value_codebooks.size(1);
+  const auto value_subvecs = value_codebooks.size(2);
+  const auto code_count = value_codebooks.size(3);
+  auto outputs = torch::empty({rows, v_steps, dim}, base_outputs.options().dtype(torch::kFloat32));
+  if (rows == 0 || dim == 0 || v_steps == 0) {
+    return outputs;
+  }
+  auto base_flat = base_outputs.reshape({rows, dim});
+  auto probs_flat = probs.reshape({rows, context_len});
+  if (context_len == 0) {
+    return outputs.copy_(base_flat.reshape({rows, 1, dim}).expand({rows, v_steps, dim}));
+  }
+
+  auto flat_opts = base_outputs.options().dtype(torch::kFloat32);
+  auto long_opts = base_outputs.options().dtype(torch::kLong);
+  auto int_opts = base_outputs.options().dtype(torch::kInt);
+  auto byte_opts = base_outputs.options().dtype(torch::kUInt8);
+  auto risk_in = torch::empty({rows, context_len}, flat_opts);
+  auto risk_out = torch::empty({rows, context_len}, flat_opts);
+  auto ids_in = torch::empty({rows, context_len}, int_opts);
+  auto ids_out = torch::empty({rows, context_len}, int_opts);
+  auto offsets = torch::empty({rows + 1}, long_opts);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int threads = 256;
+  const int64_t total = rows * context_len;
+  const int64_t fill_blocks = (total + threads - 1) / threads;
+  joint_grouped_flat_risk_sort_inputs_kernel<<<static_cast<unsigned int>(fill_blocks), threads, 0, stream>>>(
+      probs_flat.data_ptr<float>(),
+      code_error_groups.data_ptr<float>(),
+      risk_in.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      groups,
+      k_count,
+      heads,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const int64_t offset_blocks = ((rows + 1) + threads - 1) / threads;
+  joint_segment_offsets_kernel<<<static_cast<unsigned int>(offset_blocks), threads, 0, stream>>>(
+      offsets.data_ptr<int64_t>(),
+      rows,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  size_t temp_bytes = 0;
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      nullptr,
+      temp_bytes,
+      risk_in.data_ptr<float>(),
+      risk_out.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      ids_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  auto temp = torch::empty({static_cast<int64_t>(temp_bytes)}, byte_opts);
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      temp.data_ptr(),
+      temp_bytes,
+      risk_in.data_ptr<float>(),
+      risk_out.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      ids_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto interval_sums = torch::empty({rows, v_steps, dim}, flat_opts);
+  constexpr int dims_per_block = 8;
+  const int64_t dim_tiles = (dim + dims_per_block - 1) / dims_per_block;
+  const int64_t interval_blocks = rows * v_steps * dim_tiles;
+#define DISPATCH_JOINT_VPQ_INTERVAL(CODE_T)                                                       \
+  AT_DISPATCH_FLOATING_TYPES_AND2(                                                                \
+      at::ScalarType::Half, at::ScalarType::BFloat16, values.scalar_type(),                       \
+      "joint_grouped_flat_vprefix_interval_sums_vpq", [&] {                                      \
+        joint_grouped_flat_vprefix_interval_sums_vpq_kernel<int32_t, scalar_t, CODE_T, dims_per_block><<< \
+            static_cast<unsigned int>(interval_blocks), threads, 0, stream>>>(                    \
+            probs_flat.data_ptr<float>(),                                                         \
+            values.data_ptr<scalar_t>(),                                                          \
+            value_codebooks.data_ptr<float>(),                                                     \
+            value_codes.data_ptr<CODE_T>(),                                                       \
+            page_starts.data_ptr<int64_t>(),                                                       \
+            ids_out.data_ptr<int32_t>(),                                                           \
+            v_budgets.data_ptr<int64_t>(),                                                         \
+            interval_sums.data_ptr<float>(),                                                       \
+            groups,                                                                                \
+            k_count,                                                                               \
+            heads,                                                                                 \
+            context_len,                                                                           \
+            context_len,                                                                           \
+            v_steps,                                                                               \
+            dim,                                                                                   \
+            pages,                                                                                 \
+            page_size,                                                                              \
+            value_subvecs,                                                                         \
+            code_count);                                                                           \
+      })
+  if (value_codes.scalar_type() == torch::kUInt8) {
+    DISPATCH_JOINT_VPQ_INTERVAL(uint8_t);
+  } else if (value_codes.scalar_type() == torch::kInt) {
+    DISPATCH_JOINT_VPQ_INTERVAL(int32_t);
+  } else if (value_codes.scalar_type() == torch::kLong) {
+    DISPATCH_JOINT_VPQ_INTERVAL(int64_t);
+  } else {
+    TORCH_CHECK(false, "value_codes must be uint8, int32, or int64");
+  }
+#undef DISPATCH_JOINT_VPQ_INTERVAL
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  const int64_t out_total = rows * dim;
+  const int64_t out_blocks = (out_total + threads - 1) / threads;
+  joint_grouped_flat_vprefix_prefix_intervals_kernel<<<static_cast<unsigned int>(out_blocks), threads, 0, stream>>>(
+      base_flat.data_ptr<float>(),
+      interval_sums.data_ptr<float>(),
+      v_budgets.data_ptr<int64_t>(),
+      outputs.data_ptr<float>(),
+      rows,
+      context_len,
+      context_len,
+      v_steps,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return outputs;
+}
+
 int64_t joint_grouped_risk_sort_temp_bytes_cuda(int64_t rows, int64_t context_len) {
   rows = std::max<int64_t>(0, rows);
   context_len = std::max<int64_t>(0, context_len);
@@ -664,4 +815,3 @@ torch::Tensor joint_vprefix_outputs_from_grouped_risk_topk_batched_cuda(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return outputs;
 }
-

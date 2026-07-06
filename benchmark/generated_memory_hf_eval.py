@@ -2362,6 +2362,12 @@ def load_hf_model(args, dtype, config):
             "Qwen3_5ForConditionalGeneration",
         ):
             add_transformers_class(class_name)
+    if text_model_type in {"phi", "phi3", "phi4"} or top_model_type in {"phi", "phi3", "phi4"}:
+        for class_name in (
+            "PhiForCausalLM",
+            "Phi3ForCausalLM",
+        ):
+            add_transformers_class(class_name)
     if text_model_type == "mistral" or top_model_type == "mistral":
         add_transformers_class("MistralForCausalLM")
     if text_model_type in {"mistral3"} or top_model_type in {"mistral3"}:

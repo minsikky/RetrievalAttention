@@ -7,6 +7,176 @@ import torch
 
 from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import GPUIndex
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_common import _env_int, _env_truthy
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_value import (
+    value_vpq_code_stat_risk_from_pack_streaming_torch,
+)
+
+
+def _maybe_log_cuda_mem(label: str, device: torch.device) -> None:
+    if not _env_truthy("SELECTOR_PQ_JOINT_MEMORY_TRACE", "0"):
+        return
+    if device.type != "cuda":
+        return
+    allocated = float(torch.cuda.memory_allocated(device)) / (1024.0 * 1024.0)
+    reserved = float(torch.cuda.memory_reserved(device)) / (1024.0 * 1024.0)
+    peak = float(torch.cuda.max_memory_allocated(device)) / (1024.0 * 1024.0)
+    print(
+        f"[frontier-mem] {label}: allocated={allocated:.1f}MiB "
+        f"reserved={reserved:.1f}MiB peak={peak:.1f}MiB",
+        flush=True,
+    )
+
+
+def grouped_vpq_compact_sidecars_for(
+    state: Any,
+    gqa_indexes: list[GPUIndex],
+    *,
+    context_len_i: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor, int] | None:
+    """Return compact grouped V-PQ sidecars for residual-risk evaluation.
+
+    This keeps deployable sidecar state as codebooks/codes plus per-token
+    risk stats.  It intentionally does not materialize full reconstructed V
+    or residual tensors, which are the dominant 128K VRAM failure mode.
+    """
+
+    if len(gqa_indexes) != int(state.num_kv_heads):
+        return None
+    args = state.args
+    context_len_i = int(context_len_i)
+    num_kv_heads = int(state.num_kv_heads)
+    values_all = state.values_all
+    pack = state.gqa_value_vpq_pack(
+        gqa_indexes,
+        value_group_pages=int(getattr(args, "value_pq_group_pages", 1)),
+    )
+    if pack is None:
+        return None
+    value_codebooks_t, value_codes_t, value_page_starts_t, value_page_size_i, actual_subbits_i = pack
+    if int(value_codebooks_t.shape[0]) != num_kv_heads:
+        return None
+    if int(value_codebooks_t.shape[2]) != 1:
+        return None
+
+    joint_vpq_cache_key_for = state.patch_state.joint_vpq_cache_key_for
+    group_key = (
+        "compact",
+        tuple(
+            joint_vpq_cache_key_for(
+                int(kv_head),
+                values_all[int(kv_head)][:context_len_i],
+                gqa_indexes[int(kv_head)],
+            )
+            for kv_head in range(num_kv_heads)
+        ),
+        int(value_codebooks_t.data_ptr()),
+        tuple(int(v) for v in value_codebooks_t.shape),
+        int(value_codes_t.data_ptr()),
+        tuple(int(v) for v in value_codes_t.shape),
+        str(value_codes_t.dtype),
+        int(value_page_starts_t.data_ptr()),
+        int(value_page_starts_t.numel()),
+        int(value_page_size_i),
+        int(actual_subbits_i),
+    )
+    compact_cache = getattr(state.module, "_pagedpq_joint_compact_vpq_sidecar_cache", None)
+    if not isinstance(compact_cache, dict):
+        compact_cache = {}
+        setattr(state.module, "_pagedpq_joint_compact_vpq_sidecar_cache", compact_cache)
+    cached = compact_cache.get(group_key)
+    if cached is not None:
+        cached_len, cached_capacity, code_error_groups_t = cached
+        cached_len_i = int(cached_len)
+        cached_capacity_i = int(cached_capacity)
+        if cached_len_i >= context_len_i:
+            return (
+                value_codebooks_t,
+                value_codes_t,
+                value_page_starts_t,
+                int(value_page_size_i),
+                code_error_groups_t[:, :context_len_i],
+                int(actual_subbits_i),
+            )
+        if cached_capacity_i < context_len_i:
+            grow_pad_i = max(
+                0,
+                _env_int("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE_GROW_PAD", 256),
+            )
+            new_capacity_i = max(
+                context_len_i,
+                cached_capacity_i + max(grow_pad_i, context_len_i - cached_capacity_i),
+            )
+            buf_t = torch.empty(
+                (num_kv_heads, int(new_capacity_i)),
+                dtype=code_error_groups_t.dtype,
+                device=code_error_groups_t.device,
+            )
+            if cached_len_i > 0:
+                buf_t[:, :cached_len_i].copy_(code_error_groups_t[:, :cached_len_i])
+            code_error_groups_t = buf_t
+            cached_capacity_i = int(new_capacity_i)
+        code_error_groups_t[:, cached_len_i:context_len_i].zero_()
+        compact_cache[group_key] = (
+            int(context_len_i),
+            int(cached_capacity_i),
+            code_error_groups_t,
+        )
+        return (
+            value_codebooks_t,
+            value_codes_t,
+            value_page_starts_t,
+            int(value_page_size_i),
+            code_error_groups_t[:, :context_len_i],
+            int(actual_subbits_i),
+        )
+
+    _maybe_log_cuda_mem("compact-vpq-risk:start", state.device)
+    code_error_parts: list[torch.Tensor] = []
+    actual_subbits = int(actual_subbits_i)
+    for kv_head in range(num_kv_heads):
+        single_pack = (
+            value_codebooks_t[int(kv_head)],
+            value_codes_t[int(kv_head)],
+            value_page_starts_t,
+            int(value_page_size_i),
+            int(actual_subbits_i),
+        )
+        code_error_t, actual_subbits = value_vpq_code_stat_risk_from_pack_streaming_torch(
+            values=values_all[int(kv_head)][:context_len_i],
+            pack=single_pack,
+            context_len=int(context_len_i),
+        )
+        code_error_parts.append(code_error_t.to(dtype=torch.float32))
+    code_error_groups_t = torch.stack(code_error_parts, dim=0).contiguous()
+    grow_pad_i = max(
+        0,
+        _env_int("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE_GROW_PAD", 256),
+    )
+    cache_capacity_i = int(context_len_i + grow_pad_i)
+    if cache_capacity_i > context_len_i:
+        buf_t = torch.empty(
+            (num_kv_heads, int(cache_capacity_i)),
+            dtype=code_error_groups_t.dtype,
+            device=code_error_groups_t.device,
+        )
+        buf_t[:, :context_len_i].copy_(code_error_groups_t)
+        code_error_groups_t = buf_t
+    if compact_cache:
+        compact_cache.clear()
+    compact_cache[group_key] = (
+        int(context_len_i),
+        int(cache_capacity_i),
+        code_error_groups_t,
+    )
+    _maybe_log_cuda_mem("compact-vpq-risk:done", state.device)
+    return (
+        value_codebooks_t,
+        value_codes_t,
+        value_page_starts_t,
+        int(value_page_size_i),
+        code_error_groups_t[:, :context_len_i],
+        int(actual_subbits),
+    )
 
 
 def grouped_vpq_residual_sidecars_for(

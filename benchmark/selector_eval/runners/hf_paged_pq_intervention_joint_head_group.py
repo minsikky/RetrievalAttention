@@ -52,6 +52,11 @@ class JointKVHeadGroupRuntime:
     grouped_vpq_vhat_groups_t: torch.Tensor | None
     grouped_vpq_residual_groups_t: torch.Tensor | None
     grouped_vpq_code_error_groups_t: torch.Tensor | None
+    grouped_vpq_value_codebooks_t: torch.Tensor | None
+    grouped_vpq_value_codes_t: torch.Tensor | None
+    grouped_vpq_value_page_starts_t: torch.Tensor | None
+    grouped_vpq_value_page_size: int | None
+    grouped_vpq_values_t: torch.Tensor | None
     grouped_vpq_actual_subbits: int | None
     grouped_risk_records: list[dict[str, object]]
     outputs_all: torch.Tensor
@@ -59,18 +64,25 @@ class JointKVHeadGroupRuntime:
     joint_vpq_sidecars_for: Callable
     joint_vpq_pack_and_fallback_for: Callable
     token_layout_for: Callable
+    nocalib_score_grid_workspace_for: Callable
+    nocalib_scatter_score_grid_workspace_for: Callable
     score_grid_workspace_for: Callable
     grouped_score_grid_workspace_for: Callable
     grouped_output_workspace_for: Callable
     softmax_base_workspace_for: Callable
     native_rank_prefix_tokens: Callable
     wall_profile_enabled: bool
+    kv_head_indices: list[int] | None = None
     grouped_geo_t0: float = 0.0
 
 
 def process_joint_kv_head_groups(runtime: JointKVHeadGroupRuntime) -> bool:
-    num_kv_heads = runtime.num_kv_heads
-    for kv_head_i in range(num_kv_heads):
+    kv_head_indices = (
+        list(runtime.kv_head_indices)
+        if runtime.kv_head_indices is not None
+        else list(range(runtime.num_kv_heads))
+    )
+    for kv_head_i in kv_head_indices:
         if not process_one_joint_kv_head(runtime, int(kv_head_i)):
             return False
     return True

@@ -50,6 +50,9 @@ class ApproxStats:
     native_joint_layout_seconds: float = 0.0
     native_joint_group_pack_seconds: float = 0.0
     native_joint_accounting_seconds: float = 0.0
+    joint_staged_kv_groups: int = 0
+    joint_staged_kv_accepted_groups: int = 0
+    joint_staged_kv_boundary_groups: int = 0
     native_vpq_append_seconds: float = 0.0
     native_vpq_append_calls: int = 0
     native_vpq_append_grouped_calls: int = 0
@@ -234,6 +237,20 @@ class ApproxStats:
         self._device_count_sums.add_(sums_t.to(dtype=torch.float64))
         self._device_count_repeats += int(repeats)
 
+    def reserve_count_sums_device_accumulator(self, repeats: int, device: torch.device) -> torch.Tensor | None:
+        """Return the deferred device accumulator for native in-place accounting."""
+
+        repeats = int(repeats)
+        if repeats <= 0:
+            return None
+        if self._device_count_sums is None:
+            self._device_count_sums = torch.zeros((11,), dtype=torch.float64, device=device)
+        elif self._device_count_sums.device != device:
+            self.flush_device_count_sums()
+            self._device_count_sums = torch.zeros((11,), dtype=torch.float64, device=device)
+        self._device_count_repeats += int(repeats)
+        return self._device_count_sums
+
     def flush_device_count_sums(self) -> None:
         if self._device_count_sums is None or int(self._device_count_repeats) <= 0:
             return
@@ -410,4 +427,9 @@ class ApproxStats:
         self.wall_joint_group_pack_seconds += float(group_pack_seconds)
         self.wall_joint_accounting_seconds += float(accounting_seconds)
 
-
+    def add_joint_staged_kv_groups(self, total_groups: int, boundary_groups: int) -> None:
+        total_i = max(0, int(total_groups))
+        boundary_i = max(0, min(int(boundary_groups), total_i))
+        self.joint_staged_kv_groups += total_i
+        self.joint_staged_kv_boundary_groups += boundary_i
+        self.joint_staged_kv_accepted_groups += total_i - boundary_i

@@ -64,6 +64,72 @@ __global__ void joint_grouped_accounting_sums_kernel(
   }
 }
 
+__global__ void joint_grouped_accounting_accumulate_kernel(
+    const int64_t* __restrict__ final_indices,
+    const int64_t* __restrict__ selected_counts_by_ki,
+    const int64_t* __restrict__ v_budgets,
+    double* __restrict__ sums,
+    int64_t heads,
+    int64_t k_count,
+    int64_t v_count,
+    int64_t context_len,
+    int64_t head_dim,
+    int64_t key_bytes,
+    int64_t value_bytes,
+    double selector_mb,
+    double v_pq_codebook_mb,
+    double metadata_mb,
+    int64_t actual_value_subvecs,
+    int64_t code_bytes) {
+  extern __shared__ double joint_accounting_shared[];
+  for (int i = threadIdx.x; i < 11 * blockDim.x; i += blockDim.x) {
+    joint_accounting_shared[i] = 0.0;
+  }
+  __syncthreads();
+  double local[11] = {0.0};
+  constexpr double mb = 1024.0 * 1024.0;
+  for (int64_t h = threadIdx.x; h < heads; h += blockDim.x) {
+    int64_t ki = final_indices[h * 2];
+    int64_t vi = final_indices[h * 2 + 1];
+    ki = ki < 0 ? 0 : (ki >= k_count ? k_count - 1 : ki);
+    vi = vi < 0 ? 0 : (vi >= v_count ? v_count - 1 : vi);
+    int64_t selected_count = selected_counts_by_ki[ki] < 0 ? 0 : selected_counts_by_ki[ki];
+    int64_t exact_v = v_budgets[vi] < 0 ? 0 : (v_budgets[vi] > context_len ? context_len : v_budgets[vi]);
+    int64_t tail_count = context_len > exact_v ? context_len - exact_v : 0;
+    double exact_key_mb = static_cast<double>(selected_count * head_dim * key_bytes) / mb;
+    double exact_v_mb = static_cast<double>(exact_v * head_dim * value_bytes) / mb;
+    double tail_mb =
+        v_pq_codebook_mb + static_cast<double>(tail_count * actual_value_subvecs * code_bytes) / mb + metadata_mb;
+    double dense_key_mb = static_cast<double>(context_len * head_dim * key_bytes) / mb;
+    local[0] += static_cast<double>(selected_count);
+    local[1] += static_cast<double>(tail_count);
+    local[2] += selector_mb;
+    local[3] += exact_key_mb + exact_v_mb;
+    local[4] += tail_mb;
+    local[6] += dense_key_mb + exact_v_mb;
+    local[8] += selector_mb > 0.0 ? 1.0 : 0.0;
+    local[9] += tail_mb > 0.0 ? 1.0 : 0.0;
+  }
+  for (int j = 0; j < 11; ++j) {
+    joint_accounting_shared[j * blockDim.x + threadIdx.x] = local[j];
+  }
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      for (int j = 0; j < 11; ++j) {
+        joint_accounting_shared[j * blockDim.x + threadIdx.x] +=
+            joint_accounting_shared[j * blockDim.x + threadIdx.x + stride];
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    for (int j = 0; j < 11; ++j) {
+      atomicAdd(&sums[j], joint_accounting_shared[j * blockDim.x]);
+    }
+  }
+}
+
 std::vector<torch::Tensor> joint_select_policy_from_grouped_risk_cuda(
     torch::Tensor base_outputs,
     torch::Tensor probs,
@@ -434,11 +500,24 @@ std::vector<torch::Tensor> joint_select_policy_grouped_flat_cuda(
       v_mb.data_ptr<float>(),
       final_indices.data_ptr<int64_t>(),
       final_outputs.data_ptr<float>(),
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
       groups,
       k_count,
       v_count,
       heads,
       dim,
+      0,
+      0,
+      0,
+      0,
+      0.0,
+      0.0,
+      0.0,
+      0,
+      0,
       threshold,
       static_cast<int>(policy_id));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -469,13 +548,136 @@ std::vector<torch::Tensor> joint_select_policy_grouped_flat_no_mb_cuda(
       nullptr,
       final_indices.data_ptr<int64_t>(),
       final_outputs.data_ptr<float>(),
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
       groups,
       k_count,
       v_count,
       heads,
       dim,
+      0,
+      0,
+      0,
+      0,
+      0.0,
+      0.0,
+      0.0,
+      0,
+      0,
       threshold,
       static_cast<int>(policy_id));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {final_outputs, final_indices};
+}
+
+std::vector<torch::Tensor> joint_select_policy_grouped_flat_no_mb_accounting_cuda(
+    torch::Tensor outputs_flat,
+    torch::Tensor selected_counts_by_ki,
+    torch::Tensor v_budgets,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len,
+    int64_t head_dim,
+    int64_t key_bytes,
+    int64_t value_bytes,
+    double selector_mb,
+    double v_pq_codebook_mb,
+    double metadata_mb,
+    int64_t actual_value_subvecs,
+    int64_t code_bytes,
+    double threshold,
+    int64_t policy_id) {
+  const auto rows = outputs_flat.size(0);
+  const auto v_count = outputs_flat.size(1);
+  const auto groups = rows / (k_count * heads);
+  const auto dim = outputs_flat.size(2);
+  auto final_outputs = torch::empty({groups, heads, dim}, outputs_flat.options().dtype(torch::kFloat32));
+  auto final_indices = torch::empty({groups, heads, 2}, outputs_flat.options().dtype(torch::kLong));
+  auto accounting_sums = torch::empty({11}, outputs_flat.options().dtype(torch::kFloat64));
+  auto stream = at::cuda::getCurrentCUDAStream();
+  C10_CUDA_CHECK(cudaMemsetAsync(accounting_sums.data_ptr<double>(), 0, 11 * sizeof(double), stream));
+  if (groups == 0 || v_count == 0 || dim == 0) {
+    return {final_outputs, final_indices, accounting_sums};
+  }
+  const int threads = 256;
+  const int shared_bytes = threads * 4 * sizeof(double);
+  joint_select_policy_grouped_flat_kernel<<<static_cast<unsigned int>(groups * heads), threads, shared_bytes, stream>>>(
+      outputs_flat.data_ptr<float>(),
+      nullptr,
+      nullptr,
+      final_indices.data_ptr<int64_t>(),
+      final_outputs.data_ptr<float>(),
+      nullptr,
+      accounting_sums.data_ptr<double>(),
+      selected_counts_by_ki.data_ptr<int64_t>(),
+      v_budgets.data_ptr<int64_t>(),
+      groups,
+      k_count,
+      v_count,
+      heads,
+      dim,
+      context_len,
+      head_dim,
+      key_bytes,
+      value_bytes,
+      selector_mb,
+      v_pq_codebook_mb,
+      metadata_mb,
+      actual_value_subvecs,
+      code_bytes,
+      threshold,
+      static_cast<int>(policy_id));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {final_outputs, final_indices, accounting_sums};
+}
+
+std::vector<torch::Tensor> joint_select_policy_grouped_flat_staged_no_mb_cuda(
+    torch::Tensor outputs_flat,
+    int64_t k_count,
+    int64_t heads,
+    double threshold,
+    int64_t policy_id) {
+  const auto rows = outputs_flat.size(0);
+  const auto v_count = outputs_flat.size(1);
+  const auto groups = rows / (k_count * heads);
+  const auto dim = outputs_flat.size(2);
+  auto final_outputs = torch::empty({groups, heads, dim}, outputs_flat.options().dtype(torch::kFloat32));
+  auto final_indices = torch::empty({groups, heads, 2}, outputs_flat.options().dtype(torch::kLong));
+  auto boundary_groups = torch::zeros({groups}, outputs_flat.options().dtype(torch::kBool));
+  if (groups == 0 || v_count == 0 || dim == 0) {
+    return {final_outputs, final_indices, boundary_groups};
+  }
+  const int threads = 256;
+  const int shared_bytes = threads * 4 * sizeof(double);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  joint_select_policy_grouped_flat_kernel<<<static_cast<unsigned int>(groups * heads), threads, shared_bytes, stream>>>(
+      outputs_flat.data_ptr<float>(),
+      nullptr,
+      nullptr,
+      final_indices.data_ptr<int64_t>(),
+      final_outputs.data_ptr<float>(),
+      boundary_groups.data_ptr<bool>(),
+      nullptr,
+      nullptr,
+      nullptr,
+      groups,
+      k_count,
+      v_count,
+      heads,
+      dim,
+      0,
+      0,
+      0,
+      0,
+      0.0,
+      0.0,
+      0.0,
+      0,
+      0,
+      threshold,
+      static_cast<int>(policy_id));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {final_outputs, final_indices, boundary_groups};
 }

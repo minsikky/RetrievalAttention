@@ -439,6 +439,61 @@ def value_vpq_code_stat_risk_torch(
     return out, int(actual_value_subbits)
 
 
+def value_vpq_code_stat_risk_from_pack_streaming_torch(
+    *,
+    values: torch.Tensor,
+    pack: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int],
+    context_len: int,
+) -> tuple[torch.Tensor, int]:
+    """Build deployable V-PQ residual-risk stats without full vhat/residual tensors.
+
+    The statistic is page/code-local.  Streaming one page at a time preserves
+    the same bucket means as `value_vpq_code_stat_risk_torch`, but avoids
+    materializing `[context, dim]` reconstructed values and residuals.
+    """
+
+    codebooks, codes, page_starts, page_size, actual_value_subbits = pack
+    context_len_i = max(0, min(int(context_len), int(values.shape[0])))
+    out = torch.zeros((context_len_i,), dtype=torch.float64, device=values.device)
+    if context_len_i == 0 or int(page_starts.numel()) == 0:
+        return out, int(actual_value_subbits)
+    subvecs = int(codebooks.shape[1])
+    subdim = int(codebooks.shape[-1])
+    dim = int(values.shape[-1])
+    if subvecs <= 0 or subdim <= 0 or dim <= 0:
+        return out, int(actual_value_subbits)
+    if subvecs * subdim != dim:
+        raise RuntimeError(
+            "V-PQ streaming risk requires subvecs * subdim to match value dim"
+        )
+    num_codes = 1 << int(actual_value_subbits)
+    pages = int(page_starts.numel())
+    for page_i in range(pages):
+        start_i = int(page_starts[page_i].item())
+        if start_i >= context_len_i:
+            continue
+        end_i = min(context_len_i, start_i + int(page_size), int(values.shape[0]))
+        rows_i = end_i - start_i
+        if rows_i <= 0:
+            continue
+        values_page = values[start_i:end_i].float()
+        codes_page = codes[page_i, :rows_i].to(torch.long)
+        risk_page = torch.zeros((rows_i,), dtype=torch.float64, device=values.device)
+        for sub in range(subvecs):
+            lo = int(sub) * subdim
+            hi = lo + subdim
+            code_ids = torch.clamp(codes_page[:, int(sub)], min=0, max=num_codes - 1)
+            approx = codebooks[page_i, int(sub)].index_select(0, code_ids).float()
+            residual = values_page[:, lo:hi] - approx
+            per_token = torch.sum(residual.double() * residual.double(), dim=1)
+            sums = torch.bincount(code_ids, weights=per_token, minlength=num_codes)
+            counts = torch.bincount(code_ids, minlength=num_codes).to(dtype=torch.float64)
+            means = sums / torch.clamp_min(counts, 1.0)
+            risk_page += means.index_select(0, code_ids)
+        out[start_i:end_i] = risk_page
+    return out, int(actual_value_subbits)
+
+
 def value_vpq_code_stat_risk_subset_torch(
     *,
     index: GPUIndex,
@@ -613,4 +668,3 @@ def selected_value_exact_counts_from_mass_gpu(
     if int(max_top) > 0:
         counts = torch.minimum(counts, torch.full_like(counts, min(rank, int(max_top))))
     return torch.clamp(counts, min=0, max=rank).to(torch.long)
-

@@ -38,7 +38,7 @@ echo "[value_exact_strategy] decode_lengths=${DECODE_LENGTHS:-500,1000,2000,4000
   --selector_mode "${SELECTOR_MODE:-fullscan}" \
   --k_budget "${K_BUDGET:-14336}" \
   --prob_sources "${PROB_SOURCES:-dense,mixed}" \
-  --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-affine_selected}" \
+  --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-none}" \
   --selected_value_exact_mass "${SELECTED_VALUE_EXACT_MASS:-0.99}" \
   --selected_value_min_exact_top "${SELECTED_VALUE_MIN_EXACT_TOP:-0}" \
   --selected_value_max_exact_top "${SELECTED_VALUE_MAX_EXACT_TOP:-0}" \

@@ -35,6 +35,48 @@ torch::Tensor joint_grouped_accounting_sums(
       code_bytes);
 }
 
+void joint_grouped_accounting_accumulate(
+    torch::Tensor accumulator,
+    torch::Tensor final_indices,
+    torch::Tensor selected_counts_by_ki,
+    torch::Tensor v_budgets,
+    int64_t context_len,
+    int64_t head_dim,
+    int64_t key_bytes,
+    int64_t value_bytes,
+    double selector_mb,
+    double v_pq_codebook_mb,
+    double metadata_mb,
+    int64_t actual_value_subvecs,
+    int64_t code_bytes) {
+  TORCH_CHECK(accumulator.is_cuda(), "accumulator must be CUDA");
+  TORCH_CHECK(final_indices.is_cuda(), "final_indices must be CUDA");
+  TORCH_CHECK(selected_counts_by_ki.is_cuda(), "selected_counts_by_ki must be CUDA");
+  TORCH_CHECK(v_budgets.is_cuda(), "v_budgets must be CUDA");
+  TORCH_CHECK(accumulator.scalar_type() == torch::kFloat64, "accumulator must be float64");
+  TORCH_CHECK(final_indices.scalar_type() == torch::kLong, "final_indices must be int64");
+  TORCH_CHECK(selected_counts_by_ki.scalar_type() == torch::kLong, "selected_counts_by_ki must be int64");
+  TORCH_CHECK(v_budgets.scalar_type() == torch::kLong, "v_budgets must be int64");
+  TORCH_CHECK(accumulator.dim() == 1 && accumulator.size(0) == 11, "accumulator shape must be [11]");
+  TORCH_CHECK(final_indices.dim() == 2 && final_indices.size(1) == 2, "final_indices shape must be [heads, 2]");
+  TORCH_CHECK(selected_counts_by_ki.dim() == 1, "selected_counts_by_ki shape must be [k_count]");
+  TORCH_CHECK(v_budgets.dim() == 1, "v_budgets shape must be [v_count]");
+  joint_grouped_accounting_accumulate_cuda(
+      accumulator,
+      final_indices.contiguous(),
+      selected_counts_by_ki.contiguous(),
+      v_budgets.contiguous(),
+      context_len,
+      head_dim,
+      key_bytes,
+      value_bytes,
+      selector_mb,
+      v_pq_codebook_mb,
+      metadata_mb,
+      actual_value_subvecs,
+      code_bytes);
+}
+
 std::vector<torch::Tensor> joint_select_policy_from_grouped_risk(
     torch::Tensor base_outputs,
     torch::Tensor probs,
@@ -485,6 +527,131 @@ torch::Tensor joint_mixed_score_grid_workspace(
       ranked_prefix_tokens.contiguous(),
       k_take_counts.contiguous(),
       calibrate);
+}
+
+torch::Tensor joint_mixed_score_grid_rankpos_nocalib_workspace(
+    torch::Tensor output,
+    torch::Tensor token_to_indexed,
+    torch::Tensor base_mask,
+    torch::Tensor rank_pos,
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    double pq_scale) {
+  TORCH_CHECK(output.is_cuda(), "output must be CUDA");
+  TORCH_CHECK(token_to_indexed.is_cuda(), "token_to_indexed must be CUDA");
+  TORCH_CHECK(base_mask.is_cuda(), "base_mask must be CUDA");
+  TORCH_CHECK(rank_pos.is_cuda(), "rank_pos must be CUDA");
+  TORCH_CHECK(exact_scores.is_cuda(), "exact_scores must be CUDA");
+  TORCH_CHECK(pq_logits.is_cuda(), "pq_logits must be CUDA");
+  TORCH_CHECK(indexed_tokens.is_cuda(), "indexed_tokens must be CUDA");
+  TORCH_CHECK(base_tokens.is_cuda(), "base_tokens must be CUDA");
+  TORCH_CHECK(ranked_prefix_tokens.is_cuda(), "ranked_prefix_tokens must be CUDA");
+  TORCH_CHECK(k_take_counts.is_cuda(), "k_take_counts must be CUDA");
+  TORCH_CHECK(output.scalar_type() == torch::kFloat32, "output must be float32");
+  TORCH_CHECK(token_to_indexed.scalar_type() == torch::kInt, "token_to_indexed must be int32");
+  TORCH_CHECK(base_mask.scalar_type() == torch::kUInt8, "base_mask must be uint8");
+  TORCH_CHECK(rank_pos.scalar_type() == torch::kInt, "rank_pos must be int32");
+  TORCH_CHECK(exact_scores.scalar_type() == torch::kFloat32, "exact_scores must be float32");
+  TORCH_CHECK(pq_logits.scalar_type() == torch::kFloat32, "pq_logits must be float32");
+  TORCH_CHECK(indexed_tokens.scalar_type() == torch::kLong, "indexed_tokens must be int64");
+  TORCH_CHECK(base_tokens.scalar_type() == torch::kLong, "base_tokens must be int64");
+  TORCH_CHECK(ranked_prefix_tokens.scalar_type() == torch::kLong, "ranked_prefix_tokens must be int64");
+  TORCH_CHECK(k_take_counts.scalar_type() == torch::kLong, "k_take_counts must be int64");
+  TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
+  TORCH_CHECK(token_to_indexed.is_contiguous(), "token_to_indexed must be contiguous");
+  TORCH_CHECK(base_mask.is_contiguous(), "base_mask must be contiguous");
+  TORCH_CHECK(rank_pos.is_contiguous(), "rank_pos must be contiguous");
+  TORCH_CHECK(exact_scores.dim() == 2, "exact_scores shape must be [heads, context]");
+  TORCH_CHECK(pq_logits.dim() == 2, "pq_logits shape must be [heads, indexed]");
+  TORCH_CHECK(indexed_tokens.dim() == 1, "indexed_tokens shape must be [indexed]");
+  TORCH_CHECK(base_tokens.dim() == 1, "base_tokens shape must be [base]");
+  TORCH_CHECK(ranked_prefix_tokens.dim() == 2, "ranked_prefix_tokens shape must be [heads, max_rank]");
+  TORCH_CHECK(k_take_counts.dim() == 1, "k_take_counts shape must be [k]");
+  TORCH_CHECK(output.dim() == 3, "output shape must be [k, heads, context]");
+  TORCH_CHECK(token_to_indexed.dim() == 1, "token_to_indexed shape must be [context]");
+  TORCH_CHECK(base_mask.dim() == 1, "base_mask shape must be [context]");
+  TORCH_CHECK(rank_pos.dim() == 2, "rank_pos shape must be [heads, context]");
+  TORCH_CHECK(pq_logits.size(0) == exact_scores.size(0), "pq/exact head count mismatch");
+  TORCH_CHECK(indexed_tokens.size(0) == pq_logits.size(1), "indexed token count mismatch");
+  TORCH_CHECK(ranked_prefix_tokens.size(0) == exact_scores.size(0), "ranked/exact head count mismatch");
+  TORCH_CHECK(output.size(0) == k_take_counts.size(0), "output k dimension mismatch");
+  TORCH_CHECK(output.size(1) == exact_scores.size(0), "output head dimension mismatch");
+  TORCH_CHECK(output.size(2) == exact_scores.size(1), "output context dimension mismatch");
+  TORCH_CHECK(token_to_indexed.size(0) == exact_scores.size(1), "token_to_indexed context mismatch");
+  TORCH_CHECK(base_mask.size(0) == exact_scores.size(1), "base_mask context mismatch");
+  TORCH_CHECK(rank_pos.size(0) == exact_scores.size(0), "rank_pos head mismatch");
+  TORCH_CHECK(rank_pos.size(1) == exact_scores.size(1), "rank_pos context mismatch");
+  return joint_mixed_score_grid_rankpos_nocalib_workspace_cuda(
+      output,
+      token_to_indexed,
+      base_mask,
+      rank_pos,
+      exact_scores.contiguous(),
+      pq_logits.contiguous(),
+      indexed_tokens.contiguous(),
+      base_tokens.contiguous(),
+      ranked_prefix_tokens.contiguous(),
+      k_take_counts.contiguous(),
+      pq_scale);
+}
+
+torch::Tensor joint_mixed_score_grid_nocalib_scatter_workspace(
+    torch::Tensor output,
+    torch::Tensor token_to_indexed,
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor k_take_counts,
+    double pq_scale) {
+  TORCH_CHECK(output.is_cuda(), "output must be CUDA");
+  TORCH_CHECK(token_to_indexed.is_cuda(), "token_to_indexed must be CUDA");
+  TORCH_CHECK(exact_scores.is_cuda(), "exact_scores must be CUDA");
+  TORCH_CHECK(pq_logits.is_cuda(), "pq_logits must be CUDA");
+  TORCH_CHECK(indexed_tokens.is_cuda(), "indexed_tokens must be CUDA");
+  TORCH_CHECK(base_tokens.is_cuda(), "base_tokens must be CUDA");
+  TORCH_CHECK(ranked_prefix_tokens.is_cuda(), "ranked_prefix_tokens must be CUDA");
+  TORCH_CHECK(k_take_counts.is_cuda(), "k_take_counts must be CUDA");
+  TORCH_CHECK(output.scalar_type() == torch::kFloat32, "output must be float32");
+  TORCH_CHECK(token_to_indexed.scalar_type() == torch::kInt, "token_to_indexed must be int32");
+  TORCH_CHECK(exact_scores.scalar_type() == torch::kFloat32, "exact_scores must be float32");
+  TORCH_CHECK(pq_logits.scalar_type() == torch::kFloat32, "pq_logits must be float32");
+  TORCH_CHECK(indexed_tokens.scalar_type() == torch::kLong, "indexed_tokens must be int64");
+  TORCH_CHECK(base_tokens.scalar_type() == torch::kLong, "base_tokens must be int64");
+  TORCH_CHECK(ranked_prefix_tokens.scalar_type() == torch::kLong, "ranked_prefix_tokens must be int64");
+  TORCH_CHECK(k_take_counts.scalar_type() == torch::kLong, "k_take_counts must be int64");
+  TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
+  TORCH_CHECK(token_to_indexed.is_contiguous(), "token_to_indexed must be contiguous");
+  TORCH_CHECK(exact_scores.dim() == 2, "exact_scores shape must be [heads, context]");
+  TORCH_CHECK(pq_logits.dim() == 2, "pq_logits shape must be [heads, indexed]");
+  TORCH_CHECK(indexed_tokens.dim() == 1, "indexed_tokens shape must be [indexed]");
+  TORCH_CHECK(base_tokens.dim() == 1, "base_tokens shape must be [base]");
+  TORCH_CHECK(ranked_prefix_tokens.dim() == 2, "ranked_prefix_tokens shape must be [heads, max_rank]");
+  TORCH_CHECK(k_take_counts.dim() == 1, "k_take_counts shape must be [k]");
+  TORCH_CHECK(output.dim() == 3, "output shape must be [k, heads, context]");
+  TORCH_CHECK(token_to_indexed.dim() == 1, "token_to_indexed shape must be [context]");
+  TORCH_CHECK(pq_logits.size(0) == exact_scores.size(0), "pq/exact head count mismatch");
+  TORCH_CHECK(indexed_tokens.size(0) == pq_logits.size(1), "indexed token count mismatch");
+  TORCH_CHECK(ranked_prefix_tokens.size(0) == exact_scores.size(0), "ranked/exact head count mismatch");
+  TORCH_CHECK(output.size(0) == k_take_counts.size(0), "output k dimension mismatch");
+  TORCH_CHECK(output.size(1) == exact_scores.size(0), "output head dimension mismatch");
+  TORCH_CHECK(output.size(2) == exact_scores.size(1), "output context dimension mismatch");
+  TORCH_CHECK(token_to_indexed.size(0) == exact_scores.size(1), "token_to_indexed context mismatch");
+  return joint_mixed_score_grid_nocalib_scatter_workspace_cuda(
+      output,
+      token_to_indexed,
+      exact_scores.contiguous(),
+      pq_logits.contiguous(),
+      indexed_tokens.contiguous(),
+      base_tokens.contiguous(),
+      ranked_prefix_tokens.contiguous(),
+      k_take_counts.contiguous(),
+      pq_scale);
 }
 
 torch::Tensor joint_mixed_score_grid_scaled(

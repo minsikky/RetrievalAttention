@@ -28,7 +28,7 @@ echo "[confidence_budget_rule_one] run ${name} rule=${rule}"
   --selector_index_bytes "${SELECTOR_INDEX_BYTES:-4}" \
   --budgets "${BUDGETS:-16384}" \
   --online_confidence_rule "${rule}" \
-  --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-affine_selected}" \
+  --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-none}" \
   --proxy_mass_target "${PROXY_MASS_TARGET:-0.99}" \
   --marginal_mass_max "${MARGINAL_MASS_MAX:-0.010}" \
   --marginal_score_gap_max "${MARGINAL_SCORE_GAP_MAX:--6.0}" \

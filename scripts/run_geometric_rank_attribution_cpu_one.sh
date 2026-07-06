@@ -39,7 +39,7 @@ echo "[geom_rank_diag_cpu] selector=${SELECTOR_MODE:-fullscan} rule=${ONLINE_CON
   --selector_mode "${SELECTOR_MODE:-fullscan}" \
   --budgets "${BUDGETS:-4096}" \
   --online_confidence_rule "${ONLINE_CONFIDENCE_RULE:-geometric_probe_tail_switch}" \
-  --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-affine_selected}" \
+  --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-none}" \
   --tail_mode "${TAIL_MODE:-vpq_value}" \
   --tail_blend "${TAIL_BLEND:-1.0}" \
   --tail_probe_rel_l2_max "${TAIL_PROBE_REL_L2_MAX:-0.020}" \

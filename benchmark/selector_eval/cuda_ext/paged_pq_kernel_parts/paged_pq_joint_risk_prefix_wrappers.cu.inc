@@ -65,6 +65,72 @@ torch::Tensor joint_grouped_accounting_sums_cuda(
   return sums;
 }
 
+void joint_grouped_accounting_accumulate_cuda(
+    torch::Tensor accumulator,
+    torch::Tensor final_indices,
+    torch::Tensor selected_counts_by_ki,
+    torch::Tensor v_budgets,
+    int64_t context_len,
+    int64_t head_dim,
+    int64_t key_bytes,
+    int64_t value_bytes,
+    double selector_mb,
+    double v_pq_codebook_mb,
+    double metadata_mb,
+    int64_t actual_value_subvecs,
+    int64_t code_bytes) {
+  TORCH_CHECK(accumulator.is_cuda(), "accumulator must be CUDA");
+  TORCH_CHECK(final_indices.is_cuda(), "final_indices must be CUDA");
+  TORCH_CHECK(selected_counts_by_ki.is_cuda(), "selected_counts_by_ki must be CUDA");
+  TORCH_CHECK(v_budgets.is_cuda(), "v_budgets must be CUDA");
+  TORCH_CHECK(accumulator.scalar_type() == torch::kFloat64, "accumulator must be float64");
+  TORCH_CHECK(final_indices.scalar_type() == torch::kLong, "final_indices must be int64");
+  TORCH_CHECK(selected_counts_by_ki.scalar_type() == torch::kLong, "selected_counts_by_ki must be int64");
+  TORCH_CHECK(v_budgets.scalar_type() == torch::kLong, "v_budgets must be int64");
+  TORCH_CHECK(accumulator.dim() == 1 && accumulator.size(0) == 11, "accumulator shape must be [11]");
+  TORCH_CHECK(final_indices.dim() == 2 && final_indices.size(1) == 2, "final_indices shape must be [heads, 2]");
+  TORCH_CHECK(selected_counts_by_ki.dim() == 1, "selected_counts_by_ki shape must be [k_count]");
+  TORCH_CHECK(v_budgets.dim() == 1, "v_budgets shape must be [v_count]");
+  TORCH_CHECK(context_len >= 0, "context_len must be non-negative");
+  TORCH_CHECK(head_dim > 0, "head_dim must be positive");
+  TORCH_CHECK(key_bytes > 0, "key_bytes must be positive");
+  TORCH_CHECK(value_bytes > 0, "value_bytes must be positive");
+  TORCH_CHECK(actual_value_subvecs >= 0, "actual_value_subvecs must be non-negative");
+  TORCH_CHECK(code_bytes >= 0, "code_bytes must be non-negative");
+  const auto heads = final_indices.size(0);
+  const auto k_count = selected_counts_by_ki.size(0);
+  const auto v_count = v_budgets.size(0);
+  TORCH_CHECK(k_count > 0, "selected_counts_by_ki must be non-empty");
+  TORCH_CHECK(v_count > 0, "v_budgets must be non-empty");
+  if (heads == 0) {
+    return;
+  }
+
+  auto final_indices_c = final_indices.contiguous();
+  auto selected_counts_c = selected_counts_by_ki.contiguous();
+  auto v_budgets_c = v_budgets.contiguous();
+  const int threads = 128;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  joint_grouped_accounting_accumulate_kernel<<<1, threads, threads * 11 * sizeof(double), stream>>>(
+      final_indices_c.data_ptr<int64_t>(),
+      selected_counts_c.data_ptr<int64_t>(),
+      v_budgets_c.data_ptr<int64_t>(),
+      accumulator.data_ptr<double>(),
+      heads,
+      k_count,
+      v_count,
+      context_len,
+      head_dim,
+      key_bytes,
+      value_bytes,
+      selector_mb,
+      v_pq_codebook_mb,
+      metadata_mb,
+      actual_value_subvecs,
+      code_bytes);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 torch::Tensor joint_rank_prefix_tokens_cuda(
     torch::Tensor scores,
     torch::Tensor indexed_tokens,
@@ -349,7 +415,7 @@ static torch::Tensor joint_mixed_score_grid_cuda_impl(
   const int threads = 256;
   auto stream = at::cuda::getCurrentCUDAStream();
   const int64_t score_total = k_count * heads * context_len;
-  if (fill_exact_first) {
+  if (fill_exact_first && calibrate) {
     const int64_t score_blocks = (score_total + threads - 1) / threads;
     joint_mixed_score_grid_fill_exact_kernel<<<static_cast<unsigned int>(score_blocks), threads, 0, stream>>>(
         exact_scores.data_ptr<float>(),
@@ -360,9 +426,67 @@ static torch::Tensor joint_mixed_score_grid_cuda_impl(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
+  const int64_t base_count = base_tokens.size(0);
+  if (!calibrate) {
+    auto byte_opts = exact_scores.options().dtype(torch::kUInt8);
+    auto int_opts = exact_scores.options().dtype(torch::kInt);
+    auto token_to_indexed = torch::full({context_len}, -1, int_opts);
+    auto base_mask = torch::zeros({context_len}, byte_opts);
+    auto rank_pos = torch::full({heads, context_len}, -1, int_opts);
+    if (indexed_count > 0) {
+      const int64_t blocks = (indexed_count + threads - 1) / threads;
+      joint_indexed_token_to_pos_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+          token_to_indexed.data_ptr<int>(),
+          indexed_tokens.data_ptr<int64_t>(),
+          indexed_count,
+          context_len);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    if (base_count > 0) {
+      const int64_t blocks = (base_count + threads - 1) / threads;
+      joint_base_mask_set_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+          base_mask.data_ptr<unsigned char>(),
+          base_tokens.data_ptr<int64_t>(),
+          base_count,
+          context_len);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    if (max_rank_take > 0) {
+      const int64_t total = heads * max_rank_take;
+      const int64_t blocks = (total + threads - 1) / threads;
+      joint_rank_position_scatter_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+          rank_pos.data_ptr<int>(),
+          ranked_prefix_tokens.data_ptr<int64_t>(),
+          heads,
+          max_rank_take,
+          context_len);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    {
+      const int64_t total = k_count * heads * context_len;
+      const int64_t blocks = (total + threads - 1) / threads;
+      joint_mixed_score_grid_fill_rankpos_nocalib_kernel<<<
+          static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+          exact_scores.data_ptr<float>(),
+          pq_logits.data_ptr<float>(),
+          token_to_indexed.data_ptr<int>(),
+          base_mask.data_ptr<unsigned char>(),
+          rank_pos.data_ptr<int>(),
+          k_take_counts.data_ptr<int64_t>(),
+          outputs.data_ptr<float>(),
+          k_count,
+          heads,
+          context_len,
+          indexed_count,
+          max_rank_take,
+          pq_scale);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return outputs;
+  }
+
   auto byte_opts = exact_scores.options().dtype(torch::kUInt8);
   auto selected_mask = torch::zeros({k_count, heads, context_len}, byte_opts);
-  const int64_t base_count = base_tokens.size(0);
   if (base_count > 0) {
     const int64_t total = k_count * heads * base_count;
     const int64_t blocks = (total + threads - 1) / threads;
@@ -456,4 +580,3 @@ static torch::Tensor joint_mixed_score_grid_cuda_impl(
   }
   return outputs;
 }
-

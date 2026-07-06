@@ -449,3 +449,165 @@ std::vector<torch::Tensor> joint_mixed_softmax_base_outputs_tokenfit_scaled_cuda
   return {probs, outputs};
 }
 
+std::vector<torch::Tensor> joint_mixed_softmax_base_outputs_sparse_exact_tokenfit_scaled_cuda(
+    torch::Tensor pq_logits,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor base_logits,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor ranked_logits,
+    torch::Tensor k_take_counts,
+    torch::Tensor values,
+    int64_t context_len,
+    bool calibrate,
+    double pq_scale) {
+  TORCH_CHECK(pq_logits.is_cuda(), "pq_logits must be CUDA");
+  TORCH_CHECK(indexed_tokens.is_cuda(), "indexed_tokens must be CUDA");
+  TORCH_CHECK(base_tokens.is_cuda(), "base_tokens must be CUDA");
+  TORCH_CHECK(base_logits.is_cuda(), "base_logits must be CUDA");
+  TORCH_CHECK(ranked_prefix_tokens.is_cuda(), "ranked_prefix_tokens must be CUDA");
+  TORCH_CHECK(ranked_logits.is_cuda(), "ranked_logits must be CUDA");
+  TORCH_CHECK(k_take_counts.is_cuda(), "k_take_counts must be CUDA");
+  TORCH_CHECK(values.is_cuda(), "values must be CUDA");
+  TORCH_CHECK(pq_logits.scalar_type() == torch::kFloat32, "pq_logits must be float32");
+  TORCH_CHECK(indexed_tokens.scalar_type() == torch::kLong, "indexed_tokens must be int64");
+  TORCH_CHECK(base_tokens.scalar_type() == torch::kLong, "base_tokens must be int64");
+  TORCH_CHECK(base_logits.scalar_type() == torch::kFloat32, "base_logits must be float32");
+  TORCH_CHECK(ranked_prefix_tokens.scalar_type() == torch::kLong, "ranked_prefix_tokens must be int64");
+  TORCH_CHECK(ranked_logits.scalar_type() == torch::kFloat32, "ranked_logits must be float32");
+  TORCH_CHECK(k_take_counts.scalar_type() == torch::kLong, "k_take_counts must be int64");
+  TORCH_CHECK(values.scalar_type() == torch::kFloat32, "values must be float32");
+  TORCH_CHECK(pq_logits.dim() == 2, "pq_logits shape must be [heads, indexed_count]");
+  TORCH_CHECK(indexed_tokens.dim() == 1, "indexed_tokens shape must be [indexed_count]");
+  TORCH_CHECK(base_tokens.dim() == 1, "base_tokens shape must be [base_count]");
+  TORCH_CHECK(base_logits.dim() == 2, "base_logits shape must be [heads, base_count]");
+  TORCH_CHECK(ranked_prefix_tokens.dim() == 2, "ranked_prefix_tokens shape must be [heads, max_rank_take]");
+  TORCH_CHECK(ranked_logits.dim() == 2, "ranked_logits shape must be [heads, max_rank_take]");
+  TORCH_CHECK(k_take_counts.dim() == 1, "k_take_counts shape must be [k_count]");
+  TORCH_CHECK(values.dim() == 2, "values shape must be [context_len, dim]");
+  TORCH_CHECK(context_len >= 0, "context_len must be non-negative");
+  TORCH_CHECK(base_logits.size(0) == pq_logits.size(0), "base_logits heads must match pq_logits");
+  TORCH_CHECK(ranked_prefix_tokens.size(0) == pq_logits.size(0), "ranked tokens heads must match pq_logits");
+  TORCH_CHECK(ranked_logits.sizes() == ranked_prefix_tokens.sizes(), "ranked_logits must match ranked tokens shape");
+  TORCH_CHECK(base_logits.size(1) == base_tokens.size(0), "base_logits base count mismatch");
+  TORCH_CHECK(indexed_tokens.size(0) == pq_logits.size(1), "indexed token count mismatch");
+  TORCH_CHECK(values.size(0) >= context_len, "values length must cover context_len");
+
+  const auto heads = pq_logits.size(0);
+  const auto indexed_count = indexed_tokens.size(0);
+  const auto base_count = base_tokens.size(0);
+  const auto k_count = k_take_counts.size(0);
+  const auto max_rank_take = ranked_prefix_tokens.size(1);
+  const auto dim = values.size(1);
+  if (k_count > 0 && max_rank_take > 0) {
+    auto max_take = k_take_counts.max().item<int64_t>();
+    TORCH_CHECK(
+        max_take <= max_rank_take,
+        "sparse exact fused softmax/base requires all K take counts to fit ranked_prefix_tokens");
+  }
+  auto probs = torch::empty({k_count, heads, context_len}, pq_logits.options().dtype(torch::kFloat32));
+  auto outputs = torch::empty({k_count, heads, dim}, pq_logits.options().dtype(torch::kFloat32));
+  if (k_count == 0 || heads == 0 || context_len == 0 || dim == 0) {
+    if (context_len == 0 && k_count > 0 && heads > 0 && dim > 0) {
+      outputs.zero_();
+    }
+    return {probs, outputs};
+  }
+
+  const int threads = 256;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  auto int_opts = pq_logits.options().dtype(torch::kInt);
+  auto token_to_indexed = torch::full({context_len}, -1, int_opts);
+  if (indexed_count > 0) {
+    const int64_t blocks = (indexed_count + threads - 1) / threads;
+    joint_indexed_token_to_pos_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        token_to_indexed.data_ptr<int>(),
+        indexed_tokens.data_ptr<int64_t>(),
+        indexed_count,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  auto base_pos = torch::full({context_len}, -1, int_opts);
+  if (base_count > 0) {
+    const int64_t blocks = (base_count + threads - 1) / threads;
+    joint_base_position_scatter_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        base_pos.data_ptr<int>(),
+        base_tokens.data_ptr<int64_t>(),
+        base_count,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  auto rank_pos = torch::full({heads, context_len}, -1, int_opts);
+  if (max_rank_take > 0) {
+    const int64_t total = heads * max_rank_take;
+    const int64_t blocks = (total + threads - 1) / threads;
+    joint_rank_position_scatter_kernel<<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+        rank_pos.data_ptr<int>(),
+        ranked_prefix_tokens.data_ptr<int64_t>(),
+        heads,
+        max_rank_take,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  auto fit_scale = torch::empty({k_count, heads}, pq_logits.options().dtype(torch::kFloat32));
+  auto fit_bias = torch::empty_like(fit_scale);
+  const int64_t fit_blocks = k_count * heads;
+  const size_t shared_bytes = static_cast<size_t>(threads) * 5 * sizeof(float);
+  joint_affine_selected_fit_sparse_tokenlist_kernel<<<static_cast<unsigned int>(fit_blocks), threads, shared_bytes, stream>>>(
+      pq_logits.data_ptr<float>(),
+      token_to_indexed.data_ptr<int>(),
+      base_tokens.data_ptr<int64_t>(),
+      base_logits.data_ptr<float>(),
+      ranked_prefix_tokens.data_ptr<int64_t>(),
+      ranked_logits.data_ptr<float>(),
+      k_take_counts.data_ptr<int64_t>(),
+      fit_scale.data_ptr<float>(),
+      fit_bias.data_ptr<float>(),
+      k_count,
+      heads,
+      indexed_count,
+      context_len,
+      base_count,
+      max_rank_take,
+      static_cast<float>(pq_scale),
+      calibrate);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  const int64_t rows = k_count * heads;
+  joint_mixed_sparse_softmax_rows_kernel<<<static_cast<unsigned int>(rows), threads, threads * sizeof(float), stream>>>(
+      pq_logits.data_ptr<float>(),
+      token_to_indexed.data_ptr<int>(),
+      base_pos.data_ptr<int>(),
+      base_logits.data_ptr<float>(),
+      rank_pos.data_ptr<int>(),
+      ranked_logits.data_ptr<float>(),
+      k_take_counts.data_ptr<int64_t>(),
+      fit_scale.data_ptr<float>(),
+      fit_bias.data_ptr<float>(),
+      probs.data_ptr<float>(),
+      rows,
+      heads,
+      indexed_count,
+      base_count,
+      max_rank_take,
+      static_cast<float>(pq_scale),
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  constexpr int dims_per_block = 8;
+  const int64_t dim_tiles = (dim + dims_per_block - 1) / dims_per_block;
+  const int64_t out_blocks = rows * dim_tiles;
+  joint_base_outputs_from_probs_kernel<dims_per_block><<<
+      static_cast<unsigned int>(out_blocks), threads, 0, stream>>>(
+      probs.data_ptr<float>(),
+      values.data_ptr<float>(),
+      outputs.data_ptr<float>(),
+      rows,
+      context_len,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {probs, outputs};
+}

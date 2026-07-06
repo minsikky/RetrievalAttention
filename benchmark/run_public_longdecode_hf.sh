@@ -27,33 +27,10 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_CACHE_DIR}/datasets}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_CACHE_DIR}/transformers}"
 
 HF_MODEL_PRESET="${HF_MODEL_PRESET:-qwen3_8b}"
-PRESET_MODEL_NAME=""
-PRESET_HF_EXTRA_PYTHONPATH=""
-PRESET_QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="32768"
-case "${HF_MODEL_PRESET}" in
-  ""|qwen3_8b)
-    PRESET_MODEL_NAME=".hf_cache/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
-    PRESET_HF_EXTRA_PYTHONPATH=".hf_pydeps"
-    PRESET_QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="32768"
-    ;;
-  llama31_8b|llama3_1_8b)
-    PRESET_MODEL_NAME=".hf_cache/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
-    PRESET_HF_EXTRA_PYTHONPATH=""
-    PRESET_QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="32768"
-    ;;
-  qwen3_5_9b)
-    PRESET_MODEL_NAME=".hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a"
-    PRESET_HF_EXTRA_PYTHONPATH=".hf_pydeps"
-    PRESET_QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="262144"
-    ;;
-  *)
-    echo "[ERROR] Unknown HF_MODEL_PRESET=${HF_MODEL_PRESET}"
-    echo "[ERROR] Supported presets: qwen3_8b, llama31_8b, llama3_1_8b, qwen3_5_9b"
-    exit 2
-    ;;
-esac
+source scripts/hf_model_presets.sh
+resolve_hf_model_preset "${HF_MODEL_PRESET}" || exit $?
 
-HF_VENV_DIR="${HF_VENV_DIR:-.venv}"
+HF_VENV_DIR="${HF_VENV_DIR:-${PRESET_HF_VENV_DIR:-.venv}}"
 if [ -f "${HF_VENV_DIR}/bin/activate" ]; then
   # shellcheck disable=SC1090
   source "${HF_VENV_DIR}/bin/activate"
@@ -75,6 +52,7 @@ if [ -n "${HF_EXTRA_PYTHONPATH}" ]; then
     export LD_LIBRARY_PATH="${HF_EXTRA_PYTHONPATH}/numpy.libs:${LD_LIBRARY_PATH:-}"
   fi
 fi
+export LD_LIBRARY_PATH="$PWD/${HF_VENV_DIR}/lib/python3.10/site-packages/torch/lib:/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
 export TOKENIZERS_PARALLELISM=false
 
 DEFAULT_MODEL_PATH="${PRESET_MODEL_NAME}"
@@ -89,23 +67,103 @@ OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}}"
 DTYPE="${DTYPE:-bf16}"
 DEVICE_MAP="${DEVICE_MAP:-auto}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-}"
-TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-0}"
+TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-${PRESET_TRUST_REMOTE_CODE:-0}}"
 LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-1}"
 LOW_CPU_MEM_USAGE="${LOW_CPU_MEM_USAGE:-1}"
-HF_LANGUAGE_MODEL_ONLY="${HF_LANGUAGE_MODEL_ONLY:-0}"
-USE_CHAT_TEMPLATE="${USE_CHAT_TEMPLATE:-1}"
-DISABLE_THINKING="${DISABLE_THINKING:-0}"
+HF_LANGUAGE_MODEL_ONLY="${HF_LANGUAGE_MODEL_ONLY:-${PRESET_HF_LANGUAGE_MODEL_ONLY:-0}}"
+USE_CHAT_TEMPLATE="${USE_CHAT_TEMPLATE:-${PRESET_USE_CHAT_TEMPLATE:-1}}"
+QWEN3_AIME_MAX_NEW_TOKENS=38912
+QWEN3_DEFAULT_MAX_NEW_TOKENS=32768
+USE_QWEN3_OFFICIAL_EVAL_DEFAULTS="${USE_QWEN3_OFFICIAL_EVAL_DEFAULTS:-1}"
+QWEN3_EVAL_MODE="${QWEN3_EVAL_MODE:-thinking}"
+is_qwen3=0
+if [[ "${HF_MODEL_PRESET}" == qwen3* ]] || [[ "${MODEL_NAME}" == *Qwen3* ]] || [[ "${MODEL_NAME}" == *Qwen--Qwen3* ]]; then
+  is_qwen3=1
+fi
+is_qwen3_report_benchmark=0
+case "${BENCHMARK}" in
+  aime24|gpqa|livecodebench_codegen)
+    is_qwen3_report_benchmark=1
+    ;;
+esac
+if [ "${USE_QWEN3_OFFICIAL_EVAL_DEFAULTS}" = "1" ] && [ "${is_qwen3}" = "1" ] && [ "${is_qwen3_report_benchmark}" = "1" ]; then
+  case "${QWEN3_EVAL_MODE}" in
+    thinking|think)
+      default_disable_thinking=0
+      default_temperature=0.6
+      default_top_p=0.95
+      default_top_k=20
+      ;;
+    nonthinking|non-thinking|no_think|nothink)
+      default_disable_thinking=1
+      default_temperature=0.7
+      default_top_p=0.8
+      default_top_k=20
+      ;;
+    *)
+      echo "[ERROR] Unknown QWEN3_EVAL_MODE=${QWEN3_EVAL_MODE}" >&2
+      exit 2
+      ;;
+  esac
+else
+  default_disable_thinking="${PRESET_DISABLE_THINKING:-0}"
+  default_temperature=0.0
+  default_top_p=1.0
+  default_top_k=0
+fi
+case "${BENCHMARK}" in
+  aime24)
+    default_max_new_tokens="${QWEN3_AIME_MAX_NEW_TOKENS}"
+    ;;
+  gpqa|livecodebench_codegen)
+    default_max_new_tokens="${QWEN3_DEFAULT_MAX_NEW_TOKENS}"
+    ;;
+  helmet_rag)
+    default_max_new_tokens=20
+    ;;
+  helmet_recall)
+    default_max_new_tokens=100
+    ;;
+  helmet_longqa)
+    default_max_new_tokens=100
+    ;;
+  longproc_2k)
+    default_max_new_tokens=3072
+    ;;
+  longproc_8k)
+    default_max_new_tokens=9216
+    ;;
+  *)
+    default_max_new_tokens=1024
+    ;;
+esac
+case "${BENCHMARK}" in
+  longproc_2k)
+    default_min_new_tokens=2048
+    default_force_max_new_tokens=1
+    ;;
+  longproc_8k)
+    default_min_new_tokens=8192
+    default_force_max_new_tokens=1
+    ;;
+  *)
+    default_min_new_tokens=0
+    default_force_max_new_tokens=0
+    ;;
+esac
+DISABLE_THINKING="${DISABLE_THINKING:-${PUBLIC_DISABLE_THINKING:-${default_disable_thinking}}}"
 SEED="${SEED:-2026}"
 MAX_EXAMPLES="${MAX_EXAMPLES:-1}"
 TASK_OFFSET="${TASK_OFFSET:-0}"
 SELECTION="${SELECTION:-first}"
 MAX_INPUT_TOKENS="${MAX_INPUT_TOKENS:-120000}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
-MIN_NEW_TOKENS="${MIN_NEW_TOKENS:-0}"
-TEMPERATURE="${TEMPERATURE:-0.0}"
-TOP_P="${TOP_P:-1.0}"
-TOP_K="${TOP_K:-0}"
-FORCE_MAX_NEW_TOKENS="${FORCE_MAX_NEW_TOKENS:-0}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-${default_max_new_tokens}}"
+MIN_NEW_TOKENS="${MIN_NEW_TOKENS:-${default_min_new_tokens}}"
+TEMPERATURE="${TEMPERATURE:-${PUBLIC_TEMPERATURE:-${default_temperature}}}"
+TOP_P="${TOP_P:-${PUBLIC_TOP_P:-${default_top_p}}}"
+TOP_K="${TOP_K:-${PUBLIC_TOP_K:-${default_top_k}}}"
+FORCE_MAX_NEW_TOKENS="${FORCE_MAX_NEW_TOKENS:-${default_force_max_new_tokens}}"
+DRY_RUN="${DRY_RUN:-0}"
 QWEN_YARN_FACTOR="${QWEN_YARN_FACTOR:-0}"
 QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="${QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS:-${PRESET_QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS}}"
 
@@ -117,6 +175,12 @@ CODE_EVAL_PROCESSES="${CODE_EVAL_PROCESSES:-4}"
 CODE_EVAL_TIMEOUT="${CODE_EVAL_TIMEOUT:-6}"
 LONGGENBENCH_GSM8K_K="${LONGGENBENCH_GSM8K_K:-32}"
 LONGGENBENCH_GSM8K_QUESTION_LIMIT="${LONGGENBENCH_GSM8K_QUESTION_LIMIT:-256}"
+HELMET_REPO="${HELMET_REPO:-third_party/benchmarks/HELMET}"
+HELMET_DATA_DIR="${HELMET_DATA_DIR:-third_party/benchmarks/HELMET/data}"
+HELMET_DATASET_FILTER="${HELMET_DATASET_FILTER:-}"
+LONGPROC_REPO="${LONGPROC_REPO:-third_party/benchmarks/LongProc}"
+LONGPROC_DATA_DIR="${LONGPROC_DATA_DIR:-third_party/benchmarks/LongProc/data}"
+LONGPROC_DATASETS="${LONGPROC_DATASETS:-}"
 
 LAYERS="${LAYERS:-all}"
 SELECTOR_MODE="${SELECTOR_MODE:-fullscan}"
@@ -124,7 +188,7 @@ SELECTOR_BACKEND="${SELECTOR_BACKEND:-cuda_ext}"
 BUDGET="${BUDGET:-4096}"
 ONLINE_CONFIDENCE_RULE="${ONLINE_CONFIDENCE_RULE:-joint_kv_stability}"
 TAIL_MODE="${TAIL_MODE:-vpq_value}"
-TAIL_SCORE_CALIBRATION="${TAIL_SCORE_CALIBRATION:-affine_selected}"
+TAIL_SCORE_CALIBRATION="${TAIL_SCORE_CALIBRATION:-none}"
 TAIL_PROBE_REL_L2_MAX="${TAIL_PROBE_REL_L2_MAX:-0.020}"
 TAIL_PROXY_MASS_MIN="${TAIL_PROXY_MASS_MIN:-0.990}"
 TAIL_PROXY_MASS_MAX="${TAIL_PROXY_MASS_MAX:-1.0}"
@@ -141,6 +205,15 @@ echo "[INFO] ENABLE_NATIVE_DECODE_FUSED=${ENABLE_NATIVE_DECODE_FUSED}"
 echo "[INFO] NATIVE_DECODE_SCORELESS_FUSED=${NATIVE_DECODE_SCORELESS_FUSED}"
 echo "[INFO] PREFILL_SELECTOR_BACKEND=${PREFILL_SELECTOR_BACKEND}"
 echo "[INFO] PREFILL_RANK_BUFFER_LIMIT_MB=${PREFILL_RANK_BUFFER_LIMIT_MB}"
+echo "[INFO] MODEL_NAME=${MODEL_NAME}"
+echo "[INFO] USE_CHAT_TEMPLATE=${USE_CHAT_TEMPLATE}"
+echo "[INFO] DISABLE_THINKING=${DISABLE_THINKING}"
+echo "[INFO] QWEN3_EVAL_MODE=${QWEN3_EVAL_MODE}"
+echo "[INFO] MAX_NEW_TOKENS=${MAX_NEW_TOKENS}"
+echo "[INFO] FORCE_MAX_NEW_TOKENS=${FORCE_MAX_NEW_TOKENS}"
+echo "[INFO] TEMPERATURE=${TEMPERATURE}"
+echo "[INFO] TOP_P=${TOP_P}"
+echo "[INFO] TOP_K=${TOP_K}"
 
 "${HF_VENV_DIR}/bin/python" benchmark/public_longdecode_eval.py \
   --benchmark "${BENCHMARK}" \
@@ -167,6 +240,12 @@ echo "[INFO] PREFILL_RANK_BUFFER_LIMIT_MB=${PREFILL_RANK_BUFFER_LIMIT_MB}"
   --livecodebench_end_date "${LIVE_CODE_END_DATE}" \
   --code_eval_processes "${CODE_EVAL_PROCESSES}" \
   --code_eval_timeout "${CODE_EVAL_TIMEOUT}" \
+  --helmet_repo "${HELMET_REPO}" \
+  --helmet_data_dir "${HELMET_DATA_DIR}" \
+  --helmet_dataset_filter "${HELMET_DATASET_FILTER}" \
+  --longproc_repo "${LONGPROC_REPO}" \
+  --longproc_data_dir "${LONGPROC_DATA_DIR}" \
+  --longproc_datasets "${LONGPROC_DATASETS}" \
   --longgenbench_gsm8k_k "${LONGGENBENCH_GSM8K_K}" \
   --longgenbench_gsm8k_question_limit "${LONGGENBENCH_GSM8K_QUESTION_LIMIT}" \
   --selector_mode "${SELECTOR_MODE}" \
@@ -190,7 +269,15 @@ echo "[INFO] PREFILL_RANK_BUFFER_LIMIT_MB=${PREFILL_RANK_BUFFER_LIMIT_MB}"
   --joint_kv_policy "${JOINT_KV_POLICY}" \
   --joint_kv_k_budgets "${JOINT_KV_K_BUDGETS}" \
   --joint_kv_v_budgets "${JOINT_KV_V_BUDGETS}" \
+  --joint_kv_k_budget_fracs "${JOINT_KV_K_BUDGET_FRACS}" \
+  --joint_kv_v_budget_fracs "${JOINT_KV_V_BUDGET_FRACS}" \
   --joint_kv_stability_threshold "${JOINT_KV_STABILITY_THRESHOLD}" \
+  --joint_kv_threshold_mode "${JOINT_KV_THRESHOLD_MODE}" \
+  --joint_kv_threshold_reference_frac "${JOINT_KV_THRESHOLD_REFERENCE_FRAC}" \
+  --joint_kv_threshold_scale_shape "${JOINT_KV_THRESHOLD_SCALE_SHAPE}" \
+  --joint_kv_threshold_min_scale "${JOINT_KV_THRESHOLD_MIN_SCALE}" \
+  --joint_kv_threshold_max_scale "${JOINT_KV_THRESHOLD_MAX_SCALE}" \
+  --joint_kv_start_strategy "${JOINT_KV_START_STRATEGY}" \
   --selected_value_mode "${SELECTED_VALUE_MODE}" \
   --selected_value_exact_rule "${SELECTED_VALUE_EXACT_RULE}" \
   --selected_value_exact_top "${SELECTED_VALUE_EXACT_TOP}" \
@@ -231,4 +318,5 @@ echo "[INFO] PREFILL_RANK_BUFFER_LIMIT_MB=${PREFILL_RANK_BUFFER_LIMIT_MB}"
   $( [ "${ENABLE_NATIVE_DECODE_FUSED}" = "1" ] && printf '%s' "--enable_native_decode_fused" ) \
   $( [ "${NATIVE_DECODE_SCORELESS_FUSED}" = "1" ] && printf '%s %s' "--native_decode_scoreless_fused --native_decode_scoreless_force_mode" "${NATIVE_DECODE_SCORELESS_FORCE_MODE}" ) \
   $( [ "${NATIVE_DECODE_TAIL}" = "1" ] && printf '%s' "--native_decode_tail" ) \
+  $( [ "${DRY_RUN}" = "1" ] && printf '%s' "--dry_run" ) \
   $( [ -n "${ATTN_IMPLEMENTATION}" ] && printf '%s %s' "--attn_implementation" "${ATTN_IMPLEMENTATION}" )

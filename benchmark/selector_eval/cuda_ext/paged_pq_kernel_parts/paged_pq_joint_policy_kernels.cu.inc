@@ -208,11 +208,24 @@ __global__ void joint_select_policy_grouped_flat_kernel(
     const float* __restrict__ v_mb,
     int64_t* __restrict__ final_indices,
     float* __restrict__ final_outputs,
+    bool* __restrict__ boundary_groups,
+    double* __restrict__ accounting_sums,
+    const int64_t* __restrict__ selected_counts_by_ki,
+    const int64_t* __restrict__ v_budgets,
     int64_t groups,
     int64_t k_count,
     int64_t v_count,
     int64_t heads,
     int64_t dim,
+    int64_t context_len,
+    int64_t head_dim,
+    int64_t key_bytes,
+    int64_t value_bytes,
+    double selector_mb,
+    double v_pq_codebook_mb,
+    double metadata_mb,
+    int64_t actual_value_subvecs,
+    int64_t code_bytes,
     double threshold,
     int policy_id) {
   int64_t gh = blockIdx.x;
@@ -341,6 +354,28 @@ __global__ void joint_select_policy_grouped_flat_kernel(
   if (threadIdx.x == 0) {
     final_indices[gh * 2] = final_ki;
     final_indices[gh * 2 + 1] = final_vi;
+    if (boundary_groups != nullptr && (final_ki >= k_count - 1 || final_vi >= v_count - 1)) {
+      boundary_groups[group] = true;
+    }
+    if (accounting_sums != nullptr && selected_counts_by_ki != nullptr && v_budgets != nullptr) {
+      constexpr double mb = 1024.0 * 1024.0;
+      int64_t selected_count = selected_counts_by_ki[final_ki] < 0 ? 0 : selected_counts_by_ki[final_ki];
+      int64_t exact_v = v_budgets[final_vi] < 0 ? 0 : (v_budgets[final_vi] > context_len ? context_len : v_budgets[final_vi]);
+      int64_t tail_count = context_len > exact_v ? context_len - exact_v : 0;
+      double exact_key_mb = static_cast<double>(selected_count * head_dim * key_bytes) / mb;
+      double exact_v_mb = static_cast<double>(exact_v * head_dim * value_bytes) / mb;
+      double tail_mb =
+          v_pq_codebook_mb + static_cast<double>(tail_count * actual_value_subvecs * code_bytes) / mb + metadata_mb;
+      double dense_key_mb = static_cast<double>(context_len * head_dim * key_bytes) / mb;
+      atomicAdd(&accounting_sums[0], static_cast<double>(selected_count));
+      atomicAdd(&accounting_sums[1], static_cast<double>(tail_count));
+      atomicAdd(&accounting_sums[2], selector_mb);
+      atomicAdd(&accounting_sums[3], exact_key_mb + exact_v_mb);
+      atomicAdd(&accounting_sums[4], tail_mb);
+      atomicAdd(&accounting_sums[6], dense_key_mb + exact_v_mb);
+      atomicAdd(&accounting_sums[8], selector_mb > 0.0 ? 1.0 : 0.0);
+      atomicAdd(&accounting_sums[9], tail_mb > 0.0 ? 1.0 : 0.0);
+    }
   }
 }
 
@@ -517,4 +552,3 @@ __global__ void joint_select_policy_grouped_intervals_no_mb_kernel(
     final_indices[gh * 2 + 1] = final_vi;
   }
 }
-

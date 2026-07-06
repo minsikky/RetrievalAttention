@@ -132,7 +132,8 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
             if query_len != 1:
                 stats[layer_id].add_passthrough_attention_call()
                 out = call_original_forward()
-                warm_dense_prefill_decode_sidecars(int(layer_id), self, cache_obj)
+                if not bool(getattr(self, "_pagedpq_defer_prefill_sidecar_warm", False)):
+                    warm_dense_prefill_decode_sidecars(int(layer_id), self, cache_obj)
                 return out
 
             if cache_position is not None and torch.numel(cache_position) > 0:

@@ -34,7 +34,35 @@ mkdir -p "${DATA_DIR}" "${PRED_DIR}" "${SUMMARY_DIR}"
 
 module purge
 module load python/3.10.4
-source .venv/bin/activate
+module unload pytorch 2>/dev/null || true
+module load cuda/12.8.1
+
+HF_VENV_DIR="${HF_VENV_DIR:-.venv}"
+if [ -f "${HF_VENV_DIR}/bin/activate" ]; then
+  # shellcheck disable=SC1090
+  source "${HF_VENV_DIR}/bin/activate"
+else
+  echo "[ERROR] ${HF_VENV_DIR}/bin/activate not found." >&2
+  exit 1
+fi
+
+unset PYTHONPATH
+unset PYTHONHOME
+export PYTHONNOUSERSITE=1
+HF_EXTRA_PYTHONPATH="${HF_EXTRA_PYTHONPATH:-}"
+if [ -n "${HF_EXTRA_PYTHONPATH}" ] && [[ "${HF_EXTRA_PYTHONPATH}" != /* ]]; then
+  HF_EXTRA_PYTHONPATH="$(pwd)/${HF_EXTRA_PYTHONPATH}"
+fi
+if [ -n "${HF_EXTRA_PYTHONPATH}" ]; then
+  export PYTHONPATH="${HF_EXTRA_PYTHONPATH}:$(pwd)/benchmark/selector_eval/cuda_ext"
+else
+  export PYTHONPATH="$(pwd)/benchmark/selector_eval/cuda_ext"
+fi
+if [ -d "${HF_EXTRA_PYTHONPATH:-}/numpy.libs" ]; then
+  export LD_LIBRARY_PATH="${HF_EXTRA_PYTHONPATH}/numpy.libs:${LD_LIBRARY_PATH:-}"
+fi
+export LD_LIBRARY_PATH="$PWD/${HF_VENV_DIR}/lib/python3.10/site-packages/torch/lib:/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
+export TOKENIZERS_PARALLELISM=false
 
 PROFILE_NATIVE_OPS_ARG=()
 if [ "${PROFILE_NATIVE_OPS:-0}" = "1" ]; then
@@ -108,7 +136,7 @@ else
   popd >/dev/null
 fi
 
-.venv/bin/python benchmark/ruler/pred/call_pagedpq_streaming.py \
+"${HF_VENV_DIR}/bin/python" benchmark/ruler/pred/call_pagedpq_streaming.py \
   --model_name "${MODEL_PATH}" \
   --cache_dir "${CACHE_DIR:-.hf_cache}" \
   --data_file "${DATA_FILE}" \
@@ -127,7 +155,7 @@ fi
   --budget_by_head "${BUDGET_BY_HEAD:-}" \
   --tail_mode "${TAIL_MODE:-vpq_value}" \
   --online_confidence_rule "${ONLINE_CONFIDENCE_RULE:-joint_kv_stability}" \
-  --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-affine_selected}" \
+  --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-none}" \
   --tail_blend "${TAIL_BLEND:-1.0}" \
   --tail_probe_rel_l2_max "${TAIL_PROBE_REL_L2_MAX:-0.020}" \
   --tail_proxy_mass_min "${TAIL_PROXY_MASS_MIN:-0.0}" \
@@ -144,7 +172,15 @@ fi
   --joint_kv_policy "${JOINT_KV_POLICY:-k_first_alternating}" \
   --joint_kv_k_budgets "${JOINT_KV_K_BUDGETS:-4096,8192,14336,32768}" \
   --joint_kv_v_budgets "${JOINT_KV_V_BUDGETS:-1024,2048,4096,6144,8192,12288,16384}" \
-  --joint_kv_stability_threshold "${JOINT_KV_STABILITY_THRESHOLD:-0.001}" \
+  --joint_kv_k_budget_fracs "${JOINT_KV_K_BUDGET_FRACS:-0.10,0.30,0.50,0.70,0.90,1.0}" \
+  --joint_kv_v_budget_fracs "${JOINT_KV_V_BUDGET_FRACS:-0.05,0.10,0.20,0.40,0.60,0.80,1.0}" \
+  --joint_kv_stability_threshold "${JOINT_KV_STABILITY_THRESHOLD:-0.002}" \
+  --joint_kv_threshold_mode "${JOINT_KV_THRESHOLD_MODE:-budget_delta_frac}" \
+  --joint_kv_threshold_reference_frac "${JOINT_KV_THRESHOLD_REFERENCE_FRAC:-0.2}" \
+  --joint_kv_threshold_scale_shape "${JOINT_KV_THRESHOLD_SCALE_SHAPE:-sqrt}" \
+  --joint_kv_threshold_min_scale "${JOINT_KV_THRESHOLD_MIN_SCALE:-0.0}" \
+  --joint_kv_threshold_max_scale "${JOINT_KV_THRESHOLD_MAX_SCALE:-1.5}" \
+  --joint_kv_start_strategy "${JOINT_KV_START_STRATEGY:-proxy_mass_m0p9}" \
   --selected_value_mode "${SELECTED_VALUE_MODE:-vpq_value}" \
   --selected_value_exact_rule "${SELECTED_VALUE_EXACT_RULE:-global_residual_risk}" \
   --selected_value_exact_top "${SELECTED_VALUE_EXACT_TOP:-0}" \
@@ -190,7 +226,7 @@ python -u eval/evaluate.py \
   --benchmark synthetic
 popd >/dev/null
 
-.venv/bin/python - <<PY
+"${HF_VENV_DIR}/bin/python" - <<PY
 import csv
 import json
 from pathlib import Path

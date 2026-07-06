@@ -11,6 +11,10 @@ SLURM_ROOT="${SLURM_ROOT:-slurm_out/frontier_benchmark_matrix_${TAG}}"
 MANIFEST="${MANIFEST:-notes/slurm_manifests/frontier_benchmark_matrix_${TAG}.tsv}"
 DRY_RUN="${DRY_RUN:-0}"
 SBATCH_DEPENDENCY="${SBATCH_DEPENDENCY:-}"
+PARTITIONS="${PARTITIONS:-spgpu}"
+HF_VENV_DIR="${HF_VENV_DIR:-.venv}"
+HF_EXTRA_PYTHONPATH="${HF_EXTRA_PYTHONPATH:-}"
+TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-}"
 
 RUN_RULER="${RUN_RULER:-1}"
 RULER_TASKS="${RULER_TASKS:-niah_single_1,niah_multikey_2,vt,fwe}"
@@ -46,10 +50,11 @@ submit_job() {
   fi
   local jobid
   jobid=$(sbatch --parsable \
+    --partition="${PARTITIONS}" \
     --job-name="${label:0:40}" \
     --output="${slurm_out}" \
     "${dependency_args[@]}" \
-    --export="ALL,$*" \
+    --export="ALL,HF_VENV_DIR=${HF_VENV_DIR},HF_EXTRA_PYTHONPATH=${HF_EXTRA_PYTHONPATH},TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST},$*" \
     "${script}")
   printf '%s\t%s\t%s\t%s\n' "${label}" "${jobid}" "${output_dir}" "${slurm_out//%j/${jobid}}" >> "${MANIFEST}"
   printf '[SUBMITTED] %s %s\n' "${label}" "${jobid}"

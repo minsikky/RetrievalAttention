@@ -106,6 +106,58 @@ __global__ void gqa_pq_scores_kernel(
 }
 
 template <typename code_t>
+__global__ void gqa_pq_scores_lut_kernel(
+    const float* __restrict__ queries,
+    const float* __restrict__ codebooks,
+    const code_t* __restrict__ codes,
+    float* __restrict__ scores,
+    int64_t heads,
+    int64_t kv_heads,
+    int64_t dim,
+    int64_t pages,
+    int64_t page_size,
+    int64_t subvecs,
+    int64_t centroids,
+    int64_t subdim,
+    int64_t total_tokens,
+    int64_t group_size) {
+  int64_t head = static_cast<int64_t>(blockIdx.x);
+  int64_t page = static_cast<int64_t>(blockIdx.y);
+  if (head >= heads || page >= pages) {
+    return;
+  }
+
+  int64_t kv_head = min(head / group_size, kv_heads - 1);
+  extern __shared__ float lut[];
+  const float* q = queries + head * dim;
+  int64_t lut_entries = subvecs * centroids;
+  for (int64_t entry = threadIdx.x; entry < lut_entries; entry += blockDim.x) {
+    int64_t sub = entry / centroids;
+    int64_t centroid = entry - sub * centroids;
+    const float* cb = codebooks + ((((kv_head * pages + page) * subvecs + sub) * centroids + centroid) * subdim);
+    const float* q_sub = q + sub * subdim;
+    float dot = 0.0f;
+    for (int64_t d = 0; d < subdim; ++d) {
+      dot += q_sub[d] * cb[d];
+    }
+    lut[entry] = dot;
+  }
+  __syncthreads();
+
+  float* page_scores = scores + head * total_tokens + page * page_size;
+  for (int64_t row = threadIdx.x; row < page_size; row += blockDim.x) {
+    const code_t* code_row = codes + ((kv_head * pages + page) * page_size + row) * subvecs;
+    float score = 0.0f;
+    for (int64_t sub = 0; sub < subvecs; ++sub) {
+      int64_t code = static_cast<int64_t>(code_row[sub]);
+      code = max(static_cast<int64_t>(0), min(code, centroids - 1));
+      score += lut[sub * centroids + code];
+    }
+    page_scores[row] = score;
+  }
+}
+
+template <typename code_t>
 __global__ void gqa_causal_pq_scores_kernel(
     const float* __restrict__ queries,
     const float* __restrict__ codebooks,
@@ -729,4 +781,3 @@ __global__ void gqa_causal_pq_top_pages_kernel(
     __syncthreads();
   }
 }
-

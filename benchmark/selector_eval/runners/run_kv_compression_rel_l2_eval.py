@@ -383,6 +383,113 @@ def _quantize_per_channel_with_cost(
     return out, float(cost), float(per_token)
 
 
+def _kivi_quantize_key_time_groups(x: np.ndarray, group_size: int, bits: int) -> np.ndarray:
+    """KIVI key quantization: per channel, grouped along token/time."""
+    x32 = x.astype(np.float32, copy=False)
+    if x32.size == 0:
+        return x32.copy()
+    n, dim = int(x32.shape[0]), int(x32.shape[1])
+    group_size = int(group_size)
+    if group_size <= 0 or n % group_size != 0:
+        raise ValueError(f"KIVI key quantized length {n} must be divisible by group_size {group_size}")
+    levels = float((1 << int(bits)) - 1)
+    view = x32.reshape(n // group_size, group_size, dim)
+    lo = view.min(axis=1, keepdims=True)
+    hi = view.max(axis=1, keepdims=True)
+    scale = np.maximum((hi - lo) / max(levels, 1.0), np.float32(1e-8))
+    codes = np.clip(np.rint((view - lo) / scale), 0.0, levels)
+    return (codes * scale + lo).reshape(x32.shape).astype(np.float32, copy=False)
+
+
+def _kivi_quantize_value_channel_groups(x: np.ndarray, group_size: int, bits: int) -> np.ndarray:
+    """KIVI value quantization: per token, grouped along channel/head-dim."""
+    return _quantize_groupwise_lastdim(x, group_size=int(group_size), bits=int(bits))
+
+
+def _build_kivi_with_cost(
+    keys: np.ndarray,
+    values: np.ndarray,
+    *,
+    bits: int,
+    group_size: int,
+    residual_window: int,
+    key_bytes: int,
+    value_bytes: int,
+    metadata_bytes: int,
+) -> tuple[np.ndarray, np.ndarray, float, float, dict[str, int | float]]:
+    """KIVI cache state for a single KV head snapshot.
+
+    The official implementation stores quantized K as [tokens grouped along time] per
+    key channel, while V is quantized per token along channel groups. K keeps only a
+    partially-filled residual chunk exact; V keeps the most recent residual window exact.
+    """
+    if int(bits) not in (2, 4):
+        raise ValueError("KIVI supports the official 2/4-bit settings")
+    n, dim = int(keys.shape[0]), int(keys.shape[1])
+    group = int(group_size)
+    residual = int(residual_window)
+    if residual <= 0:
+        raise ValueError("KIVI requires a positive residual window")
+    if group <= 0 or dim % group != 0 or residual % group != 0:
+        raise ValueError(
+            f"KIVI requires head_dim and residual_window divisible by group_size; "
+            f"got dim={dim}, residual={residual}, group={group}"
+        )
+
+    keys32 = keys.astype(np.float32, copy=False)
+    values32 = values.astype(np.float32, copy=False)
+    keys_hat = keys32.copy()
+    values_hat = values32.copy()
+
+    key_quant_len = n - (n % residual)
+    key_exact_count = n - key_quant_len
+    if key_quant_len > 0:
+        keys_hat[:key_quant_len] = _kivi_quantize_key_time_groups(keys32[:key_quant_len], group, bits)
+
+    value_exact_count = min(residual, n)
+    value_quant_len = max(0, n - value_exact_count)
+    if value_quant_len > 0:
+        values_hat[:value_quant_len] = _kivi_quantize_value_channel_groups(values32[:value_quant_len], group, bits)
+
+    key_groups = key_quant_len // group
+    value_groups = dim // group
+    key_code_bytes = _packed_code_bytes(key_quant_len, dim, bits)
+    key_meta_bytes = _scale_zero_bytes(dim, key_groups, int(metadata_bytes))
+    value_code_bytes = _packed_code_bytes(value_quant_len, dim, bits)
+    value_meta_bytes = _scale_zero_bytes(value_quant_len, value_groups, int(metadata_bytes))
+    exact_key_bytes = float(key_exact_count * dim * int(key_bytes))
+    exact_value_bytes = float(value_exact_count * dim * int(value_bytes))
+
+    key_sidecar_per_token = _packed_code_bytes(1, dim, bits) + float(dim * 2 * int(metadata_bytes)) / float(group)
+    value_sidecar_per_token = _packed_code_bytes(1, dim, bits) + _scale_zero_bytes(1, value_groups, int(metadata_bytes))
+    exact_append_per_token = float(dim * (int(key_bytes) + int(value_bytes)))
+    update_bytes_per_token = exact_append_per_token + key_sidecar_per_token + value_sidecar_per_token
+
+    query_bytes = (
+        exact_key_bytes
+        + exact_value_bytes
+        + key_code_bytes
+        + key_meta_bytes
+        + value_code_bytes
+        + value_meta_bytes
+    )
+    metadata = {
+        "key_quantized_tokens": int(key_quant_len),
+        "key_exact_tokens": int(key_exact_count),
+        "key_groups": int(key_groups),
+        "value_quantized_tokens": int(value_quant_len),
+        "value_exact_tokens": int(value_exact_count),
+        "value_groups_per_token": int(value_groups),
+        "exact_key_MB": exact_key_bytes / MB,
+        "exact_value_MB": exact_value_bytes / MB,
+        "compressed_key_MB": float(key_code_bytes + key_meta_bytes) / MB,
+        "compressed_value_MB": float(value_code_bytes + value_meta_bytes) / MB,
+        "key_sidecar_update_MB_per_token": float(key_sidecar_per_token) / MB,
+        "value_sidecar_update_MB_per_token": float(value_sidecar_per_token) / MB,
+    }
+    return keys_hat, values_hat, float(query_bytes), float(update_bytes_per_token), metadata
+
+
 def _tiered_quantize_with_cost(
     x: np.ndarray,
     scores: np.ndarray,
@@ -1558,6 +1665,8 @@ def build_compressed_kv(
 
     keys_hat = keys32.copy()
     values_hat = values32.copy()
+    query_read_override: float | None = None
+    update_override: float | None = None
 
     if name.startswith("pmkvq_like"):
         bits = _parse_bits(name, default=4)
@@ -1935,15 +2044,36 @@ def build_compressed_kv(
             },
             position_weights=pos_weights,
         )
-    elif name.startswith("kivi_like"):
+    elif name.startswith("kivi_b"):
         bits = _parse_bits(name, default=2)
-        keys_hat[comp_mask] = _quantize_per_channel(keys32[comp_mask], bits)
-        values_hat[comp_mask] = _quantize_per_token(values32[comp_mask], bits)
-        key_bytes_total = _packed_code_bytes(comp_count, dim, bits) + _scale_zero_bytes(1, dim, int(metadata_bytes))
-        value_bytes_total = _packed_code_bytes(comp_count, dim, bits) + _scale_zero_bytes(comp_count, 1, int(metadata_bytes))
-        sidecar_per_token = (2.0 * _packed_code_bytes(1, dim, bits)) + _scale_zero_bytes(1, 1, int(metadata_bytes))
-        label = f"kivi_like_b{bits}_w{residual_window}"
-        meta = {"family": "kivi_like", "bits": bits}
+        group_size = _parse_count(name, prefix="g", default=32)
+        keys_hat, values_hat, query_bytes, update_bytes_per_token, kivi_meta = _build_kivi_with_cost(
+            keys32,
+            values32,
+            bits=int(bits),
+            group_size=int(group_size),
+            residual_window=int(residual_window),
+            key_bytes=int(key_bytes),
+            value_bytes=int(value_bytes),
+            metadata_bytes=int(metadata_bytes),
+        )
+        key_bytes_total = float(kivi_meta["compressed_key_MB"]) * MB
+        value_bytes_total = float(kivi_meta["compressed_value_MB"]) * MB
+        exact_bytes = float(kivi_meta["exact_key_MB"] + kivi_meta["exact_value_MB"]) * MB
+        sidecar_per_token = float(kivi_meta["key_sidecar_update_MB_per_token"] + kivi_meta["value_sidecar_update_MB_per_token"]) * MB
+        label = f"kivi_b{bits}_g{group_size}_w{residual_window}"
+        meta = {
+            "family": "kivi",
+            "bits": int(bits),
+            "group_size": int(group_size),
+            "source_impl": "official jy-yuan/KIVI quantization layout: K time-groups, V channel-groups",
+            "proxy_not_faithful_paper_impl": False,
+            **kivi_meta,
+        }
+        query_read_override = float(query_bytes) / MB
+        update_override = float(update_bytes_per_token) / MB
+        exact_count = max(int(kivi_meta["key_exact_tokens"]), int(kivi_meta["value_exact_tokens"]))
+        comp_count = context_len - exact_count
     elif name.startswith("per_token_kv"):
         bits = _parse_bits(name, default=4)
         keys_hat[comp_mask] = _quantize_per_token(keys32[comp_mask], bits)
@@ -2198,8 +2328,16 @@ def build_compressed_kv(
         raise ValueError(f"unknown compression method: {method}")
 
     _copy_exact_window(keys_hat, values_hat, keys32, values32, exact_mask)
-    query_read_mb = float(exact_bytes + key_bytes_total + value_bytes_total) / MB
-    update_mb_per_token = float(update_exact_window if residual_window > 0 else sidecar_per_token) / MB
+    query_read_mb = (
+        float(query_read_override)
+        if query_read_override is not None
+        else float(exact_bytes + key_bytes_total + value_bytes_total) / MB
+    )
+    update_mb_per_token = (
+        float(update_override)
+        if update_override is not None
+        else float(update_exact_window if residual_window > 0 else sidecar_per_token) / MB
+    )
     meta.update(
         {
             "method": label,
@@ -2213,7 +2351,7 @@ def build_compressed_kv(
             "compressed_key_MB": float(key_bytes_total) / MB,
             "compressed_value_MB": float(value_bytes_total) / MB,
             "online_update_MB_per_token": update_mb_per_token,
-            "proxy_not_faithful_paper_impl": True,
+            "proxy_not_faithful_paper_impl": bool(meta.get("proxy_not_faithful_paper_impl", True)),
         }
     )
     return CompressedKV(
@@ -2232,7 +2370,7 @@ def build_compressed_kv(
 def method_display_name(method: str) -> str:
     mapping = [
         ("dense", "Dense fp16"),
-        ("kivi_like", "KIVI-like scalar"),
+        ("kivi", "KIVI"),
         ("kvquant_like", "KVQuant-like clipped scalar"),
         ("per_token_kv", "Per-token scalar"),
         ("pmkvq_like", "PM-KVQ-like progressive scalar"),
@@ -2357,7 +2495,7 @@ def run() -> None:
         "--methods",
         default=(
             "dense,"
-            "kivi_like_b2_w128,kivi_like_b4_w128,kivi_like_b2_w2048,kivi_like_b4_w2048,"
+            "kivi_b2_g32_w128,kivi_b4_g32_w128,kivi_b2_g32_w2048,kivi_b4_g32_w2048,"
             "kvquant_like_b3_clip0p1_w128,kvquant_like_b4_clip0p1_w128,"
             "per_token_kv_b3_w128,per_token_kv_b4_w128,"
             "tq_k3v3_w128,tqprod_k3v3_w128,tqprod_k4v4_w128,"

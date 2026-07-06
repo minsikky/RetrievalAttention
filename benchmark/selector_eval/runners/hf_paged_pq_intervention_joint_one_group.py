@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import math
 import time
 
 import torch
@@ -33,6 +34,66 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_vprefix impo
     JointVPrefixGridRuntime,
     build_joint_vprefix_grid,
 )
+
+
+def _budget_index_at_least(budgets: list[int], target: float) -> int:
+    for idx, budget in enumerate(budgets):
+        if int(budget) >= float(target):
+            return int(idx)
+    return max(0, len(budgets) - 1)
+
+
+def _fraction_suffix(name: str, marker: str, default: float) -> float:
+    tail = str(name).split(str(marker), 1)[-1]
+    token = tail.split("_", 1)[0].replace("p", ".")
+    try:
+        return float(token)
+    except ValueError:
+        return float(default)
+
+
+def _softmax_prefix_counts_for_mass(sorted_logits: torch.Tensor, mass: float) -> torch.Tensor:
+    if int(sorted_logits.shape[-1]) == 0:
+        return torch.zeros((int(sorted_logits.shape[0]),), dtype=torch.long, device=sorted_logits.device)
+    weights = torch.softmax(sorted_logits.to(dtype=torch.float32), dim=1)
+    prefix = torch.cumsum(weights, dim=1)
+    counts = torch.sum(prefix < float(mass), dim=1).to(dtype=torch.long) + 1
+    return torch.clamp(counts, min=1, max=int(sorted_logits.shape[1]))
+
+
+def _joint_start_indices_for_heads(
+    *,
+    strategy: str,
+    context_len: int,
+    dense_score_rows_t: torch.Tensor,
+    sqrt_dim: float,
+    k_budgets: list[int],
+    v_budgets: list[int],
+) -> tuple[list[int], list[int]]:
+    name = str(strategy).strip().lower()
+    group_heads = int(dense_score_rows_t.shape[0])
+    if name in {"", "min", "zero"}:
+        return [0 for _ in range(group_heads)], [0 for _ in range(group_heads)]
+    if name.startswith("fixed_f"):
+        frac = _fraction_suffix(name, "f", 0.05)
+        k_target = max(float(k_budgets[0]), float(context_len) * float(frac))
+        v_target = max(float(v_budgets[0]), k_target * 0.25)
+        ki = _budget_index_at_least(k_budgets, k_target)
+        vi = _budget_index_at_least(v_budgets, v_target)
+        return [int(ki) for _ in range(group_heads)], [int(vi) for _ in range(group_heads)]
+    if name.startswith("proxy_mass_m"):
+        mass = min(max(_fraction_suffix(name, "m", 0.5), 0.0), 0.999999)
+        sorted_logits = torch.sort(dense_score_rows_t.to(dtype=torch.float32) / float(sqrt_dim), dim=1, descending=True).values
+        counts = _softmax_prefix_counts_for_mass(sorted_logits, float(mass)).detach().cpu().tolist()
+        k_indices: list[int] = []
+        v_indices: list[int] = []
+        for count in counts:
+            k_target = max(float(k_budgets[0]), float(count))
+            v_target = max(float(v_budgets[0]), k_target * 0.25)
+            k_indices.append(_budget_index_at_least(k_budgets, k_target))
+            v_indices.append(_budget_index_at_least(v_budgets, v_target))
+        return k_indices, v_indices
+    raise ValueError(f"unknown joint_kv_start_strategy: {strategy}")
 
 
 def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
@@ -77,6 +138,13 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     grouped_vpq_vhat_groups_t = runtime.grouped_vpq_vhat_groups_t
     grouped_vpq_residual_groups_t = runtime.grouped_vpq_residual_groups_t
     grouped_vpq_code_error_groups_t = runtime.grouped_vpq_code_error_groups_t
+    compact_grouped_vpq_enabled = (
+        runtime.grouped_vpq_value_codebooks_t is not None
+        and runtime.grouped_vpq_value_codes_t is not None
+        and runtime.grouped_vpq_value_page_starts_t is not None
+        and runtime.grouped_vpq_values_t is not None
+        and grouped_vpq_code_error_groups_t is not None
+    )
     grouped_vpq_actual_subbits = runtime.grouped_vpq_actual_subbits
     grouped_risk_records = runtime.grouped_risk_records
     outputs_all = runtime.outputs_all
@@ -84,6 +152,8 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     joint_vpq_sidecars_for = runtime.joint_vpq_sidecars_for
     joint_vpq_pack_and_fallback_for = runtime.joint_vpq_pack_and_fallback_for
     token_layout_for = runtime.token_layout_for
+    nocalib_score_grid_workspace_for = runtime.nocalib_score_grid_workspace_for
+    nocalib_scatter_score_grid_workspace_for = runtime.nocalib_scatter_score_grid_workspace_for
     score_grid_workspace_for = runtime.score_grid_workspace_for
     grouped_score_grid_workspace_for = runtime.grouped_score_grid_workspace_for
     grouped_output_workspace_for = runtime.grouped_output_workspace_for
@@ -229,7 +299,26 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     if bool(getattr(args, "profile_native_ops", False)):
         _sync_if_cuda(device)
         vsidecar_t0 = time.perf_counter()
-    if (
+    if compact_grouped_vpq_enabled and int(grouped_vpq_code_error_groups_t.shape[0]) > int(kv_head_i):
+        vhat_all_t = torch.empty(
+            (0, int(self.head_dim)),
+            dtype=torch.float32,
+            device=device,
+        )
+        residual_t = torch.empty(
+            (0, int(self.head_dim)),
+            dtype=torch.float32,
+            device=device,
+        )
+        code_error_t = grouped_vpq_code_error_groups_t[int(kv_head_i)]
+        actual_value_subbits_for_cost = (
+            int(grouped_vpq_actual_subbits)
+            if grouped_vpq_actual_subbits is not None
+            else int(args.value_subbits)
+            if int(args.value_subbits) > 0
+            else int(args.subbits)
+        )
+    elif (
         grouped_vpq_vhat_groups_t is not None
         and grouped_vpq_residual_groups_t is not None
         and grouped_vpq_code_error_groups_t is not None
@@ -375,6 +464,29 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                         )
                 allhead_rank_prefix_cache[rank_prefix_key] = allhead_ranked_prefix_t
             ranked_prefix_tokens_t = allhead_ranked_prefix_t[head_start_i:head_end_i]
+            if _env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_RANK_AUDIT", "0"):
+                audit_order_t = torch.topk(
+                    ranked_nonbase_scores_t,
+                    k=int(max_rank_take),
+                    dim=1,
+                    largest=True,
+                    sorted=True,
+                ).indices
+                audit_ranked_prefix_t = ranked_nonbase_t.index_select(
+                    0,
+                    audit_order_t.reshape(-1),
+                ).reshape(
+                    group_heads_i,
+                    int(max_rank_take),
+                )
+                if not torch.equal(ranked_prefix_tokens_t, audit_ranked_prefix_t):
+                    mismatch_t = ranked_prefix_tokens_t.ne(audit_ranked_prefix_t)
+                    mismatch_count = int(mismatch_t.sum().item())
+                    first = int(mismatch_t.flatten().nonzero()[0].item())
+                    raise RuntimeError(
+                        "all-head rank-prefix audit failed: "
+                        f"{mismatch_count} mismatched token positions; first_flat={first}"
+                    )
         else:
             rank_prefix_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
             if bool(getattr(args, "profile_native_ops", False)):
@@ -535,6 +647,13 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         else None
     )
 
+    def y_indexed_for_native_score_grid() -> torch.Tensor:
+        if y_indexed_prob_t is not None:
+            return y_indexed_prob_t.to(dtype=torch.float32)
+        # Native score-grid wrappers require a shape-compatible y_indexed
+        # tensor even when raw/no-calibration mode ignores it.
+        return pq_logits_t.to(dtype=torch.float32)
+
     def selected_for_budget_batch(k_budget: int) -> torch.Tensor:
         take = max(0, min(int(k_budget), int(ranked_nonbase_t.numel())))
         cached_selected = selected_batch_by_take.get(int(take))
@@ -612,9 +731,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             else:
                 ranked_prefix_tokens_for_grid_t = ranked_prefix_tokens_t
             y_for_grid_t = (
-                y_indexed_prob_t.to(dtype=torch.float32)
-                if y_indexed_prob_t is not None
-                else torch.empty_like(pq_logits_t, dtype=torch.float32)
+                y_indexed_for_native_score_grid()
             )
             if _env_truthy("SELECTOR_PQ_JOINT_TOKENFIT_SCORE_GRID", "0"):
                 if not hasattr(native, "joint_mixed_score_grid_tokenfit_scaled"):
@@ -946,6 +1063,14 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         sim_t0 = time.perf_counter()
     policy_name = str(getattr(args, "joint_kv_policy", "k_first_alternating"))
     threshold_value = float(getattr(args, "joint_kv_stability_threshold", 0.001))
+    start_ki_by_head, start_vi_by_head = _joint_start_indices_for_heads(
+        strategy=str(getattr(args, "joint_kv_start_strategy", "min")),
+        context_len=int(context_len_i),
+        dense_score_rows_t=ranked_nonbase_scores_t,
+        sqrt_dim=float(sqrt_dim),
+        k_budgets=active_joint_k_budgets,
+        v_budgets=joint_v_budgets,
+    )
     final_ki_by_head: list[int] = []
     final_vi_by_head: list[int] = []
     final_idx_t_for_output: torch.Tensor | None = None
@@ -977,6 +1102,16 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         fused_mixed_softmax_base_enabled = _env_truthy(
             "SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE",
             "0",
+        )
+        fused_sparse_direct_softmax_enabled = (
+            fused_mixed_softmax_base_enabled
+            and _env_truthy("SELECTOR_PQ_JOINT_FUSED_TOKENFIT_SOFTMAX_BASE", "0")
+            and use_sparse_direct_score_grid
+            and exact_scores_h is None
+            and sparse_base_logits_t is not None
+            and sparse_ranked_tokens_t is not None
+            and sparse_ranked_logits_t is not None
+            and use_score_grid_no_fill
         )
         if fused_mixed_softmax_base_enabled and not native_score_grid_enabled:
             raise RuntimeError("SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE requires native score-grid mode")
@@ -1049,10 +1184,97 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 device=device,
             )
             y_for_grid_t = (
-                y_indexed_prob_t.to(dtype=torch.float32)
-                if y_indexed_prob_t is not None
-                else torch.empty_like(pq_logits_t, dtype=torch.float32)
+                y_indexed_for_native_score_grid()
             )
+            if _env_truthy("SELECTOR_PQ_JOINT_MERGE_RISK_POLICY", "0"):
+                if policy_uses_mb:
+                    raise RuntimeError(
+                        "SELECTOR_PQ_JOINT_MERGE_RISK_POLICY only supports non-MB joint policies"
+                    )
+                if str(args.tail_score_calibration) == "affine_selected":
+                    raise RuntimeError(
+                        "SELECTOR_PQ_JOINT_MERGE_RISK_POLICY requires raw/no-calibration K-PQ tail logits"
+                    )
+                if exact_scores_h is None:
+                    raise RuntimeError("SELECTOR_PQ_JOINT_MERGE_RISK_POLICY requires exact score table")
+                if not hasattr(native, "joint_mixed_select_policy_merge_rankpos_no_calib_no_mb"):
+                    raise RuntimeError(
+                        "SELECTOR_PQ_JOINT_MERGE_RISK_POLICY requires updated CUDA extension"
+                    )
+                merge_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                if bool(getattr(args, "profile_native_ops", False)):
+                    _sync_if_cuda(device)
+                    merge_t0 = time.perf_counter()
+                else:
+                    merge_t0 = 0.0
+                final_outputs_t, final_idx_t = native.joint_mixed_select_policy_merge_rankpos_no_calib_no_mb(
+                    exact_scores_h.to(dtype=torch.float32).contiguous(),
+                    pq_logits_t.to(dtype=torch.float32).contiguous(),
+                    indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                    base_t.to(dtype=torch.long).contiguous(),
+                    ranked_prefix_tokens_for_grid_t.to(dtype=torch.long).contiguous(),
+                    k_take_counts_t,
+                    vhat_all_t.to(dtype=torch.float32).contiguous(),
+                    residual_t.to(dtype=torch.float32).contiguous(),
+                    code_error_t.to(dtype=torch.float32).contiguous(),
+                    joint_v_budgets_t,
+                    float(pq_logit_scale),
+                    float(threshold_value),
+                    int(policy_id),
+                )
+                if bool(getattr(args, "profile_native_ops", False)):
+                    _sync_if_cuda(device)
+                    elapsed = float(time.perf_counter() - merge_t0)
+                    stats[layer_id].add_joint_detail_timing(risk_prefix_seconds=elapsed)
+                    stats[layer_id].add_native_detail_timing(
+                        geometric_seconds=float(time.perf_counter() - sim_t0)
+                    )
+                if wall_profile_enabled:
+                    stats[layer_id].add_joint_wall_timing(
+                        risk_prefix_seconds=float(time.perf_counter() - merge_wall_t0)
+                    )
+                if bool(getattr(args, "disable_cost_stats", False)):
+                    outputs_all[head_start_i:head_end_i] = final_outputs_t[:group_heads_i]
+                    return True
+                if grid_selected_counts_by_ki is None:
+                    raise RuntimeError("merge-risk policy requires selected-count metadata for accounting")
+                final_idx_rows = final_idx_t.detach().cpu().tolist()
+                for local_head_i, row in enumerate(final_idx_rows):
+                    ki = int(row[0])
+                    vi = int(row[1])
+                    selected_count_i = int(grid_selected_counts_by_ki[int(ki)])
+                    exact_v_count = max(0, min(int(joint_v_budgets[int(vi)]), context_len_i))
+                    exact_key_mb = float(selected_count_i * int(self.head_dim) * key_bytes) / MB
+                    exact_v_mb = float(exact_v_count * int(self.head_dim) * value_bytes) / MB
+                    compressed_v_codes_mb = (
+                        float(
+                            max(0, context_len_i - int(exact_v_count))
+                            * int(actual_value_subvecs)
+                            * int(code_bytes)
+                        )
+                        / MB
+                    )
+                    tail_mb_override = (
+                        float(v_pq_codebook_mb)
+                        + compressed_v_codes_mb
+                        + float(metadata_mb)
+                    )
+                    dense_physical_key_mb = float(context_len_i * int(self.head_dim) * key_bytes) / MB
+                    stats[layer_id].add_count(
+                        int(selected_count_i),
+                        max(0, context_len_i - int(exact_v_count)),
+                        float(selector_mb),
+                        int(self.head_dim),
+                        key_bytes,
+                        value_bytes,
+                        tail_mb_override=tail_mb_override,
+                        exact_kv_mb_override=float(exact_key_mb + exact_v_mb),
+                        confidence_mb_override=0.0,
+                        physical_gpu_exact_kv_mb_override=float(dense_physical_key_mb + exact_v_mb),
+                        physical_gpu_confidence_mb_override=0.0,
+                    )
+                    outputs_all[int(head_start_i) + int(local_head_i)] = final_outputs_t[int(local_head_i)]
+                return True
             use_score_grid_no_fill = _env_truthy("SELECTOR_PQ_JOINT_SCORE_GRID_NO_EXACT_FILL", "0")
             if use_score_grid_no_fill:
                 if not bool(layout_covers_context):
@@ -1061,53 +1283,76 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                         "tokens to cover the full context"
                     )
             if fused_mixed_softmax_base_enabled:
-                if use_score_grid_no_fill:
+                if use_score_grid_no_fill and not (
+                    fused_sparse_direct_softmax_enabled or fused_tokenfit_softmax_base_enabled
+                ):
                     raise RuntimeError(
                         "SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE does not support no-fill diagnostic mode"
                     )
-                use_rankpos_score_grid = _env_truthy("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID", "0")
-                if fused_tokenfit_softmax_base_enabled:
-                    fused_score_fn_name = "joint_mixed_softmax_base_outputs_tokenfit_scaled"
-                else:
-                    if _env_truthy("SELECTOR_PQ_JOINT_TOKENFIT_SCORE_GRID", "0"):
+                if fused_sparse_direct_softmax_enabled:
+                    fused_score_fn_name = "joint_mixed_softmax_base_outputs_sparse_exact_tokenfit_scaled"
+                    if not hasattr(native, fused_score_fn_name):
                         raise RuntimeError(
-                            "SELECTOR_PQ_JOINT_TOKENFIT_SCORE_GRID requires "
-                            "SELECTOR_PQ_JOINT_FUSED_TOKENFIT_SOFTMAX_BASE with fused softmax/base"
+                            "SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE requires updated CUDA extension: "
+                            f"{fused_score_fn_name}"
                         )
-                    if native_pq_scale_in_kernel:
-                        raise RuntimeError(
-                            "SELECTOR_PQ_JOINT_NATIVE_PQ_SCALE_IN_KERNEL requires "
-                            "SELECTOR_PQ_JOINT_FUSED_TOKENFIT_SOFTMAX_BASE with fused softmax/base"
-                        )
-                    fused_score_fn_name = (
-                        "joint_mixed_softmax_base_outputs_rankpos"
-                        if use_rankpos_score_grid
-                        else "joint_mixed_softmax_base_outputs"
-                    )
-                if not hasattr(native, fused_score_fn_name):
-                    raise RuntimeError(
-                        f"SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE requires updated CUDA extension: {fused_score_fn_name}"
-                    )
-                fused_args = (
-                    exact_scores_h.to(dtype=torch.float32).contiguous(),
-                    pq_logits_t.to(dtype=torch.float32).contiguous(),
-                    y_for_grid_t.contiguous(),
-                    indexed_tokens_t.to(dtype=torch.long).contiguous(),
-                    base_t.to(dtype=torch.long).contiguous(),
-                    ranked_prefix_tokens_for_grid_t.to(dtype=torch.long).contiguous(),
-                    k_take_counts_t,
-                    vhat_all_t.to(dtype=torch.float32).contiguous(),
-                    bool(str(args.tail_score_calibration) == "affine_selected"),
-                )
-                if fused_tokenfit_softmax_base_enabled:
                     probs_grid_t, base_output_grid_t = getattr(native, fused_score_fn_name)(
-                        *fused_args,
+                        pq_logits_t.to(dtype=torch.float32).contiguous(),
+                        indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                        base_t.to(dtype=torch.long).contiguous(),
+                        sparse_base_logits_t.to(dtype=torch.float32).contiguous(),
+                        sparse_ranked_tokens_t.to(dtype=torch.long).contiguous(),
+                        sparse_ranked_logits_t.to(dtype=torch.float32).contiguous(),
+                        k_take_counts_t,
+                        vhat_all_t.to(dtype=torch.float32).contiguous(),
+                        int(context_len_i),
+                        bool(str(args.tail_score_calibration) == "affine_selected"),
                         float(pq_logit_scale),
                     )
                 else:
-                    probs_grid_t, base_output_grid_t = getattr(native, fused_score_fn_name)(
-                        *fused_args,
+                    use_rankpos_score_grid = _env_truthy("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID", "0")
+                    if fused_tokenfit_softmax_base_enabled:
+                        fused_score_fn_name = "joint_mixed_softmax_base_outputs_tokenfit_scaled"
+                    else:
+                        if _env_truthy("SELECTOR_PQ_JOINT_TOKENFIT_SCORE_GRID", "0"):
+                            raise RuntimeError(
+                                "SELECTOR_PQ_JOINT_TOKENFIT_SCORE_GRID requires "
+                                "SELECTOR_PQ_JOINT_FUSED_TOKENFIT_SOFTMAX_BASE with fused softmax/base"
+                            )
+                        if native_pq_scale_in_kernel:
+                            raise RuntimeError(
+                                "SELECTOR_PQ_JOINT_NATIVE_PQ_SCALE_IN_KERNEL requires "
+                                "SELECTOR_PQ_JOINT_FUSED_TOKENFIT_SOFTMAX_BASE with fused softmax/base"
+                            )
+                        fused_score_fn_name = (
+                            "joint_mixed_softmax_base_outputs_rankpos"
+                            if use_rankpos_score_grid
+                            else "joint_mixed_softmax_base_outputs"
+                        )
+                    if not hasattr(native, fused_score_fn_name):
+                        raise RuntimeError(
+                            f"SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE requires updated CUDA extension: {fused_score_fn_name}"
+                        )
+                    fused_args = (
+                        exact_scores_h.to(dtype=torch.float32).contiguous(),
+                        pq_logits_t.to(dtype=torch.float32).contiguous(),
+                        y_for_grid_t.contiguous(),
+                        indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                        base_t.to(dtype=torch.long).contiguous(),
+                        ranked_prefix_tokens_for_grid_t.to(dtype=torch.long).contiguous(),
+                        k_take_counts_t,
+                        vhat_all_t.to(dtype=torch.float32).contiguous(),
+                        bool(str(args.tail_score_calibration) == "affine_selected"),
                     )
+                    if fused_tokenfit_softmax_base_enabled:
+                        probs_grid_t, base_output_grid_t = getattr(native, fused_score_fn_name)(
+                            *fused_args,
+                            float(pq_logit_scale),
+                        )
+                    else:
+                        probs_grid_t, base_output_grid_t = getattr(native, fused_score_fn_name)(
+                            *fused_args,
+                        )
                 score_grid_t = None
             else:
                 use_rankpos_score_grid = _env_truthy("SELECTOR_PQ_JOINT_RANKPOS_SCORE_GRID", "0")
@@ -1159,7 +1404,66 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                         "SELECTOR_PQ_JOINT_GROUPED_SCORE_WORKSPACE only supports the canonical "
                         "non-rankpos, non-tokenfit, exact-fill, non-fused score-grid path"
                     )
-                if use_grouped_score_grid_workspace:
+                use_nocalib_score_grid_workspace = (
+                    _env_truthy("SELECTOR_PQ_JOINT_NOCALIB_SCORE_GRID_WORKSPACE", "0")
+                    and str(args.tail_score_calibration) != "affine_selected"
+                    and not use_rankpos_score_grid
+                    and not use_tokenfit_score_grid
+                    and not use_score_grid_no_fill
+                    and not native_pq_scale_in_kernel
+                    and hasattr(native, "joint_mixed_score_grid_rankpos_nocalib_workspace")
+                )
+                use_nocalib_scatter_score_grid = (
+                    _env_truthy("SELECTOR_PQ_JOINT_NOCALIB_SCATTER_SCORE_GRID", "0")
+                    and str(args.tail_score_calibration) != "affine_selected"
+                    and not use_rankpos_score_grid
+                    and not use_tokenfit_score_grid
+                    and not use_score_grid_no_fill
+                    and not native_pq_scale_in_kernel
+                    and hasattr(native, "joint_mixed_score_grid_nocalib_scatter_workspace")
+                )
+                if use_nocalib_scatter_score_grid:
+                    score_workspace_t, token_to_indexed_workspace_t = nocalib_scatter_score_grid_workspace_for(
+                        k_count=int(k_take_counts_t.numel()),
+                        heads=int(exact_scores_h.shape[0]),
+                        context_len=int(context_len_i),
+                    )
+                    score_grid_t = native.joint_mixed_score_grid_nocalib_scatter_workspace(
+                        score_workspace_t,
+                        token_to_indexed_workspace_t,
+                        exact_scores_h.to(dtype=torch.float32).contiguous(),
+                        pq_logits_t.to(dtype=torch.float32).contiguous(),
+                        indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                        base_t.to(dtype=torch.long).contiguous(),
+                        ranked_prefix_tokens_for_grid_t.to(dtype=torch.long).contiguous(),
+                        k_take_counts_t,
+                        float(pq_logit_scale),
+                    )
+                elif use_nocalib_score_grid_workspace:
+                    (
+                        score_workspace_t,
+                        token_to_indexed_workspace_t,
+                        base_mask_workspace_t,
+                        rank_pos_workspace_t,
+                    ) = nocalib_score_grid_workspace_for(
+                        k_count=int(k_take_counts_t.numel()),
+                        heads=int(exact_scores_h.shape[0]),
+                        context_len=int(context_len_i),
+                    )
+                    score_grid_t = native.joint_mixed_score_grid_rankpos_nocalib_workspace(
+                        score_workspace_t,
+                        token_to_indexed_workspace_t,
+                        base_mask_workspace_t,
+                        rank_pos_workspace_t,
+                        exact_scores_h.to(dtype=torch.float32).contiguous(),
+                        pq_logits_t.to(dtype=torch.float32).contiguous(),
+                        indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                        base_t.to(dtype=torch.long).contiguous(),
+                        ranked_prefix_tokens_for_grid_t.to(dtype=torch.long).contiguous(),
+                        k_take_counts_t,
+                        float(pq_logit_scale),
+                    )
+                elif use_grouped_score_grid_workspace:
                     score_workspace_t, mask_workspace_t, fit_scale_workspace_t, fit_bias_workspace_t = (
                         grouped_score_grid_workspace_for(
                             kv_heads=int(num_kv_heads),
@@ -1327,13 +1631,27 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             use_grouped_risk_prefix
             and _env_truthy("SELECTOR_PQ_JOINT_GROUPED_SOFTMAX_BASE_CUBLAS", "0")
         )
-        if use_grouped_softmax_base_cublas:
+        use_grouped_softmax_base = (
+            use_grouped_risk_prefix
+            and _env_truthy("SELECTOR_PQ_JOINT_GROUPED_SOFTMAX_BASE", "0")
+        )
+        if use_grouped_softmax_base and use_grouped_softmax_base_cublas:
+            raise RuntimeError(
+                "SELECTOR_PQ_JOINT_GROUPED_SOFTMAX_BASE and "
+                "SELECTOR_PQ_JOINT_GROUPED_SOFTMAX_BASE_CUBLAS are mutually exclusive"
+            )
+        if use_grouped_softmax_base or use_grouped_softmax_base_cublas:
             if score_grid_t is None:
-                raise RuntimeError("SELECTOR_PQ_JOINT_GROUPED_SOFTMAX_BASE_CUBLAS requires score_grid_t")
+                raise RuntimeError("grouped softmax/base requires score_grid_t")
             native = load_selector_paged_pq_ext()
-            if not hasattr(native, "joint_softmax_base_outputs_grouped_cublas"):
+            grouped_softmax_fn_name = (
+                "joint_softmax_base_outputs_grouped_cublas"
+                if use_grouped_softmax_base_cublas
+                else "joint_softmax_base_outputs_grouped"
+            )
+            if not hasattr(native, grouped_softmax_fn_name):
                 raise RuntimeError(
-                    "SELECTOR_PQ_JOINT_GROUPED_SOFTMAX_BASE_CUBLAS requires updated CUDA extension"
+                    "grouped softmax/base requires updated CUDA extension"
                 )
         elif use_score_direct_vprefix:
             if score_grid_t is None:
@@ -1343,7 +1661,11 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 raise RuntimeError(
                     "SELECTOR_PQ_JOINT_SCORE_DIRECT_VPREFIX requires updated CUDA extension"
                 )
-        elif probs_grid_t is None and _env_truthy("SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE", "0"):
+        elif (
+            probs_grid_t is None
+            and _env_truthy("SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE", "0")
+            and not compact_grouped_vpq_enabled
+        ):
             native = load_selector_paged_pq_ext()
             if not hasattr(native, "joint_softmax_base_outputs"):
                 raise RuntimeError(
@@ -1422,8 +1744,14 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             if score_grid_t is None:
                 raise RuntimeError("missing score grid for Torch softmax/base")
             probs_grid_t = torch.softmax(score_grid_t, dim=2)
+        if compact_grouped_vpq_enabled and not _env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE", "0"):
+            raise RuntimeError(
+                "SELECTOR_PQ_JOINT_COMPACT_VPQ_RISK_PREFIX requires "
+                "SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE=1"
+            )
         if (
             not use_score_direct_vprefix
+            and not use_grouped_softmax_base
             and not use_grouped_softmax_base_cublas
             and base_output_grid_t is None
             and _env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE", "0")
@@ -1449,7 +1777,12 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 value_page_starts_t.to(dtype=torch.long).contiguous(),
                 fallback_tokens_t.to(dtype=torch.long).contiguous(),
             )
-        if not use_score_direct_vprefix and not use_grouped_softmax_base_cublas and base_output_grid_t is None:
+        if (
+            not use_score_direct_vprefix
+            and not use_grouped_softmax_base
+            and not use_grouped_softmax_base_cublas
+            and base_output_grid_t is None
+        ):
             base_output_grid_t = (
                 probs_grid_t.to(torch.float32).reshape(k_count_i * group_heads_i, context_len_i)
                 @ vhat_all_t.float()
@@ -1481,10 +1814,31 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 "grid_selected_counts_by_ki": grid_selected_counts_by_ki,
                 "grid_k_mb_by_idx": grid_k_mb_by_idx,
                 "v_mb_by_idx": v_mb_by_idx,
-                "residual": residual_t.to(dtype=torch.float32).contiguous(),
                 "code_error": code_error_t.to(dtype=torch.float32).contiguous(),
             }
-            if use_score_direct_vprefix or use_grouped_softmax_base_cublas:
+            if not compact_grouped_vpq_enabled:
+                record_i["residual"] = residual_t.to(dtype=torch.float32).contiguous()
+            if _env_truthy("SELECTOR_PQ_JOINT_MERGE_RISK_PREFIX", "0"):
+                if str(args.tail_score_calibration) == "affine_selected":
+                    raise RuntimeError(
+                        "SELECTOR_PQ_JOINT_MERGE_RISK_PREFIX requires raw/no-calibration K-PQ tail logits"
+                    )
+                if exact_scores_h is None:
+                    raise RuntimeError("SELECTOR_PQ_JOINT_MERGE_RISK_PREFIX requires exact score table")
+                if not native_score_grid_enabled:
+                    raise RuntimeError(
+                        "SELECTOR_PQ_JOINT_MERGE_RISK_PREFIX requires native score-grid rank-prefix metadata"
+                    )
+                record_i["merge_exact_scores"] = exact_scores_h.to(dtype=torch.float32).contiguous()
+                record_i["merge_pq_logits"] = pq_logits_t.to(dtype=torch.float32).contiguous()
+                record_i["merge_indexed_tokens"] = indexed_tokens_t.to(dtype=torch.long).contiguous()
+                record_i["merge_base_tokens"] = base_t.to(dtype=torch.long).contiguous()
+                record_i["merge_ranked_prefix_tokens"] = ranked_prefix_tokens_for_grid_t.to(
+                    dtype=torch.long
+                ).contiguous()
+                record_i["merge_k_take_counts"] = k_take_counts_t
+                record_i["merge_pq_scale"] = float(pq_logit_scale)
+            if use_score_direct_vprefix or use_grouped_softmax_base or use_grouped_softmax_base_cublas:
                 if score_grid_t is None:
                     raise RuntimeError("missing score grid for grouped deferred softmax/base")
                 record_i["vhat"] = vhat_all_t.to(dtype=torch.float32).contiguous()
@@ -1549,6 +1903,14 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             policy_id=int(policy_id),
             policy_uses_mb=bool(policy_uses_mb),
             threshold=float(threshold_value),
+            context_len=int(context_len_i),
+            threshold_mode=str(getattr(args, "joint_kv_threshold_mode", "fixed")),
+            threshold_reference_frac=float(getattr(args, "joint_kv_threshold_reference_frac", 0.2)),
+            threshold_scale_shape=str(getattr(args, "joint_kv_threshold_scale_shape", "linear")),
+            threshold_min_scale=float(getattr(args, "joint_kv_threshold_min_scale", 0.0)),
+            threshold_max_scale=float(getattr(args, "joint_kv_threshold_max_scale", 1.0)),
+            start_ki_by_head=start_ki_by_head,
+            start_vi_by_head=start_vi_by_head,
             use_incremental_v_grid=bool(use_incremental_v_grid),
             grid_outputs=grid_outputs_t,
             grid_outputs_for_v_idx=grid_outputs_for_v_idx,

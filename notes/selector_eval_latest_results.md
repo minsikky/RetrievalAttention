@@ -6,10 +6,31 @@ Keep this page compact. Archive full tables and stale variants instead of append
 
 End state: one benchmark-ready canonical GPU implementation of the current CPU frontier decode algorithm. It keeps dense prefill, approximates decode only after sealed PQ pages are active, matches CPU frontier semantics, and is fast enough to run real dense-vs-frontier task benchmarks.
 
+## Streaming Exact-V Read-Union Variant - 2026-06-02
+
+Question: can exact-V selection be made FlashAttention-style by scanning blocks, maintaining a running top-k residual-risk set, immediately reading newly-entered exact V rows, and discarding each probability/logit block without rereading it later?
+
+Implementation/result:
+
+- Added `streaming_global_risk_b<size>` to the CPU trace runner. Semantics are read-union: if a token ever enters the running top-k risk set, its exact-V correction remains in the output even if later blocks evict it.
+- The runner now accounts actual exact V reads for streaming rules, not just the active final V budget. A batched prefix-rank helper computes all V budgets for a row and was checked against a brute-force running top-k implementation.
+- Representative-head long subset (`heads 0,8,16,24`, decodes `32k,128k`) output: `attention_efficiency_result/joint_kv_streaming_risk_20260602/streaming_risk_long_subset_heads_0_8_16_24_batched`.
+- Plot/report: `attention_efficiency_result/joint_kv_streaming_risk_20260602/plots_long_subset_heads_0_8_16_24_batched/local_block_commit_summary.md`.
+
+Headline representative-head results:
+
+| rule | threshold | MB/head-q | mean o-proj relL2 | max o-proj relL2 | active V target | exact V reads |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| global residual risk | `0.002` | `11.355` | `0.001639` | `0.001898` | `9655` | `9655` |
+| streaming risk b2048 | `0.002` | `14.594` | `0.001466` | `0.001690` | `9655` | `23201` |
+| streaming risk b8192 | `0.002` | `13.918` | `0.001477` | `0.001700` | `9655` | `20422` |
+
+Decision: the corrected FlashAttention-style streaming read-union is semantically valid but not a better logical frontier in this proxy. It avoids storing/rereading global P/S for exact-V choice, but it reads many extra V rows because tokens that enter early running top-k are kept even after later eviction. Quality improves slightly, but MB increases materially versus global residual-risk final top-k.
+
 Canonical algorithm semantics to preserve:
 
 - Prefill attention is dense. Prefill may build/update PQ sidecars, but it must not use sparse/frontier attention.
-- Decode uses the CPU frontier algorithm: paged K-PQ fullscan selector, affine-calibrated approximate logits, candidate ranking, exact-K refinement, mixed exact-K/K-PQ logits and probabilities, adaptive K/V output-stability confidence, global residual-risk exact-V selection, and V-PQ reconstruction for non-exact V rows.
+- Decode uses the CPU frontier algorithm: paged K-PQ fullscan selector, raw K-PQ approximate logits, candidate ranking, exact-K refinement, mixed exact-K/K-PQ logits and probabilities, adaptive K/V output-stability confidence, global residual-risk exact-V selection, and V-PQ reconstruction for non-exact V rows.
 - Exact V selection is global residual risk: `risk_i = p_i^2 * V_PQ_error_stat_i`, where `p_i` comes from the mixed exact-K/K-PQ probability distribution.
 - Accepted K budgets, accepted V budgets, selected-token counts, logical MB/query, attention outputs, and o-proj outputs must match the CPU reference within parity tolerance.
 - Any change to selector scoring, calibration, ranking, budget ladder, confidence/stopping rule, probability construction, exact-V rule, V-PQ reconstruction, or dense-prefill/decode-only scope is a separate algorithm variant, not a canonical optimization.
@@ -54,20 +75,78 @@ Constraints / invalid shortcuts:
 - Do not claim benchmark readiness from no-stats/disabled-cost-stat runs, short smokes, single-layer/head traces, inactive approximation paths, runs where sealed PQ pages never activate, or runs that only pass because the context is too short.
 - Do not run heavy GPU jobs or extension builds on login nodes; use Slurm `spgpu` with account `zhengya98`.
 
+## 128K GPU Memory Feasibility - 2026-05-27
+
+Question: can the canonical frontier benchmark run at 128K context on smaller GPU partitions if prefill stays dense?
+
+Answer: yes for A40 and MIG40, but only with chunked dense prefill and per-chunk CUDA cache release. This does not reduce the final KV cache; it reduces transient SDPA/prefill workspace and allocator slack.
+
+| device / partition | job | chunk | result | peak allocated | peak reserved | decode-start allocated | score | stream time |
+| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| A40 / `spgpu` | `51022861` | 16K | passed | 43.31 GiB | 44.08 GiB | 31.86 GiB | 100.0 | 256.97s |
+| A100 MIG40 / `gpu_mig40` | `51022862` | 8K | passed | 38.07 GiB | 38.91 GiB | 31.86 GiB | 100.0 | 309.26s |
+| A40 / `spgpu` | `51022686` | 32K | failed | OOM before final prefill chunk | - | - | - | - |
+| A100 MIG40 / `gpu_mig40` | `51022689` | 16K | failed | OOM before final prefill chunk | - | - | - | - |
+
+Runtime/cost from passing runs:
+
+| device | prefill | decode | decode ms/token | logical step MB/head-query | physical GPU step MB/head-query | selected tokens/head-query |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A40 | 158.00s | 98.97s | 773.21 | 9.790 | 35.700 | 24823.2 |
+| MIG40 | 189.98s | 119.28s | 931.89 | 9.778 | 35.696 | 24785.0 |
+
+Implementation changes:
+
+- `PREFILL_CHUNK_SIZE` now drives dense prefill chunking in the RULER streaming runner.
+- Dense-prefill sidecar warming is deferred until the full prompt has been prefetched, avoiding sidecar rebuilds after every prefill chunk.
+- `FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK=1` releases transient prefill workspace between chunks.
+- Memory tracing now reports allocated, reserved, peak allocated, peak reserved, free, and total GPU memory at model load, chunk boundaries, sidecar warmup, and decode.
+
+Recommended 128K settings:
+
+- A40: `PREFILL_CHUNK_SIZE=16384 FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK=1 FRONTIER_EMPTY_CACHE_AFTER_PREFILL=1`.
+- MIG40: `PREFILL_CHUNK_SIZE=8192 FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK=1 FRONTIER_EMPTY_CACHE_AFTER_PREFILL=1`.
+
 ## Canonical Frontier Path
 
-Current reference frontier path as of 2026-05-22:
+Current reference frontier path as of 2026-05-25:
 
 - dense prefill;
 - decode-only fullscan paged-PQ selector;
 - K-PQ approximate logits for all tokens, ranked token candidates, then exact K logits for selected tokens;
-- mixed attention probabilities from exact selected-K logits plus K-PQ tail logits;
+- mixed attention probabilities from exact selected-K logits plus raw K-PQ tail logits (`a=1,b=0`);
 - adaptive K and V budgets by output-stability confidence;
 - global exact-V selection by residual-risk, `risk_i = p_i^2 * V_PQ_error_stat_i`;
 - V-PQ reconstruction for non-exact V rows;
 - exact accepted-budget logical accounting separated from physical GPU reads.
 
-Reference trace result: `k_first_alternating`, threshold `0.001`, layer 16/all heads, decode lengths `500..128000`, mean logical cost `4.779 MB/head-query`, mean o-proj relL2 `0.001118`, max o-proj relL2 `0.002082`.
+Current canonical trace policy as of 2026-05-28:
+
+- K budget grid is relative: `10%,30%,50%,70%,90%,100%`.
+- V budget grid is relative: `5%,10%,20%,40%,60%,80%,100%`.
+- Initial budget hint is `proxy_mass_m0p9`.
+- Confidence threshold is budget-jump-aware: base `0.002`, mode `budget_delta_frac`, shape `sqrt`, reference fraction `0.2`, max scale `1.5`.
+
+Reference trace result: hybrid relative K/V grid, `k_first_alternating`, layer 16/all heads, decode lengths `500..128000`, raw K-PQ tail logits, mean logical cost `4.519 MB/head-query`, mean o-proj relL2 `0.001301`, max o-proj relL2 `0.001761`.
+
+Local block-commit exact-V selection, 2026-06-01: implemented `v_selection_rules=local_block_b<size>` in the joint K/V trace runner and compared against current global residual-risk exact-V selection. The local rule selects exact V independently inside each contiguous block with a proportional quota, so it does not need to retain a global survivor list/logit state before committing V for that block. Full all-head sweep over decode lengths `500..128000`, thresholds `0.0002..0.032`, block sizes `512,1024,2048,4096,8192`, and state-inclusive accounting completed as Slurm job `51252564`. Result: local block commit is not a Pareto improvement. The avoided global survivor state is tiny (`~0.014-0.032 MB/head-query` in this trace), while block-local quotas lose global residual-risk ordering and require substantially more exact V reads. At the canonical `threshold=0.002`, global costs `4.537 MB/head-query` with mean/max o-proj relL2 `0.001301/0.001761`; best local block is `b8192`, costing `5.579 MB/head-query` with `0.001442/0.001963`. Cheapest points satisfying mean relL2 `<=0.002`: global `4.300 MB`, best local `b8192` `5.259 MB`. Artifacts: `attention_efficiency_result/joint_kv_local_block_commit_20260601/local_block_full_allheads_dense_thresholds` and plots under `attention_efficiency_result/joint_kv_local_block_commit_20260601/plots_full_allheads_dense_thresholds`.
+
+V-error-only exact-V selection, 2026-06-02: implemented `v_selection_rules=v_error_only` and `local_v_error_b<size>` to test exact-V ranking by stored V-PQ residual/error metadata alone, without multiplying by attention probability `p_i`. This is attractive for streaming because the exact-V priority is query-independent and does not require keeping/re-reading the full probability row. Full all-head trace sweep over decode lengths `500..128000`, thresholds `0.0002..0.032`, and rules `global_residual_risk,v_error_only,local_v_error_b2048,local_v_error_b8192` completed as Slurm job `51266285`. Result: strongly negative. At `threshold=0.002`, global residual-risk is `4.537 MB/head-query`, mean/max o-proj relL2 `0.001301/0.001761`; `v_error_only` is `6.299 MB/head-query`, `0.01334/0.04560`. Cheapest mean relL2 `<=0.002`: global `4.300 MB`, while global `v_error_only` does not reach the target in the tested sweep; local V-error reaches it only by reading `~27K-28K` exact V rows and costs `11.5-11.9 MB/head-query`. Conclusion: `p_i` is essential for deciding which V reconstruction errors matter. Artifacts: `attention_efficiency_result/joint_kv_v_error_only_20260602/v_error_only_full_allheads_dense_thresholds` and plots under `attention_efficiency_result/joint_kv_v_error_only_20260602/plots_full_allheads_dense_thresholds`.
+
+Page-size sensitivity, 2026-05-28: swept current canonical trace policy over page sizes `512,1024,...,5632` with all heads and decode lengths `500..128000`. Output: `attention_efficiency_result/joint_kv_page_size_sweep_20260528`. Smaller pages increase cost and do not improve output error: `ps512` costs `7.610 MB/head-query` with mean o-proj relL2 `0.001102`, while `ps5632` costs `4.813 MB/head-query` with mean o-proj relL2 `0.001026`. Best mean cost in the sweep is `ps4608` at `4.804 MB/head-query`, but `ps5632` has the best mean o-proj relL2 and remains a sensible canonical setting.
+
+Budget-ladder and initial-trial sensitivity, 2026-05-28:
+
+- Budget-ladder sweep output: `attention_efficiency_result/joint_kv_budget_ladder_sweep_20260528`. Current coarse ladder remains the high-quality point: `4.813 MB/head-query`, mean/max o-proj relL2 `0.001026/0.002083`, mean K/V budgets `12231/2581`, mean iterations `2.02`. Finer ladders expose lower-cost but lower-quality points: `fine_abs` costs `2.999 MB/head-query` with mean/max relL2 `0.004465/0.012873`; `fine_tiny` costs `2.894 MB/head-query` with mean/max relL2 `0.005683/0.014478`. Conclusion: the coarse geometric ladder is conservative, and finer ladders are useful Pareto points, but they are not drop-in high-quality replacements.
+- Initial-trial sweep output: `attention_efficiency_result/joint_kv_start_strategy_sweep_20260528`. All-head anchor sweep with the fine-tiny grid shows the expected tradeoff. Starting from `min` gives `2.894 MB/head-query` but poor max relL2 `0.014478` and `9.21` iterations. PQ proxy-mass starts improve quality and reduce iterations with modest cost: `proxy_mass_m0p7` gives `3.134 MB/head-query`, mean/max relL2 `0.002995/0.005254`, and `4.68` iterations. `temporal_prev_low` gives `3.516 MB/head-query`, mean/max relL2 `0.002685/0.005016`, and `2.82` iterations. Raw `temporal_prev` over-reads: `6.195 MB/head-query`, mean/max relL2 `0.000999/0.002579`, and `0.88` iterations.
+- Entropy start is a direct flat-vs-spiky PQ-score heuristic. On all heads, `proxy_entropy_f0p25` gives `4.301 MB/head-query`, mean/max relL2 `0.001756/0.002724`; `proxy_entropy_f0p50` over-reads to `5.690 MB/head-query` for mean/max relL2 `0.001079/0.001831`.
+- Temporal locality diagnostic over all 288 sampled decode queries on heads `0,8` shows direct previous-budget reuse is too conservative. `temporal_prev` starts near full budget (`start K/V 32182/16205`) and costs `7.972 MB/head-query`. Damped reuse (`temporal_prev_low`) is cheaper (`5.176 MB/head-query`) but still not clearly better than PQ-score proxy starts. `proxy_mass_m0p7` gives `5.251 MB/head-query` with lower max relL2 `0.00920` than `temporal_prev_low` (`0.02101`).
+- Relative geometric budget ladder, 2026-05-28: added per-query percentage budget support and tested K fractions `0.2%,0.4%,0.8%,1.6%,3.2%,6.4%,12.8%,25.6%,51.2%,100%`, V fractions `0.1%,0.2%,0.4%,0.8%,1.6%,3.2%,6.4%,12.8%,25.6%,51.2%,100%`, start strategies `min,proxy_mass_m0p9`. Output: `attention_efficiency_result/joint_kv_relative_budget_sweep_20260528`. Relative `proxy_mass_m0p9` is high quality but higher cost: `5.309 MB/head-query`, mean/max o-proj relL2 `0.000930/0.001130`, mean K/V budgets `13121/3523`, mean iterations `1.39`. The relative `min` control costs `4.555 MB/head-query` but has poor mean/max relL2 `0.009053/0.014597`. Conclusion: relative geometric `proxy_mass_m0p9` is not a bandwidth win over current coarse absolute budgets; it mainly buys stricter quality by starting/escalating larger at long contexts.
+- Budget-jump-aware confidence thresholds, 2026-05-28: added `threshold_mode=budget_delta_frac`, where the effective stability threshold scales with the fractional budget jump. This directly tests whether small budget increments should require a smaller output delta while large increments can use the base threshold. On the `5%,10%,20%,40%,60%,80%,100%` relative grid with `proxy_mass_m0p9`, threshold sweeps over `0.0005,0.001,0.002,0.004,0.008` show the scaled rules improve the target `4.25-4.75 MB/head-query` region versus fixed threshold. Around `4.4-4.6 MB/head-query`, fixed threshold `0.002` gives `4.363 MB`, mean/max relL2 `0.001690/0.003074`; scaled `sqrt` gives `4.475 MB`, `0.001319/0.001909`; scaled `log` gives `4.546 MB`, `0.001200/0.001878`; scaled `linear` gives `4.614 MB`, `0.001155/0.001836`. Conclusion: budget-jump-aware thresholds are a real quality/MB improvement around the useful operating region, not only a higher-cost quality buy; at the very lowest-cost point near `4.0 MB`, fixed threshold is still competitive/noisy. Plots: `attention_efficiency_result/joint_kv_relative_budget_sweep_20260528/plots_threshold_curves/threshold_scaling_mean_relL2.png` and `attention_efficiency_result/joint_kv_relative_budget_sweep_20260528/plots_threshold_curves/threshold_scaling_max_relL2.png`.
+- Grid-shape diagnostic, 2026-05-28: on the current `5-100%` grid with `sqrt` threshold `0.002`, final K uses the `5%` bucket only `11/288` head-queries (`3.8%`), while final V uses `5%` for `121/288` (`42.0%`). Apples-to-apples jobs tested `K/V 10,30,50,70,90,100%` and hybrid `K 10,30,50,70,90,100%` with `V 5,10,20,40,60,80,100%`. Full `K/V 10-100` is worse overall (`4.763 MB`, mean/max relL2 `0.001323/0.001974`) than current `K/V 5-100` (`4.475 MB`, `0.001318/0.001909`), though it uses fewer iterations. Hybrid `K10-100,V5-100` is the better candidate: `4.519 MB`, mean/max relL2 `0.001301/0.001761`, and fewer iterations `0.62` vs current `0.79`. Conclusion: do not remove `5%` from V; removing it from K may be useful.
+- Canonicalization update, 2026-05-28: the trace and HF benchmark defaults now use the hybrid relative grid (`K 10-100%, V 5-100%`), `proxy_mass_m0p9`, budget-jump-aware `sqrt` threshold `0.002`, raw/no-affine K-PQ tail logits, and global residual-risk exact V. Relative budgets are derived from each query's current context length. HF runtime falls back from the fixed-threshold native policy kernel to the Torch policy evaluator when scaled thresholds or nonzero proxy starts are enabled; this preserves algorithm semantics while leaving native score-grid/risk/V-prefix helpers active.
+- Proxy-start oracle diagnostic, 2026-05-28: added offline-only cheapest-grid oracle reporting to the joint K/V policy runner. On `relative 5-100% + proxy_mass_m0p9 + sqrt-scaled threshold 0.002`, the proxy initializer is well matched to a moderate per-head relL2 target `0.002`: start cost is `0.86x` oracle MB on average, covers both oracle K/V budgets for `52.1%` of head-queries, and the adaptive loop ends at `1.01x` oracle MB with `87.2%` oracle K/V coverage. It is not self-calibrating across quality regimes: for target `0.001`, start/final are too low (`0.72x` / `0.84x` oracle MB); for target `0.004`, start/final overread (`1.04x` / `1.22x` oracle MB). Artifact: `attention_efficiency_result/joint_kv_oracle_budget_policy_20260528/relative_5to100_sqrt_proxy_m0p9_oracle/oracle_policy_report.md`.
+- Current conclusion: initial trial should be treated as an online runtime/iteration hint, not as a replacement for adaptive confidence. It can change logical MB only when it overshoots because the loop never moves downward. PQ-score sharpness/proxy-mass is the more deployable start heuristic; temporal warm-start may help if damped, but raw previous-budget reuse is too conservative.
 
 Implementation status: the trace runner `run_joint_kv_budget_policy_eval.py` implements the adaptive K/V residual-risk policy. The HF benchmark wrapper now exposes `online_confidence_rule=joint_kv_stability` plus `selected_value_exact_rule=global_residual_risk`, and `FRONTIER_CANONICAL_GPU=1` requires those settings. CPU-vs-CUDA trace parity smokes passed. The benchmark-facing wrapper defaults now enable the validated native V-prefix helper plus prewarmed persistent V-PQ sidecars, which brings the 32k/4 decode diagnostic inside the `2-3x` dense target. Representative 128-token frontier validation and dense-vs-frontier task slices are still pending.
 
@@ -75,6 +154,19 @@ Implementation status: the trace runner `run_joint_kv_budget_policy_eval.py` imp
 
 Latest 2026-05-24 status:
 
+- 2026-05-26 current canonical all-head path now passes the accounting/profile runtime gates with cost stats enabled. RULER 32k/128 job `50903294` scored `100.0` and decoded in `43.98s` (`2.44x` dense `17.99s`), with logical `4.0243 MB/head-query`, physical `8.9173 MB/head-query`, and selected `12503.5`. Sustained LongGen8192 job `50903295` generated `8192` tokens in `894.78s` (`2.76x` dense `323.65s`, target `<=971s`), with logical `1.7629 MB/head-query`, physical `1.8716 MB/head-query`, selected `4284.7`, and active fraction `0.359`. Main LongGen8192 wall buckets: score-grid `94.35s`, exact logits `60.47s`, QKV cache `60.79s`, accounting `59.24s`, V-PQ sidecar `24.26s`, prob/base `23.35s`, risk-prefix `17.12s`, rank-prefix `6.82s`. Sparse-direct diagnostic LongGen8192 retry `50903299` generated in `896.56s`, so it has no sustained speed advantage and remains noncanonical because of the prior benchmark-style parity miss.
+- 2026-05-26 no-calib score-grid workspace is rejected. CUDA unit `50904418` passed, and native CPU/GPU parity was nearly exact, but benchmark-style Torch/GPU parity still missed tolerance slightly (`~5.8e-4`). RULER 32k/128 `50904609` decoded in `57.83s`, slower than canonical `43.98s`; sustained LongGen8192 `50904613` generated in `1190.48s`, much worse than canonical `894.78s`. Wall buckets regressed broadly: score-grid `137.04s`, exact logits `91.46s`, prob/base `60.94s`, risk-prefix `69.66s`. Keep `SELECTOR_PQ_JOINT_NOCALIB_SCORE_GRID_WORKSPACE=0`.
+- 2026-05-26 native accounting accumulation is useful but not promoted yet. CUDA unit `50904656` and explicit accumulator unit `50904682` passed. RULER 32k/128 `50904671` reduced accounting wall time slightly (`~1.00s` scale to `0.88s`) but did not beat the canonical short gate. LongGen8192 `50904672` reduced accounting wall time versus canonical (`59.24s` to `25.62s`), but total generation was slower (`1155.35s`) because unrelated buckets were also slower on that run (`score-grid 121.75s`, exact logits `87.89s`, QKV `74.65s`). Keep `SELECTOR_PQ_JOINT_NATIVE_ACCOUNTING_ACCUMULATE=0` until a paired same-code/same-run validation shows stable total-runtime benefit without hiding stats.
+- 2026-05-26 wall-profile-only benchmark mode is positive for runtime gates. RULER 32k/128 job `50904953` kept cost stats and wall profiling enabled but used `PROFILE_NATIVE_OPS=0`, avoiding per-bucket CUDA synchronization. It scored `100.0`, decoded in `41.42s` (`2.30x` dense `17.99s`), and preserved logical/physical accounting (`4.0249` / `8.9173 MB/head-query`, selected `12506.2`). Use this mode for benchmark runtime plus MB accounting. Caveat: no-sync wall buckets are useful for coarse timing only; synchronized `PROFILE_NATIVE_OPS=1` runs are still needed for precise kernel-attribution diagnostics.
+- 2026-05-26 clean no-sync/accounting baseline: after reverting rejected QKV fast-view edits, clean canonical LongGen8192 job `50906767` generated in `762.62s`, preserving logical/physical accounting (`1.7628` / `1.8715 MB/head-query`, selected `4284.6`). Main wall buckets were score-grid `76.78s`, accounting `58.30s`, exact logits `49.93s`, QKV cache `48.34s`, prob/base `19.36s`, risk-prefix `14.70s`, and rank-prefix `6.10s`. LongGen16384 job `50905126` generated in `2588.76s`, about `3.69x` dense `702.13s`, so the 16k sustained `<=3x` gate still fails. In the no-sync candidate matrix, accounting accumulation `50906696` is noise-level (`758.24s`), native cuBLAS exact `50906745` is negative (`776.64s`), grouped output workspace `50906707` is negative (`919.59s`), softmax workspace `50906705` is negative (`773.83s`), and grouped exact logits `50906698` remains noncanonical despite `733.85s` because parity failed. A new no-calibration scatter-fill score-grid candidate is tracked in `notes/slurm_manifests/nocalib_scatter_scoregrid_20260526.tsv`.
+- 2026-05-26 sparse-direct/all-head workspace follow-up: manifest `notes/slurm_manifests/nocalib_sparse_direct_ws_20260526.tsv`. RULER 32k/128 base diagnostic `50894877` scored `100.0`, decoded in `56.91s`, logical `4.0256 MB/head-query`, physical `8.9177 MB/head-query`, selected `12507.5`, rank `2.14s`, score-grid `4.64s`, exact-logit `4.59s`, prob/base `8.28s`, and risk-prefix `13.58s`. Workspace variants did not improve enough: output workspace `50894879` decoded in `56.83s`, risk workspace `50894878` `56.91s`, softmax workspace `50894880` `57.24s`, strided workspace `50894881` `58.39s`. Long trace parity `50894882` matched CPU/native nearly exactly (`4.25e-9` attention, `1.70e-8` o-proj) but exceeded the benchmark-style Torch/GPU policy tolerance slightly (`5.8e-4` attention, `5.7e-4` o-proj), so this remains diagnostic/off. Follow-up fused sparse-direct softmax/base validation is in `notes/slurm_manifests/fused_sparse_direct_softmax_20260526.tsv`.
+- 2026-05-26 no-calib rank/exact-logit diagnostics: `notes/slurm_manifests/nocalib_rank_exact_diag_20260526.tsv` and follow-ups `notes/slurm_manifests/nocalib_allhead_rank_followups_20260526.tsv`. Baseline RULER 32k/128: decode `58.73s`, logical `4.025355 MB/head-query`, physical `8.917617 MB/head-query`, selected `12506.793`, rank-prefix `7.35s`, exact-logit `4.37s`, score-grid `4.06s`, prob/base `8.07s`, risk-prefix `13.50s`. `SELECTOR_PQ_JOINT_ALLHEAD_RANK_PREFIX=1` is promoted after same-run audit job `50894782` computed the old per-group rank-prefix and all-head batched rank-prefix together and completed without mismatch. Diagnostic RULER `50894730`: decode `52.98s`, rank-prefix `2.04s`, logical `4.025212 MB/head-query`, physical `8.917361 MB/head-query`, selected `12507.258`. Current-code baseline repeat `50894772`: decode `64.57s`, selected `12506.93`, confirming the small selected-count differences are run noise rather than rank-prefix mismatch. Canonical promoted-default validation `50894796` passed with score `100.0`, decode `59.11s`, rank-prefix `2.75s`, logical `4.025067 MB/head-query`, physical `8.917334 MB/head-query`, selected `12506.773`; total decode is noisy, so only claim rank-prefix reduction, not a clean end-to-end RULER win. Sustained LongGen diagnostic `50894774` generated 8192 tokens in `1072.61s`, logical `1.8437 MB/head-query`, physical `1.9297 MB/head-query`, selected `4387.0`, rank-prefix `12.88s`, joint total `619.78s`; this modestly improves the no-calib one-pass reference (`~1078s`, joint `675.5s`) but remains above the `<=971s` sustained target. Selector-produced top-k reuse is negative: `50894773` removed rank-prefix time but raised selector time and decoded in `57.32s`. Other variants are negative: native rank-prefix fullsort `65.92s`, rank workspace `66.72s`, budget-prefix `79.30s`, budget-prefix workspace `74.40s`, native exact logits `63.60s`; native exact plus risk workspace OOMed before summary.
+- 2026-05-26 merge-risk all-in-one diagnostic is rejected. `SELECTOR_PQ_JOINT_MERGE_RISK_POLICY=1` avoids the canonical grouped risk path and does too much per-KV-group recomputation. RULER 32k/128 job `50894641` scored `100.0` but decoded in `443.27s`, with `392.81s` in the merged risk-prefix bucket. Accepted stats drifted to `3.731 MB/head-query` and `11288.6` selected tokens, compared with the no-calib baseline `4.025 MB/head-query` and `12506.8` selected tokens. Keep the flag diagnostic/off.
+- 2026-05-26 grouped merge-risk-prefix diagnostic is rejected. `SELECTOR_PQ_JOINT_MERGE_RISK_PREFIX=1` passed CUDA unit job `50894666`, but RULER 32k/128 job `50894675` decoded in `111.72s`; risk-prefix rose to `58.28s` versus no-calib baseline `13.50s`. Logical stats were close but still shifted (`4.030 MB/head-query`, `12509.6` selected). Existing single grouped risk sort is faster than this two-sort-plus-merge approach.
+- 2026-05-26 no-calib native diagnostic batch found no useful existing-flag win. Manifest: `notes/slurm_manifests/nocalib_native_diag_20260526.tsv`. Baseline: decode `58.73s`, step `4.025 MB/head-query`, selected `12506.8`. Completed variants: `risk_ws` `58.39s`, `output_ws` `58.47s`, `risk_topk_ws` `59.77s`, `output_risk_ws` `64.74s`, `risk_topk` `67.31s`, `score_direct_ws` `63.20s`, `score_direct_vprefix` `70.06s`. The score-direct variants prove prob/base can be removed, but residual-risk work grows to `~26.8s`, so end-to-end regresses.
+- 2026-05-26 score-grid follow-up: direct gridless recomputation and score-grid workspace reuse are not promotable. The recompute variant is guarded by `SELECTOR_PQ_JOINT_MIXED_POLICY_RECOMPUTE_SCORES=1`; it preserved logical stats but RULER 32k/128 job `50889069` decoded in `97.74s`, much worse than canonical. The fused probability-reuse variant job `50889523` also preserved logical stats (`4.025 MB/head-query`, selected `12507.3`) but decoded in `66.98s` with fused work reported as `score-grid=31.51s`, versus canonical decode `58.73s`. The no-calib score-grid workspace job `50889439` was neutral/slower: decode `59.20s`, joint total `50.15s`, score-grid `4.20s`, versus canonical `58.73s` / `49.68s` / `4.06s`. CUDA unit job `50889524` passed after the guarded diagnostic code. Keep these flags diagnostic/off. Conclusion: score-grid fill/allocation is no longer the main lever; runtime work should target residual-risk prefix, probability/base output, rank-prefix, and exact-logit feeding cost.
+- 2026-05-25 score-grid no-calibration optimization: canonical tail logits are raw (`a=1,b=0`), so native score-grid now bypasses affine selected-mask fitting. Added a one-pass no-calibration fill that writes each score-grid element once from `token_to_indexed`, `base_mask`, and `rank_pos`. Validation passed: CUDA unit `50888377`; native saved-trace parity `50888418` over 32k/64k/128k heads 0/8 with max attention/o-proj relL2 `4.25e-9` / `1.70e-8`; RULER 32k/128 `50888423` scored `100.0`, elapsed `73.50s`, decode `58.73s`, logical/physical stats preserved. Sustained LongGen 8192 improved modestly from `1094.62s` / score-grid `106.39s` (`50888244`) to `1078.22s` / score-grid `101.13s` (`50888422`), with logical step still `1.763 MB/head-query` and selected `4284.7`. Safe small win; next bottleneck is whole-grid rank-prefix/exact-logit/prob-base/risk-prefix work, not score-grid fill.
+- 2026-05-25 staged K/V policy follow-up: implemented native staged policy helper `joint_select_policy_grouped_flat_staged_no_mb`, returning final outputs/indices plus a CUDA per-group boundary mask. Staged K already used max-prefix rank retrieval; staged V now automatically uses top-k V-prefix construction when available, so a staged V grid reads/sorts only the largest staged exact-V prefix and slices smaller budgets. Targeted CUDA unit job `50885519` passed. RULER 32k/128 staged `k3/v5` job `50885531` scored `100.0`, decoded in `76.91s`, logical `3.836 MB/head-query`, physical `8.918 MB/head-query`, selected `11730.3`, staged accept fraction `0.6685`. This is not promotable: canonical is still about `43s`, and staging still duplicates stage plus full fallback for roughly one-third of KV groups.
 - 2026-05-25 canonical joint K/V cleanup: canonical joint decode no longer keeps grouped-risk record construction, adaptive K/V policy walking, fused-policy diagnostics, value-cost arithmetic, V-prefix construction, and final cost/output writeback inside the top-level runner. Legacy fast decode, approximate prefill, per-head fallback, and helper re-export modules were removed. Benchmark wrappers import through `hf_paged_pq_intervention_api.py`; CUDA/parity tests import low-level helpers directly. Current hot-path sizes: `run_hf_paged_pq_intervention_eval.py` 429 lines, `hf_paged_pq_intervention_index_sidecars.py` 205, `hf_paged_pq_intervention_joint.py` 533, `hf_paged_pq_intervention_joint_grouped_risk.py` 956, and `hf_paged_pq_intervention_joint_one_group.py` 1598. Validation: local `py_compile`, import checks, wrapper audit, and `git diff --check` passed. Slurm smoke `50879927` completed cleanly in `00:01:47` but stayed dense-equivalent below page size; active-path Slurm smoke `50879957` completed cleanly in `00:01:49`, with `approx_path_active_fraction=0.667`, `approx_attention_calls_total=64`, and mean logical frontier step `2.092 MB/head-query`.
 - 2026-05-25 CUDA kernel split: `paged_pq_kernel.cu` is no longer a 22k-line implementation file. It now contains the common includes/helpers plus ordered includes for 18 fragments in `benchmark/selector_eval/cuda_ext/paged_pq_kernel_parts/`; largest fragment is 2,935 lines. Slurm CUDA build/unit gate passed as job `50811572` with output `cuda_unit_result/kernel_split_20260525`, return code `0`, elapsed `241s`.
 - Maintainability refactor landed for canonical config drift control. The single source of truth is now `benchmark/selector_eval/frontier_config.py`; generated shell fragments are `scripts/frontier_canonical_env.sh` and `scripts/frontier_direct_runtime_env.sh`. The HF runner guard, wrapper audit, and readiness audit share the same required/disallowed canonical flags, and the wrapper audit checks generated fragments for staleness.
@@ -132,7 +224,7 @@ Latest 2026-05-24 status:
 - The native score-grid now treats rows with `k_take_count > ranked_prefix_width` as full exact rows. This repairs the earlier skipped-full-sort diagnostic failure mode where the full-budget row became partly PQ-scored. Unit coverage was added for normal and no-fill helpers; compile-only Slurm build `50712396` passed on `standard` in `264s`. Long-context trace parity job `50712458` passed for `SELECTOR_PQ_JOINT_SKIP_FULL_BUDGET_SORT=1` over decodes `32000,64000,128000`, heads `0,8`, with no failures, max CPU/native attention/o-proj relL2 `4.25e-09` / `1.70e-08`, and max Torch/GPU-policy attention/o-proj relL2 `2.62e-06` / `2.14e-06`. Noncanonical 32k/16 profile job `50712539` completed: decode `54.82s`, rank-prefix `1.77s`, logical step `4.0836 MB/head-query`, selected `12463.75`. This is faster than current profile `50711825` but still changes accepted stats slightly, so keep it diagnostic for now.
 - Decode-index cache metadata now refreshes `pending_start` and `indexed_end` on cached indexes every decode step. This preserves online pending-token coverage while sealed pages are reused; otherwise the static suffix can slide while cached index metadata stays stale. Canonical 32k/16 profile job `50711825` completed: score `100.0`, decode `61.67s`, logical step `4.0833 MB/head-query`, selected `12462.66`. This is slower than older exact-fullbudget profile `50708291` (`48.02s`) and shows slight accepted-stat drift, so treat it as the current post-cachemetadata baseline/regression to beat.
 - The diagnostic grouped V-PQ sidecar cache now caches grouped `vhat`, residuals, and residual-risk stats together, so enabling it no longer forces a second per-head V-PQ sidecar pass in the decode loop. Fresh profile job `50711661` completed, but the repaired path is still negative: 32k/16 decode `58.07s`, logical step `4.0836 MB/head-query`, selected `12463.75`, worse and slightly different from the canonical exact-fullbudget point `48.02s`, `4.0815 MB`, selected `12455.16`. Keep `SELECTOR_PQ_JOINT_GROUPED_VPQ_CACHE=0`.
-- `benchmark/audit_benchmark_readiness.py` now treats the current CPU-frontier semantics as the readiness contract. It flags non-`joint_kv_stability` confidence, non-`global_residual_risk` exact-V selection, non-fullscan selectors, approximate prefill, missing canonical guard, and non-affine tail-score calibration. It no longer flags exact logical cost accounting as a readiness failure.
+- `benchmark/audit_benchmark_readiness.py` now treats the current CPU-frontier semantics as the readiness contract. It flags non-`joint_kv_stability` confidence, non-`global_residual_risk` exact-V selection, non-fullscan selectors, approximate prefill, missing canonical guard, and non-raw tail-score calibration. It no longer flags exact logical cost accounting as a readiness failure.
 - `benchmark/audit_benchmark_readiness.py` now reports decode seconds per example and physical GPU step MB, and accepts `--max-frontier-decode-seconds`. It also flags no-stats timing-only runs as `cost-stats-disabled` / `missing-step-cost`, and inactive sealed-page smokes as `approx-path-inactive` / `selector-inactive`. With a `54s` threshold, the old 32k/128 no-stats artifact `50707936` is correctly not ready: `decode=127.85s`, `cost-stats-disabled`, `missing-step-cost`, `decode>54.000s`.
 - Benchmark summaries now include the native joint-K/V CUDA flag state in `pagedpq_config`, and readiness audit requires the promoted native CUDA flags while rejecting unpromoted diagnostic flags. This means older pre-metadata artifacts no longer prove readiness by themselves, even if they were run with canonical wrapper defaults. A synthetic current-format copy of the canonical 32k/16 artifact passes `--strict`; setting `fused_risk_policy=1` is correctly reported as `diagnostic-cuda-flags:fused_risk_policy`.
 - Runtime jobs `50708850`, `50709244`, and `50709265` were canceled while still pending so CUDA unit validation could run first.
@@ -189,6 +281,7 @@ Latest 2026-05-24 status:
 ## Current Task-Quality Validation
 
 - Public task-quality validation is in progress for the passing canonical CUDA path.
+- Current active-path validation batch completed: `notes/slurm_manifests/public_longdecode_active_validation_active_validation_20260526_current.tsv`. These forced-8192 slices compare dense vs canonical frontier with sealed pages active. AIME24: dense accuracy `0.333`, generation `336.17s`; frontier accuracy `0.333`, generation `662.35s` (`1.97x` dense), logical `1.5952 MB/head-query`, physical `1.6945 MB/head-query`, selected `3830.9`, active fraction `0.299`. LiveCodeBench codegen: dense pass@1 `0.333`, generation `336.02s`; frontier pass@1 `0.333`, generation `706.85s` (`2.10x` dense), logical `1.6608 MB/head-query`, physical `1.7734 MB/head-query`, selected `4041.0`, active fraction `0.331`. LongGenBench SGT-short: dense completion `0.538` and substring accuracy `0.0`, generation `344.26s`; frontier completion `0.538` and substring accuracy `0.0`, generation `884.51s` (`2.57x` dense), logical `1.7629 MB/head-query`, physical `1.8716 MB/head-query`, selected `4284.6`, active fraction `0.359`. This is active-path quality smoke evidence, not full benchmark evidence.
 - Active-path forced 8192-token AIME24 and LiveCodeBench dense/frontier slices were submitted in `notes/slurm_manifests/public_task_active_fastlayout_20260523.tsv` (`50723500`, `50723501`, `50723511`, `50723512`). These are intentionally forced to exercise sealed PQ pages; interpret task scores with that caveat.
 - Forced active-path AIME24 completed with matching dense/frontier accuracy `100.0`. Dense job `50723500` generated `8192` forced tokens in `323.80s`; frontier job `50723501` generated `8192` forced tokens in `663.66s` (`2.05x` dense), with approximation active fraction `0.302`. This is active reasoning-quality smoke evidence, but only one forced sample.
 - Forced active-path LiveCodeBench completed but is weak quality evidence because both dense and frontier pass@1 are `0.0`. Dense job `50723511`: forced `8192` generated tokens, generation `320.84s`. Frontier job `50723512`: forced `8192` generated tokens, generation `840.88s` (`2.62x` dense), approximation active fraction `0.328`.
@@ -209,7 +302,7 @@ Latest 2026-05-24 status:
 
 Goal: compare selector-side frontier bandwidth reduction against KV-cache compression families on the same saved real Q/K/V trace, using mean step MB/head-query versus mean o-proj relL2 over layer 16, all heads, decode lengths `500..128000`.
 
-Important caveat: these are paper-inspired compression proxies, not faithful KIVI/KVQuant/TurboQuant kernels. They are useful for first-pass MB-vs-relL2 positioning; task-level and faithful implementation comparisons are still required.
+Important caveat: most rows here are paper-inspired compression proxies, not official method implementations. KIVI is being rerun with the official quantization layout before being used in new comparisons.
 
 Artifacts:
 
@@ -225,11 +318,16 @@ Best current comparison points:
 | method | family | mean MB/head-query | mean o-proj relL2 | max o-proj relL2 | interpretation |
 | --- | --- | ---: | ---: | ---: | --- |
 | Current adaptive K/V confidence | selector + V-PQ | `4.779` | `0.001118` | `0.002082` | best quality at similar bandwidth, but does not reduce KV-cache capacity |
-| KIVI-like b4, 2048 exact window | scalar KV compression proxy | `5.224` | `0.013028` | `0.036735` | closest compression proxy quality, still much worse relL2 than current frontier |
-| KIVI-like b4, 128 exact window | scalar KV compression proxy | `4.528` | `0.021423` | `0.041800` | similar MB to frontier but much worse relL2 |
+| KIVI b4, group 32, 2048 residual | scalar KV compression | `5.903` | `0.004388` | `0.013980` | best tested KIVI quality, higher MB than frontier |
+| KIVI b4, group 32, 128 residual | scalar KV compression | `5.407` | `0.007119` | `0.014053` | closer MB to frontier, higher relL2 |
+| KIVI b2, group 32, 2048 residual | scalar KV compression | `3.849` | `0.085225` | `0.180118` | lower MB, too much output distortion |
 | KVQuant-like b4 clipped, 128 exact window | clipped scalar proxy | `4.395` | `0.025512` | `0.060401` | lower MB than frontier, worse relL2 |
 | PQ-like s8b6, 128 exact window | PQ/VQ compression proxy | `0.557` | `0.158352` | `0.270666` | very low MB but large output distortion |
 | Dense fp16, mean over decode suite | dense | `17.201` | `0.0` | `0.0` | exact reference |
+
+KIVI rows use the `jy-yuan/KIVI` quantization layout and are produced by `kivi_b*_g*_w*`.
+
+2026-05-29 update: ran a denser ours-new operating sweep for the current hybrid relative policy (`K 10,30,50,70,90,100%`, `V 5,10,20,40,60,80,100%`, `proxy_mass_m0p9`, sqrt budget-delta confidence). Slurm job `51123321` swept 21 thresholds from `0.0002` to `0.032` in `15:35`. The curve spans `4.028 MB/head-query` at mean o-proj relL2 `0.00337` to `7.780 MB/head-query` at `0.000172`; canonical `tau=0.002` is `4.519 MB/head-query`, mean/max relL2 `0.001301/0.001761`. Plot: `attention_efficiency_result/plots/kivi_vs_frontier_new_20260529/kivi_vs_ours_new_dense_pareto.png`; raw plotted points: `attention_efficiency_result/plots/kivi_vs_frontier_new_20260529/kivi_vs_ours_new_dense_pareto_points.csv`.
 
 Conclusion so far: compression alone can drive MB extremely low, but the low-MB proxy points have high relL2. The current frontier remains much closer to dense output at comparable MB. The main competitive threat is not these naive proxies; it is faithful SOTA KV compression that may achieve lower relL2 while also reducing cache capacity, which our current bandwidth-only frontier does not.
 
@@ -245,9 +343,9 @@ Best representative points under `5 MB/head-query`:
 | family | best point under 5 MB | mean MB/head-query | mean o-proj relL2 | max o-proj relL2 |
 | --- | --- | ---: | ---: | ---: |
 | Current frontier | `frontier_current_tau0.001` | `4.785` | `0.001034` | `0.002168` |
+| KIVI scalar KV compression | `kivi_b4_g32_w128` | `5.407` | `0.007119` | `0.014053` |
 | Kitty-like channel-promoted scalar | `kitty_like_k4v4_p0.1_pb8_buf128_s32` | `4.828` | `0.009785` | `0.018728` |
 | TaDA-like mean-centered scalar | `tada_like_b4_g64_w128` | `4.928` | `0.013670` | `0.031462` |
-| KIVI-like scalar | `kivi_like_b4_w128` | `4.528` | `0.021423` | `0.041800` |
 | KVQuant-like scalar | `kvquant_like_b4_clip0.1_w128` | `4.395` | `0.025512` | `0.060401` |
 | PM-KVQ-like scalar | `pmkvq_like_b4_s1_g128_w128` | `4.616` | `0.037347` | `0.050926` |
 | ZeroMerge-like merging | `zeromerge_like_k8192_tail4096_dense512_s0_obs64_ker5` | `3.950` | `0.066768` | `0.159438` |
@@ -759,6 +857,37 @@ Artifacts:
 - `attention_efficiency_result/joint_kv_quest_20260523/quest_vs_frontier/mb_vs_logit_relL2.png`;
 - `attention_efficiency_result/joint_kv_quest_20260523/quest_vs_frontier/mb_vs_prob_js.png`.
 
+## Tail-Logit Calibration Ablation
+
+Question: what happens if the K-PQ tail logits are not affine-calibrated, i.e. `tail_logit = raw_pq_logit` with `a=1, b=0`?
+
+Setup:
+
+- same full CPU trace suite as the current joint K/V reference;
+- decode lengths `500..128000`, all heads, layer 16;
+- selector: fullscan paged K-PQ;
+- policy: `k_first_alternating`, threshold `0.001`;
+- V path: residual-risk exact V plus V-PQ reconstruction.
+
+Results:
+
+| tail calibration | mean MB/head-query | max MB/head-query | mean o-proj relL2 | max o-proj relL2 | mean logit relL2 | mean prob JS | mean K budget | mean V budget |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| affine selected | `4.785` | `14.562` | `0.001034` | `0.002168` | `0.036639` | `0.000121` | `12096` | `2581` |
+| none (`a=1,b=0`) | `4.813` | `14.562` | `0.001026` | `0.002083` | `0.035484` | `0.000114` | `12231` | `2581` |
+
+Interpretation:
+
+- The affine calibration is not justified by this trace.
+- No-affine slightly improves output, logit, and probability metrics, with a tiny MB increase from a slightly larger accepted K budget.
+- Raw K-PQ tail logits are now the canonical frontier default; affine calibration should be treated as an explicit ablation.
+
+Artifacts:
+
+- `attention_efficiency_result/joint_kv_tail_calibration_20260525/tail_calibration_ablation/summary.md`;
+- `attention_efficiency_result/joint_kv_tail_calibration_20260525/tail_calibration_ablation/summary.csv`;
+- `attention_efficiency_result/joint_kv_tail_calibration_20260525/tail_calibration_ablation/per_decode.csv`.
+
 ## Historical Source
 
 The full pre-cleanup result log is preserved at `notes/archive/status_history/selector_eval_latest_results_2026-05-20_full.md`.
@@ -819,3 +948,109 @@ Latest runner decomposition:
 | validation | Slurm jobs `50818766` and `50820581` passed the full CUDA unit set; latest output `cuda_unit_result/thermo_runner_decompose_final_20260525` |
 
 Remaining structural debt: the 9.7k-line `patched_paged_pq_attention` context manager in the HF intervention runner. It is still the next serious thermo blocker; the remaining split needs real decomposition of the prefill, decode, and joint K/V all-head paths without changing canonical frontier semantics.
+
+## CUDA Staged V-Grid Diagnostic - 2026-05-25
+
+Question: can the GPU path evaluate only the first few V-budget grid points, accept early when confidence is stable, and fall back to the full V grid only when the staged pass reaches the boundary?
+
+Implementation:
+
+- Added trace-parity support for `--use_staged_risk_prefix` and `--staged_risk_prefix_v_steps`.
+- The diagnostic computes a staged fullsort V-prefix grid for the first `4` V budgets, runs the same native policy on that staged grid, and falls back to the full canonical grid when the selected staged V index is the boundary.
+- The top-k staged variant remains diagnostic/off; the tested path is fullsort staged risk prefix.
+
+Results:
+
+| gate | job | runtime | logical MB/head-query | physical MB/head-query | selected tokens | quality/parity | decision |
+| --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| long trace parity, decodes `32000,64000,128000`, heads `0,8` | `50883761` | `72.84s` | matched CPU | matched CPU | matched CPU | no failures; max Torch/GPU o-proj relL2 `2.14e-6` | semantically valid |
+| RULER 32k/128 staged fullsort | `50883766` | decode `50.37s` | `3.836` | `8.918` | `11731.2` | score `100.0` | passes short gate, but only marginally useful |
+| LongGen 8192 staged fullsort | `50883762` | generation `836.04s` | `1.762` | `1.872` | `4281.1` | completed forced 8192 tokens | not promotable |
+| LongGen 8192 guarded current reference | `50883671` | generation `824.28s` | `1.762` | `1.872` | `4281.0` | completed forced 8192 tokens | current canonical remains better |
+
+Interpretation:
+
+- Staged-grid execution is logically compatible with the CPU frontier policy when it uses fullsort risk-prefix rows and full-grid fallback.
+- It does not improve sustained decode. On LongGen 8192 it preserves logical MB but increases wall time because many rows hit the staged V-boundary and pay both staged risk-prefix work and full-grid fallback work.
+- Keep `SELECTOR_PQ_JOINT_STAGED_RISK_PREFIX=0` in canonical defaults. Staged risk prefix remains a diagnostic/off path unless a future version can predict early-accept rows cheaply enough to avoid duplicate full-grid work.
+
+Artifacts:
+
+- Manifest: `notes/slurm_manifests/staged_risk_prefix_20260525.tsv`.
+- Parity summary: `attention_efficiency_result/joint_kv_cpu_gpu_parity_20260525/staged_fullsort_long/summary.json`.
+- RULER summary: `ruler_eval_result/frontier_cuda_opt_20260525_staged_fullsort_ruler32k128_current/pagedpq_batched_niah_single_1_32768_n1/summary/niah_single_1.json`.
+- LongGen summary: `public_longdecode_result/frontier_cuda_opt_20260525_staged_fullsort_longgen8192_nosync/pagedpq_longgenbench_sgt_short_smoke/summary.json`.
+
+## CUDA Score-Prob Interval Diagnostic - 2026-05-26
+
+| gate | job | result | decision |
+| --- | --- | --- | --- |
+| CUDA VPQ/unit | `50890848` | passed in `222s`; output `cuda_unit_result/score_prob_interval_policy_20260526` | valid build/unit |
+| long saved-trace parity | `50893278` | native path matched CPU over `32000,64000,128000`, heads `0,8`; max CPU/native attention/o-proj relL2 `4.25e-09` / `1.70e-08`; auxiliary Torch-GPU path hit `5.8e-4` and tripped the old `5e-4` tolerance | native semantics valid |
+| RULER 32k/128 accounting | `50892121` | score `100.0`; decode `74.51s`; joint total `64.72s`; logical `4.026 MB/head-query`; physical `8.918 MB/head-query`; selected `12507.5` | not promotable |
+| score-direct top-k CUDA VPQ/unit | `50894450` | passed in `229s`; output `cuda_unit_result/score_direct_topk_interval_retry_20260526` | valid build/unit |
+| score-direct top-k long parity | `50894451` | native path matched CPU over `32000,64000,128000`, heads `0,8`; max CPU/native attention/o-proj relL2 `4.25e-09` / `1.70e-08`; auxiliary Torch-GPU path tripped the old tolerance | native semantics valid |
+| score-direct top-k RULER 32k/128 accounting | `50894452` | score `100.0`; decode `66.35s`; joint total `57.05s`; logical `4.024 MB/head-query`; physical `8.917 MB/head-query`; selected `12503.5`; prob/base `0.45s`, risk-prefix/top-k `28.15s` | not promotable |
+| grouped native softmax/base CUDA VPQ/unit | `50894511` | passed in `220s` after fixing a grouped-value stride bug caught by failed unit job `50894503` | valid build/unit |
+| grouped native softmax/base long parity | `50894513` | native path matched CPU over `32000,64000,128000`, heads `0,8`; max CPU/native attention/o-proj relL2 `4.25e-09` / `1.70e-08`; auxiliary Torch-GPU path tripped the old tolerance | native semantics valid |
+| grouped native softmax/base RULER 32k/128 accounting | `50894514` | score `100.0`; decode `68.71s`; joint total `59.92s`; logical `4.025 MB/head-query`; physical `8.917 MB/head-query`; selected `12506.8`; prob/base worsened to `18.90s` | not promotable |
+| native budget + risk workspace | `50894552` | score `100.0`; decode `65.33s`; joint total `55.20s`; logical `4.025 MB/head-query`; physical `8.918 MB/head-query`; selected `12505.8` | not promotable |
+| native budget + grouped output workspace | `50894553` | score `100.0`; decode `57.98s`; joint total `49.16s`; logical `4.026 MB/head-query`; physical `8.918 MB/head-query`; selected `12507.7` | noise-level, selected/logical drift |
+| native budget + sparse exact score | `50894554` | score `100.0`; decode `58.48s`; joint total `49.55s`; logical `4.027 MB/head-query`; physical `8.918 MB/head-query`; selected `12512.7` | noise-level, selected/logical drift |
+
+Interpretation: materializing grouped probabilities once eliminates most prob/base time (`0.52s` vs canonical `8.07s`) but inflates residual-risk/V-prefix work (`31.67s` risk-prefix vs canonical `13.50s`). Total decode regresses from canonical `58.73s` to `74.51s`, so keep `SELECTOR_PQ_JOINT_SCORE_PROB_INTERVAL_POLICY=0`.
+
+The score-direct top-k variant proves the same point from the opposite direction: avoiding full probability materialization drops prob/base to `0.45s`, but exact top-k residual-risk ordering is still expensive when the maximum exact-V prefix is large. It decodes in `66.35s`, still slower than canonical `58.73s`, so keep `SELECTOR_PQ_JOINT_SCORE_DIRECT_TOPK_INTERVAL_POLICY=0`.
+
+The grouped native softmax/base variant preserves semantics but also regresses: deferring softmax/base into one grouped native call increases prob/base to `18.90s`, likely from large grouped score/Vhat packing plus a less favorable grouped-kernel shape. Keep `SELECTOR_PQ_JOINT_GROUPED_SOFTMAX_BASE=0`.
+
+The workspace/native-budget combos do not remove enough work to matter. The only apparent speedup (`57.98s` vs `58.73s`) is within noise and changes selected/logical stats, so it is not a clean promotion candidate.
+
+## CUDA Score-Grid / Accounting Diagnostics - 2026-05-26
+
+| candidate | job(s) | result | decision |
+| --- | --- | --- | --- |
+| no-calib scatter score-grid | `50909143`, `50909522`, `50909523`, `50909524` | CUDA unit passed; partial parity passed for `32000/head0`; RULER 32k/128 was flat (`37.75s` patched vs clean `37.60s`); LongGen8192 regressed (`511.37s` patched vs clean `505.50s`, score-grid `80.64s` vs clean `76.78s`) | not promotable; full parity `50910087` canceled after runtime rejection |
+| fused policy accounting | `50911480`, `50911602`, `50911603`, `50911611` | CUDA unit passed in `233s`; native CPU/GPU parity matched tightly (`4.25e-09` attention relL2, `1.70e-08` o-proj relL2), with only auxiliary Torch-GPU tolerance failures; RULER 32k/128 decoded `39.09s`; LongGen8192 generated `508.17s` | not promotable; slightly slower than clean baselines |
+| native-op accounting profile | `50910465` | RULER 32k/128 decoded `53.20s` with `PROFILE_NATIVE_OPS=1`; true native accounting time was `0.96s`, not the earlier apparent `13s+` wall bucket | accounting was mostly async attribution noise |
+
+Interpretation: the no-calib scatter score-grid reduced some rank-prefix overhead on short RULER but increased score-grid time on sustained LongGen, so the score-grid bottleneck is not simply rank-position/base-mask traffic. The fused policy-accounting experiment removed the apparent accounting bucket (`58.30s` LongGen8192 clean wall bucket to `1.00s`) but did not improve end-to-end runtime (`508.17s` vs clean `505.50s`). That means the accounting bucket was mostly async attribution noise. Do not target accounting next; target real compute/memory buckets: score-grid, exact logits/QKV handling, prob/base, risk-prefix, and V-PQ sidecar.
+
+## Benchmark Reporting Rule - 2026-05-27
+
+All task reports must include bandwidth savings, not only raw frontier MB. `benchmark/audit_benchmark_readiness.py` now reports:
+
+| field | meaning |
+| --- | --- |
+| `dense step` | estimated dense K/V-read MB per head-query, using average decode context tokens and bf16 K+V with head_dim 128 |
+| `logical save %` | savings from the logical frontier cost model vs dense |
+| `physical save %` | savings from the actual GPU-emulation memory traffic vs dense |
+
+Current archived reports:
+
+| artifact | note |
+| --- | --- |
+| `notes/archive/benchmark_audits_2026-05/ruler64k_partial_bandwidth_20260527.md` | RULER 64k partial results; frontier logical savings are about `66-81%`, but physical GPU-emulation savings are only about `41-44%` |
+| `notes/archive/benchmark_audits_2026-05/public_longdecode_partial_bandwidth_20260527.md` | public long-decode partial results; current LongGenBench rows are still substring/completion smoke metrics, not official LLM-judge LongGenBench accuracy |
+
+## CPU/GPU Frontier Hyperparameter Audit - 2026-05-27
+
+The current CPU sweet-spot headline `4.813 MB/head-query` is a mean over decode lengths `500..128000`, not the 128k point. The same CPU trace has substantially higher per-decode logical cost at long contexts:
+
+| decode length | CPU raw-tail mean MB/head-query | mean K budget | mean V budget | mean selected K tokens | mean o-proj relL2 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 500 | `1.947` | `4864` | `1472` | `6090` | `0.000493` |
+| 1000 | `2.140` | `5120` | `1664` | `6686` | `0.000583` |
+| 2000 | `2.253` | `4352` | `1408` | `7398` | `0.000602` |
+| 4000 | `2.668` | `4096` | `1184` | `9302` | `0.000538` |
+| 8000 | `3.387` | `7616` | `2528` | `10518` | `0.000824` |
+| 16000 | `5.248` | `20160` | `3904` | `15990` | `0.001137` |
+| 32000 | `7.386` | `20096` | `2656` | `25142` | `0.001022` |
+| 64000 | `8.294` | `22848` | `3008` | `26102` | `0.001949` |
+| 128000 | `9.998` | `20928` | `5408` | `26230` | `0.002083` |
+
+Static audit:
+
+- RULER64 frontier summaries use the same core policy/budget settings as the current CPU raw-tail frontier: `joint_kv_stability`, `k_first_alternating`, threshold `0.001`, K budgets `4096,8192,14336,32768`, V budgets `1024,2048,4096,6144,8192,12288,16384`, `tail_score_calibration=none`, and `selected_value_exact_rule=global_residual_risk`.
+- The RULER64 run summaries omitted some metadata (`subvecs`, `subbits`, `value_subvecs`, `value_subbits`, `kmeans_iters`, `compact_vpq_risk_prefix`) even though the wrapper passes those settings. This was a reporting/audit issue, not an algorithm change; future RULER/LongBench summaries now record `compact_vpq_risk_prefix`, and future RULER summaries also record the PQ parameter fields.
+- The strongest existing saved CPU-vs-GPU parity artifact before this audit (`50728005`) used the old `tail_score_calibration=affine_selected` setting. A new raw-tail parity job was submitted as `51050181` to verify current canonical raw-tail GPU semantics directly over the long saved trace.

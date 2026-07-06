@@ -20,6 +20,7 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_value import (
     value_vpq_pack_torch,
 )
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_vpq_grouped import (
+    grouped_vpq_compact_sidecars_for,
     grouped_vpq_residual_sidecars_for,
 )
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_vpq_sidecars import joint_vpq_sidecars_for
@@ -441,6 +442,18 @@ class PagedPQForwardState:
         context_len_i: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
         return grouped_vpq_residual_sidecars_for(
+            self,
+            gqa_indexes,
+            context_len_i=context_len_i,
+        )
+
+    def grouped_vpq_compact_sidecars_for(
+        self,
+        gqa_indexes: list[GPUIndex],
+        *,
+        context_len_i: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor, int] | None:
+        return grouped_vpq_compact_sidecars_for(
             self,
             gqa_indexes,
             context_len_i=context_len_i,

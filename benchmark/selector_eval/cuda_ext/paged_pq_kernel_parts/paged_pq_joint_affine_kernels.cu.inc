@@ -108,6 +108,21 @@ __global__ void joint_base_mask_set_kernel(
   }
 }
 
+__global__ void joint_base_position_scatter_kernel(
+    int* __restrict__ base_pos,
+    const int64_t* __restrict__ base_tokens,
+    int64_t base_count,
+    int64_t context_len) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= base_count) {
+    return;
+  }
+  int64_t token = base_tokens[idx];
+  if (token >= 0 && token < context_len) {
+    base_pos[token] = static_cast<int>(idx);
+  }
+}
+
 __global__ void joint_rank_position_scatter_kernel(
     int* __restrict__ rank_pos,
     const int64_t* __restrict__ ranked_prefix_tokens,
@@ -534,4 +549,3 @@ __global__ void joint_affine_selected_fit_sparse_tokenlist_kernel(
     fit_bias[kh] = bias;
   }
 }
-

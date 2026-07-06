@@ -15,7 +15,13 @@ cd /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttentio
 export LD_LIBRARY_PATH="/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
 module purge
 module load python/3.10.4
-source .venv/bin/activate
+module unload pytorch 2>/dev/null || true
+module load cuda/12.8.1
+HF_VENV_DIR="${HF_VENV_DIR:-.venv_cu128}"
+source "${HF_VENV_DIR}/bin/activate"
+export PYTHONNOUSERSITE=1
+export LD_LIBRARY_PATH="$PWD/${HF_VENV_DIR}/lib/python3.10/site-packages/torch/lib:/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
+export PYTHONPATH="$PWD/benchmark/selector_eval/cuda_ext:${PYTHONPATH:-}"
 
 TRACE="${TRACE:-attention_efficiency_result/real_qkv_llama31_l16_6838_g131072_q288_window32_graphall_s16.npz}"
 X_TRACE="${X_TRACE:-attention_efficiency_result/real_xtrace_llama31_8b_layer16_8k_g131072_sampled_maskstop.npz}"
@@ -67,7 +73,7 @@ echo "[jointkv_parity] trace=${TRACE}"
 echo "[jointkv_parity] x_trace=${X_TRACE}"
 echo "[jointkv_parity] output=${OUTPUT_DIR}"
 
-.venv/bin/python benchmark/selector_eval/gpu/run_joint_kv_cpu_gpu_parity_eval.py \
+"${HF_VENV_DIR}/bin/python" benchmark/selector_eval/gpu/run_joint_kv_cpu_gpu_parity_eval.py \
   --trace "${TRACE}" \
   --x_trace "${X_TRACE}" \
   --output_dir "${OUTPUT_DIR}" \
@@ -86,7 +92,7 @@ echo "[jointkv_parity] output=${OUTPUT_DIR}"
   --key_bytes "${KEY_BYTES:-2}" \
   --value_bytes "${VALUE_BYTES:-2}" \
   --value_code_stat_bytes "${VALUE_CODE_STAT_BYTES:-2}" \
-  --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-affine_selected}" \
+  --tail_score_calibration "${TAIL_SCORE_CALIBRATION:-none}" \
   --output_rel_l2_tolerance "${OUTPUT_REL_L2_TOLERANCE:-5e-4}" \
   --oproj_rel_l2_tolerance "${OPROJ_REL_L2_TOLERANCE:-5e-4}" \
   --device cuda \
@@ -98,8 +104,15 @@ echo "[jointkv_parity] output=${OUTPUT_DIR}"
   ${USE_NATIVE_PQ_SCALE_IN_KERNEL:+--use_native_pq_scale_in_kernel} \
   ${USE_TOKENFIT_SCORE_GRID:+--use_tokenfit_score_grid} \
   ${USE_SCORE_GRID_WORKSPACE:+--use_score_grid_workspace} \
+  ${USE_NOCALIB_SCORE_GRID_WORKSPACE:+--use_nocalib_score_grid_workspace} \
+  ${USE_NOCALIB_SCATTER_SCORE_GRID:+--use_nocalib_scatter_score_grid} \
   ${USE_NATIVE_POLICY:+--use_native_policy} \
   ${USE_INTERVAL_RISK_POLICY:+--use_interval_risk_policy} \
-  ${USE_SCORE_DIRECT_INTERVAL_POLICY:+--use_score_direct_interval_policy}
+  ${USE_SCORE_DIRECT_INTERVAL_POLICY:+--use_score_direct_interval_policy} \
+  ${USE_SCORE_PROB_INTERVAL_POLICY:+--use_score_prob_interval_policy} \
+  ${USE_SCORE_DIRECT_TOPK_INTERVAL_POLICY:+--use_score_direct_topk_interval_policy} \
+  ${USE_MERGE_RISK_POLICY:+--use_merge_risk_policy} \
+  ${USE_STAGED_RISK_PREFIX:+--use_staged_risk_prefix} \
+  --staged_risk_prefix_v_steps "${STAGED_RISK_PREFIX_V_STEPS:-3}"
 
 echo "[jointkv_parity] finished=$(date --iso-8601=seconds)"

@@ -355,7 +355,10 @@ class PagedPQPatchState:
                 build_stats = getattr(cached_index, "_last_value_vpq_build_stats", None)
                 if build_stats is not None:
                     self.stats[int(layer_id)].add_index_build(*build_stats)
-                if _env_truthy("SELECTOR_PQ_JOINT_PREWARM_VPQ_SIDECARS", "0"):
+                if _env_truthy(
+                    "SELECTOR_PQ_JOINT_PREWARM_VPQ_SIDECARS",
+                    "0",
+                ) and not _env_truthy("SELECTOR_PQ_JOINT_COMPACT_VPQ_RISK_PREFIX", "0"):
                     persistent_cache = getattr(module, "_pagedpq_joint_vpq_sidecar_cache", None)
                     if not isinstance(persistent_cache, dict):
                         persistent_cache = {}

@@ -188,42 +188,81 @@ std::vector<torch::Tensor> gqa_fullscan_pq_topk_cuda(
 
   auto scores = torch::empty({heads, total_tokens}, score_opts);
   const int threads = 256;
-  const int64_t score_elems = heads * total_tokens;
-  const int blocks = static_cast<int>((score_elems + threads - 1) / threads);
   auto stream = at::cuda::getCurrentCUDAStream();
+  const bool use_lut_scores = env_enabled_default("SELECTOR_PQ_FULLSCAN_LUT_SCORES", false);
 
-  if (codes.scalar_type() == torch::kUInt8) {
-    gqa_pq_scores_kernel<uint8_t><<<blocks, threads, 0, stream>>>(
-        queries.data_ptr<float>(),
-        codebooks.data_ptr<float>(),
-        codes.data_ptr<uint8_t>(),
-        scores.data_ptr<float>(),
-        heads,
-        kv_heads,
-        dim,
-        pages,
-        page_size,
-        subvecs,
-        centroids,
-        subdim,
-        total_tokens,
-        group_size);
+  if (use_lut_scores) {
+    const dim3 score_blocks(static_cast<unsigned int>(heads), static_cast<unsigned int>(pages), 1);
+    const size_t lut_smem = static_cast<size_t>(subvecs * centroids) * sizeof(float);
+    if (codes.scalar_type() == torch::kUInt8) {
+      gqa_pq_scores_lut_kernel<uint8_t><<<score_blocks, threads, lut_smem, stream>>>(
+          queries.data_ptr<float>(),
+          codebooks.data_ptr<float>(),
+          codes.data_ptr<uint8_t>(),
+          scores.data_ptr<float>(),
+          heads,
+          kv_heads,
+          dim,
+          pages,
+          page_size,
+          subvecs,
+          centroids,
+          subdim,
+          total_tokens,
+          group_size);
+    } else {
+      gqa_pq_scores_lut_kernel<int64_t><<<score_blocks, threads, lut_smem, stream>>>(
+          queries.data_ptr<float>(),
+          codebooks.data_ptr<float>(),
+          codes.data_ptr<int64_t>(),
+          scores.data_ptr<float>(),
+          heads,
+          kv_heads,
+          dim,
+          pages,
+          page_size,
+          subvecs,
+          centroids,
+          subdim,
+          total_tokens,
+          group_size);
+    }
   } else {
-    gqa_pq_scores_kernel<int64_t><<<blocks, threads, 0, stream>>>(
-        queries.data_ptr<float>(),
-        codebooks.data_ptr<float>(),
-        codes.data_ptr<int64_t>(),
-        scores.data_ptr<float>(),
-        heads,
-        kv_heads,
-        dim,
-        pages,
-        page_size,
-        subvecs,
-        centroids,
-        subdim,
-        total_tokens,
-        group_size);
+    const int64_t score_elems = heads * total_tokens;
+    const int blocks = static_cast<int>((score_elems + threads - 1) / threads);
+    if (codes.scalar_type() == torch::kUInt8) {
+      gqa_pq_scores_kernel<uint8_t><<<blocks, threads, 0, stream>>>(
+          queries.data_ptr<float>(),
+          codebooks.data_ptr<float>(),
+          codes.data_ptr<uint8_t>(),
+          scores.data_ptr<float>(),
+          heads,
+          kv_heads,
+          dim,
+          pages,
+          page_size,
+          subvecs,
+          centroids,
+          subdim,
+          total_tokens,
+          group_size);
+    } else {
+      gqa_pq_scores_kernel<int64_t><<<blocks, threads, 0, stream>>>(
+          queries.data_ptr<float>(),
+          codebooks.data_ptr<float>(),
+          codes.data_ptr<int64_t>(),
+          scores.data_ptr<float>(),
+          heads,
+          kv_heads,
+          dim,
+          pages,
+          page_size,
+          subvecs,
+          centroids,
+          subdim,
+          total_tokens,
+          group_size);
+    }
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -273,42 +312,81 @@ std::vector<torch::Tensor> gqa_fullscan_pq_topk_scores_cuda(
   }
 
   const int threads = 256;
-  const int64_t score_elems = heads * total_tokens;
-  const int blocks = static_cast<int>((score_elems + threads - 1) / threads);
   auto stream = at::cuda::getCurrentCUDAStream();
+  const bool use_lut_scores = env_enabled_default("SELECTOR_PQ_FULLSCAN_LUT_SCORES", false);
 
-  if (codes.scalar_type() == torch::kUInt8) {
-    gqa_pq_scores_kernel<uint8_t><<<blocks, threads, 0, stream>>>(
-        queries.data_ptr<float>(),
-        codebooks.data_ptr<float>(),
-        codes.data_ptr<uint8_t>(),
-        scores.data_ptr<float>(),
-        heads,
-        kv_heads,
-        dim,
-        pages,
-        page_size,
-        subvecs,
-        centroids,
-        subdim,
-        total_tokens,
-        group_size);
+  if (use_lut_scores) {
+    const dim3 score_blocks(static_cast<unsigned int>(heads), static_cast<unsigned int>(pages), 1);
+    const size_t lut_smem = static_cast<size_t>(subvecs * centroids) * sizeof(float);
+    if (codes.scalar_type() == torch::kUInt8) {
+      gqa_pq_scores_lut_kernel<uint8_t><<<score_blocks, threads, lut_smem, stream>>>(
+          queries.data_ptr<float>(),
+          codebooks.data_ptr<float>(),
+          codes.data_ptr<uint8_t>(),
+          scores.data_ptr<float>(),
+          heads,
+          kv_heads,
+          dim,
+          pages,
+          page_size,
+          subvecs,
+          centroids,
+          subdim,
+          total_tokens,
+          group_size);
+    } else {
+      gqa_pq_scores_lut_kernel<int64_t><<<score_blocks, threads, lut_smem, stream>>>(
+          queries.data_ptr<float>(),
+          codebooks.data_ptr<float>(),
+          codes.data_ptr<int64_t>(),
+          scores.data_ptr<float>(),
+          heads,
+          kv_heads,
+          dim,
+          pages,
+          page_size,
+          subvecs,
+          centroids,
+          subdim,
+          total_tokens,
+          group_size);
+    }
   } else {
-    gqa_pq_scores_kernel<int64_t><<<blocks, threads, 0, stream>>>(
-        queries.data_ptr<float>(),
-        codebooks.data_ptr<float>(),
-        codes.data_ptr<int64_t>(),
-        scores.data_ptr<float>(),
-        heads,
-        kv_heads,
-        dim,
-        pages,
-        page_size,
-        subvecs,
-        centroids,
-        subdim,
-        total_tokens,
-        group_size);
+    const int64_t score_elems = heads * total_tokens;
+    const int blocks = static_cast<int>((score_elems + threads - 1) / threads);
+    if (codes.scalar_type() == torch::kUInt8) {
+      gqa_pq_scores_kernel<uint8_t><<<blocks, threads, 0, stream>>>(
+          queries.data_ptr<float>(),
+          codebooks.data_ptr<float>(),
+          codes.data_ptr<uint8_t>(),
+          scores.data_ptr<float>(),
+          heads,
+          kv_heads,
+          dim,
+          pages,
+          page_size,
+          subvecs,
+          centroids,
+          subdim,
+          total_tokens,
+          group_size);
+    } else {
+      gqa_pq_scores_kernel<int64_t><<<blocks, threads, 0, stream>>>(
+          queries.data_ptr<float>(),
+          codebooks.data_ptr<float>(),
+          codes.data_ptr<int64_t>(),
+          scores.data_ptr<float>(),
+          heads,
+          kv_heads,
+          dim,
+          pages,
+          page_size,
+          subvecs,
+          centroids,
+          subdim,
+          total_tokens,
+          group_size);
+    }
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -723,4 +801,3 @@ std::vector<torch::Tensor> gqa_causal_fullscan_pq_topk_fused_force_cuda(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {top_tokens, top_scores};
 }
-

@@ -165,6 +165,7 @@ __device__ __forceinline__ float logaddexp_device(float a, float b) {
 #include "paged_pq_kernel_parts/paged_pq_joint_softmax_base_wrappers.cu.inc"
 #include "paged_pq_kernel_parts/paged_pq_joint_softmax_score_wrappers.cu.inc"
 #include "paged_pq_kernel_parts/paged_pq_joint_score_direct_wrappers.cu.inc"
+#include "paged_pq_kernel_parts/paged_pq_joint_merge_risk_wrappers.cu.inc"
 #include "paged_pq_kernel_parts/paged_pq_joint_vpq_sidecar_wrappers.cu.inc"
 #include "paged_pq_kernel_parts/paged_pq_joint_mixed_output_wrappers.cu.inc"
 #include "paged_pq_kernel_parts/paged_pq_joint_risk_vprefix_wrappers.cu.inc"

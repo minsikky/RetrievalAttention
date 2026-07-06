@@ -113,6 +113,14 @@ class JointKVWorkspace:
             self.model,
             "_pagedpq_joint_grouped_score_grid_workspace_cache",
         )
+        self.nocalib_score_grid_workspace_cache = _dict_attr(
+            self.model,
+            "_pagedpq_joint_nocalib_score_grid_workspace_cache",
+        )
+        self.nocalib_scatter_score_grid_workspace_cache = _dict_attr(
+            self.model,
+            "_pagedpq_joint_nocalib_scatter_score_grid_workspace_cache",
+        )
         self.softmax_base_workspace_cache = _dict_attr(
             self.model,
             "_pagedpq_joint_softmax_base_workspace_cache",
@@ -132,6 +140,117 @@ class JointKVWorkspace:
         self.score_direct_workspace_cache = _dict_attr(
             self.model,
             "_pagedpq_joint_score_direct_workspace_cache",
+        )
+
+    def nocalib_score_grid_workspace_for(
+        self,
+        *,
+        k_count: int,
+        heads: int,
+        context_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        key = (str(self.device), int(k_count), int(heads))
+        cached = self.nocalib_score_grid_workspace_cache.get(key)
+        capacity = int(context_len)
+        if cached is not None:
+            cached_capacity, score_flat_t, token_to_indexed_t, base_mask_t, rank_pos_flat_t = cached
+            if int(cached_capacity) >= int(context_len):
+                capacity = int(cached_capacity)
+                view_len = max(1, int(k_count) * int(heads) * int(context_len))
+                rank_len = max(1, int(heads) * int(context_len))
+                return (
+                    score_flat_t[:view_len].reshape(int(k_count), int(heads), int(context_len)),
+                    token_to_indexed_t[: int(context_len)],
+                    base_mask_t[: int(context_len)],
+                    rank_pos_flat_t[:rank_len].reshape(int(heads), int(context_len)),
+                )
+            grow_pad = max(
+                0,
+                _env_int("SELECTOR_PQ_JOINT_NOCALIB_SCORE_GRID_WORKSPACE_GROW_PAD", 1024),
+            )
+            capacity = max(
+                int(context_len),
+                int(cached_capacity) + max(int(grow_pad), int(context_len) - int(cached_capacity)),
+            )
+        else:
+            capacity = int(context_len) + max(
+                0,
+                _env_int("SELECTOR_PQ_JOINT_NOCALIB_SCORE_GRID_WORKSPACE_GROW_PAD", 1024),
+            )
+        score_flat_t = torch.empty(
+            (max(1, int(k_count) * int(heads) * int(capacity)),),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        token_to_indexed_t = torch.empty((max(1, int(capacity)),), dtype=torch.int32, device=self.device)
+        base_mask_t = torch.empty((max(1, int(capacity)),), dtype=torch.uint8, device=self.device)
+        rank_pos_flat_t = torch.empty(
+            (max(1, int(heads) * int(capacity)),),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.nocalib_score_grid_workspace_cache[key] = (
+            int(capacity),
+            score_flat_t,
+            token_to_indexed_t,
+            base_mask_t,
+            rank_pos_flat_t,
+        )
+        view_len = max(1, int(k_count) * int(heads) * int(context_len))
+        rank_len = max(1, int(heads) * int(context_len))
+        return (
+            score_flat_t[:view_len].reshape(int(k_count), int(heads), int(context_len)),
+            token_to_indexed_t[: int(context_len)],
+            base_mask_t[: int(context_len)],
+            rank_pos_flat_t[:rank_len].reshape(int(heads), int(context_len)),
+        )
+
+    def nocalib_scatter_score_grid_workspace_for(
+        self,
+        *,
+        k_count: int,
+        heads: int,
+        context_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (str(self.device), int(k_count), int(heads))
+        cached = self.nocalib_scatter_score_grid_workspace_cache.get(key)
+        capacity = int(context_len)
+        if cached is not None:
+            cached_capacity, score_flat_t, token_to_indexed_t = cached
+            if int(cached_capacity) >= int(context_len):
+                view_len = max(1, int(k_count) * int(heads) * int(context_len))
+                return (
+                    score_flat_t[:view_len].reshape(int(k_count), int(heads), int(context_len)),
+                    token_to_indexed_t[: int(context_len)],
+                )
+            grow_pad = max(
+                0,
+                _env_int("SELECTOR_PQ_JOINT_NOCALIB_SCORE_GRID_WORKSPACE_GROW_PAD", 1024),
+            )
+            capacity = max(
+                int(context_len),
+                int(cached_capacity) + max(int(grow_pad), int(context_len) - int(cached_capacity)),
+            )
+        else:
+            capacity = int(context_len) + max(
+                0,
+                _env_int("SELECTOR_PQ_JOINT_NOCALIB_SCORE_GRID_WORKSPACE_GROW_PAD", 1024),
+            )
+        score_flat_t = torch.empty(
+            (max(1, int(k_count) * int(heads) * int(capacity)),),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        token_to_indexed_t = torch.empty((max(1, int(capacity)),), dtype=torch.int32, device=self.device)
+        self.nocalib_scatter_score_grid_workspace_cache[key] = (
+            int(capacity),
+            score_flat_t,
+            token_to_indexed_t,
+        )
+        view_len = max(1, int(k_count) * int(heads) * int(context_len))
+        return (
+            score_flat_t[:view_len].reshape(int(k_count), int(heads), int(context_len)),
+            token_to_indexed_t[: int(context_len)],
         )
 
     def score_grid_workspace_for(

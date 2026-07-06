@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import math
 import os
 import sys
 import time
@@ -55,6 +56,57 @@ def _parse_budget_schedule(text: str, *, name: str) -> list[int]:
     return values
 
 
+def _parse_ratio_schedule(text: str, *, name: str) -> list[float]:
+    ratios: list[float] = []
+    for part in str(text).split(","):
+        token = part.strip().lower()
+        if not token:
+            continue
+        is_percent = token.endswith("%")
+        if is_percent:
+            token = token[:-1]
+        value = float(token.replace("p", "."))
+        ratios.append(value / 100.0 if is_percent else value)
+    if not ratios:
+        raise ValueError(f"{name} must contain at least one positive ratio")
+    return ratios
+
+
+def _budgets_from_fraction_schedule(text: str, *, name: str, context_len: int) -> list[int]:
+    budgets = {
+        max(1, min(int(context_len), int(math.ceil(float(context_len) * float(frac)))))
+        for frac in _parse_ratio_schedule(text, name=name)
+        if float(frac) > 0.0
+    }
+    if not budgets:
+        raise ValueError(f"{name} produced no positive budgets")
+    return sorted(budgets)
+
+
+def _scaled_budget_delta_threshold(
+    *,
+    base_threshold: float,
+    budget_delta_frac: float,
+    reference_frac: float,
+    shape: str,
+    min_scale: float,
+    max_scale: float,
+) -> float:
+    ref = max(float(reference_frac), 1e-12)
+    ratio = max(float(budget_delta_frac), 0.0) / ref
+    mode = str(shape).strip().lower()
+    if mode == "linear":
+        scale = ratio
+    elif mode == "sqrt":
+        scale = math.sqrt(ratio)
+    elif mode == "log":
+        scale = math.log1p(ratio) / math.log(2.0)
+    else:
+        raise ValueError(f"unknown joint_kv_threshold_scale_shape: {shape}")
+    scale = min(max(float(scale), float(min_scale)), float(max_scale))
+    return float(base_threshold) * scale
+
+
 def _rel_l2_np(a: np.ndarray, b: np.ndarray) -> float:
     aa = a.astype(np.float64, copy=False)
     bb = b.astype(np.float64, copy=False)
@@ -75,12 +127,16 @@ def _choose_joint_kv_action(
     k_can: bool,
     v_can: bool,
     threshold: float,
+    k_threshold: float | None = None,
+    v_threshold: float | None = None,
     turn: int,
     extra_k_mb: float,
     extra_v_mb: float,
 ) -> str:
-    k_bad = bool(k_can and float(k_delta) > float(threshold))
-    v_bad = bool(v_can and float(v_delta) > float(threshold))
+    effective_k_threshold = float(threshold if k_threshold is None else k_threshold)
+    effective_v_threshold = float(threshold if v_threshold is None else v_threshold)
+    k_bad = bool(k_can and float(k_delta) > effective_k_threshold)
+    v_bad = bool(v_can and float(v_delta) > effective_v_threshold)
     if not k_bad and not v_bad:
         return "stop"
     if str(policy) == "k_first_priority":

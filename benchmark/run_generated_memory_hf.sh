@@ -23,43 +23,20 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_CACHE_DIR}/datasets}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_CACHE_DIR}/transformers}"
 
 HF_MODEL_PRESET="${HF_MODEL_PRESET:-}"
-PRESET_MODEL_NAME=""
-PRESET_HF_EXTRA_PYTHONPATH=""
-PRESET_TRUST_REMOTE_CODE=""
-PRESET_HF_LANGUAGE_MODEL_ONLY=""
-PRESET_USE_CHAT_TEMPLATE=""
-PRESET_DISABLE_THINKING=""
-case "${HF_MODEL_PRESET}" in
-  "")
-    ;;
-  qwen3_8b)
-    PRESET_MODEL_NAME="Qwen/Qwen3-8B"
-    PRESET_HF_EXTRA_PYTHONPATH=".hf_pydeps"
-    PRESET_HF_LANGUAGE_MODEL_ONLY="1"
-    PRESET_USE_CHAT_TEMPLATE="1"
-    PRESET_DISABLE_THINKING="1"
-    ;;
-  mistral_nemo_12b)
-    PRESET_MODEL_NAME="mistralai/Mistral-Nemo-Instruct-2407"
-    PRESET_HF_EXTRA_PYTHONPATH=".hf_pydeps"
-    PRESET_HF_LANGUAGE_MODEL_ONLY="1"
-    PRESET_USE_CHAT_TEMPLATE="1"
-    ;;
-  glm4_9b)
-    PRESET_MODEL_NAME="zai-org/glm-4-9b-chat-hf"
-    PRESET_HF_EXTRA_PYTHONPATH=".hf_pydeps"
-    PRESET_TRUST_REMOTE_CODE="1"
-    PRESET_HF_LANGUAGE_MODEL_ONLY="1"
-    PRESET_USE_CHAT_TEMPLATE="1"
-    ;;
-  *)
-    echo "[ERROR] Unknown HF_MODEL_PRESET=${HF_MODEL_PRESET}"
-    echo "[ERROR] Supported presets: qwen3_8b, mistral_nemo_12b, glm4_9b"
-    exit 2
-    ;;
-esac
+source scripts/hf_model_presets.sh
+if [ -n "${HF_MODEL_PRESET}" ]; then
+  resolve_hf_model_preset "${HF_MODEL_PRESET}" || exit $?
+else
+  PRESET_MODEL_NAME=""
+  PRESET_HF_VENV_DIR=""
+  PRESET_HF_EXTRA_PYTHONPATH=""
+  PRESET_TRUST_REMOTE_CODE=""
+  PRESET_HF_LANGUAGE_MODEL_ONLY=""
+  PRESET_USE_CHAT_TEMPLATE=""
+  PRESET_DISABLE_THINKING=""
+fi
 
-HF_VENV_DIR="${HF_VENV_DIR:-.venv}"
+HF_VENV_DIR="${HF_VENV_DIR:-${PRESET_HF_VENV_DIR:-.venv}}"
 if [ -f "${HF_VENV_DIR}/bin/activate" ]; then
   # shellcheck disable=SC1090
   source "${HF_VENV_DIR}/bin/activate"

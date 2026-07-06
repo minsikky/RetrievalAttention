@@ -49,6 +49,10 @@ SUM_COST_FIELDS = (
     "patched_attention_seconds_total",
 )
 
+DEFAULT_DENSE_HEAD_DIM = 128
+DEFAULT_DENSE_BYTES_PER_ELEM = 2
+MB = 1024 * 1024
+
 
 @dataclass
 class RunSummary:
@@ -67,6 +71,9 @@ class RunSummary:
     tail_mb: float | None
     update_mb: float | None
     physical_step_mb: float | None
+    dense_step_mb: float | None
+    logical_savings_pct: float | None
+    physical_savings_pct: float | None
     selected_tokens: float | None
     active_fraction: float | None
     passthrough: float | None
@@ -100,7 +107,12 @@ def _manifest_runs(path: Path) -> list[tuple[str, Path]]:
                 label = str(row.get("label", "")).strip()
                 output_dir = str(row.get("output_dir", "")).strip()
                 if label and output_dir:
-                    runs.append((label, Path(output_dir)))
+                    labels = [part.strip() for part in str(row.get("task_labels", "")).split(",") if part.strip()]
+                    output_dirs = [part.strip() for part in output_dir.split(",") if part.strip()]
+                    if len(labels) == len(output_dirs):
+                        runs.extend((run_label, Path(run_dir)) for run_label, run_dir in zip(labels, output_dirs))
+                    else:
+                        runs.extend((f"{label}/{idx:03d}", Path(run_dir)) for idx, run_dir in enumerate(output_dirs))
             return runs
 
     with path.open("r", encoding="utf-8", newline="") as f:
@@ -109,7 +121,12 @@ def _manifest_runs(path: Path) -> list[tuple[str, Path]]:
             if not row or row[0] == "label":
                 continue
             if len(row) >= 3:
-                runs.append((row[0], Path(row[2])))
+                output_dirs = [part.strip() for part in row[2].split(",") if part.strip()]
+                task_labels = [part.strip() for part in row[6].split(",") if part.strip()] if len(row) >= 7 else []
+                if len(task_labels) == len(output_dirs):
+                    runs.extend((run_label, Path(run_dir)) for run_label, run_dir in zip(task_labels, output_dirs))
+                else:
+                    runs.extend((f"{row[0]}/{idx:03d}", Path(run_dir)) for idx, run_dir in enumerate(output_dirs))
     return runs
 
 
@@ -214,6 +231,42 @@ def _cost_value(cost: dict[str, float], *names: str) -> float | None:
     return None
 
 
+def _avg_decode_context_tokens(payload: dict[str, Any]) -> float | None:
+    """Estimate average dense decode context length per generated query."""
+    prompt = _cost_value(
+        {k: v for k, v in payload.items() if isinstance(v, (int, float)) and not isinstance(v, bool)},
+        "mean_prompt_tokens",
+        "avg_used_prompt_tokens",
+        "avg_prompt_tokens",
+    )
+    generated = _cost_value(
+        {k: v for k, v in payload.items() if isinstance(v, (int, float)) and not isinstance(v, bool)},
+        "mean_generated_tokens",
+        "avg_generated_tokens",
+    )
+    if prompt is None:
+        prompt = _as_float(payload.get("max_input_tokens"))
+    if prompt is None:
+        return None
+    if generated is None:
+        generated = _as_float(payload.get("max_new_tokens")) or 1.0
+    # During autoregressive decode, context increases by one token per query.
+    return float(prompt) + max(0.0, float(generated) - 1.0) / 2.0
+
+
+def _dense_step_mb(payload: dict[str, Any], *, head_dim: int, bytes_per_elem: int) -> float | None:
+    context_tokens = _avg_decode_context_tokens(payload)
+    if context_tokens is None:
+        return None
+    return float(context_tokens) * float(head_dim) * float(bytes_per_elem) * 2.0 / MB
+
+
+def _savings_pct(candidate_mb: float | None, dense_mb: float | None) -> float | None:
+    if candidate_mb is None or dense_mb is None or dense_mb <= 0:
+        return None
+    return 100.0 * (1.0 - float(candidate_mb) / float(dense_mb))
+
+
 def _config_bool(config: dict[str, Any], name: str) -> bool | None:
     value = config.get(name)
     if isinstance(value, bool):
@@ -233,7 +286,7 @@ REQUIRED_CANONICAL_CUDA_FLAGS = tuple(name.lower() for name in REQUIRED_CANONICA
 DISALLOWED_DIAGNOSTIC_CUDA_FLAGS = tuple(name.lower() for name in DISALLOWED_DIAGNOSTIC_ENV_FLAGS)
 
 
-def _ruler_summary(label: str, path: Path) -> RunSummary:
+def _ruler_summary(label: str, path: Path, *, head_dim: int, bytes_per_elem: int) -> RunSummary:
     payload = _load_json(path)
     eval_csv = _ruler_eval_csv(path)
     cost = _cost(payload)
@@ -248,6 +301,13 @@ def _ruler_summary(label: str, path: Path) -> RunSummary:
     quality = _as_float(payload.get("score"))
     if quality is None:
         quality = _as_float(eval_csv.get("Score"))
+    dense_step_mb = _dense_step_mb(payload, head_dim=head_dim, bytes_per_elem=bytes_per_elem)
+    step_mb = cost.get("mean_step_MB_per_head_query")
+    physical_step_mb = _cost_value(
+        cost,
+        "mean_physical_gpu_step_MB_per_head_query",
+        "mean_physical_gpu_total_MB_per_head_query",
+    )
     return RunSummary(
         label=label,
         kind="ruler",
@@ -258,16 +318,15 @@ def _ruler_summary(label: str, path: Path) -> RunSummary:
         examples=examples,
         seconds_per_example=_as_float(payload.get("mean_stream_total_seconds")),
         decode_seconds_per_example=_as_float(payload.get("mean_stream_decode_seconds")),
-        step_mb=cost.get("mean_step_MB_per_head_query"),
+        step_mb=step_mb,
         selector_mb=cost.get("mean_selector_MB_per_head_query"),
         exact_kv_mb=cost.get("mean_exact_KV_MB_per_head_query"),
         tail_mb=cost.get("mean_tail_estimator_MB_per_head_query"),
         update_mb=_cost_value(cost, "mean_update_MB_per_head_query", "online_update_MB_per_head_query"),
-        physical_step_mb=_cost_value(
-            cost,
-            "mean_physical_gpu_step_MB_per_head_query",
-            "mean_physical_gpu_total_MB_per_head_query",
-        ),
+        physical_step_mb=physical_step_mb,
+        dense_step_mb=dense_step_mb,
+        logical_savings_pct=_savings_pct(step_mb, dense_step_mb),
+        physical_savings_pct=_savings_pct(physical_step_mb, dense_step_mb),
         selected_tokens=cost.get("mean_selected_tokens"),
         active_fraction=_cost_value(cost, "approx_path_active_fraction", "selector_active_fraction"),
         passthrough=_passthrough(cost),
@@ -291,13 +350,20 @@ def _public_quality(payload: dict[str, Any]) -> tuple[float | None, str]:
     return None, "quality"
 
 
-def _longbench_summary(label: str, path: Path) -> RunSummary:
+def _longbench_summary(label: str, path: Path, *, head_dim: int, bytes_per_elem: int) -> RunSummary:
     summary_path = path / "summary.json" if path.is_dir() else path
     payload = _load_json(summary_path)
     cost = _cost(payload)
     mode = str(payload.get("attention_mode", ""))
     warnings = _common_warnings(payload, cost, mode)
     quality, quality_name = _public_quality(payload)
+    dense_step_mb = _dense_step_mb(payload, head_dim=head_dim, bytes_per_elem=bytes_per_elem)
+    step_mb = cost.get("mean_step_MB_per_head_query")
+    physical_step_mb = _cost_value(
+        cost,
+        "mean_physical_gpu_step_MB_per_head_query",
+        "mean_physical_gpu_total_MB_per_head_query",
+    )
     return RunSummary(
         label=label,
         kind="public-longdecode" if "benchmark" in payload else "longbench-v2",
@@ -308,16 +374,15 @@ def _longbench_summary(label: str, path: Path) -> RunSummary:
         examples=int(payload["num_examples"]) if isinstance(payload.get("num_examples"), int) else None,
         seconds_per_example=_as_float(payload.get("avg_generation_sec")),
         decode_seconds_per_example=_as_float(payload.get("avg_generation_sec")),
-        step_mb=cost.get("mean_step_MB_per_head_query"),
+        step_mb=step_mb,
         selector_mb=cost.get("mean_selector_MB_per_head_query"),
         exact_kv_mb=cost.get("mean_exact_KV_MB_per_head_query"),
         tail_mb=cost.get("mean_tail_estimator_MB_per_head_query"),
         update_mb=_cost_value(cost, "mean_update_MB_per_head_query", "online_update_MB_per_head_query"),
-        physical_step_mb=_cost_value(
-            cost,
-            "mean_physical_gpu_step_MB_per_head_query",
-            "mean_physical_gpu_total_MB_per_head_query",
-        ),
+        physical_step_mb=physical_step_mb,
+        dense_step_mb=dense_step_mb,
+        logical_savings_pct=_savings_pct(step_mb, dense_step_mb),
+        physical_savings_pct=_savings_pct(physical_step_mb, dense_step_mb),
         selected_tokens=cost.get("mean_selected_tokens"),
         active_fraction=_cost_value(cost, "approx_path_active_fraction", "selector_active_fraction"),
         passthrough=_passthrough(cost),
@@ -367,7 +432,7 @@ def _common_warnings(payload: dict[str, Any], cost: dict[str, float], mode: str)
                 warnings.append("selected-v-max-exact-fallback")
             if config.get("online_confidence_rule") != "joint_kv_stability":
                 warnings.append("noncanonical-confidence-rule")
-            if config.get("tail_score_calibration") != "affine_selected":
+            if config.get("tail_score_calibration") != "none":
                 warnings.append("noncanonical-tail-calibration")
             missing_native = [
                 name.removeprefix("selector_pq_joint_")
@@ -419,6 +484,9 @@ def _row(run: RunSummary) -> list[str]:
         _fmt(run.tail_mb),
         _fmt(run.update_mb, 6),
         _fmt(run.physical_step_mb),
+        _fmt(run.dense_step_mb),
+        _fmt(run.logical_savings_pct, 1),
+        _fmt(run.physical_savings_pct, 1),
         _fmt(run.selected_tokens, 1),
         _fmt(run.active_fraction),
         _fmt(run.passthrough, 0),
@@ -442,6 +510,9 @@ def _markdown_table(runs: Iterable[RunSummary]) -> str:
         "tail",
         "update",
         "phys step",
+        "dense step",
+        "logical save %",
+        "physical save %",
         "selected",
         "active",
         "passthrough",
@@ -470,6 +541,18 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=None, help="Optional markdown output path")
     parser.add_argument("--strict", action="store_true", help="Exit nonzero if any readiness warning is present.")
     parser.add_argument(
+        "--dense-head-dim",
+        type=int,
+        default=DEFAULT_DENSE_HEAD_DIM,
+        help="Head dimension used to estimate dense K/V-read MB per head-query.",
+    )
+    parser.add_argument(
+        "--dense-bytes-per-elem",
+        type=int,
+        default=DEFAULT_DENSE_BYTES_PER_ELEM,
+        help="Bytes per K/V element used to estimate dense K/V-read MB per head-query.",
+    )
+    parser.add_argument(
         "--max-frontier-decode-seconds",
         type=float,
         default=None,
@@ -479,9 +562,9 @@ def main() -> None:
 
     runs: list[RunSummary] = []
     for label, path in args.ruler:
-        runs.append(_ruler_summary(label, path))
+        runs.append(_ruler_summary(label, path, head_dim=args.dense_head_dim, bytes_per_elem=args.dense_bytes_per_elem))
     for label, path in args.longbench:
-        runs.append(_longbench_summary(label, path))
+        runs.append(_longbench_summary(label, path, head_dim=args.dense_head_dim, bytes_per_elem=args.dense_bytes_per_elem))
     for manifest in args.manifest:
         for label, output_dir in _manifest_runs(manifest):
             detected = _detect_summaries(label, output_dir)
@@ -503,6 +586,9 @@ def main() -> None:
                         tail_mb=None,
                         update_mb=None,
                         physical_step_mb=None,
+                        dense_step_mb=None,
+                        logical_savings_pct=None,
+                        physical_savings_pct=None,
                         selected_tokens=None,
                         active_fraction=None,
                         passthrough=None,
@@ -513,9 +599,23 @@ def main() -> None:
             for run_label, kind, summary_path in detected:
                 try:
                     if kind == "longbench":
-                        runs.append(_longbench_summary(run_label, summary_path))
+                        runs.append(
+                            _longbench_summary(
+                                run_label,
+                                summary_path,
+                                head_dim=args.dense_head_dim,
+                                bytes_per_elem=args.dense_bytes_per_elem,
+                            )
+                        )
                     elif kind == "ruler":
-                        runs.append(_ruler_summary(run_label, summary_path))
+                        runs.append(
+                            _ruler_summary(
+                                run_label,
+                                summary_path,
+                                head_dim=args.dense_head_dim,
+                                bytes_per_elem=args.dense_bytes_per_elem,
+                            )
+                        )
                 except Exception as exc:
                     runs.append(
                         RunSummary(
@@ -534,6 +634,9 @@ def main() -> None:
                             tail_mb=None,
                             update_mb=None,
                             physical_step_mb=None,
+                            dense_step_mb=None,
+                            logical_savings_pct=None,
+                            physical_savings_pct=None,
                             selected_tokens=None,
                             active_fraction=None,
                             passthrough=None,

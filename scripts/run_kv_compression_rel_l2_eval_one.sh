@@ -37,7 +37,7 @@ echo "[kv_compression_l2] methods=${METHODS:-default}"
   --decode_lengths "${DECODE_LENGTHS:-500,1000,2000,4000,8000,16000,32000,64000,128000}" \
   --max_qidx_per_decode "${MAX_QIDX_PER_DECODE:-1}" \
   --heads "${HEADS:-}" \
-  --methods "${METHODS:-dense,kivi_like_b2_w128,kivi_like_b4_w128,kivi_like_b2_w2048,kivi_like_b4_w2048,kvquant_like_b3_clip0p1_w128,kvquant_like_b4_clip0p1_w128,per_token_kv_b3_w128,per_token_kv_b4_w128,tq_k3v3_w128,tqprod_k3v3_w128,tqprod_k4v4_w128,pq_like_s4b4_w128,pq_like_s4b6_w128}" \
+  --methods "${METHODS:-dense,kivi_b2_g32_w128,kivi_b4_g32_w128,kivi_b2_g32_w2048,kivi_b4_g32_w2048,kvquant_like_b3_clip0p1_w128,kvquant_like_b4_clip0p1_w128,per_token_kv_b3_w128,per_token_kv_b4_w128,tq_k3v3_w128,tqprod_k3v3_w128,tqprod_k4v4_w128,pq_like_s4b4_w128,pq_like_s4b6_w128}" \
   --static_prefix "${STATIC_PREFIX:-128}" \
   --residual_window "${RESIDUAL_WINDOW:-128}" \
   --key_bytes "${KEY_BYTES:-2}" \

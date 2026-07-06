@@ -13,6 +13,7 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_common import (
     _choose_joint_kv_action,
     _env_truthy,
     _rel_l2_torch,
+    _scaled_budget_delta_threshold,
 )
 
 
@@ -38,6 +39,14 @@ class JointPolicyRuntime:
     policy_id: int
     policy_uses_mb: bool
     threshold: float
+    context_len: int
+    threshold_mode: str
+    threshold_reference_frac: float
+    threshold_scale_shape: str
+    threshold_min_scale: float
+    threshold_max_scale: float
+    start_ki_by_head: list[int] | None
+    start_vi_by_head: list[int] | None
     use_incremental_v_grid: bool
     grid_outputs: torch.Tensor | None
     grid_outputs_for_v_idx: Callable[[int], torch.Tensor] | None
@@ -72,7 +81,10 @@ def select_joint_kv_budgets(runtime: JointPolicyRuntime) -> JointPolicyResult:
         and not _env_truthy("SELECTOR_PQ_JOINT_NATIVE_LAZY_POLICY", "0")
     ):
         output_grid = _materialize_output_grid(runtime)
-        if _env_truthy("SELECTOR_PQ_JOINT_NATIVE_POLICY", "0"):
+        if (
+            _env_truthy("SELECTOR_PQ_JOINT_NATIVE_POLICY", "0")
+            and not _requires_torch_policy(runtime)
+        ):
             final_idx_for_output, final_output_grid = _select_with_native_policy(runtime, output_grid)
             if not bool(getattr(runtime.args, "disable_cost_stats", False)):
                 final_rows = final_idx_for_output.detach().cpu().tolist()
@@ -131,6 +143,71 @@ def _extra_v_mb(runtime: JointPolicyRuntime, vi: int, v_can: bool) -> float:
     return float(runtime.v_mb_by_idx[int(vi) + 1] - runtime.v_mb_by_idx[int(vi)])
 
 
+def _head_start_indices(runtime: JointPolicyRuntime, local_head_i: int) -> tuple[int, int]:
+    ki = 0
+    vi = 0
+    if runtime.start_ki_by_head is not None and int(local_head_i) < len(runtime.start_ki_by_head):
+        ki = int(runtime.start_ki_by_head[int(local_head_i)])
+    if runtime.start_vi_by_head is not None and int(local_head_i) < len(runtime.start_vi_by_head):
+        vi = int(runtime.start_vi_by_head[int(local_head_i)])
+    ki = min(max(0, int(ki)), max(0, len(runtime.active_k_budgets) - 1))
+    vi = min(max(0, int(vi)), max(0, len(runtime.v_budgets) - 1))
+    return ki, vi
+
+
+def _requires_torch_policy(runtime: JointPolicyRuntime) -> bool:
+    if str(runtime.threshold_mode) != "fixed":
+        return True
+    for values in (runtime.start_ki_by_head, runtime.start_vi_by_head):
+        if values is not None and any(int(v) != 0 for v in values):
+            return True
+    return False
+
+
+def _thresholds_for_step(
+    runtime: JointPolicyRuntime,
+    *,
+    ki: int,
+    vi: int,
+    k_can: bool,
+    v_can: bool,
+) -> tuple[float, float]:
+    if str(runtime.threshold_mode) == "fixed":
+        return float(runtime.threshold), float(runtime.threshold)
+    if str(runtime.threshold_mode) != "budget_delta_frac":
+        raise ValueError(f"unknown joint_kv_threshold_mode: {runtime.threshold_mode}")
+    context = max(float(runtime.context_len), 1.0)
+    k_threshold = float(runtime.threshold)
+    v_threshold = float(runtime.threshold)
+    if k_can:
+        k_frac = (
+            float(max(0, int(runtime.active_k_budgets[int(ki) + 1]) - int(runtime.active_k_budgets[int(ki)])))
+            / context
+        )
+        k_threshold = _scaled_budget_delta_threshold(
+            base_threshold=float(runtime.threshold),
+            budget_delta_frac=float(k_frac),
+            reference_frac=float(runtime.threshold_reference_frac),
+            shape=str(runtime.threshold_scale_shape),
+            min_scale=float(runtime.threshold_min_scale),
+            max_scale=float(runtime.threshold_max_scale),
+        )
+    if v_can:
+        v_frac = (
+            float(max(0, int(runtime.v_budgets[int(vi) + 1]) - int(runtime.v_budgets[int(vi)])))
+            / context
+        )
+        v_threshold = _scaled_budget_delta_threshold(
+            base_threshold=float(runtime.threshold),
+            budget_delta_frac=float(v_frac),
+            reference_frac=float(runtime.threshold_reference_frac),
+            shape=str(runtime.threshold_scale_shape),
+            min_scale=float(runtime.threshold_min_scale),
+            max_scale=float(runtime.threshold_max_scale),
+        )
+    return float(k_threshold), float(v_threshold)
+
+
 def _next_action(
     runtime: JointPolicyRuntime,
     *,
@@ -150,6 +227,13 @@ def _next_action(
         if k_can
         else float("inf")
     )
+    k_threshold, v_threshold = _thresholds_for_step(
+        runtime,
+        ki=int(ki),
+        vi=int(vi),
+        k_can=bool(k_can),
+        v_can=bool(v_can),
+    )
     return _choose_joint_kv_action(
         policy=runtime.policy_name,
         k_delta=float(k_delta),
@@ -157,6 +241,8 @@ def _next_action(
         k_can=bool(k_can),
         v_can=bool(v_can),
         threshold=float(runtime.threshold),
+        k_threshold=float(k_threshold),
+        v_threshold=float(v_threshold),
         turn=int(turn),
         extra_k_mb=float(extra_k_mb),
         extra_v_mb=_extra_v_mb(runtime, vi, v_can),
@@ -170,8 +256,7 @@ def _walk_incremental_grid(
 ) -> tuple[int, int]:
     if runtime.grid_outputs_for_v_idx is None:
         raise RuntimeError("missing incremental V-grid output accessor")
-    ki = 0
-    vi = 0
+    ki, vi = _head_start_indices(runtime, local_head_i)
     steps = 0
     max_steps = len(runtime.active_k_budgets) + len(runtime.v_budgets) + 4
     while steps < max_steps:
@@ -286,8 +371,7 @@ def _select_with_torch_policy(
     k_mb_by_idx = _k_mb_by_index(runtime)
     selected: list[tuple[int, int]] = []
     for local_head_i in range(runtime.group_heads):
-        ki = 0
-        vi = 0
+        ki, vi = _head_start_indices(runtime, local_head_i)
         steps = 0
         max_steps = len(runtime.active_k_budgets) + len(runtime.v_budgets) + 4
         while steps < max_steps:
@@ -320,8 +404,7 @@ def _select_with_torch_policy(
 
 
 def _walk_lazy_outputs(runtime: JointPolicyRuntime, local_head_i: int) -> tuple[int, int]:
-    ki = 0
-    vi = 0
+    ki, vi = _head_start_indices(runtime, local_head_i)
     steps = 0
     max_steps = len(runtime.active_k_budgets) + len(runtime.v_budgets) + 4
     while steps < max_steps:

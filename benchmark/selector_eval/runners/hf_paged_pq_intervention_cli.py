@@ -50,7 +50,7 @@ def build_hf_paged_pq_intervention_arg_parser() -> argparse.ArgumentParser:
         default="joint_kv_stability",
         help="deployable online budget/confidence rule; non-none disables fixed-budget native fast paths",
     )
-    parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="affine_selected")
+    parser.add_argument("--tail_score_calibration", choices=["none", "affine_selected"], default="none")
     parser.add_argument("--tail_probe_rel_l2_max", type=float, default=float("inf"))
     parser.add_argument("--tail_proxy_mass_min", type=float, default=0.0)
     parser.add_argument("--tail_proxy_mass_max", type=float, default=1.0)
@@ -93,7 +93,23 @@ def build_hf_paged_pq_intervention_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--joint_kv_k_budgets", default="4096,8192,14336,32768")
     parser.add_argument("--joint_kv_v_budgets", default="1024,2048,4096,6144,8192,12288,16384")
-    parser.add_argument("--joint_kv_stability_threshold", type=float, default=0.001)
+    parser.add_argument(
+        "--joint_kv_k_budget_fracs",
+        default="0.10,0.30,0.50,0.70,0.90,1.0",
+        help="optional comma-separated K budget fractions, e.g. 10%,30%,50%; overrides joint_kv_k_budgets",
+    )
+    parser.add_argument(
+        "--joint_kv_v_budget_fracs",
+        default="0.05,0.10,0.20,0.40,0.60,0.80,1.0",
+        help="optional comma-separated V budget fractions; overrides joint_kv_v_budgets",
+    )
+    parser.add_argument("--joint_kv_stability_threshold", type=float, default=0.002)
+    parser.add_argument("--joint_kv_threshold_mode", choices=["fixed", "budget_delta_frac"], default="budget_delta_frac")
+    parser.add_argument("--joint_kv_threshold_reference_frac", type=float, default=0.2)
+    parser.add_argument("--joint_kv_threshold_scale_shape", choices=["linear", "sqrt", "log"], default="sqrt")
+    parser.add_argument("--joint_kv_threshold_min_scale", type=float, default=0.0)
+    parser.add_argument("--joint_kv_threshold_max_scale", type=float, default=1.5)
+    parser.add_argument("--joint_kv_start_strategy", default="proxy_mass_m0p9")
     parser.add_argument("--selected_value_mode", choices=["exact", "vpq_value"], default="vpq_value")
     parser.add_argument(
         "--selected_value_exact_rule",
@@ -290,6 +306,12 @@ def approx_stats_payload(approx_stats: dict[int, ApproxStats]) -> dict[str, dict
             "native_joint_layout_seconds": s.native_joint_layout_seconds,
             "native_joint_group_pack_seconds": s.native_joint_group_pack_seconds,
             "native_joint_accounting_seconds": s.native_joint_accounting_seconds,
+            "joint_staged_kv_groups": s.joint_staged_kv_groups,
+            "joint_staged_kv_accepted_groups": s.joint_staged_kv_accepted_groups,
+            "joint_staged_kv_boundary_groups": s.joint_staged_kv_boundary_groups,
+            "joint_staged_kv_accept_fraction": (
+                float(s.joint_staged_kv_accepted_groups) / max(1, int(s.joint_staged_kv_groups))
+            ),
             "native_vpq_append_seconds": s.native_vpq_append_seconds,
             "native_vpq_append_calls": s.native_vpq_append_calls,
             "native_vpq_append_grouped_calls": s.native_vpq_append_grouped_calls,

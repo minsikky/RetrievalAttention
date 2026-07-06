@@ -10,7 +10,7 @@ These can be evaluated on the saved layer-16 Q/K/V trace because they only requi
 
 | family | representative papers / methods | local proxy | status |
 | --- | --- | --- | --- |
-| Scalar KV quantization | KIVI, KVQuant, SKVQ, QAQ-style | `kivi_like`, `kvquant_like`, `per_token_kv` | completed |
+| Scalar KV quantization | KIVI, KVQuant, SKVQ, QAQ-style | `kivi_b*_g*_w*`, `kvquant_like`, `per_token_kv` | KIVI uses the official quantization layout; others are proxies |
 | Vector/PQ quantization | PQCache, CommVQ-style, TurboQuant-style | `pq_like`, `tq`, `tqprod` | completed |
 | Pruning / eviction / sparse retention | StreamingLLM, H2O-style retention, Scissorhands-style persistence, SnapKV/PyramidKV, KVzip, RocketKV prompt-retention path | `recent_k*`, `sink_recent_*`, `l2ret_*`, `h2o_k*`, `snapkv_k*`, `kvzip_k*`, `rocket_snap_k*`, `expected_attn_*`, `critical_snap_*`, `chunk_snap_*`, `keydiff_*`, `tova_*`, `cur_*`, `lagkv_*`, `compactor_*` | completed, trace scorer proxies |
 | Importance-aware mixed precision | ZipCache / No Token Left Behind-style salient exact + compressed rest | `salient_quant_*` | completed |

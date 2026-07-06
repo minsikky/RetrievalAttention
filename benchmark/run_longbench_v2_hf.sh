@@ -23,33 +23,10 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_CACHE_DIR}/datasets}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_CACHE_DIR}/transformers}"
 
 HF_MODEL_PRESET="${HF_MODEL_PRESET:-qwen3_8b}"
-PRESET_MODEL_NAME=""
-PRESET_HF_EXTRA_PYTHONPATH=""
-PRESET_QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="32768"
-case "${HF_MODEL_PRESET}" in
-  ""|qwen3_8b)
-    PRESET_MODEL_NAME=".hf_cache/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
-    PRESET_HF_EXTRA_PYTHONPATH=".hf_pydeps"
-    PRESET_QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="32768"
-    ;;
-  llama31_8b|llama3_1_8b)
-    PRESET_MODEL_NAME=".hf_cache/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
-    PRESET_HF_EXTRA_PYTHONPATH=""
-    PRESET_QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="32768"
-    ;;
-  qwen3_5_9b)
-    PRESET_MODEL_NAME=".hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a"
-    PRESET_HF_EXTRA_PYTHONPATH=".hf_pydeps"
-    PRESET_QWEN_YARN_ORIGINAL_MAX_POSITION_EMBEDDINGS="262144"
-    ;;
-  *)
-    echo "[ERROR] Unknown HF_MODEL_PRESET=${HF_MODEL_PRESET}"
-    echo "[ERROR] Supported presets: qwen3_8b, llama31_8b, llama3_1_8b, qwen3_5_9b"
-    exit 2
-    ;;
-esac
+source scripts/hf_model_presets.sh
+resolve_hf_model_preset "${HF_MODEL_PRESET}" || exit $?
 
-HF_VENV_DIR="${HF_VENV_DIR:-.venv}"
+HF_VENV_DIR="${HF_VENV_DIR:-${PRESET_HF_VENV_DIR:-.venv}}"
 if [ -f "${HF_VENV_DIR}/bin/activate" ]; then
   # shellcheck disable=SC1090
   source "${HF_VENV_DIR}/bin/activate"
@@ -71,6 +48,7 @@ if [ -n "${HF_EXTRA_PYTHONPATH}" ]; then
     export LD_LIBRARY_PATH="${HF_EXTRA_PYTHONPATH}/numpy.libs:${LD_LIBRARY_PATH:-}"
   fi
 fi
+export LD_LIBRARY_PATH="$PWD/${HF_VENV_DIR}/lib/python3.10/site-packages/torch/lib:/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
 export TOKENIZERS_PARALLELISM=false
 set -euo pipefail
 
@@ -98,12 +76,12 @@ fi
 DTYPE="${DTYPE:-bf16}"
 DEVICE_MAP="${DEVICE_MAP:-auto}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-}"
-TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-0}"
+TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-${PRESET_TRUST_REMOTE_CODE:-0}}"
 LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-0}"
 LOW_CPU_MEM_USAGE="${LOW_CPU_MEM_USAGE:-1}"
-HF_LANGUAGE_MODEL_ONLY="${HF_LANGUAGE_MODEL_ONLY:-1}"
-USE_CHAT_TEMPLATE="${USE_CHAT_TEMPLATE:-1}"
-DISABLE_THINKING="${DISABLE_THINKING:-1}"
+HF_LANGUAGE_MODEL_ONLY="${HF_LANGUAGE_MODEL_ONLY:-${PRESET_HF_LANGUAGE_MODEL_ONLY:-1}}"
+USE_CHAT_TEMPLATE="${USE_CHAT_TEMPLATE:-${PRESET_USE_CHAT_TEMPLATE:-1}}"
+DISABLE_THINKING="${DISABLE_THINKING:-${PRESET_DISABLE_THINKING:-1}}"
 DATASET_NAME="${DATASET_NAME:-THUDM/LongBench-v2}"
 SPLIT="${SPLIT:-train}"
 OUTPUT_DIR="${OUTPUT_DIR:-longbench_v2_hf_result}"
@@ -130,7 +108,7 @@ SELECTOR_BACKEND="${SELECTOR_BACKEND:-cuda_ext}"
 BUDGET="${BUDGET:-4096}"
 ONLINE_CONFIDENCE_RULE="${ONLINE_CONFIDENCE_RULE:-joint_kv_stability}"
 TAIL_MODE="${TAIL_MODE:-vpq_value}"
-TAIL_SCORE_CALIBRATION="${TAIL_SCORE_CALIBRATION:-affine_selected}"
+TAIL_SCORE_CALIBRATION="${TAIL_SCORE_CALIBRATION:-none}"
 TAIL_PROBE_REL_L2_MAX="${TAIL_PROBE_REL_L2_MAX:-0.020}"
 TAIL_PROXY_MASS_MIN="${TAIL_PROXY_MASS_MIN:-0.990}"
 TAIL_PROXY_MASS_MAX="${TAIL_PROXY_MASS_MAX:-1.0}"
@@ -198,7 +176,15 @@ python -V
   --joint_kv_policy "${JOINT_KV_POLICY}" \
   --joint_kv_k_budgets "${JOINT_KV_K_BUDGETS}" \
   --joint_kv_v_budgets "${JOINT_KV_V_BUDGETS}" \
+  --joint_kv_k_budget_fracs "${JOINT_KV_K_BUDGET_FRACS}" \
+  --joint_kv_v_budget_fracs "${JOINT_KV_V_BUDGET_FRACS}" \
   --joint_kv_stability_threshold "${JOINT_KV_STABILITY_THRESHOLD}" \
+  --joint_kv_threshold_mode "${JOINT_KV_THRESHOLD_MODE}" \
+  --joint_kv_threshold_reference_frac "${JOINT_KV_THRESHOLD_REFERENCE_FRAC}" \
+  --joint_kv_threshold_scale_shape "${JOINT_KV_THRESHOLD_SCALE_SHAPE}" \
+  --joint_kv_threshold_min_scale "${JOINT_KV_THRESHOLD_MIN_SCALE}" \
+  --joint_kv_threshold_max_scale "${JOINT_KV_THRESHOLD_MAX_SCALE}" \
+  --joint_kv_start_strategy "${JOINT_KV_START_STRATEGY}" \
   --selected_value_mode "${SELECTED_VALUE_MODE}" \
   --selected_value_exact_rule "${SELECTED_VALUE_EXACT_RULE}" \
   --selected_value_exact_top "${SELECTED_VALUE_EXACT_TOP}" \

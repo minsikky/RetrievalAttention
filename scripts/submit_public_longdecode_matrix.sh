@@ -12,41 +12,69 @@ mkdir -p "${OUTPUT_ROOT}" "${SLURM_ROOT}" "$(dirname "${MANIFEST}")"
 printf "label\tjobid\toutput_dir\tslurm_out\n" > "${MANIFEST}"
 
 HF_MODEL_PRESET="${HF_MODEL_PRESET:-qwen3_8b}"
-case "${HF_MODEL_PRESET}" in
-  ""|qwen3_8b)
-    DEFAULT_MODEL_NAME=".hf_cache/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
-    ;;
-  llama31_8b|llama3_1_8b)
-    DEFAULT_MODEL_NAME=".hf_cache/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
-    ;;
-  qwen3_5_9b)
-    DEFAULT_MODEL_NAME=".hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a"
-    ;;
-  *)
-    echo "[ERROR] Unknown HF_MODEL_PRESET=${HF_MODEL_PRESET}"
-    echo "[ERROR] Supported presets: qwen3_8b, llama31_8b, llama3_1_8b, qwen3_5_9b"
-    exit 2
-    ;;
-esac
-MODEL_NAME="${MODEL_NAME:-${DEFAULT_MODEL_NAME}}"
+source scripts/hf_model_presets.sh
+resolve_hf_model_preset "${HF_MODEL_PRESET}" || exit $?
+
+QWEN3_AIME_MAX_NEW_TOKENS=38912
+QWEN3_DEFAULT_MAX_NEW_TOKENS=32768
+USE_QWEN3_OFFICIAL_EVAL_DEFAULTS="${USE_QWEN3_OFFICIAL_EVAL_DEFAULTS:-1}"
+QWEN3_EVAL_MODE="${QWEN3_EVAL_MODE:-thinking}"
+is_qwen3=0
+if [[ "${HF_MODEL_PRESET}" == qwen3* ]] || [[ "${PRESET_MODEL_NAME}" == *Qwen3* ]] || [[ "${PRESET_MODEL_NAME}" == *Qwen--Qwen3* ]]; then
+  is_qwen3=1
+fi
+if [ "${USE_QWEN3_OFFICIAL_EVAL_DEFAULTS}" = "1" ] && [ "${is_qwen3}" = "1" ]; then
+  case "${QWEN3_EVAL_MODE}" in
+    thinking|think)
+      official_disable_thinking=0
+      official_temperature=0.6
+      official_top_p=0.95
+      official_top_k=20
+      ;;
+    nonthinking|non-thinking|no_think|nothink)
+      official_disable_thinking=1
+      official_temperature=0.7
+      official_top_p=0.8
+      official_top_k=20
+      ;;
+    *)
+      echo "[ERROR] Unknown QWEN3_EVAL_MODE=${QWEN3_EVAL_MODE}" >&2
+      exit 2
+      ;;
+  esac
+else
+  official_disable_thinking="${PRESET_DISABLE_THINKING:-1}"
+  official_temperature=0.0
+  official_top_p=1.0
+  official_top_k=0
+fi
+
+MODEL_NAME="${MODEL_NAME:-${PRESET_MODEL_NAME}}"
+HF_LANGUAGE_MODEL_ONLY="${HF_LANGUAGE_MODEL_ONLY:-${PRESET_HF_LANGUAGE_MODEL_ONLY:-1}}"
+USE_CHAT_TEMPLATE="${USE_CHAT_TEMPLATE:-${PRESET_USE_CHAT_TEMPLATE:-1}}"
+DISABLE_THINKING="${DISABLE_THINKING:-${PUBLIC_DISABLE_THINKING:-${official_disable_thinking}}}"
+TEMPERATURE="${TEMPERATURE:-${PUBLIC_TEMPERATURE:-${official_temperature}}}"
+TOP_P="${TOP_P:-${PUBLIC_TOP_P:-${official_top_p}}}"
+TOP_K="${TOP_K:-${PUBLIC_TOP_K:-${official_top_k}}}"
 MAX_EXAMPLES="${MAX_EXAMPLES:-1}"
 LOCAL_FILES_ONLY="${LOCAL_FILES_ONLY:-1}"
 LIVE_CODE_EVALUATE_CODE="${LIVE_CODE_EVALUATE_CODE:-1}"
 LIVE_CODE_MAX_EXAMPLES="${LIVE_CODE_MAX_EXAMPLES:-${MAX_EXAMPLES}}"
 LIVE_CODE_CODE_EVAL_TIMEOUT="${LIVE_CODE_CODE_EVAL_TIMEOUT:-6}"
 
-# Smoke defaults are intentionally small. Increase MAX_EXAMPLES and MAX_NEW_TOKENS
-# for validation/full runs after the wrapper is confirmed on this model.
+# Smoke defaults use Qwen3 official-style generation caps for task-quality
+# benchmarks, but keep LongGenBench forced/deterministic because it is a
+# long-decode stress benchmark rather than a Qwen3 report benchmark.
 declare -a BENCHMARKS=(
-  "aime24:2048:0:0"
-  "livecodebench_codegen:2048:0:0"
+  "aime24:${AIME_MAX_NEW_TOKENS:-${QWEN3_AIME_MAX_NEW_TOKENS}}:0:0:official"
+  "livecodebench_codegen:${LIVE_CODE_MAX_NEW_TOKENS:-${QWEN3_DEFAULT_MAX_NEW_TOKENS}}:0:0:official"
   "longgenbench_sgt_short:16384:1:8192"
 )
 
 declare -a MODES=("dense" "pagedpq")
 
 for item in "${BENCHMARKS[@]}"; do
-  IFS=: read -r bench max_new force_max min_new <<< "${item}"
+  IFS=: read -r bench max_new force_max min_new generation_policy <<< "${item}"
   for mode in "${MODES[@]}"; do
     label="${mode}_${bench}"
     out_dir="${OUTPUT_ROOT}/${label}"
@@ -59,12 +87,25 @@ for item in "${BENCHMARKS[@]}"; do
       evaluate_code="${LIVE_CODE_EVALUATE_CODE}"
       code_eval_timeout="${LIVE_CODE_CODE_EVAL_TIMEOUT}"
     fi
+    task_temperature="${TEMPERATURE}"
+    task_top_p="${TOP_P}"
+    task_top_k="${TOP_K}"
+    task_disable_thinking="${DISABLE_THINKING}"
+    if [ "${generation_policy:-deterministic}" != "official" ]; then
+      task_temperature=0.0
+      task_top_p=1.0
+      task_top_k=0
+      task_disable_thinking="${PRESET_DISABLE_THINKING:-0}"
+    fi
     export_args=(
       "ALL"
       "HF_MODEL_PRESET=${HF_MODEL_PRESET}"
       "BENCHMARK=${bench}"
       "ATTENTION_MODE=${mode}"
       "MODEL_NAME=${MODEL_NAME}"
+      "HF_LANGUAGE_MODEL_ONLY=${HF_LANGUAGE_MODEL_ONLY}"
+      "USE_CHAT_TEMPLATE=${USE_CHAT_TEMPLATE}"
+      "DISABLE_THINKING=${task_disable_thinking}"
       "OUTPUT_DIR=${out_dir}"
       "RUN_NAME=${label}"
       "OUTPUT_ROOT=${OUTPUT_ROOT}"
@@ -72,6 +113,9 @@ for item in "${BENCHMARKS[@]}"; do
       "MAX_NEW_TOKENS=${max_new}"
       "MIN_NEW_TOKENS=${min_new}"
       "FORCE_MAX_NEW_TOKENS=${force_max}"
+      "TEMPERATURE=${task_temperature}"
+      "TOP_P=${task_top_p}"
+      "TOP_K=${task_top_k}"
       "LOCAL_FILES_ONLY=${LOCAL_FILES_ONLY}"
       "EVALUATE_CODE=${evaluate_code}"
       "CODE_EVAL_TIMEOUT=${code_eval_timeout}"

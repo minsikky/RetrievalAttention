@@ -19,6 +19,7 @@ from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import (
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_common import (
     MB,
     _choose_joint_kv_action,
+    _env_int,
     _env_truthy,
     _joint_kv_policy_id,
     _rel_l2_torch,
@@ -94,6 +95,7 @@ def approximate_joint_kv_all_heads(
     gqa_native_fullscan_pack = ctx.forward_state.gqa_native_fullscan_pack
     joint_vpq_sidecars_for = ctx.forward_state.joint_vpq_sidecars_for
     grouped_vpq_residual_sidecars_for = ctx.forward_state.grouped_vpq_residual_sidecars_for
+    grouped_vpq_compact_sidecars_for = ctx.forward_state.grouped_vpq_compact_sidecars_for
     joint_vpq_pack_and_fallback_for = ctx.forward_state.joint_vpq_pack_and_fallback_for
 
     if online_confidence_rule != "joint_kv_stability":
@@ -126,6 +128,8 @@ def approximate_joint_kv_all_heads(
     sqrt_dim = float(math.sqrt(float(self.head_dim)))
     prob_dtype = torch.float32 if _env_truthy("SELECTOR_PQ_JOINT_FP32_PROBS", "1") else torch.float64
     outputs_all = torch.empty((num_heads, int(self.head_dim)), dtype=torch.float32, device=device)
+    allhead_precompute = _env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_PRECOMPUTE", "1")
+    allhead_exact_precompute = _env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_EXACT_PRECOMPUTE", "0")
     use_grouped_risk_prefix = (
         _env_truthy("SELECTOR_PQ_JOINT_GROUPED_RISK_PREFIX", "0")
         and _env_truthy("SELECTOR_PQ_JOINT_GRID_ARTIFACTS", "1")
@@ -133,10 +137,30 @@ def approximate_joint_kv_all_heads(
         and not _env_truthy("SELECTOR_PQ_JOINT_INCREMENTAL_V_GRID", "0")
         and not _env_truthy("SELECTOR_PQ_JOINT_ONDEMAND_V_PREFIX", "0")
     )
+    staged_kv_prefix_enabled = _env_truthy("SELECTOR_PQ_JOINT_STAGED_KV_PREFIX", "0")
+    if staged_kv_prefix_enabled:
+        if not use_grouped_risk_prefix:
+            raise RuntimeError("SELECTOR_PQ_JOINT_STAGED_KV_PREFIX requires grouped risk-prefix mode")
+        if policy_uses_mb:
+            raise RuntimeError("SELECTOR_PQ_JOINT_STAGED_KV_PREFIX currently supports non-MB policies only")
+        if allhead_exact_precompute:
+            raise RuntimeError(
+                "SELECTOR_PQ_JOINT_STAGED_KV_PREFIX is incompatible with all-head exact-logit precompute"
+            )
+    stage_k_steps = min(
+        len(joint_k_budgets),
+        max(2, _env_int("SELECTOR_PQ_JOINT_STAGED_KV_K_STEPS", 2)),
+    )
+    stage_v_steps = min(
+        len(joint_v_budgets),
+        max(2, _env_int("SELECTOR_PQ_JOINT_STAGED_KV_V_STEPS", 3)),
+    )
+    staged_kv_active = bool(
+        staged_kv_prefix_enabled
+        and (stage_k_steps < len(joint_k_budgets) or stage_v_steps < len(joint_v_budgets))
+    )
     grouped_risk_records: list[dict[str, object]] = []
     joint_total_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
-    allhead_precompute = _env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_PRECOMPUTE", "1")
-    allhead_exact_precompute = _env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_EXACT_PRECOMPUTE", "0")
     native_exact_logits_enabled = _env_truthy("SELECTOR_PQ_JOINT_NATIVE_EXACT_LOGITS", "0")
     native_exact_logits_backend = str(
         os.environ.get("SELECTOR_PQ_JOINT_NATIVE_EXACT_LOGITS_BACKEND", "cublas_t")
@@ -182,7 +206,11 @@ def approximate_joint_kv_all_heads(
                     and not use_unsorted_k_prefix
                 ):
                     ranked_count_upper = int(codes.shape[1]) * int(codes.shape[2])
-                    active_budget_upper = list(joint_k_budgets)
+                    active_budget_upper = (
+                        list(joint_k_budgets[:stage_k_steps])
+                        if staged_kv_active
+                        else list(joint_k_budgets)
+                    )
                     if _env_truthy("SELECTOR_PQ_JOINT_COLLAPSE_DUP_K_ROWS", "0"):
                         collapsed_upper: list[int] = []
                         seen_upper: set[int] = set()
@@ -361,12 +389,19 @@ def approximate_joint_kv_all_heads(
     native_rank_prefix_tokens = joint_workspace.native_rank_prefix_tokens
     grouped_risk_prefix_workspace_for = joint_workspace.grouped_risk_prefix_workspace_for
     grouped_score_direct_workspace_for = joint_workspace.grouped_score_direct_workspace_for
+    nocalib_score_grid_workspace_for = joint_workspace.nocalib_score_grid_workspace_for
+    nocalib_scatter_score_grid_workspace_for = joint_workspace.nocalib_scatter_score_grid_workspace_for
     token_layout_for = joint_workspace.token_layout_for
     allhead_rank_prefix_cache: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
     grouped_vpq_vhat_groups_t: torch.Tensor | None = None
     grouped_vpq_residual_groups_t: torch.Tensor | None = None
     grouped_vpq_code_error_groups_t: torch.Tensor | None = None
+    grouped_vpq_value_codebooks_t: torch.Tensor | None = None
+    grouped_vpq_value_codes_t: torch.Tensor | None = None
+    grouped_vpq_value_page_starts_t: torch.Tensor | None = None
+    grouped_vpq_value_page_size: int | None = None
+    grouped_vpq_values_t: torch.Tensor | None = None
     grouped_vpq_actual_subbits: int | None = None
     grouped_output_workspace_enabled = (
         use_grouped_risk_prefix
@@ -418,17 +453,33 @@ def approximate_joint_kv_all_heads(
                 grouped_vpq_t0 = time.perf_counter()
             else:
                 grouped_vpq_t0 = 0.0
-            grouped_vpq = grouped_vpq_residual_sidecars_for(
-                gqa_indexes_for_grouped,
-                context_len_i=context_len_i,
-            )
-            if grouped_vpq is not None:
-                (
-                    grouped_vpq_vhat_groups_t,
-                    grouped_vpq_residual_groups_t,
-                    grouped_vpq_code_error_groups_t,
-                    grouped_vpq_actual_subbits,
-                ) = grouped_vpq
+            if _env_truthy("SELECTOR_PQ_JOINT_COMPACT_VPQ_RISK_PREFIX", "0"):
+                grouped_compact_vpq = grouped_vpq_compact_sidecars_for(
+                    gqa_indexes_for_grouped,
+                    context_len_i=context_len_i,
+                )
+                if grouped_compact_vpq is not None:
+                    (
+                        grouped_vpq_value_codebooks_t,
+                        grouped_vpq_value_codes_t,
+                        grouped_vpq_value_page_starts_t,
+                        grouped_vpq_value_page_size,
+                        grouped_vpq_code_error_groups_t,
+                        grouped_vpq_actual_subbits,
+                    ) = grouped_compact_vpq
+                    grouped_vpq_values_t = ctx.forward_state.values_all[:, :context_len_i, :]
+            else:
+                grouped_vpq = grouped_vpq_residual_sidecars_for(
+                    gqa_indexes_for_grouped,
+                    context_len_i=context_len_i,
+                )
+                if grouped_vpq is not None:
+                    (
+                        grouped_vpq_vhat_groups_t,
+                        grouped_vpq_residual_groups_t,
+                        grouped_vpq_code_error_groups_t,
+                        grouped_vpq_actual_subbits,
+                    ) = grouped_vpq
             if bool(getattr(args, "profile_native_ops", False)):
                 _sync_if_cuda(device)
                 stats[layer_id].add_native_detail_timing(
@@ -439,83 +490,110 @@ def approximate_joint_kv_all_heads(
                     vpq_sidecar_seconds=float(time.perf_counter() - grouped_vpq_wall_t0)
                 )
 
-    head_group_runtime = JointKVHeadGroupRuntime(
-        args=args,
-        self=self,
-        layer_id=int(layer_id),
-        stats=stats,
-        device=device,
-        q_all=q_all,
-        torch_k_cache=torch_k_cache,
-        torch_v_cache=torch_v_cache,
-        context_len_i=int(context_len_i),
-        num_heads=int(num_heads),
-        num_kv_heads=int(num_kv_heads),
-        group_size=int(group_size),
-        nprobes=nprobes,
-        key_bytes=int(key_bytes),
-        value_bytes=int(value_bytes),
-        local_qpos=int(local_qpos),
-        sqrt_dim=float(sqrt_dim),
-        prob_dtype=prob_dtype,
-        policy_id=int(policy_id),
-        policy_uses_mb=bool(policy_uses_mb),
-        needs_logical_accounting=bool(needs_logical_accounting),
-        needs_budget_mb_vectors=bool(needs_budget_mb_vectors),
-        joint_k_budgets=joint_k_budgets,
-        joint_v_budgets=joint_v_budgets,
-        joint_v_budgets_t=joint_v_budgets_t,
-        allhead_indexes=allhead_indexes,
-        allhead_dense_pq_scores_t=allhead_dense_pq_scores_t,
-        allhead_selector_mb=allhead_selector_mb,
-        allhead_exact_scores_t=allhead_exact_scores_t,
-        allhead_selector_rank_prefix_t=allhead_selector_rank_prefix_t,
-        allhead_rank_prefix_cache=allhead_rank_prefix_cache,
-        use_unsorted_k_prefix=bool(use_unsorted_k_prefix),
-        native_exact_logits_enabled=bool(native_exact_logits_enabled),
-        native_full_exact_logits=native_full_exact_logits,
-        use_grouped_risk_prefix=bool(use_grouped_risk_prefix),
-        grouped_output_workspace_enabled=bool(grouped_output_workspace_enabled),
-        grouped_strided_output_workspace_enabled=bool(grouped_strided_output_workspace_enabled),
-        grouped_score_workspace_enabled=bool(grouped_score_workspace_enabled),
-        grouped_vpq_vhat_groups_t=grouped_vpq_vhat_groups_t,
-        grouped_vpq_residual_groups_t=grouped_vpq_residual_groups_t,
-        grouped_vpq_code_error_groups_t=grouped_vpq_code_error_groups_t,
-        grouped_vpq_actual_subbits=grouped_vpq_actual_subbits,
-        grouped_risk_records=grouped_risk_records,
-        outputs_all=outputs_all,
-        prefix_index_for=prefix_index_for,
-        joint_vpq_sidecars_for=joint_vpq_sidecars_for,
-        joint_vpq_pack_and_fallback_for=joint_vpq_pack_and_fallback_for,
-        token_layout_for=token_layout_for,
-        score_grid_workspace_for=score_grid_workspace_for,
-        grouped_score_grid_workspace_for=grouped_score_grid_workspace_for,
-        grouped_output_workspace_for=grouped_output_workspace_for,
-        softmax_base_workspace_for=softmax_base_workspace_for,
-        native_rank_prefix_tokens=native_rank_prefix_tokens,
-        wall_profile_enabled=bool(wall_profile_enabled),
-    )
-    if not process_joint_kv_head_groups(head_group_runtime):
-        return None
-
     threshold_value = float(getattr(args, "joint_kv_stability_threshold", 0.001))
-    process_grouped_risk_records(
-        JointGroupedRiskRuntime(
+
+    def make_head_group_runtime(
+        *,
+        k_budgets: list[int],
+        v_budgets: list[int],
+        v_budgets_t: torch.Tensor,
+        records: list[dict[str, object]],
+        kv_head_indices: list[int] | None = None,
+    ) -> JointKVHeadGroupRuntime:
+        return JointKVHeadGroupRuntime(
+            args=args,
+            self=self,
+            layer_id=int(layer_id),
+            stats=stats,
+            device=device,
+            q_all=q_all,
+            torch_k_cache=torch_k_cache,
+            torch_v_cache=torch_v_cache,
+            context_len_i=int(context_len_i),
+            num_heads=int(num_heads),
+            num_kv_heads=int(num_kv_heads),
+            group_size=int(group_size),
+            nprobes=nprobes,
+            key_bytes=int(key_bytes),
+            value_bytes=int(value_bytes),
+            local_qpos=int(local_qpos),
+            sqrt_dim=float(sqrt_dim),
+            prob_dtype=prob_dtype,
+            policy_id=int(policy_id),
+            policy_uses_mb=bool(policy_uses_mb),
+            needs_logical_accounting=bool(needs_logical_accounting),
+            needs_budget_mb_vectors=bool(needs_budget_mb_vectors),
+            joint_k_budgets=k_budgets,
+            joint_v_budgets=v_budgets,
+            joint_v_budgets_t=v_budgets_t,
+            allhead_indexes=allhead_indexes,
+            allhead_dense_pq_scores_t=allhead_dense_pq_scores_t,
+            allhead_selector_mb=allhead_selector_mb,
+            allhead_exact_scores_t=allhead_exact_scores_t,
+            allhead_selector_rank_prefix_t=allhead_selector_rank_prefix_t,
+            allhead_rank_prefix_cache=allhead_rank_prefix_cache,
+            use_unsorted_k_prefix=bool(use_unsorted_k_prefix),
+            native_exact_logits_enabled=bool(native_exact_logits_enabled),
+            native_full_exact_logits=native_full_exact_logits,
+            use_grouped_risk_prefix=bool(use_grouped_risk_prefix),
+            grouped_output_workspace_enabled=bool(grouped_output_workspace_enabled),
+            grouped_strided_output_workspace_enabled=bool(grouped_strided_output_workspace_enabled),
+            grouped_score_workspace_enabled=bool(grouped_score_workspace_enabled),
+            grouped_vpq_vhat_groups_t=grouped_vpq_vhat_groups_t,
+            grouped_vpq_residual_groups_t=grouped_vpq_residual_groups_t,
+            grouped_vpq_code_error_groups_t=grouped_vpq_code_error_groups_t,
+            grouped_vpq_value_codebooks_t=grouped_vpq_value_codebooks_t,
+            grouped_vpq_value_codes_t=grouped_vpq_value_codes_t,
+            grouped_vpq_value_page_starts_t=grouped_vpq_value_page_starts_t,
+            grouped_vpq_value_page_size=grouped_vpq_value_page_size,
+            grouped_vpq_values_t=grouped_vpq_values_t,
+            grouped_vpq_actual_subbits=grouped_vpq_actual_subbits,
+            grouped_risk_records=records,
+            outputs_all=outputs_all,
+            prefix_index_for=prefix_index_for,
+            joint_vpq_sidecars_for=joint_vpq_sidecars_for,
+            joint_vpq_pack_and_fallback_for=joint_vpq_pack_and_fallback_for,
+            token_layout_for=token_layout_for,
+            nocalib_score_grid_workspace_for=nocalib_score_grid_workspace_for,
+            nocalib_scatter_score_grid_workspace_for=nocalib_scatter_score_grid_workspace_for,
+            score_grid_workspace_for=score_grid_workspace_for,
+            grouped_score_grid_workspace_for=grouped_score_grid_workspace_for,
+            grouped_output_workspace_for=grouped_output_workspace_for,
+            softmax_base_workspace_for=softmax_base_workspace_for,
+            native_rank_prefix_tokens=native_rank_prefix_tokens,
+            wall_profile_enabled=bool(wall_profile_enabled),
+            kv_head_indices=kv_head_indices,
+        )
+
+    def make_grouped_risk_runtime(
+        *,
+        records: list[dict[str, object]],
+        v_budgets: list[int],
+        v_budgets_t: torch.Tensor,
+        head_group_runtime: JointKVHeadGroupRuntime,
+        staged_prefix_pass: bool = False,
+    ) -> JointGroupedRiskRuntime:
+        return JointGroupedRiskRuntime(
             args=args,
             self=self,
             layer_id=int(layer_id),
             stats=stats,
             device=device,
             wall_profile_enabled=bool(wall_profile_enabled),
-            grouped_risk_records=grouped_risk_records,
+            grouped_risk_records=records,
             grouped_strided_output_workspace_enabled=bool(grouped_strided_output_workspace_enabled),
             grouped_vpq_vhat_groups_t=grouped_vpq_vhat_groups_t,
             grouped_vpq_residual_groups_t=grouped_vpq_residual_groups_t,
             grouped_vpq_code_error_groups_t=grouped_vpq_code_error_groups_t,
+            grouped_vpq_value_codebooks_t=grouped_vpq_value_codebooks_t,
+            grouped_vpq_value_codes_t=grouped_vpq_value_codes_t,
+            grouped_vpq_value_page_starts_t=grouped_vpq_value_page_starts_t,
+            grouped_vpq_value_page_size=grouped_vpq_value_page_size,
+            grouped_vpq_values_t=grouped_vpq_values_t,
             grouped_risk_prefix_workspace_for=grouped_risk_prefix_workspace_for,
             grouped_score_direct_workspace_for=grouped_score_direct_workspace_for,
-            joint_v_budgets=joint_v_budgets,
-            joint_v_budgets_t=joint_v_budgets_t,
+            joint_v_budgets=v_budgets,
+            joint_v_budgets_t=v_budgets_t,
             key_bytes=int(key_bytes),
             value_bytes=int(value_bytes),
             policy_id=int(policy_id),
@@ -523,8 +601,67 @@ def approximate_joint_kv_all_heads(
             threshold_value=float(threshold_value),
             outputs_all=outputs_all,
             head_group_runtime=head_group_runtime,
+            staged_prefix_pass=bool(staged_prefix_pass),
         )
-    )
+
+    if staged_kv_active:
+        stage_records: list[dict[str, object]] = []
+        stage_k_budgets = list(joint_k_budgets[:stage_k_steps])
+        stage_v_budgets = list(joint_v_budgets[:stage_v_steps])
+        stage_v_budgets_t = joint_v_budgets_t[:stage_v_steps].contiguous()
+        stage_runtime = make_head_group_runtime(
+            k_budgets=stage_k_budgets,
+            v_budgets=stage_v_budgets,
+            v_budgets_t=stage_v_budgets_t,
+            records=stage_records,
+        )
+        if not process_joint_kv_head_groups(stage_runtime):
+            return None
+        boundary_kv_heads = process_grouped_risk_records(
+            make_grouped_risk_runtime(
+                records=stage_records,
+                v_budgets=stage_v_budgets,
+                v_budgets_t=stage_v_budgets_t,
+                head_group_runtime=stage_runtime,
+                staged_prefix_pass=True,
+            )
+        )
+        if boundary_kv_heads:
+            full_records: list[dict[str, object]] = []
+            full_runtime = make_head_group_runtime(
+                k_budgets=joint_k_budgets,
+                v_budgets=joint_v_budgets,
+                v_budgets_t=joint_v_budgets_t,
+                records=full_records,
+                kv_head_indices=sorted(int(v) for v in boundary_kv_heads),
+            )
+            if not process_joint_kv_head_groups(full_runtime):
+                return None
+            process_grouped_risk_records(
+                make_grouped_risk_runtime(
+                    records=full_records,
+                    v_budgets=joint_v_budgets,
+                    v_budgets_t=joint_v_budgets_t,
+                    head_group_runtime=full_runtime,
+                )
+            )
+    else:
+        head_group_runtime = make_head_group_runtime(
+            k_budgets=joint_k_budgets,
+            v_budgets=joint_v_budgets,
+            v_budgets_t=joint_v_budgets_t,
+            records=grouped_risk_records,
+        )
+        if not process_joint_kv_head_groups(head_group_runtime):
+            return None
+        process_grouped_risk_records(
+            make_grouped_risk_runtime(
+                records=grouped_risk_records,
+                v_budgets=joint_v_budgets,
+                v_budgets_t=joint_v_budgets_t,
+                head_group_runtime=head_group_runtime,
+            )
+        )
 
     if wall_profile_enabled:
         stats[layer_id].add_joint_wall_timing(

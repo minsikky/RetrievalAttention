@@ -44,6 +44,10 @@ else
   echo "[INFO] ${HF_PYDEPS_DIR}/transformers already exists; set HF_FORCE_REINSTALL=1 to refresh it."
 fi
 
+# pip --target overlays do not remove stale package metadata, which can make
+# importlib report the wrong version after pin changes.
+rm -rf "${HF_PYDEPS_DIR}/tokenizers" "${HF_PYDEPS_DIR}"/tokenizers-*.dist-info
+
 "${PIP_CMD[@]}" install \
   --upgrade \
   --no-deps \
@@ -51,16 +55,20 @@ fi
   'accelerate>=1.0.0' \
   'huggingface-hub>=0.34.0' \
   'hf_xet' \
-  'tokenizers' \
+  'tokenizers==0.22.1' \
   'safetensors' \
   'pillow' \
+  'psutil' \
   'httpx' \
   'httpcore' \
   'h11' \
   'anyio' \
   'idna' \
   'certifi' \
+  'charset-normalizer' \
   'sniffio' \
+  'requests' \
+  'urllib3' \
   'filelock' \
   'fsspec' \
   'packaging' \
@@ -75,6 +83,7 @@ fi
   'pandas' \
   'numpy' \
   'python-dateutil' \
+  'six' \
   'pytz' \
   'tzdata' \
   'xxhash' \
