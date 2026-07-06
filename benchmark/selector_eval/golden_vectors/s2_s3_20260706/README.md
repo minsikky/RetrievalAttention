@@ -18,14 +18,26 @@ the selector, before any policy simulation).
 | `ranked_idx` | token indices sorted by PQ logit descending — S3's expected output order (int64) |
 | `ranked_scores_raw_fp32` | raw PQ logits in `ranked_idx` order, BEFORE the 1/sqrt(d) scale — S2's expected per-token output (fp32 reference) |
 | `ranked_scores_postscale_fp16` | raw / sqrt(128), fp16 — the value the mixed-softmax tail consumes |
-| `k_budgets, v_budgets` | rung tables for this context (fractions x context_len, see spec §3) |
-| `proxy_mass_start_ki, proxy_mass_start_vi` | proxy_mass_m0p9 start rungs computed from `ranked_scores_raw_fp32` (spec §4 step 1; v_start = max(v_budgets[0], 0.25 x k_target)) |
+| `k_budgets, v_budgets` | rung tables for this context: budget = max(1, min(ctx, **ceil**(frac x ctx))) over the FULL context_len, deduplicated ascending (spec §3) |
+| `proxy_mass_start_ki, proxy_mass_start_vi` | proxy_mass_m0p9 start rungs computed from `ranked_scores_raw_fp32` (spec §4 step 1). c = smallest ranked-prefix count with softmax mass >= 0.9 (softmax over indexed tokens only, logits x 1/sqrt(d)); **k_target = max(k_budgets[0], c)** (the crossing count itself, clamped below by the bottom rung); **v_target = max(v_budgets[0], 0.25 x k_target)** — NOTE: 0.25 multiplies the CLAMPED k_target, not raw c (differs when c < k_budgets[0]); ki/vi = first rung with budget >= target (float compare; clamps to the top rung if no rung suffices) |
 
 Rung prefix set at rung ki = base tokens ∪ `ranked_idx[:k_budgets[ki] - |base ∩ selected|]`
 — in practice the golden model takes `ranked_idx[:budget]` after excluding
 base tokens from the ranking, so the prefix at budget B is exactly
 `ranked_idx[:B']` where B' = B minus the base-token count; row-level CSVs
 (`selected_k_tokens`) give the settled totals for cross-checking.
+
+## Page blocks for S1/S2 (`page_ctx<ctx>_kv<kv>.npz`)
+
+Codebooks + codes of the LAST sealed page per (context, kv_head) — 12
+files covering the same rows as the golden dumps, so S1 (LUT build) and
+S2 (scan) can be driven end-to-end without the trace. Fields:
+`codebooks_fp32` (subvecs x 256 x subdim, the exact fp32 bits the
+reference einsum consumes), `codes_u8` (page_size x subvecs),
+`page_start`, `page_size`, build config + seed. Self-checked at dump
+time: reference logits recomputed from these blocks match
+`ranked_scores_raw_fp32` bit-for-bit on the page's token range
+(regenerate/verify with `runners/dump_golden_pq_pages.py`).
 
 ## Inputs to drive RTL (pointers, not copies)
 
@@ -57,8 +69,10 @@ torch CPU):
   subvector order 0->1->2->3: `scores += table[sub][code[token,sub]]`.
 - Ranking: stable descending sort on the fp32 logits (`torch.argsort`,
   `stable=True`); ties keep token order.
-- `ranked_scores_postscale_fp16`: raw fp32 x (1/sqrt(128)) in fp32, then
-  cast to fp16 round-to-nearest-even.
+- `ranked_scores_postscale_fp16`: raw fp32 **divided by** fp32(sqrt(128))
+  (true fp32 division, NOT multiply-by-reciprocal — the two differ by
+  1 fp16-ulp on ~34 values across these dumps), then cast to fp16
+  round-to-nearest-even.
 
 Per the contract agreed on issue #5: S2 accumulation order is left to
 hardware — RTL logits compare against `ranked_scores_raw_fp32` within a
