@@ -39,9 +39,10 @@ arithmetic on those; **[estimate]** is a sizing guess to be validated in RTL.
 
 | Region | Size @128k ctx | Layout notes |
 |---|---|---|
-| K MSB plane (int8) | 16.8 MB | row-major, 128 B/token; the int8 tier read |
-| K LSB plane (int8 residual) | 16.8 MB | read only for hi-precision tokens (fp16 = MSB+LSB) |
-| V MSB / LSB planes | 16.8 + 16.8 MB | same split as K |
+| K plane A (absmax int8) | 16.8 MB | row-major, 128 B/token; the lo-tier read; separate contiguous region |
+| K plane B (int8 residual) | 16.8 MB | read only for hi/exact tokens (exact = A+B); separate contiguous region |
+| V plane A / plane B | 16.8 + 16.8 MB | same split as K |
+| K/V scale arrays | 4 x 0.5 MB | 2 fp16 scales/row (A,B), dense separate array, sidecar stream |
 | K-PQ codes | 0.5 MB | 4 B/token, page-contiguous for streaming |
 | K-PQ codebooks | 64 KB/page (1.5 MB) | 4 x 256 x 32 x fp16, page header |
 | V-PQ codes | 64 KB | 0.5 B/token |
@@ -49,13 +50,17 @@ arithmetic on those; **[estimate]** is a sizing guess to be validated in RTL.
 | int8-err sidecar (V commit test) | 256 KB | 2B/token, written at page seal |
 
 Total index overhead over raw fp16 KV: ~2.5 MB / 67 MB ~= **3.7% [derived]**
-(codes + codebooks + 2 sidecars). CAVEAT (OPEN-2 in `algorithm_spec_v1.md`):
-the bit-plane layout above (int8 tier = partial read of fp16, zero capacity
-overhead) is the design INTENT but is UNVALIDATED — the measured -31%
-precision result used per-row absmax int8, which as a stored tier costs +50%
-K/V capacity. Either validate fp16-MSB-plane reads at trace level (M6) or
-accept the capacity cost; do not start RTL on the DRAM layout before this is
-settled.
+(codes + codebooks + 2 sidecars), plus ~1.6% for the scale arrays.
+**OPEN-2 RESOLVED (2026-07-06, M6 + full-spectrum job 53003123)**: the
+layout above is the validated **int8 dual-plane** format — plane A = per-row
+absmax int8 of x (lo tier), plane B = per-row absmax int8 of the residual
+(exact tier reads A+B, error ~absmax/127² < fp16 rounding). fp16-equivalent
+capacity, +0.13% trace MB, quality identical (relL2 0.00875 vs 0.00871 at
+tau=0.004). The rejected fp16-MSB-plane read fails hard (relL2 0.087).
+Bandwidth accounting NOTE: the golden model's trace-MB curves charge zero
+bytes for scales — RTL bandwidth budgets must add the ~1.6% scale-sidecar
+adder (2 B/row lo-tier reads, 4 B/row hi-tier) on top of every trace-MB
+number in this document.
 
 ## 3. Engine pipeline (one decode step, one kv-head lane)
 
@@ -182,7 +187,7 @@ competitor is a *tier*, not an alternative.
 - **M4**: logit-buffer precision — can tail logits live at 1B in SRAM?
   (affects the dominant SRAM buffer; one CPU trace experiment).
 - **M5.5 (was implicit)**: M6 below folded here.
-- **M6**: fp16-MSB-plane lo tier vs absmax int8 — one CPU trace experiment; decides the DRAM layout (OPEN-2).
+- **M6 — DONE (2026-07-06)**: fp16-MSB-plane lo tier FAILS (relL2 0.087); int8 dual-plane storage validated at full spectrum (job 53003123: +0.13% MB, quality identical). DRAM layout in Sec. 2 is final; see algorithm_spec_v1.md Sec. 6.
 - **M5**: rank-select rung granularity for the histogram select vs the
   budget grid (hardware wants power-of-2 bins; grid is fractional).
 - **RTL order**: S2 scan + S3 rank first (fixed-function, testable against

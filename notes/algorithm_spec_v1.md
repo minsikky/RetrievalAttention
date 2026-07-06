@@ -110,12 +110,23 @@ round(x_row/s)*s, s = absmax(x_row)/127, stored as int8 codes + fp16 scale
   validated NEGATIVE (outlier-absmax rows).
 - Measured: -31 to -34% total MB at identical trace relL2; 4-bit lo tier is
   NOT free (relL2 0.007-0.018) — do not implement without new validation.
-- **OPEN-2 (storage layout)**: the validated tier stores a SEPARATE int8
-  copy (+50% K/V capacity) or recomputes. The zero-overhead alternative —
-  reading the literal high byte of fp16 rows as the lo tier — is UNVALIDATED
-  (fp16 MSB != absmax int8; ~5-bit effective mantissa). RTL must not assume
-  the bit-plane layout until a trace experiment validates it (M6 in
-  hw_arch_v0.md Sec. 8).
+- **OPEN-2 RESOLVED (2026-07-06, M6): int8 dual-plane storage.** K/V rows
+  are stored as two int8 planes at fp16-equivalent capacity: plane A =
+  per-row symmetric absmax int8 of x (the lo tier, read alone); plane B =
+  per-row symmetric absmax int8 of the residual x − A (hi/exact tier reads
+  A+B; reconstruction error ~absmax/127², below fp16 rounding in practice).
+  Two fp16 scales per row (A-scale, B-scale) in a separate dense scale
+  array. Rejected alternative: reading the literal fp16 high byte as the lo
+  tier FAILS (relL2 0.087 vs 0.004 — 2 effective mantissa bits; job
+  `precision_fp16msb_smoke`). Full-spectrum confirmation (job 53003123,
+  `storage_dualplane_deesc_prec/`): 2.8611 MB/head-query @ tau=0.004, max
+  relL2 0.00875, vs fp16-storage golden 2.8573 / 0.00871 — +0.13% MB, quality
+  identical. Layout details (plane placement, scale array) per issue #2:
+  separate contiguous A and B regions (lo-tier stream stays dense 1 B/elem;
+  interleaving would double real lo-tier bandwidth vs the trace-MB curves);
+  scales as a separate dense array. NOTE: the golden model charges ZERO
+  bytes for scales — add ~1.6% (2 B/row lo, 4 B/row hi at d=128) as an
+  explicit sidecar adder in any RTL bandwidth budget.
 
 ## 7. Explicit non-goals (validated negatives — do not build)
 
@@ -150,8 +161,12 @@ algorithm side rather than re-deriving.
 
 The algorithm side owns this file. RTL discrepancies against the golden
 model are bugs on whichever side diverges from THIS document; if the
-document is ambiguous, fix the document first. OPEN items: OPEN-2 (int8 storage layout), plus M4/M5 in `hw_arch_v0.md`
-Sec. 8. RESOLVED: OPEN-1 (tau=0.004 frozen); M2 (GQA union factors: K
-0.35-0.44, V 0.49-0.57 across the 4-head group, rising with context); M3
-(deesc x precision composition golden run `deesc_precision_compose/`:
-2.857 MB/head-query at tau=0.004 on the 288-position spectrum).
+document is ambiguous, fix the document first. OPEN items: M4 (8-bit logit
+buffer — smoke says free, confirmation job 53003124 in flight), M5
+(histogram select — agreed on issue #4, pinned pending M4 commit).
+RESOLVED: OPEN-1 (tau=0.004 frozen); OPEN-2 (int8 dual-plane storage, Sec.
+6 — fp16-equivalent capacity, +0.13% MB, quality identical); M2 (GQA union
+factors: K 0.35-0.44, V 0.49-0.57 across the 4-head group, rising with
+context); M3 (deesc x precision composition golden run
+`deesc_precision_compose/`: 2.857 MB/head-query at tau=0.004 on the
+288-position spectrum).
