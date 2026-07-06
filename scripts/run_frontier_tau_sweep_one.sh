@@ -48,7 +48,8 @@ export TASK_NAME CONTEXT_LEN NUM_SAMPLES
 echo "[TAU-SWEEP] task=${TASK_NAME} ctx=${CONTEXT_LEN} n=${NUM_SAMPLES} taus=${TAUS}"
 
 IFS=',' read -r -a tau_arr <<< "${TAUS}"
-data_override=""
+# Seed from env to pair samples with an arm run in a previous job.
+data_override="${DATA_FILE_OVERRIDE:-}"
 for tau in "${tau_arr[@]}"; do
   run_name="frontier_tau${tau}_${TASK_NAME}_ctx${CONTEXT_LEN}_n${NUM_SAMPLES}"
   echo "[TAU-SWEEP] === tau=${tau} -> ${SWEEP_ROOT}/${run_name} ==="
