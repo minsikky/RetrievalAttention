@@ -75,6 +75,32 @@ picked from prior work — it is implied by the method's design.
 Plan: quality-vs-decode-position curves on public_longdecode + LongGenBench
 SGT metrics, ours vs fixed-topk at matched bytes.
 
+## Venue calibration (2026-07-06, after discussion)
+
+Target venue is architecture/circuits (chip tape-out), not NeurIPS-class ML.
+Consequences for the evaluation set:
+- **Benchmark breadth: RULER-hard + HELMET is sufficient**, plus two
+  nearly-free additions: **LongBench-v2** (harness already in repo,
+  `longbench_v2_hf_eval.py`; frontier already matched dense at short bins —
+  extend to long bins, config-only) and **long-document perplexity**
+  (PG19-class slices; smooth metric that renders the tau-knee and baseline
+  degradation as continuous curves instead of task-score deltas).
+- **Model generality is the real attack surface**: everything is calibrated
+  on Llama-3.1-8B. Add ONE second family — Qwen2.5-7B/14B at 128k — and
+  re-verify that page size / PQ config / tau / proxy-mass transfer
+  untouched. Hardware-relevant twist: Qwen GQA is 7:1 vs Llama 4:1, which
+  stresses the kv-lane sharing design; do this BEFORE RTL freezes lane
+  arithmetic.
+- **One frozen config everywhere**: deesc + precision @ tau=0.004 for every
+  accuracy number in the paper; no per-task tuning. Arch reviewers check
+  consistency with the hardware-eval config, not benchmark count.
+- **Skip** (venue-inappropriate effort): InfiniteBench, BABILong,
+  ZeroSCROLLS, LV-Eval; exhaustive author-code baselines beyond Quest +
+  KIVI. The load-bearing pillars are matched-bytes iso-accuracy (B),
+  decode-drift (D, doubles as the sustained-decode story), and RTL
+  bandwidth/energy/area vs a GPU baseline — accuracy section must be
+  unimpeachable, not encyclopedic.
+
 ## Sequencing / cost
 
 - Tonight (this window): Phase A jobs (8 GPU jobs, ~4-8h each, submitted /
