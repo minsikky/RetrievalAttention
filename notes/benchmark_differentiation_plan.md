@@ -101,6 +101,50 @@ Consequences for the evaluation set:
   bandwidth/energy/area vs a GPU baseline — accuracy section must be
   unimpeachable, not encyclopedic.
 
+## Phase E — 1M-context path (chip target ctx is 1M+; added 2026-07-06)
+
+Motivation: RTL side is designing for 1M+ ctx with DRAM bytes as the
+objective (issue #2 rev-2 spill model); algorithm-side validation must
+reach the same context or the spec is extrapolated, not measured.
+
+Feasibility facts (verified 2026-07-06):
+- **Model: Qwen/Qwen2.5-7B-Instruct-1M** — native 1,010,000 ctx, 28 layers,
+  28 Q / 4 KV heads (GQA 7:1 = exactly the kv-lane stress case from the
+  venue-calibration list), head_dim 128. KV @ 1M = 55 GB fp16.
+- **Hardware: gpu-rtx6000 partition = 8x RTX Pro 6000 Blackwell 96 GB**
+  (the 44 GB OOM ceiling was spgpu's A40s). 55 GB KV + 15 GB weights +
+  chunked-prefill activations ~= 75 GB -> ONE Blackwell holds a full 1M
+  dense run (expandable_segments); 2 GPUs via device_map for margin. No
+  KV-offload plumbing needed. Pin 1M jobs: `--partition=gpu-rtx6000`.
+- **Benchmarks**: BABILong (HF eval splits ready-made at 64k...512k/1M/10M,
+  100 or 1000 samples per task-length, 20 reasoning-in-haystack tasks) +
+  RULER at 512k/1M from our own generator (parameterized ctx) + passkey.
+- **Wall-time**: dense 128k ~= 1.5-3 min/sample (A40). Attention x64,
+  linear x8, Blackwell ~4x A40 -> ~20-50 min/sample @ 1M; a 16-sample
+  task fits one 10h job.
+- **Known risk**: Qwen2.5-1M trained to 256k, extended to 1M via DCA+YaRN
+  in their vLLM stack; plain HF full attention may degrade past 256k
+  despite the model card. Spike below measures exactly this. Backup:
+  GLM-4-9B-Chat-1M (40 GB KV @ 1M).
+
+Steps (each gated on the previous):
+1. Qwen2 arch support in the intervention harness (subsumes the planned
+   second-model-family item; Qwen2Attention = Llama + QKV bias).
+2. Dense feasibility spike: passkey/niah_single @ 256k/512k/1M, one
+   Blackwell, n=8. Decides whether the dense reference itself holds at 1M
+   in plain HF attention (if not: GLM backup or cap the claim at 512k).
+3. Frontier tau=0.004 arms on RULER niah/mk + BABILong qa1-qa5 @ 512k/1M,
+   matched samples vs the dense arm.
+4. **1M trace capture** for the CPU golden model: K/V/q dump at 1M (4 kv
+   heads x 1M x 128 fp16 ~= 2 GB/layer — cheap), then the full
+   rung/proxy-mass/deesc analysis at 1M. Closes the spec-extrapolation gap
+   (rung tables, proxy-mass starts, controller walk MEASURED at the chip's
+   target context) and feeds hw_arch Sec. 5 with 1M bandwidth rows.
+
+Chip-story split: algorithm validated at 1M on real tasks (GPU, this
+phase); silicon demonstrates the same selection algorithm at 1M with DRAM
+bytes as the objective.
+
 ## Sequencing / cost
 
 Standing constraint: at most ~6 concurrent Slurm jobs on zhengya0 (account
