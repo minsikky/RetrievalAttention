@@ -103,6 +103,10 @@ Consequences for the evaluation set:
 
 ## Sequencing / cost
 
+Standing constraint: at most ~6 concurrent Slurm jobs on zhengya0 (account
+cap 12, shared with labmates) — chain extra submissions with
+`--dependency=afterany:<jobid>`.
+
 - Tonight (this window): Phase A jobs (8 GPU jobs, ~4-8h each, submitted /
   pending qa data download); analysis when they land.
 - Next session: Phase A knee analysis -> pick 3-4 differentiator tasks;
