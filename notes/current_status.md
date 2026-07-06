@@ -1,5 +1,41 @@
 # Current Status
 
+## 2026-07-06 RTL Gates Closed + e4m3 Verdict + Phase A First Scores + 1M Path
+
+- **All three RTL gates resolved at full spectrum** (issues #2/#3/#4 closed):
+  OPEN-2 = int8 dual-plane storage (job 53003123: +0.13% MB, quality identical
+  to fp16 storage, fp16-equivalent capacity; DRAM layout final in hw_arch §2);
+  M4 = 8-bit logit buffer free (53003124: ±0.05% MB, relL2 identical; 1 B/token,
+  512 KB/lane); M5 = 256-bin histogram select + exact boundary-bin refine
+  (agreed option 1, golden CSVs authoritative).
+- **e4m3 buffer format (issue #6, job 53008051): quality PASSES (max relL2
+  0.00784 @ 0.004, better than int8's 0.00864), bytes +0.93% aggregate at the
+  operating point, concentrated in head 0 (+7.5%); h8/h24 got cheaper. Head 16's
+  top logit flips sign across ctx (−58.6/−61.8/+13.5) — static bias contingency
+  unsafe for drifting heads. Recommended accept (scale-free write + histogram
+  unification worth 1%); awaiting RTL ack before freezing in spec §9.**
+- **Golden vectors delivered and RTL-validated** (issues #5/#7): 12 npz row
+  dumps + 12 page blocks (fp32 codebooks + u8 codes, bit-exact self-checked),
+  all pass the RTL bit-model. Verification contract pinned: S2 tolerance-based
+  vs fp32 reference, S3 bit-exact counting sort. Proxy-mass corner-case flagged:
+  v_target = 0.25 × max(k_budgets[0], c), NOT 0.25 × c — and per the ctx-scaling
+  memo the clamp is ALREADY active on h16 at 134.8k (c/n = 0.051 < 0.10) and
+  becomes the mainline path at 1M. Stage-2 goldens (controller trace, band
+  partials, tail sums, V risk) queued behind the #6 format decision.
+- **Phase A first scores (128k, n=16, paired)**: mk3 dense 75.0 = frontier
+  τ0.004 75.0 = τ0.016 75.0; qa_1 62.5 flat across all arms; **fwe: frontier
+  τ0.004 52.08 BEATS dense 43.75, τ0.016 drops to 41.67** — first task where
+  sparse selection outperforms dense (denoising effect) and the first measured
+  knee (between 0.004 and 0.016). cwe floored at 128k (0.0), dense 10.0 at 64k.
+  Pending: qa_2 frontier (53002393), cwe 64k frontier (53002395).
+- **1M path activated** (Phase E in benchmark_differentiation_plan.md):
+  gpu-rtx6000 = 96 GB Blackwells (the 44 GB ceiling was spgpu A40s);
+  Qwen2.5-7B-Instruct-1M (native 1M, GQA 7:1, 55 GB KV @ 1M) fits ONE card;
+  BABILong HF splits to 1M ready-made; model downloading. ctx-scaling memo
+  (notes/ctx_scaling_1m_memo.md): e4m3 ranges stable across 9× ctx (in-format
+  at 1M), c/n falls with ctx, boundary ties ~linear (size refine pass for
+  ~2×10⁵-token bins at 1M).
+
 ## 2026-07-06 OPERATING POINT FROZEN: tau=0.004 + de-escalation + precision
 
 - **GPU tau sweep (jobs 52980959/61/62 + vt retry 52985915): every arm scores 100.0.** Frontier end-to-end (real structured error, not Gaussian): niah_multikey_2 / vt / niah_single_1 at 32k n25 for tau in {0.002, 0.004, 0.008}, niah_single_1 at 128k n16 for {0.002, 0.004} - all 100.0, no nulls, paired samples. tau=0.004 is task-validated end-to-end; 0.008 also passes everywhere tested (headroom, not adopted). GPU max-physical step MB trends down 11.3 -> 10.7 -> 10.0 (multikey 32k). Env fixes en route: numpy.libs/scipy.libs on LD_LIBRARY_PATH (51ea773) and tau unpinned from the canonical-frontier guard (4f6462a).
