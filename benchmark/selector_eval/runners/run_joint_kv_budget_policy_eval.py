@@ -1050,6 +1050,30 @@ def _quantize_rows_symmetric(x: np.ndarray, bits: int) -> np.ndarray:
     return (np.round(x / scale) * scale).astype(np.float32, copy=False)
 
 
+def _int8_dualplane_rows(x: np.ndarray) -> np.ndarray:
+    """Reconstruct rows from a two-plane int8 storage format: plane A =
+    per-row absmax int8 of x, plane B = per-row absmax int8 of the residual
+    (x - dq(A)); two fp16 scales per row. Same 2 B/element capacity as fp16.
+    The lo tier reads plane A alone (the validated absmax-int8 tier); the
+    "exact" tier reads A+B, whose ~absmax/127^2 reconstruction error is finer
+    than fp16 mantissa steps for most elements. Candidate OPEN-2 resolution."""
+    a = _quantize_rows_symmetric(x, 8)
+    r = x.astype(np.float32, copy=False) - a
+    b = _quantize_rows_symmetric(r, 8)
+    return (a + b).astype(np.float32, copy=False)
+
+
+def _truncate_fp16_msb(x: np.ndarray) -> np.ndarray:
+    """Zero the low mantissa byte of fp16: the literal MSB-plane read
+    (sign + 5 exponent + 2 mantissa bits per element). The zero-storage-
+    overhead alternative to the stored absmax-int8 lo tier (spec OPEN-2/M6:
+    the stored tier costs +50% K/V capacity; this reads half of each fp16
+    row in place)."""
+    u = np.ascontiguousarray(x.astype(np.float16)).view(np.uint16).copy()
+    u &= np.uint16(0xFF00)
+    return u.view(np.float16).astype(np.float32, copy=False)
+
+
 def _precision_lo_tokens(
     base: list[int],
     ranked_cpu: np.ndarray,
@@ -1350,6 +1374,54 @@ def run() -> None:
         ),
     )
     parser.add_argument("--precision_lo_bits", type=int, default=8)
+    parser.add_argument(
+        "--precision_lo_mode",
+        choices=["int8", "fp16msb"],
+        default="int8",
+        help=(
+            "int8: per-row absmax int8 lo tier (validated; as a stored tier "
+            "costs +50% capacity). fp16msb: read only the high byte of each "
+            "fp16 element (sign+exp+2 mantissa bits) - zero storage overhead, "
+            "coarser. Decides the DRAM layout (spec OPEN-2 / hw M6)."
+        ),
+    )
+    parser.add_argument(
+        "--logit_buffer_bits",
+        type=int,
+        default=0,
+        help=(
+            "If >0, quantize the ranked PQ logits to this many bits before "
+            "ANY downstream use - proxy-mass start prediction, mixed tail "
+            "logits, rung-delta outputs. Models an N-bit on-chip logit "
+            "buffer (hw M4); quantization is monotone so ranking order is "
+            "unchanged (which also answers M5: 2^N-bin histogram select). "
+            "0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--logit_buffer_window",
+        type=float,
+        default=0.0,
+        help=(
+            "With --logit_buffer_bits: clamp the buffer to a fixed window of "
+            "this many POST-SCALE logit units below the step max (softmax "
+            "only resolves the top ~16 units; naive absmax over the full "
+            "range wastes levels on the irrelevant bottom and inflates rung "
+            "deltas -> ladder over-escalation). 0 = naive absmax."
+        ),
+    )
+    parser.add_argument(
+        "--kv_storage_format",
+        choices=["fp16", "int8_dualplane"],
+        default="fp16",
+        help=(
+            "int8_dualplane: K/V rows stored as two per-row absmax int8 "
+            "planes (A + residual B, fp16-capacity-equivalent); index build, "
+            "exact reads, and lo tiers all consume the reconstruction, while "
+            "the dense reference stays true fp16 so relL2 includes storage "
+            "error. Candidate OPEN-2 resolution."
+        ),
+    )
     parser.add_argument("--global_pq_subbits", type=int, default=0, help="Bits for the shared codebook (0 = same as --subbits). Larger shared codebooks recover ranking fidelity at negligible amortized read cost.")
     parser.add_argument("--global_pq_sample_rows", type=int, default=16384)
     parser.add_argument(
@@ -1479,6 +1551,14 @@ def run() -> None:
             raise ValueError("--page_scan_frac is incompatible with --lookahead_diagnostic")
         if int(args.temporal_reuse_max_stale) > 0:
             raise ValueError("--page_scan_frac and --temporal_reuse_max_stale are separate experiments")
+    precision_lo_mode = str(args.precision_lo_mode)
+    if precision_lo_mode == "fp16msb" and int(args.precision_lo_bits) != 8:
+        raise ValueError("--precision_lo_mode fp16msb is a byte read; requires --precision_lo_bits 8")
+    logit_buffer_bits = int(args.logit_buffer_bits)
+    if logit_buffer_bits < 0 or logit_buffer_bits == 1 or logit_buffer_bits > 16:
+        raise ValueError("--logit_buffer_bits must be 0 (off) or in [2, 16]")
+    logit_buffer_window = float(args.logit_buffer_window)
+    kv_storage_dualplane = str(args.kv_storage_format) == "int8_dualplane"
     temporal_reuse_max_stale = int(args.temporal_reuse_max_stale)
     temporal_cache_stats = bool(args.temporal_cache_stats)
     temporal_budget_frozen = str(args.temporal_reuse_budget) == "frozen"
@@ -1555,6 +1635,8 @@ def run() -> None:
         temporal_incremental = str(args.temporal_reuse_mode) == "incremental"
         for kv_head in needed_kv_heads:
             keys_np = trace.keys[kv_head, :context_len].astype(np.float32, copy=False)
+            if kv_storage_dualplane:
+                keys_np = _int8_dualplane_rows(keys_np)
             if temporal_reuse_now and not temporal_incremental:
                 # Frozen between rescans: same pages, same pending metadata.
                 index_cache[kv_head] = temporal_index_cache[kv_head]["index"]
@@ -1641,6 +1723,16 @@ def run() -> None:
             query_np = trace.queries[int(head), int(qidx)].astype(np.float32, copy=False)
             scores_np, _true_probs, dense_head = dense_attention_output(keys_np, values_np, query_np)
             dense_heads[int(head)] = dense_head
+            if kv_storage_dualplane:
+                # Dense reference above uses the true fp16 rows; everything
+                # downstream (exact logits, residuals, risk, lo tiers) reads
+                # the stored two-plane reconstruction, so relL2 includes the
+                # storage-format error.
+                keys_np = _int8_dualplane_rows(keys_np)
+                values_np = _int8_dualplane_rows(values_np)
+                scores_np = (
+                    (keys_np @ query_np.astype(np.float32, copy=False)) / math.sqrt(float(trace.head_dim))
+                ).astype(scores_np.dtype, copy=False)
 
             pending = list(range(max(0, int(index.pending_start)), max(0, min(int(index.indexed_end), context_len))))
             if temporal_reuse_now and not temporal_incremental:
@@ -1770,6 +1862,39 @@ def run() -> None:
             else:
                 raise ValueError(f"unknown selector_mode: {args.selector_mode}")
 
+            if logit_buffer_bits > 0:
+                # N-bit on-chip logit buffer (hw M4/M5): symmetric absmax
+                # quantization over the step's score vector. Monotone, so the
+                # already-sorted ranking order is unchanged; downstream
+                # consumers (proxy-mass start, tail logits, rung deltas) see
+                # the quantized values.
+                ranked_cpu = np.fromiter((int(x) for x in ranked_cpu.tolist()), dtype=np.int64, count=len(ranked_cpu))
+                ranked_scores_cpu = np.fromiter(
+                    (float(x) for x in ranked_scores_cpu.tolist()), dtype=np.float32, count=len(ranked_scores_cpu)
+                )
+                if ranked_scores_cpu.size:
+                    if logit_buffer_window > 0.0:
+                        # Fixed window below the step max, in post-scale logit
+                        # units (tail logits divide by sqrt(d) downstream):
+                        # softmax cannot resolve entries further below the max,
+                        # so all 2^bits levels go where resolution matters.
+                        w_raw = float(logit_buffer_window) * math.sqrt(float(trace.head_dim))
+                        s_max = float(np.max(ranked_scores_cpu))
+                        lb_lo = s_max - w_raw
+                        clipped = np.clip(ranked_scores_cpu, lb_lo, s_max)
+                        lb_step = w_raw / float((1 << logit_buffer_bits) - 1)
+                        ranked_scores_cpu = (
+                            lb_lo + np.round((clipped - lb_lo) / lb_step) * lb_step
+                        ).astype(np.float32, copy=False)
+                    else:
+                        lb_levels = float((1 << (logit_buffer_bits - 1)) - 1)
+                        lb_absmax = float(np.max(np.abs(ranked_scores_cpu)))
+                        if lb_absmax > 0.0:
+                            lb_scale = lb_absmax / lb_levels
+                            ranked_scores_cpu = (
+                                np.round(ranked_scores_cpu / lb_scale) * lb_scale
+                            ).astype(np.float32, copy=False)
+
             page_unscanned_mask: np.ndarray | None = None
             page_centroid_logit: np.ndarray | None = None
             pages_scanned_count = len(index.pages)
@@ -1840,14 +1965,22 @@ def run() -> None:
             scores_lo_np: np.ndarray | None = None
             residual_lo: np.ndarray | None = None
             if precision_k_hi_frac < 1.0:
-                keys_lo = _quantize_rows_symmetric(keys_np, precision_lo_bits)
+                keys_lo = (
+                    _truncate_fp16_msb(keys_np)
+                    if precision_lo_mode == "fp16msb"
+                    else _quantize_rows_symmetric(keys_np, precision_lo_bits)
+                )
                 scores_lo_np = (
                     (keys_lo @ query_np.astype(np.float32, copy=False))
                     / math.sqrt(float(trace.head_dim))
                 ).astype(np.float32, copy=False)
             precision_v_lo_err: np.ndarray | None = None
             if precision_v_hi_frac < 1.0:
-                values_lo = _quantize_rows_symmetric(values_np, precision_lo_bits)
+                values_lo = (
+                    _truncate_fp16_msb(values_np)
+                    if precision_lo_mode == "fp16msb"
+                    else _quantize_rows_symmetric(values_np, precision_lo_bits)
+                )
                 residual_lo = (values_lo - vhat_all.astype(np.float32, copy=False)).astype(np.float32, copy=False)
                 # Per-token squared error of the MSB-plane read, comparable to
                 # code_error: an int8 exact read only pays off where it beats

@@ -87,6 +87,18 @@ fi
 if [[ "${GQA_UNION_STATS:-0}" == "1" ]]; then
   extra_args+=(--gqa_union_stats)
 fi
+if [[ -n "${PRECISION_LO_MODE:-}" ]]; then
+  extra_args+=(--precision_lo_mode "${PRECISION_LO_MODE}")
+fi
+if [[ -n "${LOGIT_BUFFER_BITS:-}" ]]; then
+  extra_args+=(--logit_buffer_bits "${LOGIT_BUFFER_BITS}")
+fi
+if [[ -n "${LOGIT_BUFFER_WINDOW:-}" ]]; then
+  extra_args+=(--logit_buffer_window "${LOGIT_BUFFER_WINDOW}")
+fi
+if [[ -n "${KV_STORAGE_FORMAT:-}" ]]; then
+  extra_args+=(--kv_storage_format "${KV_STORAGE_FORMAT}")
+fi
 
 .venv/bin/python benchmark/selector_eval/runners/run_joint_kv_budget_policy_eval.py \
   --qkv_trace "${QKV_TRACE:-attention_efficiency_result/real_qkv_llama31_l16_6838_g131072_q288_window32_graphall_s16.npz}" \
