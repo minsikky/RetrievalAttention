@@ -49,8 +49,13 @@ arithmetic on those; **[estimate]** is a sizing guess to be validated in RTL.
 | int8-err sidecar (V commit test) | 256 KB | 2B/token, written at page seal |
 
 Total index overhead over raw fp16 KV: ~2.5 MB / 67 MB ~= **3.7% [derived]**
-(codes + codebooks + 2 sidecars). Bit-plane storage keeps capacity equal to
-fp16 while enabling the int8 tier as a *partial read*, not a second copy.
+(codes + codebooks + 2 sidecars). CAVEAT (OPEN-2 in `algorithm_spec_v1.md`):
+the bit-plane layout above (int8 tier = partial read of fp16, zero capacity
+overhead) is the design INTENT but is UNVALIDATED — the measured -31%
+precision result used per-row absmax int8, which as a stored tier costs +50%
+K/V capacity. Either validate fp16-MSB-plane reads at trace level (M6) or
+accept the capacity cost; do not start RTL on the DRAM layout before this is
+settled.
 
 ## 3. Engine pipeline (one decode step, one kv-head lane)
 
@@ -176,6 +181,8 @@ competitor is a *tier*, not an alternative.
   job) — components validated separately, composition assumed.
 - **M4**: logit-buffer precision — can tail logits live at 1B in SRAM?
   (affects the dominant SRAM buffer; one CPU trace experiment).
+- **M5.5 (was implicit)**: M6 below folded here.
+- **M6**: fp16-MSB-plane lo tier vs absmax int8 — one CPU trace experiment; decides the DRAM layout (OPEN-2).
 - **M5**: rank-select rung granularity for the histogram select vs the
   budget grid (hardware wants power-of-2 bins; grid is fractional).
 - **RTL order**: S2 scan + S3 rank first (fixed-function, testable against

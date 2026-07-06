@@ -84,6 +84,9 @@ fi
 if [[ "${BUDGET_DEESCALATE:-0}" == "1" ]]; then
   extra_args+=(--budget_deescalate)
 fi
+if [[ "${GQA_UNION_STATS:-0}" == "1" ]]; then
+  extra_args+=(--gqa_union_stats)
+fi
 
 .venv/bin/python benchmark/selector_eval/runners/run_joint_kv_budget_policy_eval.py \
   --qkv_trace "${QKV_TRACE:-attention_efficiency_result/real_qkv_llama31_l16_6838_g131072_q288_window32_graphall_s16.npz}" \

@@ -1281,6 +1281,19 @@ def run() -> None:
         ),
     )
     parser.add_argument(
+        "--gqa_union_stats",
+        action="store_true",
+        help=(
+            "Per (qidx, kv_head, trajectory) record the UNION of accepted "
+            "exact-K/exact-V token sets across the q heads sharing that kv "
+            "head, vs the sum of per-head set sizes. union/sum is the GQA "
+            "row-read sharing factor a chip gather engine would see (1.0 = "
+            "no overlap, 1/group_size = perfect overlap). Run with all q "
+            "heads of at least one kv group (e.g. --heads 0,1,2,3). Writes "
+            "gqa_union_stats.csv; does not change behavior."
+        ),
+    )
+    parser.add_argument(
         "--budget_deescalate",
         action="store_true",
         help=(
@@ -1507,6 +1520,8 @@ def run() -> None:
     # Settled (ki, vi) rung indices from each head's last rescan step, keyed
     # like previous_fraction; consumed on reuse steps in frozen-budget mode.
     temporal_budget_cache: dict[tuple[str, str, str, float, str, int], tuple[int, int]] = {}
+    gqa_union_stats = bool(args.gqa_union_stats)
+    gqa_union_rows: list[dict[str, object]] = []
     page_index_build_cache: dict[int, dict[str, object]] = {}
     t0 = time.perf_counter()
 
@@ -1522,6 +1537,7 @@ def run() -> None:
             min(context_len - max(0, int(args.static_suffix)), trace.keys.shape[1]),
         )
         needed_kv_heads = sorted({int(trace.kv_head_for(h)) for h in heads})
+        gqa_union_acc: dict[tuple, dict[str, object]] = {}
         temporal_reuse_now = False
         temporal_stale_tokens = 0
         if temporal_reuse_max_stale > 0 and all(kv in temporal_index_cache for kv in needed_kv_heads):
@@ -2192,7 +2208,7 @@ def run() -> None:
                                     residual=residual,
                                     exact_mask=exact_mask,
                                 )
-                            if temporal_cache_stats:
+                            if temporal_cache_stats or gqa_union_stats:
                                 exact_mask_by_pair[(ki, vi)] = np.asarray(exact_mask, dtype=bool)
                             if la_active:
                                 la_masks.append(np.asarray(exact_mask, dtype=bool))
@@ -2506,6 +2522,26 @@ def run() -> None:
                                         "k_set": t_k_set,
                                         "v_set": t_v_set,
                                     }
+                                if gqa_union_stats:
+                                    gkey = (
+                                        int(kv_head),
+                                        str(score_proxy_variant),
+                                        str(canonical_v_rule),
+                                        str(policy),
+                                        float(threshold),
+                                        str(start_strategy),
+                                    )
+                                    g_k = np.asarray(selected_by_k[ki], dtype=np.int64)
+                                    g_v = np.flatnonzero(exact_mask_by_pair[(ki, vi)]).astype(np.int64)
+                                    acc = gqa_union_acc.setdefault(
+                                        gkey,
+                                        {"heads": 0, "k_sum": 0, "v_sum": 0, "k_sets": [], "v_sets": []},
+                                    )
+                                    acc["heads"] += 1
+                                    acc["k_sum"] += int(g_k.size)
+                                    acc["v_sum"] += int(g_v.size)
+                                    acc["k_sets"].append(g_k)
+                                    acc["v_sets"].append(g_v)
                                 row = {
                                     "qidx": int(qidx),
                                     "position": int(position),
@@ -2686,6 +2722,32 @@ def run() -> None:
                                         head_rows.append(d_row)
                                         head_choices[d_key].append(d_row)
 
+        if gqa_union_stats:
+            for gkey, acc in gqa_union_acc.items():
+                k_sets = acc["k_sets"]
+                v_sets = acc["v_sets"]
+                k_union = int(np.unique(np.concatenate(k_sets)).size) if k_sets else 0
+                v_union = int(np.unique(np.concatenate(v_sets)).size) if v_sets else 0
+                gqa_union_rows.append(
+                    {
+                        "qidx": int(qidx),
+                        "position": int(position),
+                        "decode_length": int(decode_tokens),
+                        "kv_head": int(gkey[0]),
+                        "score_proxy_variant": str(gkey[1]),
+                        "v_selection_rule": str(gkey[2]),
+                        "policy": str(gkey[3]),
+                        "threshold": float(gkey[4]),
+                        "start_strategy": str(gkey[5]),
+                        "group_heads": int(acc["heads"]),
+                        "k_sum_tokens": int(acc["k_sum"]),
+                        "k_union_tokens": int(k_union),
+                        "k_union_over_sum": float(k_union) / max(float(acc["k_sum"]), 1.0),
+                        "v_sum_tokens": int(acc["v_sum"]),
+                        "v_union_tokens": int(v_union),
+                        "v_union_over_sum": float(v_union) / max(float(acc["v_sum"]), 1.0),
+                    }
+                )
         dense_concat = np.concatenate([dense_heads[int(head)] for head in heads], axis=0).astype(np.float32, copy=False)
         dense_proj = project_head_subset(
             concat_subset=dense_concat,
@@ -2768,6 +2830,8 @@ def run() -> None:
     ]
     if oracle_rows:
         output_tables.append(("oracle_budget_diagnostic.csv", oracle_rows))
+    if gqa_union_rows:
+        output_tables.append(("gqa_union_stats.csv", gqa_union_rows))
     for filename, rows in output_tables:
         with (out_dir / filename).open("w", newline="", encoding="utf-8") as f:
             fieldnames = list(rows[0].keys())
