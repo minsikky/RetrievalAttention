@@ -68,8 +68,10 @@ relL2(a,b) = ||a-b||_2 / max(||b||_2, eps) on the 128-dim attention output.
 2. **Stability test** between rung r and r+1 on one axis: delta =
    relL2(out(r), out(r+1)); threshold = tau * clamp(sqrt(band_frac / 0.2),
    0, 1.5) where band_frac = (budget(r+1)-budget(r))/ctx
-   (`scaled_threshold`, line ~812). Canonical tau = 0.002; tau = 0.004
-   PENDING task-level GPU validation (jobs 52980959-62) — see OPEN-1.
+   (`scaled_threshold`, line ~812). **tau = 0.004 (FROZEN 2026-07-06)**: task-validated end-to-end on the
+   GPU frontier (RULER niah_multikey_2/vt/niah_single_1 32k, niah_single_1
+   128k - all 100.0); 0.008 also passed everywhere tested and is headroom,
+   not adopted. OPEN-1 is RESOLVED.
 3. **Escalate walk**: k_first_alternating — alternate preferred axis each
    step, escalate the preferred failing axis, stop when both axes pass
    (`choose_action` line ~531, `simulate_policy` line ~576).
@@ -148,6 +150,8 @@ algorithm side rather than re-deriving.
 
 The algorithm side owns this file. RTL discrepancies against the golden
 model are bugs on whichever side diverges from THIS document; if the
-document is ambiguous, fix the document first. OPEN items: OPEN-1 (tau
-operating point, GPU sweep in flight), OPEN-2 (int8 storage layout), plus
-M2/M4/M5 measurements listed in `hw_arch_v0.md` Sec. 8.
+document is ambiguous, fix the document first. OPEN items: OPEN-2 (int8 storage layout), plus M4/M5 in `hw_arch_v0.md`
+Sec. 8. RESOLVED: OPEN-1 (tau=0.004 frozen); M2 (GQA union factors: K
+0.35-0.44, V 0.49-0.57 across the 4-head group, rising with context); M3
+(deesc x precision composition golden run `deesc_precision_compose/`:
+2.857 MB/head-query at tau=0.004 on the 288-position spectrum).

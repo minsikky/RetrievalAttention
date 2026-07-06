@@ -172,13 +172,13 @@ competitor is a *tier*, not an alternative.
 
 ## 8. Open questions / measurement TODOs (ordered)
 
-- **M1**: GPU tau sweep (jobs 52980959-62/52985915) — if 0.004 passes, freeze
-  the operating point at deescalate+precision @ tau=0.004.
-- **M2**: GQA union-read factor — measure accepted-set overlap across the 4
-  q heads of one kv group (trace runner already logs per-head sets; analysis
-  only, no new jobs). Sets the real DRAM traffic and energy numbers.
-- **M3**: de-escalation x progressive-precision composition run (CPU, one
-  job) — components validated separately, composition assumed.
+- **M1 DONE (2026-07-06)**: tau sweep all-100.0 -> operating point FROZEN at
+  deescalate+precision @ tau=0.004 = 2.857 MB/head-query (288-pos spectrum).
+- **M2 DONE (job 52989540)**: GQA union/sum across the 4-head group: K
+  0.35-0.44, V 0.49-0.57 (short ctx -> 128k). Gather-engine DRAM traffic =
+  per-head bytes x union factor; ~5x system-level reduction at 128k.
+- **M3 DONE (job 52987561)**: composition holds; precision remains free on
+  top of de-escalation at both thresholds.
 - **M4**: logit-buffer precision — can tail logits live at 1B in SRAM?
   (affects the dominant SRAM buffer; one CPU trace experiment).
 - **M5.5 (was implicit)**: M6 below folded here.

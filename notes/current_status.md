@@ -1,5 +1,11 @@
 # Current Status
 
+## 2026-07-06 OPERATING POINT FROZEN: tau=0.004 + de-escalation + precision
+
+- **GPU tau sweep (jobs 52980959/61/62 + vt retry 52985915): every arm scores 100.0.** Frontier end-to-end (real structured error, not Gaussian): niah_multikey_2 / vt / niah_single_1 at 32k n25 for tau in {0.002, 0.004, 0.008}, niah_single_1 at 128k n16 for {0.002, 0.004} - all 100.0, no nulls, paired samples. tau=0.004 is task-validated end-to-end; 0.008 also passes everywhere tested (headroom, not adopted). GPU max-physical step MB trends down 11.3 -> 10.7 -> 10.0 (multikey 32k). Env fixes en route: numpy.libs/scipy.libs on LD_LIBRARY_PATH (51ea773) and tau unpinned from the canonical-frontier guard (4f6462a).
+- **M3 composition (52987561): de-escalation x precision(0.1,0.1) stack cleanly.** 288-position subset: `3.496 MB` at thr 0.002 (identical relL2 to deesc-only, precision stays free) and **`2.857 MB` at thr 0.004** (relL2 mean 0.00356, p99 0.0074, max 0.0105 - well under the 0.05 calibrated line) vs canonical `5.748` at 0.002. **New recommended operating point: deescalate + precision(0.1,0.1) @ tau=0.004 = -50% vs the previous canonical.** Caveats: deesc+precision are trace-validated (GPU promotion pending); tau=0.004 is the piece with direct end-to-end task validation.
+- **M2 GQA union factor (52989540, heads 0-7 = 2 full kv groups):** union/sum of accepted sets across the 4 q heads of a kv group (0.25 = perfect overlap): K `0.35 -> 0.44` and V `0.49 -> 0.57` from short to 128k contexts. A physical K-row read serves ~2.3-2.9 q heads, V ~1.8-2.0. Chip DRAM traffic = trace exact-read bytes x union factor; rough system math at 128k, deesc+tau0.004+precision: ~3.4 GB/token vs dense 17.2 GB/token ~= 5x system-level, before scan sharing refinements.
+
 ## 2026-07-06 Budget-Ladder Design: Fine Grid, Warm Start, Predict-Only (all zero-code experiments)
 
 Motivation: the settled-K histogram (canonical, thr 0.002) is 0.30/0.50/0.70 = 21/42/27% — 20%-of-context rung quanta imply up to half-a-rung (~10% of context in exact-K bytes) quantization overshoot; and the temporal-reuse v2 result showed the ladder converts ranking coarseness into K escalation. Output root `attention_efficiency_result/joint_kv_ladder_grid_20260706`. All runs 4 heads (0/8/16/24), k_first_alternating, global_residual_risk.
