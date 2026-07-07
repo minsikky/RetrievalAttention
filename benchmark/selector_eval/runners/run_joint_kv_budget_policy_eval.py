@@ -1116,6 +1116,32 @@ def _quantize_risk_key(risk: np.ndarray, exp_bits: int, mantissa_bits: int) -> n
     return out
 
 
+# Frozen risk-rank key precision (issue #7, RTL-acked 2026-07-07): 6-bit
+# exponent window anchored at the per-state max positive risk, 12 RNE
+# mantissa bits, below-window positives collapse to one bottom bin, exact
+# zeros stay the structural zero bin, ties resolve in stream order.
+_FROZEN_V_RISK_KEY_EXP_BITS = 6
+_FROZEN_V_RISK_KEY_MANTISSA_BITS = 12
+
+
+def _rne_significand(x: np.ndarray, bits: int) -> np.ndarray:
+    """RNE of non-negative fp64 values to `bits` significand bits, in the
+    value domain: the result is the exactly-representable rounded value (a
+    mantissa carry lands on the next power of two naturally). Zeros stay
+    zero."""
+    r = np.asarray(x, dtype=np.float64)
+    out = np.zeros_like(r)
+    pos = r > 0.0
+    if not np.any(pos):
+        return out
+    rp = r[pos]
+    with np.errstate(divide="ignore"):
+        e = np.floor(np.log2(rp))
+    step = np.exp2(e - float(int(bits) - 1))
+    out[pos] = np.round(rp / step) * step
+    return out
+
+
 def _precision_lo_tokens(
     base: list[int],
     ranked_cpu: np.ndarray,
@@ -1413,6 +1439,47 @@ def _write_stage2_golden(
         lo_mask[commit] = True
         dropped = int(lo_candidates.size - commit.size)
 
+    # Item 6 (issue #7, frozen E=6/M=12): the key-DOMAIN V selection — the
+    # contract the hardware ranker implements. Inputs pinned to the golden's
+    # own quantized-weight domain:
+    #   w17  = RNE_17 of the fp64 exp weight probs/max(probs) (1.0 exact,
+    #          the frozen 17 b weight shape; the common 1/den scales out)
+    #   ce16 = fp16(code_error) (the 2-byte sidecar domain; range-verified
+    #          on the golden contexts: no overflow, no underflow-to-zero)
+    # risk_hw = w17^2 * ce16 has <= 45 mantissa bits so the fp64 product is
+    # EXACT, and the E6M12 window key below is bit-identical to a single
+    # RNE of the exact integer product. Ranking: key descending, stable
+    # (ties in stream order); below-window positives share one bottom bin;
+    # exact zeros (non-paged rows) are the structural zero bin.
+    p_max = float(np.max(probs)) if probs.size else 0.0
+    if p_max > 0.0:
+        w_fp64 = probs.astype(np.float64, copy=False) / p_max
+    else:
+        w_fp64 = np.zeros(n, dtype=np.float64)
+    w17 = _rne_significand(w_fp64, 17)
+    ce16 = code_error.astype(np.float16)
+    risk_hw = (w17 * w17) * ce16.astype(np.float64)
+    key_q = _quantize_risk_key(
+        risk_hw, _FROZEN_V_RISK_KEY_EXP_BITS, _FROZEN_V_RISK_KEY_MANTISSA_BITS
+    )
+    exact_mask_key = top_mask(key_q, exact_count)
+    key_cutoff = float(np.min(key_q[exact_mask_key])) if bool(np.any(exact_mask_key)) else 0.0
+    hi_mask_key = np.zeros(n, dtype=bool)
+    lo_mask_key = np.zeros(n, dtype=bool)
+    dropped_key = 0
+    if precision_v_hi_frac < 1.0 and precision_v_lo_err is not None and bool(np.any(exact_mask_key)):
+        exact_idx_key = np.flatnonzero(exact_mask_key)
+        hi_target_key = int(math.ceil(float(exact_idx_key.size) * float(precision_v_hi_frac)))
+        key_order = exact_idx_key[np.argsort(-key_q[exact_idx_key], kind="stable")]
+        lo_candidates_key = key_order[hi_target_key:]
+        commit_key = lo_candidates_key[
+            precision_v_lo_err[lo_candidates_key]
+            < code_error[lo_candidates_key].astype(np.float64, copy=False)
+        ]
+        hi_mask_key[key_order[:hi_target_key]] = True
+        lo_mask_key[commit_key] = True
+        dropped_key = int(lo_candidates_key.size - commit_key.size)
+
     np.savez_compressed(
         out / f"golden2_q{int(qidx)}_h{int(head)}.npz",
         qidx=int(qidx),
@@ -1456,6 +1523,16 @@ def _write_stage2_golden(
         v_hi_mask_packed=np.packbits(hi_mask),
         v_lo_mask_packed=np.packbits(lo_mask),
         v_dropped_reads=int(dropped),
+        v_risk_key_exp_bits=int(_FROZEN_V_RISK_KEY_EXP_BITS),
+        v_risk_key_mantissa_bits=int(_FROZEN_V_RISK_KEY_MANTISSA_BITS),
+        v_w17_fp64=w17,
+        v_code_error_fp16=ce16,
+        v_risk_key_q_fp64=key_q,
+        v_risk_key_cutoff_q=float(key_cutoff),
+        v_exact_mask_key_packed=np.packbits(exact_mask_key),
+        v_hi_mask_key_packed=np.packbits(hi_mask_key),
+        v_lo_mask_key_packed=np.packbits(lo_mask_key),
+        v_dropped_reads_key=int(dropped_key),
     )
 
 
