@@ -71,7 +71,10 @@ export FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK="${FRONTIER_EMPTY_CACHE_AFTER_PR
 
 export TASK_NAME="${DATASET}"
 export CONTEXT_LEN="${INPUT_MAX_LENGTH}"
-export NUM_SAMPLES="${MAX_TEST_SAMPLES}"
+# The converted file may hold more rows than MAX_TEST_SAMPLES (kilt dep6
+# datasets expand each question into 6 gold-depth rows). Generate ALL
+# rows of the file; scoring joins by index.
+export NUM_SAMPLES=0
 export MAX_NEW_TOKENS="${GENERATION_MAX_LENGTH}"
 export DATA_FILE_OVERRIDE="${data_file}"
 export SKIP_RULER_EVAL=1
