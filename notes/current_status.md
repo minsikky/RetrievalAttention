@@ -154,6 +154,12 @@ frozen algorithm itself:
   (65aa712), and the loader is seeded for reproducible draws.
   (2) Wrapper generated only MAX_TEST_SAMPLES rows of the 6×-expanded
   kilt file; full 96-row pair resubmitted (53030961/62).
+- **kilt_nq FULL pair landed (n=96, 128k)**: frontier τ0.004 == dense
+  on every headline metric to 6 decimals — subEM 0.3021, EM 0.1771,
+  F1 0.2818 (only rougeL_f1 −0.0004). 84/96 generations string-identical
+  to dense; genuinely sparse (1920 approx calls, ~28.6 MB/head-query
+  logical vs ~67 dense-equivalent). Zero task-quality cost on real
+  retrieval QA for the escalation-only arm; frozen-sim rerun to follow.
 
 ## 2026-07-06 RTL Gates Closed + e4m3 Verdict + Phase A First Scores + 1M Path
 
