@@ -2,6 +2,24 @@
 
 ## 2026-07-07 Stage-2 Closed + Guard Band + Qwen-1M Enabled + HELMET First Pair
 
+- **Phase A COMPLETE (128k hard-RULER, n=16, paired)**:
+
+  | task | ctx | dense | tau 0.004 | tau 0.016 |
+  |---|---|---|---|---|
+  | fwe | 128k | 43.75 | **52.08** | 41.67 |
+  | niah_multikey_3 | 128k | 75.0 | 75.0 | 75.0 |
+  | qa_1 | 128k | 62.5 | 62.5 | 62.5 |
+  | qa_2 | 128k | 43.75 | 43.75 | 43.75 |
+  | cwe | 64k | 10.0 | 10.0 | 10.0 |
+  | cwe | 128k | 0.0 (floored) | — | — |
+
+  Verdict: at the frozen tau = 0.004 the frontier matches dense on every
+  task and BEATS it on fwe (+8.3 points, the denoising effect); tau =
+  0.016 gives back the fwe gain (41.67) — the knee sits between 0.004
+  and 0.016, exactly where the operating point was frozen. Zero
+  regressions anywhere. Together with kilt_nq (frontier 0.375 vs dense
+  0.3125 subEM) the paired evidence now spans RULER-hard + HELMET RAG.
+
 - **Issue #7 CLOSED — stage-2 goldens delivered, RTL-validated 12/12.**
   Two corrections along the way: (1) the dump parser dropped kd/vd
   de-escalation trace entries (different syntax); truth is 8/12 golden
