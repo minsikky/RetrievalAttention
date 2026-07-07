@@ -1199,6 +1199,259 @@ def initial_budget_indices(
     raise ValueError(f"unknown start strategy: {strategy}")
 
 
+_STAGE2_TRACE_RE = re.compile(
+    r"^(k|v|kd|vd|stop):k(\d+)/v(\d+):dk=([^:]+):dv=([^:]+):tk=([^:]+):tv=([^:]+)$"
+)
+
+
+def _write_stage2_golden(
+    out_dir: str,
+    *,
+    qidx: int,
+    head: int,
+    kv_head: int,
+    position: int,
+    context_len: int,
+    dynamic_start: int,
+    sealed_end: int,
+    page_size: int,
+    head_dim: int,
+    threshold: float,
+    policy: str,
+    start_strategy: str,
+    start_ki: int,
+    start_vi: int,
+    settled_ki: int,
+    settled_vi: int,
+    policy_trace: list[str],
+    ranked_scores_cpu: np.ndarray,
+    k_budgets: list[int],
+    v_budgets: list[int],
+    scores_by_k: dict[int, np.ndarray],
+    probs_by_k: dict[int, np.ndarray],
+    base_output_by_k: dict[int, np.ndarray],
+    selected_by_k: dict[int, np.ndarray],
+    vhat: np.ndarray,
+    code_error: np.ndarray,
+    precision_v_hi_frac: float,
+    precision_v_lo_err: np.ndarray | None,
+) -> None:
+    """Stage-2 goldens (issue #7): controller trace, per-band flash partials
+    at the settled state, quantized-domain tail sum, proxy-mass scalars, and
+    the V-path risk/selection state. The V-selection recompute below mirrors
+    the selection block inside run() — keep the two in sync."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    n = int(context_len)
+
+    # Item 1: controller probe trace, transition for transition.
+    kinds: list[str] = []
+    p_ki: list[int] = []
+    p_vi: list[int] = []
+    p_dk: list[float] = []
+    p_dv: list[float] = []
+    p_tk: list[float] = []
+    p_tv: list[float] = []
+    for seg in policy_trace:
+        m = _STAGE2_TRACE_RE.match(str(seg))
+        if not m:
+            continue
+        kinds.append(m.group(1))
+        p_ki.append(int(m.group(2)))
+        p_vi.append(int(m.group(3)))
+        p_dk.append(float(m.group(4)))
+        p_dv.append(float(m.group(5)))
+        p_tk.append(float(m.group(6)))
+        p_tv.append(float(m.group(7)))
+
+    # Item 4: proxy-mass scalars from the literal start rule.
+    c = _softmax_prefix_count(
+        ranked_scores_cpu,
+        mass=0.9,
+        scale=1.0 / math.sqrt(max(1.0, float(head_dim))),
+    )
+
+    # Items 2+3: per-band flash partials (max, sumexp, acc[d]) at the settled
+    # K state. Bands: resident base tokens, rung bands 0..settled_ki over the
+    # ranked selection, then the never-read tail (quantized PQ logits).
+    score_vec = scores_by_k[settled_ki].astype(np.float64, copy=False)
+    vhat64 = vhat.astype(np.float64, copy=False)
+    base_mask = np.ones(n, dtype=bool)
+    base_mask[int(dynamic_start):int(sealed_end)] = False
+    part_labels = ["base"]
+    part_masks = [base_mask]
+    prev = np.zeros(n, dtype=bool)
+    for i in range(int(settled_ki) + 1):
+        m_i = np.zeros(n, dtype=bool)
+        m_i[np.asarray(selected_by_k[i], dtype=np.int64)] = True
+        part_labels.append(f"band{i}")
+        part_masks.append(m_i & ~prev & ~base_mask)
+        prev |= m_i
+    part_labels.append("tail")
+    part_masks.append(~base_mask & ~prev)
+
+    band_max: list[float] = []
+    band_sumexp: list[float] = []
+    band_acc: list[np.ndarray] = []
+    band_count: list[int] = []
+    for mask in part_masks:
+        idx = np.flatnonzero(mask)
+        if idx.size == 0:
+            band_max.append(-np.inf)
+            band_sumexp.append(0.0)
+            band_acc.append(np.zeros(vhat.shape[1], dtype=np.float64))
+            band_count.append(0)
+            continue
+        s = score_vec[idx]
+        m = float(np.max(s))
+        w = np.exp(s - m)
+        band_max.append(m)
+        band_sumexp.append(float(np.sum(w)))
+        band_acc.append(w @ vhat64[idx])
+        band_count.append(int(idx.size))
+
+    big_m = max(band_max)
+    denom = sum(
+        se * math.exp(bm - big_m) for se, bm in zip(band_sumexp, band_max) if se > 0.0
+    )
+    num = np.zeros(vhat.shape[1], dtype=np.float64)
+    for acc, bm, se in zip(band_acc, band_max, band_sumexp):
+        if se > 0.0:
+            num += acc * math.exp(bm - big_m)
+    combined = (num / max(denom, 1e-300)).astype(np.float32)
+    ref = base_output_by_k[settled_ki].astype(np.float32, copy=False)
+    combine_rel = float(
+        np.linalg.norm(combined - ref) / max(float(np.linalg.norm(ref)), 1e-20)
+    )
+    if combine_rel > 1e-5:
+        raise AssertionError(
+            f"stage2 band-combine mismatch q{qidx} h{head}: rel={combine_rel}"
+        )
+
+    # Item 5: V path at the settled pair — MIRRORS the selection block in
+    # run() (global_residual_risk + precision hi/lo split + commit test).
+    probs = probs_by_k[settled_ki]
+    risk = (probs * probs) * code_error
+    exact_count = max(0, min(int(v_budgets[settled_vi]), n))
+    exact_mask = top_mask(risk, exact_count)
+    risk_cutoff = float(np.min(risk[exact_mask])) if bool(np.any(exact_mask)) else 0.0
+    hi_mask = np.zeros(n, dtype=bool)
+    lo_mask = np.zeros(n, dtype=bool)
+    dropped = 0
+    if precision_v_hi_frac < 1.0 and precision_v_lo_err is not None and bool(np.any(exact_mask)):
+        exact_idx = np.flatnonzero(exact_mask)
+        hi_target = int(math.ceil(float(exact_idx.size) * float(precision_v_hi_frac)))
+        risk_order = exact_idx[
+            np.argsort(-risk[exact_idx].astype(np.float64, copy=False), kind="stable")
+        ]
+        lo_candidates = risk_order[hi_target:]
+        commit = lo_candidates[
+            precision_v_lo_err[lo_candidates]
+            < code_error[lo_candidates].astype(np.float64, copy=False)
+        ]
+        hi_mask[risk_order[:hi_target]] = True
+        lo_mask[commit] = True
+        dropped = int(lo_candidates.size - commit.size)
+
+    np.savez_compressed(
+        out / f"golden2_q{int(qidx)}_h{int(head)}.npz",
+        qidx=int(qidx),
+        head=int(head),
+        kv_head=int(kv_head),
+        position=int(position),
+        context_len=n,
+        dynamic_start=int(dynamic_start),
+        sealed_end=int(sealed_end),
+        page_size=int(page_size),
+        head_dim=int(head_dim),
+        threshold=float(threshold),
+        policy=str(policy),
+        start_strategy=str(start_strategy),
+        k_budgets=np.asarray(k_budgets, dtype=np.int64),
+        v_budgets=np.asarray(v_budgets, dtype=np.int64),
+        proxy_mass_c=int(c),
+        start_ki=int(start_ki),
+        start_vi=int(start_vi),
+        settled_ki=int(settled_ki),
+        settled_vi=int(settled_vi),
+        probe_kind=np.asarray(kinds),
+        probe_ki=np.asarray(p_ki, dtype=np.int64),
+        probe_vi=np.asarray(p_vi, dtype=np.int64),
+        probe_dk=np.asarray(p_dk, dtype=np.float64),
+        probe_dv=np.asarray(p_dv, dtype=np.float64),
+        probe_tk=np.asarray(p_tk, dtype=np.float64),
+        probe_tv=np.asarray(p_tv, dtype=np.float64),
+        band_labels=np.asarray(part_labels),
+        band_count=np.asarray(band_count, dtype=np.int64),
+        band_max=np.asarray(band_max, dtype=np.float64),
+        band_sumexp=np.asarray(band_sumexp, dtype=np.float64),
+        band_acc=np.stack(band_acc).astype(np.float64),
+        combined_output_fp32=combined,
+        base_output_fp32=ref,
+        combine_rel_err=float(combine_rel),
+        risk_scores=risk.astype(np.float64, copy=False),
+        v_exact_count=int(exact_count),
+        v_risk_cutoff=float(risk_cutoff),
+        v_exact_mask_packed=np.packbits(exact_mask),
+        v_hi_mask_packed=np.packbits(hi_mask),
+        v_lo_mask_packed=np.packbits(lo_mask),
+        v_dropped_reads=int(dropped),
+    )
+
+
+def _write_stage2_vpage(
+    out_dir: str,
+    *,
+    index,
+    values_np: np.ndarray,
+    kv_head: int,
+    context_len: int,
+    subbits: int,
+    value_subvecs: int,
+    value_subbits: int,
+    code_error: np.ndarray,
+    precision_v_lo_err: np.ndarray | None,
+) -> None:
+    """One V-PQ page block per (kv_head, context): value codebook + codes for
+    the LAST sealed page, with the two per-token sidecars over its range."""
+    from benchmark.selector_eval.runners.diagnose_layer_heads import _build_value_vpq_sidecars
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"page_v_ctx{int(context_len)}_kv{int(kv_head)}.npz"
+    if path.exists():
+        return
+    actual_value_subbits = int(value_subbits) if int(value_subbits) > 0 else int(subbits)
+    sidecars = _build_value_vpq_sidecars(
+        index,
+        values_np,
+        int(subbits),
+        value_subvecs=int(value_subvecs),
+        value_subbits=actual_value_subbits,
+    )
+    page_id = len(index.pages) - 1
+    page = index.pages[page_id]
+    codebook, page_codes = sidecars[int(page_id)]
+    s, e = int(page.start), int(page.start) + int(page.size)
+    np.savez_compressed(
+        path,
+        kv_head=int(kv_head),
+        context_len=int(context_len),
+        page_start=s,
+        page_size=int(page.size),
+        value_subvecs=int(value_subvecs),
+        value_subbits=int(actual_value_subbits),
+        value_codebook_fp32=np.asarray(codebook, dtype=np.float32),
+        value_codes_u8=np.asarray(page_codes, dtype=np.uint8),
+        code_error_fp64=np.asarray(code_error[s:e], dtype=np.float64),
+        int8_err_fp64=(
+            np.asarray(precision_v_lo_err[s:e], dtype=np.float64)
+            if precision_v_lo_err is not None
+            else np.zeros(0, dtype=np.float64)
+        ),
+    )
+
+
 def run() -> None:
     parser = argparse.ArgumentParser(description="Joint K/V budget policy simulation on saved QKV traces.")
     parser.add_argument("--qkv_trace", required=True)
@@ -1436,6 +1689,18 @@ def run() -> None:
             "e4m3 = OCP fp8-e4m3, scale-free (no per-step statistic, so "
             "hardware can write during the scan) and the monotone code "
             "doubles as the 256-bin histogram index (issue #6)."
+        ),
+    )
+    parser.add_argument(
+        "--golden_dump_stage2_dir",
+        default="",
+        help=(
+            "If set, dump controller/S5/S6-stage golden vectors (issue #7) per "
+            "(qidx, head) row at the settled state: parsed probe trace, per-band "
+            "flash partials (max, sumexp, acc[d]) with a combine self-check, "
+            "quantized-domain tail sum, proxy-mass scalars, and the V-path "
+            "risk/selection state; plus one V-PQ page block per (kv_head, ctx). "
+            "Run with a single (policy, threshold, start) combination."
         ),
     )
     parser.add_argument(
@@ -2614,6 +2879,50 @@ def run() -> None:
                                     float(v_budgets[vi]) / max(float(context_len), 1.0),
                                 )
                                 approx = outputs[(ki, vi)]
+                                if str(args.golden_dump_stage2_dir):
+                                    _write_stage2_golden(
+                                        str(args.golden_dump_stage2_dir),
+                                        qidx=int(qidx),
+                                        head=int(head),
+                                        kv_head=int(kv_head),
+                                        position=int(position),
+                                        context_len=int(context_len),
+                                        dynamic_start=int(dynamic_start),
+                                        sealed_end=int(sealed_end_geom),
+                                        page_size=int(args.page_size),
+                                        head_dim=int(trace.head_dim),
+                                        threshold=float(threshold),
+                                        policy=str(policy),
+                                        start_strategy=str(start_strategy),
+                                        start_ki=int(start_ki),
+                                        start_vi=int(start_vi),
+                                        settled_ki=int(ki),
+                                        settled_vi=int(vi),
+                                        policy_trace=list(policy_trace),
+                                        ranked_scores_cpu=variant_ranked_scores_cpu,
+                                        k_budgets=k_budgets,
+                                        v_budgets=v_budgets,
+                                        scores_by_k=scores_by_k,
+                                        probs_by_k=probs_by_k,
+                                        base_output_by_k=base_output_by_k,
+                                        selected_by_k=selected_by_k,
+                                        vhat=vhat_for_base,
+                                        code_error=code_error,
+                                        precision_v_hi_frac=float(precision_v_hi_frac),
+                                        precision_v_lo_err=precision_v_lo_err,
+                                    )
+                                    _write_stage2_vpage(
+                                        str(args.golden_dump_stage2_dir),
+                                        index=index,
+                                        values_np=values_np,
+                                        kv_head=int(kv_head),
+                                        context_len=int(context_len),
+                                        subbits=int(args.subbits),
+                                        value_subvecs=int(args.value_subvecs),
+                                        value_subbits=int(args.value_subbits),
+                                        code_error=code_error,
+                                        precision_v_lo_err=precision_v_lo_err,
+                                    )
                                 key = (str(score_proxy_variant), str(canonical_v_rule), policy, float(threshold), str(start_strategy))
                                 selected_heads[key][int(head)] = approx
                                 metric = _output_error_metrics(dense_head, approx)
