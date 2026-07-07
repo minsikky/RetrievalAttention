@@ -1,5 +1,49 @@
 # Current Status
 
+## 2026-07-07 (later) Frozen-Algorithm Simulator on GPU — steps 1+2 CODE-COMPLETE
+
+Context: the GPU frontier arm used in Phase A runs the frozen controller
+(tau/scaling/policy/start/rungs/page/V-risk rule) but NOT the frozen
+decision/precision domain — escalation-only walk, fp32 logit buffer, all
+selected reads fp16. All four gaps push one way, so Phase A is a fidelity
+upper bound. The frozen-sim closes them so task accuracy measures the
+frozen algorithm itself:
+
+- **Step 1 (fd73c68)**: de-escalation walk in the GPU walkers +
+  `--logit_buffer_format e4m3` (PQ score row quantized at the single
+  production point; ranking/start/softmax-base/risk/tail inherit it;
+  rank prefix re-derived by stable sort). CPU parity: e4m3 applies to
+  the PQ buffer only, never to exact or lo-tier logits — both sides.
+- **Step 2 (c78bead)**: `--joint_kv_precision_tiers` = frozen
+  progressive precision. K: ranked-prefix tokens beyond the top-10% hi
+  fraction rank/weigh with per-row absmax-int8 QDQ logits. V: risk-top
+  ceil(0.1c) reads full precision; the lo band reads the int8 plane only
+  where int8_err < code_error (per-token commit test); dropped reads
+  keep V-PQ. Composed as a second cumsum in the sorted V-prefix grid.
+  Logical-MB accounting mirrors the CPU runner (1 B lo reads, dropped
+  V counted with the tail). ALSO fixed a step-1 gap: the default walk
+  path is `_select_with_torch_policy` (vector policy), which had not
+  received the de-escalation walk — it now down-walks on the
+  materialized grid deltas (the smoke queued before this fix would have
+  silently skipped de-escalation).
+- **Parity-tested on CPU torch vs the CPU reference**: int8 QDQ
+  bit-exact; V-tier composition max err 1.1e-7; lo-read counts exact;
+  down-walk verified both flag states.
+- **Stated sim deviations** (both sub-fp16-noise, results-wise): PQ
+  trained on fp16 rows not dual-plane rows; exact tier reads fp16 not
+  fp32 dual-plane A+B (hardware A+B is FINER than fp16 for most
+  elements, so the sim is not optimistic there). In-place dual-plane
+  cache rewrite deliberately skipped: fp16(dualplane(x)) ~= fp16(x).
+- **Smokes queued** (32k niah_single_1 n=4, tau 0.004): 53032068 =
+  deesc+e4m3 arm (picks up the fixed walk from disk), 53032533 =
+  +precision tiers, chained afterany. Acceptance: score parity with the
+  100.0 non-frozen arm, flags recorded in pagedpq_config, logical MB
+  down (CPU measured -16.6% from de-escalation alone at tau 0.004).
+- Next after smokes pass: rerun Phase A tasks + kilt_nq as the
+  frozen-sim arm (deesc + e4m3 + tiers) vs existing frontier and dense
+  arms — that table becomes the frozen algorithm's accuracy, not an
+  upper bound.
+
 ## 2026-07-07 Stage-2 Closed + Guard Band + Qwen-1M Enabled + HELMET First Pair
 
 - **Phase A COMPLETE (128k hard-RULER, n=16, paired)**:
