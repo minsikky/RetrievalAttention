@@ -85,7 +85,11 @@ Controller FSM wraps S4-S6: PREDICT -> {VERIFY, WALK-UP, WALK-DOWN} -> COMMIT.
 A walk step = process one marginal band through S4-S5, compare combined
 output vs previous rung (relL2 on 128-dim fp32, trivial). **Down-probes are
 free of DRAM traffic**: recombine the band-partial tree without the top band
-— this is why the de-escalating controller costs nothing extra in bytes.
+— de-escalation costs nothing extra in bytes. [CORRECTED 2026-07-07: it also
+SAVES nothing — the bands it walks away from were already read during the
+climb, and the step is over when it settles. Charging the settled state was
+an accounting error; per-step traffic = deepest band read on each axis. See
+Sec. 5 correction.]
 var4 certify (optional) sits before S4 and can skip a band read entirely.
 
 Page seal unit (background, off critical path): 3-iter k-means on the sealed
@@ -113,6 +117,18 @@ tail logits to 1B (untested — flag for a trace experiment).
 
 ## 5. Bandwidth budget per decode step [measured, per q-head-query]
 
+**[CORRECTION 2026-07-07 — applies to every MB figure in this section]**
+These numbers charge the SETTLED (ki,vi) state. Faithful walk traffic is the
+deepest band READ on each axis (escalation probes read their lookahead band;
+bands are nested; nothing is refunded on de-escalation). Measured on the
+96-row canonical population at tau=0.004 + precision (job 53050088): settled
+4.210 (deesc) / 4.636 (no deesc) vs walk **6.930 MB/head in both arms** —
+i.e. settled numbers understate real traffic by ~1.5x, and de-escalation
+changes traffic by exactly zero. The table and the derived figures below are
+kept for continuity as lower bounds; the frozen-operating-point walk requote
+(288-pos spectrum, job 53051141) will replace the 2.857 base. Field:
+`walk_step_MB_per_head` (commit 48e9fd9).
+
 De-escalating controller, proxy-mass start, thr = tau, 288-position trace
 (`ladder_deescalate` run). Components: scan = codes+codebooks (UNSHARED trace
 accounting), exactK = selected K rows at fp16, vPath = exact V + sidecars.
@@ -132,7 +148,8 @@ Chip-level corrections to the trace numbers [derived]:
 - **Progressive precision** (int8 tiers, hi-frac 0.1): -31% on the
   exact-read terms at identical trace relL2 [measured on the precision grid]
   -> at tau=0.004 + precision the 140k total is ~**7.5 MB/q-head** vs dense
-  67 MB = **~9x dense reduction** [derived], before GQA scan sharing.
+  67 MB = **~9x dense reduction** [derived; SETTLED accounting — walk-basis
+  is ~1.5x, so quote ~11 MB/q-head / ~6x until the 53051141 requote lands].
 - Adaptive floor: short contexts settle near the behavioral floor (~10% K /
   5% V), so the reduction ratio *grows* with context — the engine gets more
   valuable exactly where decode is most bandwidth-bound.
@@ -146,7 +163,9 @@ Chip-level corrections to the trace numbers [derived]:
   `deesc_precision_compose` (mean 0.244 at tau=0.004 / 0.576 at 0.002, max 2;
   V-escalations and de-escalation steps do not sweep): **typical +9.2%
   (write + one sweep), mean +10.3%, worst-case +18.4%** on the 2.857
-  MB/head-query operating point. Recompute-from-codes mode survives as a
+  MB/head-query operating point [the +% ratios stand (they count
+  K-escalations, not settled bytes) but the 2.857 base is settled
+  accounting — rebase on the walk figure when job 53051141 lands]. Recompute-from-codes mode survives as a
   short-ctx option when the page-LUT cache covers all pages (zero writes).
   Detail: hw/docs/s2_s3_microarch_v1.md §6/§8 (RTL side).
 
@@ -191,10 +210,14 @@ competitor is a *tier*, not an alternative.
 ## 8. Open questions / measurement TODOs (ordered)
 
 - **M1 DONE (2026-07-06)**: tau sweep all-100.0 -> operating point FROZEN at
-  deescalate+precision @ tau=0.004 = 2.857 MB/head-query (288-pos spectrum).
+  deescalate+precision @ tau=0.004 = 2.857 MB/head-query (288-pos spectrum)
+  [settled accounting; walk-basis requote in flight, job 53051141 — the
+  frozen CONFIG stands, the traffic number moves ~1.5x up].
 - **M2 DONE (job 52989540)**: GQA union/sum across the 4-head group: K
   0.35-0.44, V 0.49-0.57 (short ctx -> 128k). Gather-engine DRAM traffic =
-  per-head bytes x union factor; ~5x system-level reduction at 128k.
+  per-head bytes x union factor; ~5x system-level reduction at 128k
+  [union factors stand; the per-head-bytes base is settled accounting —
+  walk-basis system reduction is nearer ~3.5x pending the 53051141 requote].
 - **M3 DONE (job 52987561)**: composition holds; precision remains free on
   top of de-escalation at both thresholds.
 - **M4 — DONE (2026-07-06, job 53003124)**: 8-bit logit buffer is FREE at

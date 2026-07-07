@@ -23,7 +23,18 @@ exact_KV_MB_per_query          = exact K/V traffic for one query at this decode 
 online_update_cumulative_MB    = cumulative update traffic up to this decode length
 online_update_MB_per_token     = online_update_cumulative_MB / decode_length
 step_MB_per_query              = selector_MB_per_query + exact_KV_MB_per_query + online_update_MB_per_token
+walk_step_MB_per_head          = selector + DEEPEST band READ per axis during the walk + online_update
 ```
+
+**Walk vs settled accounting (2026-07-07).** `step_MB_per_query` /
+`step_MB_per_head` charge the SETTLED (ki,vi) state of the adaptive walk.
+Faithful hardware traffic is `walk_step_MB_per_head`: every escalation probe
+reads its lookahead band (the stability pair (k,k+1); the marginal V band),
+bands are nested, and de-escalation reads nothing new and refunds nothing.
+Measured gap at the frozen operating point: settled understates walk by
+~1.5x, and de-escalation changes walk traffic by exactly zero. Use
+`walk_step_MB_per_head` for any DRAM/bandwidth claim; settled fields remain
+as lower bounds and for continuity with pre-2026-07-07 tables.
 
 Unqualified benchmark fields such as `mean_step_MB_per_head_query` are logical-frontier fields for backward compatibility. New summaries also emit explicit `mean_logical_frontier_*` aliases and `mean_physical_gpu_*` diagnostics.
 

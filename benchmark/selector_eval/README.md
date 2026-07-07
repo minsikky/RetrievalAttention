@@ -64,6 +64,7 @@ Tables should show unit-explicit cost columns:
 - `online_update_cumulative_MB`: cumulative online maintenance traffic up to this decode length.
 - `online_update_MB_per_token`: `online_update_cumulative_MB / decode_length`.
 - `step_MB_per_query`: `selector_MB_per_query + exact_KV_MB_per_query + online_update_MB_per_token`.
+- `walk_step_MB_per_head` (adaptive-ladder runner): faithful walk traffic — selector + the DEEPEST band read on each axis during the walk + online update. The plain `step_MB_*` fields charge the settled state only, which understates real traffic (escalation probes read lookahead bands; de-escalation refunds nothing). Use the walk field for DRAM/bandwidth claims; see COST_MODEL.md.
 
 Legacy aliases such as `selector_MB`, `exact_KV_MB`, `query_MB`, `online_update_MB`, and `total_MB` are still emitted for compatibility. Do not use them in new tables when the unit-explicit columns are available.
 

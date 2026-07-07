@@ -1,5 +1,43 @@
 # Current Status
 
+## 2026-07-07 METRIC CORRECTION: settled-state MB was not faithful walk traffic — de-escalation saves ZERO DRAM
+
+`step_MB_per_head` charges the settled (ki,vi) state, but the faithful
+hardware walk pays for the deepest band READ on each axis: every
+escalation probe reads its lookahead band (the stability pair (k,k+1);
+the marginal V band), bands are nested, and once a band is read the
+bytes are paid — de-escalation reads nothing new and refunds nothing.
+The de-escalation "savings" quoted below (2026-07-06 entries: `-16.6%`
+at tau 0.004, `-5.7%` at 0.002, `-26%` composite) were an accounting
+artifact of charging the settled state after the down-walk.
+
+- New fields (commit 48e9fd9): `walk_step_MB_per_head` /
+  `walk_k_read_max_idx` per row + walk means in summaries. Old settled
+  fields kept for continuity; they are a LOWER BOUND, not traffic.
+- **Requote (job 53050088, 96-row canonical population, tau=0.004,
+  precision(0.1,0.1))**: walk `6.930 MB/head` in BOTH arms — deesc on
+  (settled `4.210`) and off (settled `4.636`). De-escalation changes
+  real traffic by exactly 0.000; the settled metric understates
+  faithful traffic by 33% even without de-escalation (escalation-only
+  stop tests also read one band past the stop on each axis).
+- The frozen-operating-point figure `2.857 MB/head-query` (M3, 288-pos
+  spectrum) is likewise a settled number; walk requote in flight (job
+  53051141, scripts/run_walk_mb_requote_oppoint.sbatch) — expect
+  ~1.5x. hw_arch Sec 5 table + spill-model base and the algorithm-spec
+  quotes inherit this and are annotated pending that number.
+- **De-escalation's remaining value is NOT bandwidth** under the
+  per-step-independent frozen spec. What survives: (a) leaner settled
+  output state (smaller accepted sets -> smaller online-update/output
+  bookkeeping), (b) start-insensitivity — it eliminates the warm-start
+  ratchet (temporal_prev settles identically instead of ratcheting to
+  14.14 MB), which is what makes cross-step budget carry SAFE. A
+  budget-carry design (start next step at/near previous settled rung)
+  is the only way de-escalation can produce real byte savings, and it
+  is unspecced/unstudied. Decision open: keep de-esc with the honest
+  justification (b), spec budget-carry, or drop it (RTL has built
+  kd/vd sequencer machinery — coordinate before changing the frozen
+  algorithm).
+
 ## 2026-07-07 (later) Frozen-Algorithm Simulator on GPU — steps 1+2 CODE-COMPLETE
 
 Context: the GPU frontier arm used in Phase A runs the frozen controller
@@ -37,8 +75,11 @@ frozen algorithm itself:
 - **Smokes queued** (32k niah_single_1 n=4, tau 0.004): 53032068 =
   deesc+e4m3 arm (picks up the fixed walk from disk), 53032533 =
   +precision tiers, chained afterany. Acceptance: score parity with the
-  100.0 non-frozen arm, flags recorded in pagedpq_config, logical MB
-  down (CPU measured -16.6% from de-escalation alone at tau 0.004).
+  100.0 non-frozen arm, flags recorded in pagedpq_config. [The original
+  third criterion — logical MB down -16.6% from de-escalation — is
+  RETRACTED per the 2026-07-07 metric correction above: de-escalation
+  saves zero faithful walk traffic; do not use MB deltas between deesc
+  arms as an acceptance signal.]
 - Next after smokes pass: rerun Phase A tasks + kilt_nq as the
   frozen-sim arm (deesc + e4m3 + tiers) vs existing frontier and dense
   arms — that table becomes the frozen algorithm's accuracy, not an
@@ -199,6 +240,12 @@ frozen algorithm itself:
 
 ## 2026-07-06 OPERATING POINT FROZEN: tau=0.004 + de-escalation + precision
 
+[CORRECTION 2026-07-07: all MB figures in this section are SETTLED-state
+accounting — see the metric correction at the top. Faithful walk traffic
+is ~1.5x these numbers and identical with de-escalation on or off; the
+`2.857 MB` figure is being requoted under walk accounting (job 53051141).
+Quality results (relL2, task scores) are unaffected.]
+
 - **GPU tau sweep (jobs 52980959/61/62 + vt retry 52985915): every arm scores 100.0.** Frontier end-to-end (real structured error, not Gaussian): niah_multikey_2 / vt / niah_single_1 at 32k n25 for tau in {0.002, 0.004, 0.008}, niah_single_1 at 128k n16 for {0.002, 0.004} - all 100.0, no nulls, paired samples. tau=0.004 is task-validated end-to-end; 0.008 also passes everywhere tested (headroom, not adopted). GPU max-physical step MB trends down 11.3 -> 10.7 -> 10.0 (multikey 32k). Env fixes en route: numpy.libs/scipy.libs on LD_LIBRARY_PATH (51ea773) and tau unpinned from the canonical-frontier guard (4f6462a).
 - **M3 composition (52987561): de-escalation x precision(0.1,0.1) stack cleanly.** 288-position subset: `3.496 MB` at thr 0.002 (identical relL2 to deesc-only, precision stays free) and **`2.857 MB` at thr 0.004** (relL2 mean 0.00356, p99 0.0074, max 0.0105 - well under the 0.05 calibrated line) vs canonical `5.748` at 0.002. **New recommended operating point: deescalate + precision(0.1,0.1) @ tau=0.004 = -50% vs the previous canonical.** Caveats: deesc+precision are trace-validated (GPU promotion pending); tau=0.004 is the piece with direct end-to-end task validation.
 - **M2 GQA union factor (52989540, heads 0-7 = 2 full kv groups):** union/sum of accepted sets across the 4 q heads of a kv group (0.25 = perfect overlap): K `0.35 -> 0.44` and V `0.49 -> 0.57` from short to 128k contexts. A physical K-row read serves ~2.3-2.9 q heads, V ~1.8-2.0. Chip DRAM traffic = trace exact-read bytes x union factor; rough system math at 128k, deesc+tau0.004+precision: ~3.4 GB/token vs dense 17.2 GB/token ~= 5x system-level, before scan sharing refinements.
@@ -210,7 +257,7 @@ Motivation: the settled-K histogram (canonical, thr 0.002) is 0.30/0.50/0.70 = 2
 - **Fine grid is Pareto-neutral** (jobs 52959762/63, 9-point decode ladder, thr 0.001/0.002/0.004; fine = K steps of 0.10, V ~halved spacing): at thr 0.002 fine settles `5.254` vs `5.749 MB` (-8.6%) but relL2 mean `0.00224` vs `0.00165`, max `0.0097` vs `0.0031` — with smaller rungs the sqrt-scaled per-rung tau shrinks and rung deltas dip below it before the output truly stabilizes (premature stop). Cross-comparing thresholds, fine@0.002 ~= standard@0.004 and fine@0.001 vs standard@0.002 trade in the usual direction: the same tradeoff curve is reachable on the standard grid by moving tau. Grid refinement buys nothing structural.
 - **Warm start (escalate-only) ratchets; half-prev warm start mildly wins** (job 52959824, DECODE_LENGTHS=all 288 positions, thr 0.002): `temporal_prev` (start AT previous settled fraction) ratchets monotonically because the ladder cannot de-escalate — `14.14 MB` at relL2 `1.4e-5` (2.5x canonical, massively over-bought). `temporal_prev_low` (start at HALF the previous settled fraction, so the budget must be re-earned every step) gives `5.503 MB` vs canonical `5.748` at matched quality (mean `0.00162` vs `0.00153`, max `0.0049` vs `0.0037`). Cheap default improvement; also the right start for reuse steps (v5 below).
 - **Predict-only is 80% of the ladder at zero control cost** (job 52959825, thr=999 so the ladder never escalates: settle at the predicted start rung): `proxy_mass_m0p9` alone lands `4.739 MB` (-18% vs canonical) at relL2 mean `0.0049`, p99 `0.019`, max `0.033`; `m0p95` gives `5.648 MB` / p99 `0.014`. Tail is 5-10x worse than the ladder's (p99 0.003) but the worst case is still under the 0.05 noise-calibration task-safe line (Gaussian-vs-structured caveat applies). Reading: the proxy-mass predictor carries most of the information; the ladder's marginal value is tail control. A predict-then-verify controller (start at m0p9 rung, one confirm test, escalate only on failure) is the natural hardware design — sequential control the chip does cheaply — and `temporal_prev_low` + ladder is already an approximation of it.
-- **De-escalation controller is a real Pareto improvement** (`--budget_deescalate`, commit 48fe5ce; job 52979792, 288-position subset): after the escalate-only walk stops, greedily step DOWN any axis whose adjacent-band delta is within its scaled tau (same pair-delta governs both directions => cannot oscillate). Same-subset comparison vs canonical ladder: thr 0.001 `6.644` vs `6.721`; thr 0.002 `5.423` vs `5.748` (`-5.7%`) at mean relL2 `0.00169` vs `0.00153` (canonical curve interpolated to 5.423 MB predicts ~0.00215 — de-escalation sits ABOVE the curve, unlike the fine grid); thr 0.004 `4.266` vs `5.112` (`-16.6%`) at `0.00358` vs `0.00274`. Mechanism: it corrects the escalate-only walk's path-dependence — an axis over-shot by the start prediction is never revisited in the canonical ladder. Crucially the `temporal_prev` (warm start at previous settled rung) arm settles at IDENTICAL numbers (`5.422` at 0.002, ~1.4 down-steps/row): de-escalation makes the controller start-insensitive and eliminates the ratchet failure mode outright. Recommended composition if the GPU tau sweep validates 0.004: deescalate @ tau=0.004 = `4.266 MB` on this subset (`-26%` vs canonical 5.748 @ 0.002), stacking with progressive-precision int8 on top. Hardware note: a down-probe needs the output one rung below — subtractive band removal + renorm in the flash-style accumulator, same cost class as the upward test.
+- **De-escalation controller is a real Pareto improvement** [RETRACTED as a BANDWIDTH claim 2026-07-07 — the MB deltas below are settled-state accounting; faithful walk traffic is identical with de-escalation on or off (climb bands are read either way). What survives: start-insensitivity / ratchet elimination and a leaner settled output state. See the top-of-file correction.] (`--budget_deescalate`, commit 48fe5ce; job 52979792, 288-position subset): after the escalate-only walk stops, greedily step DOWN any axis whose adjacent-band delta is within its scaled tau (same pair-delta governs both directions => cannot oscillate). Same-subset comparison vs canonical ladder: thr 0.001 `6.644` vs `6.721`; thr 0.002 `5.423` vs `5.748` (`-5.7%`) at mean relL2 `0.00169` vs `0.00153` (canonical curve interpolated to 5.423 MB predicts ~0.00215 — de-escalation sits ABOVE the curve, unlike the fine grid); thr 0.004 `4.266` vs `5.112` (`-16.6%`) at `0.00358` vs `0.00274`. Mechanism: it corrects the escalate-only walk's path-dependence — an axis over-shot by the start prediction is never revisited in the canonical ladder. Crucially the `temporal_prev` (warm start at previous settled rung) arm settles at IDENTICAL numbers (`5.422` at 0.002, ~1.4 down-steps/row): de-escalation makes the controller start-insensitive and eliminates the ratchet failure mode outright. Recommended composition if the GPU tau sweep validates 0.004: deescalate @ tau=0.004 = `4.266 MB` on this subset (`-26%` vs canonical 5.748 @ 0.002), stacking with progressive-precision int8 on top. Hardware note: a down-probe needs the output one rung below — subtractive band removal + renorm in the flash-style accumulator, same cost class as the upward test.
 
 ## 2026-07-06 Scan-Floor Negative Results: Page Pruning and Global PQ Codebook
 

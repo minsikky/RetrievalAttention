@@ -82,9 +82,14 @@ relL2(a,b) = ||a-b||_2 / max(||b||_2, eps) on the 128-dim attention output.
    (`choose_action` line ~531, `simulate_policy` line ~576).
 4. **De-escalate walk** (after stop): repeatedly step DOWN any axis whose
    adjacent-band delta is within its scaled threshold (same formula). The
-   same pair-delta governs both directions => no oscillation. Validated
-   Pareto improvement (-5.7% MB @0.002, -16.6% @0.004). simulate_policy
-   `deescalate=True` branch.
+   same pair-delta governs both directions => no oscillation.
+   simulate_policy `deescalate=True` branch. [CORRECTED 2026-07-07: the
+   previously quoted MB savings (-5.7% @0.002, -16.6% @0.004) were
+   settled-state accounting and are RETRACTED — the down-walk reads no
+   DRAM and refunds none; faithful walk traffic (deepest band read per
+   axis) is identical with de-escalation on or off. De-escalation's
+   validated value is start-insensitivity (eliminates the warm-start
+   ratchet) and a leaner settled output state, not bandwidth.]
 5. Output at settle = out(ki, vi). Down-probes MUST be implemented via
    stored per-band partial accumulators (max, sum, acc[128]) — recombine,
    do not re-read DRAM.
@@ -205,7 +210,10 @@ Golden runs already in-repo (gitignored artifacts, regenerate as needed):
 `attention_efficiency_result/joint_kv_ladder_grid_20260706/ladder_deescalate/`
 and (composition) `deesc_precision_compose/`. Per-row fields to match:
 `selected_k_tokens`, `v_exact_reads`, settled `k_budget`/`v_budget`,
-`policy_trace` (rung walk sequence), `step_MB_per_head` (byte accounting),
+`policy_trace` (rung walk sequence), `step_MB_per_head` (byte accounting of
+the SETTLED state — well-defined as a golden match target, but NOT faithful
+walk traffic; `walk_step_MB_per_head` charges the deepest band read per axis
+and is the field for any DRAM/bandwidth claim, commit 48e9fd9),
 `head_attention_relative_L2` (output correctness, fp tolerance 1e-3 rel).
 Block-level goldens: PQ logits and ranked order can be dumped by
 instrumenting the runner at the `rank_paged_pq` call — coordinate with the
@@ -235,4 +243,5 @@ CSVs authoritative — issue #4); OPEN-1 (tau=0.004 frozen); OPEN-2 (int8 dual-p
 factors: K 0.35-0.44, V 0.49-0.57 across the 4-head group, rising with
 context); M3 (deesc x precision composition golden run
 `deesc_precision_compose/`: 2.857 MB/head-query at tau=0.004 on the
-288-position spectrum).
+288-position spectrum — SETTLED accounting; walk-basis figure ~1.5x,
+requote job 53051141, see hw_arch Sec. 5 correction).
