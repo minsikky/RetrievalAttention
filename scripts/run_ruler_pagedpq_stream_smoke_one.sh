@@ -131,7 +131,7 @@ else
     --tokenizer_path "${MODEL_PATH}" \
     --tokenizer_type hf \
     --max_seq_length "${CONTEXT_LEN}" \
-    --model_template_type meta-chat \
+    --model_template_type "${MODEL_TEMPLATE_TYPE:-meta-chat}" \
     --num_samples "${NUM_SAMPLES}"
   popd >/dev/null
 fi

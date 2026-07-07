@@ -13,7 +13,7 @@ import numpy as np
 import torch
 import yaml
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -892,7 +892,20 @@ def run() -> None:
     }
     if not bool(args.cpu_then_to_device):
         kwargs["device_map"] = {"": str(device)}
-    model = LlamaForCausalLM.from_pretrained(args.model_name, **kwargs)
+    # AutoModel resolves the architecture from config (Llama, Qwen2, ...).
+    # The paged-PQ patch only requires the Llama-style module layout
+    # (model.model.layers[i].self_attn with q/k/v/o_proj + head_dim),
+    # which Qwen2 shares; Qwen2.5-1M additionally needs no rope_scaling.
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, **kwargs)
+    # Qwen2.5(-1M) configs carry sliding_window=32768 with
+    # use_sliding_window=False. The attention layers gate on
+    # use_sliding_window, but the transformers 4.49 causal-mask builder
+    # gates on sliding_window alone and would band-mask everything
+    # beyond 32k once kv_len > sliding_window — silently truncating the
+    # dense baseline. Null it so the mask path matches the layers.
+    if getattr(model.config, "use_sliding_window", None) is False and getattr(model.config, "sliding_window", None):
+        log(f"disabling config.sliding_window={model.config.sliding_window} (use_sliding_window=False)")
+        model.config.sliding_window = None
     if bool(args.cpu_then_to_device):
         model = model.to(device)
     model.eval()

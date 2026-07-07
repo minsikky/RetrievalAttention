@@ -58,6 +58,8 @@ Templates = {
 
     'meta-chat': "[INST] {task_template} [/INST]",
 
+    'qwen-chat': "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n{task_template}<|im_end|>\n<|im_start|>assistant\n",
+
     'vicuna-chat': "A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: {task_template} ASSISTANT:",
 
     'lwm-chat': "You are a helpful assistant. USER: {task_template} ASSISTANT: ",
