@@ -156,6 +156,10 @@ def _head_start_indices(runtime: JointPolicyRuntime, local_head_i: int) -> tuple
 
 
 def _requires_torch_policy(runtime: JointPolicyRuntime) -> bool:
+    if bool(getattr(runtime.args, "joint_kv_deescalate", False)):
+        # The native policy kernel is escalation-only; the frozen-spec
+        # down-walk lives in the torch policy.
+        return True
     if str(runtime.threshold_mode) != "fixed":
         return True
     for values in (runtime.start_ki_by_head, runtime.start_vi_by_head):
@@ -401,6 +405,37 @@ def _select_with_torch_policy(
             else:
                 raise AssertionError(action)
             steps += 1
+        if bool(getattr(runtime.args, "joint_kv_deescalate", False)):
+            # Frozen-spec down-walk (spec §4 step 4) on the materialized
+            # grid: k_delta_np[ki-1, vi] IS relL2(out[ki-1,vi], out[ki,vi])
+            # with the richer-rung denominator, so the down-probe reuses
+            # the escalation delta arrays at zero extra GPU work. K probe
+            # then V probe each round (V reads the post-K-move ki),
+            # mirroring _deescalate_walk / simulate_policy(deescalate).
+            while True:
+                moved = False
+                if int(ki) > 0:
+                    d = float(k_delta_np[int(ki) - 1, int(vi), int(local_head_i)])
+                    thr_k = _band_threshold_between(
+                        runtime,
+                        runtime.active_k_budgets[int(ki) - 1],
+                        runtime.active_k_budgets[int(ki)],
+                    )
+                    if d <= thr_k:
+                        ki -= 1
+                        moved = True
+                if int(vi) > 0:
+                    d = float(v_delta_np[int(ki), int(vi) - 1, int(local_head_i)])
+                    thr_v = _band_threshold_between(
+                        runtime,
+                        runtime.v_budgets[int(vi) - 1],
+                        runtime.v_budgets[int(vi)],
+                    )
+                    if d <= thr_v:
+                        vi -= 1
+                        moved = True
+                if not moved:
+                    break
         selected.append((int(ki), int(vi)))
     return selected
 

@@ -35,6 +35,26 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_vprefix impo
     build_joint_vprefix_grid,
 )
 
+# Frozen progressive-precision tiers (--joint_kv_precision_tiers, spec
+# OPEN-2/M6): the top 10% of the K ranked prefix / V risk-ranked exact set
+# reads full precision; the rest reads the per-row absmax-int8 plane, with
+# V lo reads additionally gated by the per-token commit test
+# (int8_err < code_error). Mirrors --precision_k_hi_frac 0.1
+# --precision_v_hi_frac 0.1 --precision_lo_mode int8 --precision_lo_bits 8
+# in run_joint_kv_budget_policy_eval.py — keep in sync.
+_FROZEN_PRECISION_K_HI_FRAC = 0.1
+_FROZEN_PRECISION_V_HI_FRAC = 0.1
+_FROZEN_PRECISION_LO_BYTES = 1
+
+
+def _rowwise_int8_qdq(x32_t: torch.Tensor) -> torch.Tensor:
+    """Per-row symmetric absmax int8 quantize-dequantize (the MSB-plane
+    read). Torch mirror of _quantize_rows_symmetric(x, 8) in
+    run_joint_kv_budget_policy_eval.py: scale = absmax/127 clamped to
+    1e-12, round-half-even codes."""
+    scale_t = (x32_t.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min_(1e-12)
+    return torch.round(x32_t / scale_t) * scale_t
+
 
 def _budget_index_at_least(budgets: list[int], target: float) -> int:
     for idx, budget in enumerate(budgets):
@@ -859,6 +879,33 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         if int(selected_t_i.numel()) > 0:
             exact_selected_scores_t = exact_scores_h.gather(1, selected_t_i).to(prob_dtype)
             score_vec.scatter_(1, selected_t_i, exact_selected_scores_t)
+        if scores_lo_h_t is not None:
+            # Frozen K lo tier: ranked-prefix tokens beyond the hi-precision
+            # fraction (base excluded) read the int8-plane logit instead of
+            # the exact one. Mirrors _precision_lo_tokens + the
+            # score_vec[lo_tokens] = scores_lo_np substitution in
+            # run_joint_kv_budget_policy_eval.py.
+            selected_len_local = (
+                int(selected_t_i.shape[1]) if selected_t_i.ndim == 2 else int(selected_t_i.numel())
+            )
+            take_local = max(0, selected_len_local - int(base_t.numel()))
+            if take_local > 0:
+                hi_local = int(math.ceil(float(take_local) * _FROZEN_PRECISION_K_HI_FRAC))
+                if hi_local < take_local:
+                    if (
+                        ranked_prefix_tokens_t is None
+                        or int(ranked_prefix_tokens_t.shape[1]) < take_local
+                    ):
+                        raise RuntimeError(
+                            "joint_kv_precision_tiers requires the sorted ranked-prefix "
+                            "token table covering every K budget"
+                        )
+                    lo_pos_t = ranked_prefix_tokens_t[:, hi_local:take_local]
+                    score_vec.scatter_(
+                        1,
+                        lo_pos_t,
+                        scores_lo_h_t.gather(1, lo_pos_t).to(prob_dtype),
+                    )
         return score_vec
 
     def mixed_probs_for_selected_batch(selected_t_i: torch.Tensor) -> torch.Tensor:
@@ -882,6 +929,63 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     v_mb_by_idx = value_cost.v_mb_by_idx
     max_exact_v_count = int(value_cost.max_exact_v_count)
     use_ondemand_v_prefix = _env_truthy("SELECTOR_PQ_JOINT_ONDEMAND_V_PREFIX", "0")
+    precision_tiers_enabled = bool(getattr(args, "joint_kv_precision_tiers", False))
+    scores_lo_h_t: torch.Tensor | None = None
+    residual_lo_commit_t: torch.Tensor | None = None
+    v_commit_mask_t: torch.Tensor | None = None
+    if precision_tiers_enabled:
+        # The frozen tiers are implemented on the canonical torch grid
+        # path only; fail loudly instead of silently running the old
+        # single-tier composition on an optimized path.
+        unsupported = [
+            name
+            for name, active in (
+                ("SELECTOR_PQ_JOINT_GROUPED_RISK_PREFIX", use_grouped_risk_prefix),
+                ("SELECTOR_PQ_JOINT_COMPACT_VPQ_RISK_PREFIX", compact_grouped_vpq_enabled),
+                ("SELECTOR_PQ_JOINT_ONDEMAND_V_PREFIX", use_ondemand_v_prefix),
+                ("SELECTOR_PQ_JOINT_UNSORTED_K_PREFIX", use_unsorted_k_prefix),
+                (
+                    "SELECTOR_PQ_JOINT_NATIVE_SCORE_GRID",
+                    _env_truthy("SELECTOR_PQ_JOINT_NATIVE_SCORE_GRID", "0"),
+                ),
+                (
+                    "SELECTOR_PQ_JOINT_GRID_ARTIFACTS=0",
+                    not _env_truthy("SELECTOR_PQ_JOINT_GRID_ARTIFACTS", "1"),
+                ),
+            )
+            if active
+        ]
+        if unsupported:
+            raise RuntimeError(
+                "joint_kv_precision_tiers requires the canonical torch grid path; "
+                f"incompatible with: {', '.join(unsupported)}"
+            )
+        if int(residual_t.shape[0]) < context_len_i or int(vhat_all_t.shape[0]) < context_len_i:
+            raise RuntimeError(
+                "joint_kv_precision_tiers requires full V-PQ vhat/residual sidecars"
+            )
+        # K lo tier: per-row absmax-int8 QDQ of the cached keys, one extra
+        # (ctx, dim) pass + one GEMM per head group per decode step.
+        keys32_t = torch_k_cache[int(kv_head_i)][:context_len_i].to(
+            device=device, dtype=torch.float32
+        )
+        scores_lo_h_t = (queries_h @ _rowwise_int8_qdq(keys32_t).transpose(0, 1)) / sqrt_dim
+        del keys32_t
+        # V lo tier: int8-plane values, per-token commit test against the
+        # V-PQ code-error stat (both fp64, matching the CPU reference
+        # compare), and the committed lo residual pre-zeroed on failed
+        # commits so the V grid can fold it into one cumsum.
+        values32_t = values_t.to(device=device, dtype=torch.float32)
+        values_lo_t = _rowwise_int8_qdq(values32_t)
+        int8_err_t = (values32_t - values_lo_t).pow(2).sum(dim=1, dtype=torch.float64)
+        del values32_t
+        v_commit_mask_t = int8_err_t < code_error_t.to(dtype=torch.float64)
+        residual_lo_commit_t = torch.where(
+            v_commit_mask_t.reshape(-1, 1),
+            values_lo_t - vhat_all_t.to(dtype=torch.float32),
+            torch.zeros((), dtype=torch.float32, device=device),
+        )
+        del values_lo_t, int8_err_t
     k_core_by_idx: dict[
         int,
         tuple[torch.Tensor, float, torch.Tensor, torch.Tensor, torch.Tensor],
@@ -956,6 +1060,11 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         return out
 
     def k_artifacts_batch(ki_i: int) -> tuple[torch.Tensor, float, torch.Tensor, torch.Tensor | None]:
+        if precision_tiers_enabled:
+            raise RuntimeError(
+                "joint_kv_precision_tiers is only implemented for the grid V-prefix "
+                "path; the lazy k_artifacts V composition is single-tier"
+            )
         cached = k_artifacts_by_idx.get(int(ki_i))
         if cached is not None:
             return cached
@@ -1002,6 +1111,11 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         return out
 
     def output_for_budget_batch(ki_i: int, vi_i: int) -> torch.Tensor:
+        if precision_tiers_enabled:
+            raise RuntimeError(
+                "joint_kv_precision_tiers is only implemented for the grid V-prefix "
+                "path; the lazy output_for_budget V composition is single-tier"
+            )
         key = (int(ki_i), int(vi_i))
         cached = outputs_by_budget.get(key)
         if cached is not None:
@@ -1089,6 +1203,8 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     grid_selected_by_ki: list[torch.Tensor | None] | None = None
     grid_selected_counts_by_ki: list[int] | None = None
     grid_k_mb_by_idx: list[float] | None = None
+    grid_k_lo_counts_by_ki: list[int] | None = None
+    grid_v_lo_reads_t: torch.Tensor | None = None
     use_incremental_v_grid = _env_truthy("SELECTOR_PQ_JOINT_INCREMENTAL_V_GRID", "0")
     if _env_truthy("SELECTOR_PQ_JOINT_GRID_ARTIFACTS", "1"):
         joint_score_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
@@ -1101,6 +1217,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         grid_selected_counts_by_ki = [] if needs_logical_accounting else None
         grid_score_rows: list[torch.Tensor] = []
         grid_k_mb_by_idx = [] if needs_budget_mb_vectors else None
+        grid_k_lo_counts_by_ki = [] if precision_tiers_enabled else None
         grid_take_counts: list[int] = []
         exact_full_budget_grid_flag = _env_truthy("SELECTOR_PQ_JOINT_EXACT_FULL_BUDGET_GRID", "1")
         native_score_grid_enabled = (
@@ -1161,9 +1278,23 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             grid_selected_by_ki.append(selected_t_i)
             if grid_selected_counts_by_ki is not None:
                 grid_selected_counts_by_ki.append(int(selected_len_i))
+            k_lo_count_i = 0
+            if precision_tiers_enabled and int(take_i) > 0:
+                k_lo_count_i = int(take_i) - int(
+                    math.ceil(float(take_i) * _FROZEN_PRECISION_K_HI_FRAC)
+                )
+            if grid_k_lo_counts_by_ki is not None:
+                grid_k_lo_counts_by_ki.append(int(k_lo_count_i))
             if grid_k_mb_by_idx is not None:
                 grid_k_mb_by_idx.append(
-                    float(selector_mb) + float(selected_len_i * int(self.head_dim) * key_bytes) / MB
+                    float(selector_mb)
+                    + float(selected_len_i * int(self.head_dim) * key_bytes) / MB
+                    - float(
+                        k_lo_count_i
+                        * int(self.head_dim)
+                        * (key_bytes - _FROZEN_PRECISION_LO_BYTES)
+                    )
+                    / MB
                 )
             if not native_score_grid_enabled:
                 if selected_t_i is None:
@@ -1893,10 +2024,14 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 code_error=code_error_t,
                 joint_v_budgets=joint_v_budgets,
                 joint_v_budgets_t=joint_v_budgets_t,
+                residual_lo_commit=residual_lo_commit_t,
+                v_commit_mask=v_commit_mask_t,
+                v_hi_frac=_FROZEN_PRECISION_V_HI_FRAC,
             )
         )
         grid_outputs_t = vprefix_result.grid_outputs
         grid_outputs_for_v_idx = vprefix_result.grid_outputs_for_v_idx
+        grid_v_lo_reads_t = vprefix_result.v_lo_reads_grid
     policy_result = select_joint_kv_budgets(
         JointPolicyRuntime(
             args=args,
@@ -1964,5 +2099,10 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             grid_selected_by_ki=grid_selected_by_ki,
             k_artifacts=k_artifacts_batch,
             output_for_budget=output_for_budget_batch,
+            precision_tiers_enabled=bool(precision_tiers_enabled),
+            precision_v_hi_frac=float(_FROZEN_PRECISION_V_HI_FRAC),
+            precision_lo_bytes=int(_FROZEN_PRECISION_LO_BYTES),
+            k_lo_counts_by_ki=grid_k_lo_counts_by_ki,
+            v_lo_reads_grid=grid_v_lo_reads_t,
         )
     )

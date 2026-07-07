@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -31,12 +32,23 @@ class JointVPrefixGridRuntime:
     code_error: torch.Tensor
     joint_v_budgets: list[int]
     joint_v_budgets_t: torch.Tensor
+    # Frozen precision tiers (spec OPEN-2/M6, --joint_kv_precision_tiers):
+    # residual_lo_commit rows are int8-QDQ(V) - vhat where the per-token
+    # commit test passes (int8_err < code_error) and ZERO elsewhere, so the
+    # lo band folds into one extra cumsum. v_commit_mask is the raw commit
+    # bitmap (for lo-read accounting). v_hi_frac is the frozen 0.1.
+    residual_lo_commit: torch.Tensor | None = None
+    v_commit_mask: torch.Tensor | None = None
+    v_hi_frac: float = 1.0
 
 
 @dataclass(frozen=True)
 class JointVPrefixGridResult:
     grid_outputs: torch.Tensor | None
     grid_outputs_for_v_idx: Callable[[int], torch.Tensor] | None
+    # (k_count, v_count, heads) committed lo-tier exact reads per budget
+    # pair; only populated when precision tiers are active.
+    v_lo_reads_grid: torch.Tensor | None = None
 
 
 def build_joint_vprefix_grid(runtime: JointVPrefixGridRuntime) -> JointVPrefixGridResult:
@@ -44,6 +56,8 @@ def build_joint_vprefix_grid(runtime: JointVPrefixGridRuntime) -> JointVPrefixGr
     prefix_delta_by_count: dict[int, torch.Tensor] | None = None
     grid_outputs_t: torch.Tensor | None = None
     grid_outputs_for_v_idx: Callable[[int], torch.Tensor] | None = None
+    v_lo_reads_grid_t: torch.Tensor | None = None
+    precision_tiers_active = runtime.residual_lo_commit is not None
     joint_risk_wall_t0 = time.perf_counter() if runtime.wall_profile_enabled else 0.0
     if bool(getattr(runtime.args, "profile_native_ops", False)):
         _sync_if_cuda(runtime.device)
@@ -51,6 +65,16 @@ def build_joint_vprefix_grid(runtime: JointVPrefixGridRuntime) -> JointVPrefixGr
     else:
         joint_risk_t0 = 0.0
 
+    if precision_tiers_active and (
+        runtime.use_incremental_v_grid
+        or _env_truthy("SELECTOR_PQ_JOINT_NATIVE_RISK_PREFIX", "0")
+        or _env_truthy("SELECTOR_PQ_JOINT_UNSORTED_V_PREFIX", "0")
+    ):
+        raise RuntimeError(
+            "joint_kv_precision_tiers requires the sorted torch V-prefix path "
+            "(disable SELECTOR_PQ_JOINT_INCREMENTAL_V_GRID / NATIVE_RISK_PREFIX / "
+            "UNSORTED_V_PREFIX)"
+        )
     if runtime.use_incremental_v_grid:
         grid_outputs_for_v_idx = _incremental_v_grid_accessor(runtime)
     elif int(runtime.max_exact_v_count) > 0:
@@ -69,11 +93,20 @@ def build_joint_vprefix_grid(runtime: JointVPrefixGridRuntime) -> JointVPrefixGr
             )
         elif _env_truthy("SELECTOR_PQ_JOINT_UNSORTED_V_PREFIX", "0"):
             grid_outputs_t = _unsorted_vprefix_outputs(runtime, risk_grid_t)
+        elif precision_tiers_active:
+            grid_outputs_t, v_lo_reads_grid_t = _sorted_vprefix_outputs_precision_tiers(
+                runtime,
+                risk_grid_t,
+            )
         else:
             grid_outputs_t, prefix_delta_grid_t, prefix_delta_by_count = _sorted_vprefix_outputs(
                 runtime,
                 risk_grid_t,
             )
+    elif precision_tiers_active:
+        # No V budget reads exact values, so every grid row is the base
+        # output and there is nothing for the tiers to split.
+        pass
 
     if grid_outputs_t is None and not runtime.use_incremental_v_grid:
         grid_outputs_by_v: list[torch.Tensor] = []
@@ -106,6 +139,7 @@ def build_joint_vprefix_grid(runtime: JointVPrefixGridRuntime) -> JointVPrefixGr
     return JointVPrefixGridResult(
         grid_outputs=grid_outputs_t,
         grid_outputs_for_v_idx=grid_outputs_for_v_idx,
+        v_lo_reads_grid=v_lo_reads_grid_t,
     )
 
 def _incremental_v_grid_accessor(runtime: JointVPrefixGridRuntime) -> Callable[[int], torch.Tensor]:
@@ -286,3 +320,95 @@ def _sorted_vprefix_outputs(
             prev_count = int(exact_count)
         return None, None, prefix_delta_by_count
     return None, torch.cumsum(weighted_residual_grid_t, dim=2), None
+
+
+def _sorted_vprefix_outputs_precision_tiers(
+    runtime: JointVPrefixGridRuntime,
+    risk_grid_t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Frozen progressive-precision V composition (spec OPEN-2/M6): the
+    top ceil(v_hi_frac * c) of the risk-ranked exact set reads full
+    precision (residual), the remainder reads the int8 plane only where
+    the per-token commit test passed (residual_lo_commit rows, pre-zeroed
+    on failed commits so dropped reads keep the V-PQ value). Mirrors the
+    v_hi_mask/v_lo_mask split + output_from_base_and_split_masks in
+    run_joint_kv_budget_policy_eval.py."""
+    if int(runtime.max_exact_v_count) >= runtime.context_len:
+        exact_order_grid_t = torch.argsort(risk_grid_t, dim=2, descending=True, stable=True)
+    else:
+        exact_order_grid_t = torch.topk(
+            risk_grid_t,
+            k=int(runtime.max_exact_v_count),
+            dim=2,
+            largest=True,
+            sorted=True,
+        ).indices
+    gathered_probs_grid_t = torch.gather(
+        runtime.probs_grid.to(torch.float32),
+        2,
+        exact_order_grid_t,
+    )
+    order_flat_t = exact_order_grid_t.reshape(-1)
+    order_count_i = int(exact_order_grid_t.shape[2])
+    gathered_residual_grid_t = runtime.residual.index_select(0, order_flat_t).reshape(
+        runtime.k_count,
+        runtime.group_heads,
+        order_count_i,
+        int(runtime.head_dim),
+    )
+    probs_col_t = gathered_probs_grid_t.reshape(runtime.k_count, runtime.group_heads, -1, 1)
+    cum_hi_t = torch.cumsum(probs_col_t * gathered_residual_grid_t.float(), dim=2)
+    del gathered_residual_grid_t
+    gathered_lo_grid_t = runtime.residual_lo_commit.index_select(0, order_flat_t).reshape(
+        runtime.k_count,
+        runtime.group_heads,
+        order_count_i,
+        int(runtime.head_dim),
+    )
+    cum_lo_t = torch.cumsum(probs_col_t * gathered_lo_grid_t.float(), dim=2)
+    del gathered_lo_grid_t
+    commit_cum_t = torch.cumsum(
+        runtime.v_commit_mask.to(dtype=torch.int32).index_select(0, order_flat_t).reshape(
+            runtime.k_count,
+            runtime.group_heads,
+            order_count_i,
+        ),
+        dim=2,
+    )
+    grid_outputs_by_v: list[torch.Tensor] = []
+    v_lo_reads_by_v: list[torch.Tensor] = []
+    zero_reads_t = torch.zeros(
+        (runtime.k_count, runtime.group_heads),
+        dtype=torch.int32,
+        device=runtime.device,
+    )
+    for v_budget in runtime.joint_v_budgets:
+        exact_count = max(
+            0,
+            min(int(v_budget), runtime.context_len, int(runtime.max_exact_v_count)),
+        )
+        if exact_count <= 0:
+            grid_outputs_by_v.append(runtime.base_output_grid)
+            v_lo_reads_by_v.append(zero_reads_t)
+            continue
+        hi_count = min(
+            int(exact_count),
+            max(1, int(math.ceil(float(exact_count) * float(runtime.v_hi_frac)))),
+        )
+        delta_t = cum_hi_t[:, :, int(hi_count) - 1, :]
+        lo_reads_t = zero_reads_t
+        if int(exact_count) > int(hi_count):
+            delta_t = (
+                delta_t
+                + cum_lo_t[:, :, int(exact_count) - 1, :]
+                - cum_lo_t[:, :, int(hi_count) - 1, :]
+            )
+            lo_reads_t = (
+                commit_cum_t[:, :, int(exact_count) - 1]
+                - commit_cum_t[:, :, int(hi_count) - 1]
+            )
+        grid_outputs_by_v.append(runtime.base_output_grid + delta_t)
+        v_lo_reads_by_v.append(lo_reads_t)
+    grid_outputs_t = torch.stack(grid_outputs_by_v, dim=1)
+    v_lo_reads_grid_t = torch.stack(v_lo_reads_by_v, dim=1)
+    return grid_outputs_t, v_lo_reads_grid_t

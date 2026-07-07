@@ -782,6 +782,9 @@ def run() -> None:
                         help="frozen-spec de-escalation walk after the escalation stop")
     parser.add_argument("--logit_buffer_format", choices=["fp", "e4m3"], default="fp",
                         help="e4m3 = frozen-sim: quantize the PQ score row to the fp8-e4m3 buffer grid before ranking/decisions (issue #6)")
+    parser.add_argument("--joint_kv_precision_tiers", action="store_true",
+                        help="frozen-sim: int8 lo-tier K logits beyond the top-10%% ranked prefix + "
+                             "V hi/lo split with the per-token int8 commit test (spec OPEN-2/M6)")
     parser.add_argument("--tail_blend", type=float, default=1.0)
     parser.add_argument("--prefill_tail_blend", type=float, default=None)
     parser.add_argument("--decode_tail_blend", type=float, default=None)
@@ -1031,6 +1034,7 @@ def run() -> None:
             "joint_kv_start_strategy": str(getattr(args, "joint_kv_start_strategy", "")),
             "joint_kv_deescalate": bool(getattr(args, "joint_kv_deescalate", False)),
             "logit_buffer_format": str(getattr(args, "logit_buffer_format", "fp")),
+            "joint_kv_precision_tiers": bool(getattr(args, "joint_kv_precision_tiers", False)),
             "tail_blend": float(args.tail_blend),
             "selected_value_mode": str(args.selected_value_mode),
             "selected_value_exact_rule": str(args.selected_value_exact_rule),
