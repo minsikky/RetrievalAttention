@@ -120,14 +120,17 @@ tail logits to 1B (untested — flag for a trace experiment).
 **[CORRECTION 2026-07-07 — applies to every MB figure in this section]**
 These numbers charge the SETTLED (ki,vi) state. Faithful walk traffic is the
 deepest band READ on each axis (escalation probes read their lookahead band;
-bands are nested; nothing is refunded on de-escalation). Measured on the
-96-row canonical population at tau=0.004 + precision (job 53050088): settled
-4.210 (deesc) / 4.636 (no deesc) vs walk **6.930 MB/head in both arms** —
-i.e. settled numbers understate real traffic by ~1.5x, and de-escalation
-changes traffic by exactly zero. The table and the derived figures below are
-kept for continuity as lower bounds; the frozen-operating-point walk requote
-(288-pos spectrum, job 53051141) will replace the 2.857 base. Field:
-`walk_step_MB_per_head` (commit 48e9fd9).
+bands are nested; nothing is refunded on de-escalation): de-escalation
+changes real traffic by exactly zero (job 53050088: walk MB identical to 4
+decimals with deesc on/off). Frozen-operating-point walk requote (job
+53051141, 288-pos spectrum, deesc+precision — settled values reproduce
+2.8573/3.4959 bit-stably): **walk = 4.509 MB/head-query @ tau=0.004**
+(1.58x settled) and 4.852 @ 0.002 (1.39x). Per-ctx-bucket walk means @
+tau=0.004: <=16k **2.25**, <=40k **5.73**, <=80k **9.47**, <=140k **13.98
+MB** — the walk/settled ratio GROWS with context (1.30 -> 1.90) because
+long contexts climb more rungs before settling. Also note the tau=0.004 vs
+0.002 advantage shrinks on walk basis: -7.1% spectrum mean (was -18%
+settled). Field: `walk_step_MB_per_head` (commit 48e9fd9).
 
 De-escalating controller, proxy-mass start, thr = tau, 288-position trace
 (`ladder_deescalate` run). Components: scan = codes+codebooks (UNSHARED trace
@@ -147,12 +150,15 @@ Chip-level corrections to the trace numbers [derived]:
   the 1.57 MB scan term becomes ~0.4 MB per q-head equivalent.
 - **Progressive precision** (int8 tiers, hi-frac 0.1): -31% on the
   exact-read terms at identical trace relL2 [measured on the precision grid]
-  -> at tau=0.004 + precision the 140k total is ~**7.5 MB/q-head** vs dense
-  67 MB = **~9x dense reduction** [derived; SETTLED accounting — walk-basis
-  is ~1.5x, so quote ~11 MB/q-head / ~6x until the 53051141 requote lands].
+  -> at tau=0.004 + precision the 140k total is ~7.5 MB/q-head settled, but
+  the MEASURED walk-basis 140k bucket is **13.98 MB/q-head** (job 53051141)
+  vs dense 67 MB = **~4.8x dense reduction** [was quoted ~9x on settled
+  accounting — retracted], before GQA scan sharing.
 - Adaptive floor: short contexts settle near the behavioral floor (~10% K /
-  5% V), so the reduction ratio *grows* with context — the engine gets more
-  valuable exactly where decode is most bandwidth-bound.
+  5% V), so the reduction ratio *grows* with context — but on walk basis the
+  growth is much flatter than settled accounting implied (~3.4x at 16k ->
+  ~4.8x at 140k, vs the settled-basis 4.5x -> 9x), because long contexts
+  also climb more rungs and pay deeper lookahead reads.
 - **Selection-sweep spill adder** (issue #2 follow-up, 2026-07-06, rev 2 —
   bandwidth-first redesign, target ctx 1M+): the RTL lane keeps no per-token
   logits resident. Pass 1 spills the per-token sort keys to DRAM (4 B/token
@@ -161,11 +167,11 @@ Chip-level corrections to the trace numbers [derived]:
   is fused into ONE multi-threshold sweep; no codebook re-streams. Adder is a
   context-INDEPENDENT ratio. With measured K-escalations/step on
   `deesc_precision_compose` (mean 0.244 at tau=0.004 / 0.576 at 0.002, max 2;
-  V-escalations and de-escalation steps do not sweep): **typical +9.2%
-  (write + one sweep), mean +10.3%, worst-case +18.4%** on the 2.857
-  MB/head-query operating point [the +% ratios stand (they count
-  K-escalations, not settled bytes) but the 2.857 base is settled
-  accounting — rebase on the walk figure when job 53051141 lands]. Recompute-from-codes mode survives as a
+  V-escalations and de-escalation steps do not sweep): the spill adder in
+  BYTES is unchanged, but expressed against the measured walk base of
+  **4.509 MB/head-query** (job 53051141; was 2.857 settled) the ratios
+  become **typical +5.8%, mean +6.5%, worst-case +11.7%** (the old
+  +9.2/10.3/18.4% were against the settled base). Recompute-from-codes mode survives as a
   short-ctx option when the page-LUT cache covers all pages (zero writes).
   Detail: hw/docs/s2_s3_microarch_v1.md §6/§8 (RTL side).
 
@@ -210,14 +216,20 @@ competitor is a *tier*, not an alternative.
 ## 8. Open questions / measurement TODOs (ordered)
 
 - **M1 DONE (2026-07-06)**: tau sweep all-100.0 -> operating point FROZEN at
-  deescalate+precision @ tau=0.004 = 2.857 MB/head-query (288-pos spectrum)
-  [settled accounting; walk-basis requote in flight, job 53051141 — the
-  frozen CONFIG stands, the traffic number moves ~1.5x up].
+  deescalate+precision @ tau=0.004 (288-pos spectrum). Traffic REQUOTED
+  2026-07-07 on walk basis (job 53051141): **4.509 MB/head-query** (settled
+  2.857 retained only as the golden-field lower bound). The frozen CONFIG
+  stands; note tau=0.004's MB advantage over 0.002 is -7.1% on walk basis
+  (was -18% settled) — the operating-point choice rests on task validation,
+  not on a large MB margin.
 - **M2 DONE (job 52989540)**: GQA union/sum across the 4-head group: K
   0.35-0.44, V 0.49-0.57 (short ctx -> 128k). Gather-engine DRAM traffic =
   per-head bytes x union factor; ~5x system-level reduction at 128k
-  [union factors stand; the per-head-bytes base is settled accounting —
-  walk-basis system reduction is nearer ~3.5x pending the 53051141 requote].
+  [union factors stand; the per-head-bytes base was settled accounting —
+  with the measured 140k walk/settled ratio 1.90 (job 53051141) the
+  system-level reduction is nearer **~2.6-3x**; a proper recompute should
+  apply the union factor to walk exact-read bytes rather than scaling the
+  aggregate].
 - **M3 DONE (job 52987561)**: composition holds; precision remains free on
   top of de-escalation at both thresholds.
 - **M4 — DONE (2026-07-06, job 53003124)**: 8-bit logit buffer is FREE at

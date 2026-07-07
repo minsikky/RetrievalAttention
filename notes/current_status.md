@@ -20,11 +20,17 @@ artifact of charging the settled state after the down-walk.
   real traffic by exactly 0.000; the settled metric understates
   faithful traffic by 33% even without de-escalation (escalation-only
   stop tests also read one band past the stop on each axis).
-- The frozen-operating-point figure `2.857 MB/head-query` (M3, 288-pos
-  spectrum) is likewise a settled number; walk requote in flight (job
-  53051141, scripts/run_walk_mb_requote_oppoint.sbatch) — expect
-  ~1.5x. hw_arch Sec 5 table + spill-model base and the algorithm-spec
-  quotes inherit this and are annotated pending that number.
+- **Operating-point walk requote LANDED (job 53051141, 288-pos
+  spectrum, deesc+precision; settled values reproduce 2.8573/3.4959
+  bit-stably)**: walk = **4.509 MB/head-query @ tau=0.004** (1.58x
+  settled) and 4.852 @ 0.002 (1.39x). Per-bucket walk @ 0.004: 16k
+  2.25 / 40k 5.73 / 80k 9.47 / **140k 13.98 MB** — walk/settled ratio
+  GROWS with context (1.30 -> 1.90), so the headline "~9x dense at
+  140k" becomes **~4.8x** (13.98 vs dense 67 MB). tau=0.004's MB
+  advantage over 0.002 shrinks to -7.1% on walk basis (was -18%
+  settled); the operating point stands on task validation. hw_arch
+  Sec 5 + spill base + M1/M2 and the algorithm-spec quotes updated
+  with these measured numbers.
 - **De-escalation's remaining value is NOT bandwidth** under the
   per-step-independent frozen spec. What survives: (a) leaner settled
   output state (smaller accepted sets -> smaller online-update/output
@@ -242,9 +248,10 @@ frozen algorithm itself:
 
 [CORRECTION 2026-07-07: all MB figures in this section are SETTLED-state
 accounting — see the metric correction at the top. Faithful walk traffic
-is ~1.5x these numbers and identical with de-escalation on or off; the
-`2.857 MB` figure is being requoted under walk accounting (job 53051141).
-Quality results (relL2, task scores) are unaffected.]
+is identical with de-escalation on or off; the `2.857 MB` operating point
+measures **4.509 MB/head-query** on walk basis (job 53051141), and `3.496`
+@ 0.002 measures 4.852. Quality results (relL2, task scores) are
+unaffected.]
 
 - **GPU tau sweep (jobs 52980959/61/62 + vt retry 52985915): every arm scores 100.0.** Frontier end-to-end (real structured error, not Gaussian): niah_multikey_2 / vt / niah_single_1 at 32k n25 for tau in {0.002, 0.004, 0.008}, niah_single_1 at 128k n16 for {0.002, 0.004} - all 100.0, no nulls, paired samples. tau=0.004 is task-validated end-to-end; 0.008 also passes everywhere tested (headroom, not adopted). GPU max-physical step MB trends down 11.3 -> 10.7 -> 10.0 (multikey 32k). Env fixes en route: numpy.libs/scipy.libs on LD_LIBRARY_PATH (51ea773) and tau unpinned from the canonical-frontier guard (4f6462a).
 - **M3 composition (52987561): de-escalation x precision(0.1,0.1) stack cleanly.** 288-position subset: `3.496 MB` at thr 0.002 (identical relL2 to deesc-only, precision stays free) and **`2.857 MB` at thr 0.004** (relL2 mean 0.00356, p99 0.0074, max 0.0105 - well under the 0.05 calibrated line) vs canonical `5.748` at 0.002. **New recommended operating point: deescalate + precision(0.1,0.1) @ tau=0.004 = -50% vs the previous canonical.** Caveats: deesc+precision are trace-validated (GPU promotion pending); tau=0.004 is the piece with direct end-to-end task validation.

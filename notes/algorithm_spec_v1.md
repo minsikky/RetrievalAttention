@@ -242,6 +242,6 @@ CSVs authoritative — issue #4); OPEN-1 (tau=0.004 frozen); OPEN-2 (int8 dual-p
 6 — fp16-equivalent capacity, +0.13% MB, quality identical); M2 (GQA union
 factors: K 0.35-0.44, V 0.49-0.57 across the 4-head group, rising with
 context); M3 (deesc x precision composition golden run
-`deesc_precision_compose/`: 2.857 MB/head-query at tau=0.004 on the
-288-position spectrum — SETTLED accounting; walk-basis figure ~1.5x,
-requote job 53051141, see hw_arch Sec. 5 correction).
+`deesc_precision_compose/`: settled 2.857 MB/head-query at tau=0.004 on
+the 288-position spectrum; faithful walk traffic = **4.509 MB/head-query**
+(job 53051141), see hw_arch Sec. 5 correction).
