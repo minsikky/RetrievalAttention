@@ -70,6 +70,22 @@ frozen algorithm itself:
   hard gate + regenerated-reference determinism check vs the frozen
   golden dir. Functional smoke: E6M8 decisions identical, key-induced
   probe-delta perturbation 2.8e-5 on the test step.
+- **Risk-key study RESULT (job 53033569, verdict posted on #7): freeze
+  E=6, M=12.** Zero decision divergences at every config (96
+  head-steps), but the bankable criterion is the uniform bound: worst
+  key-induced probe-delta perturbation must sit under eps_band = 2e-5
+  so any flip is in-band by construction. Only M12 clears it (3.0e-6,
+  6.7x inside; M10 = 2.1e-5 is 5% OVER). E7 bit-identical to E6
+  everywhere (6 b window sufficient); E5 confirmed unshippable
+  (probe-time perturbation 1.98e-4 from the deep-window collapse).
+  Structural finding: bit-exact fp-domain golden V masks are
+  unreachable for any M (boundary-bin collisions inherent); best is
+  E6M12 at 11/12 with a single 2-token swap at a 128k rank cutoff.
+  Proposed on #7: regenerate golden V-mask fields in the KEY domain at
+  frozen E6M12 (stream-order ties) so validate_stage2 stays hard-assert
+  — same shape as the e4m3 bin-domain K-ranking semantics. Regenerated
+  fp64 reference matched the frozen golden dir 12/12 (pipeline
+  determinism confirmed).
 
 ## 2026-07-07 Stage-2 Closed + Guard Band + Qwen-1M Enabled + HELMET First Pair
 
