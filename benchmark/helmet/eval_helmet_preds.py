@@ -29,6 +29,15 @@ def main() -> None:
     parser.add_argument("--pred_file", required=True)
     parser.add_argument("--summary_out", required=True)
     parser.add_argument(
+        "--data_file",
+        default="",
+        help="converted validation.jsonl from prepare_helmet_data. When set, "
+        "score directly against its rows (gold answers stored at conversion "
+        "time) with HELMET's default_post_process instead of reloading the "
+        "dataset — the HF reload is NOT order-stable across processes, so "
+        "positional joins against it can silently score the wrong gold rows.",
+    )
+    parser.add_argument(
         "--stop_new_line",
         action="store_true",
         help="truncate predictions at the first newline (HELMET stop_new_line "
@@ -52,7 +61,22 @@ def main() -> None:
                 pred = pred.split("\n")[0]
             preds[int(row["index"])] = pred
 
-    data = load_helmet_data(args)
+    if str(args.data_file):
+        # Direct mode: gold answers come from the converted file itself, so
+        # pred index i corresponds to row i by construction.
+        import sys as _sys
+
+        _sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "third_party" / "benchmarks" / "HELMET"))
+        from data import default_post_process
+
+        examples = []
+        with open(args.data_file, encoding="utf-8") as f:
+            for line in f:
+                row = json.loads(line)
+                examples.append({"answer": row["outputs"], **row.get("others", {})})
+        data = {"data": examples, "post_process": default_post_process}
+    else:
+        data = load_helmet_data(args)
     post = data["post_process"]
 
     sums: dict[str, float] = defaultdict(float)

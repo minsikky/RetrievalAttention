@@ -94,24 +94,15 @@ pred_file="${OUTPUT_ROOT}/${RUN_NAME}/pred/${TASK_NAME}.jsonl"
 summary_out="${OUTPUT_ROOT}/${RUN_NAME}/summary/${TASK_NAME}.helmet.json"
 stop_flag=()
 if [ "${STOP_NEW_LINE}" = "1" ]; then stop_flag=(--stop_new_line); fi
-# Score against the dataset args recorded at conversion time, not this
-# job's env — a reused data file under a different TEST_FILE joins the
-# predictions to the wrong gold rows.
-meta_file="${data_dir}/meta.json"
-if [ -s "${meta_file}" ]; then
-  TEST_FILE="$(.venv/bin/python -c "import json,sys;print(json.load(open(sys.argv[1]))['test_file'])" "${meta_file}")"
-  DEMO_FILE="$(.venv/bin/python -c "import json,sys;print(json.load(open(sys.argv[1]))['demo_file'])" "${meta_file}")"
-  SHOTS="$(.venv/bin/python -c "import json,sys;print(json.load(open(sys.argv[1]))['shots'])" "${meta_file}")"
-  SEED="$(.venv/bin/python -c "import json,sys;print(json.load(open(sys.argv[1]))['seed'])" "${meta_file}")"
-  echo "[helmet] eval args from ${meta_file}: test_file=${TEST_FILE} demo_file=${DEMO_FILE} shots=${SHOTS} seed=${SEED}"
-fi
+# Score directly against the converted data file (gold stored at
+# conversion time; pred index == row index by construction). NEVER score
+# via a dataset reload: the HF reload is not order-stable across
+# processes, and a positional join against it can silently score the
+# wrong gold rows (frontier kilt_nq scored 0.0000 on predictions
+# containing the gold answers verbatim).
 .venv/bin/python benchmark/helmet/eval_helmet_preds.py \
   --dataset "${DATASET}" \
-  --test_file "${TEST_FILE}" \
-  --demo_file "${DEMO_FILE}" \
-  --shots "${SHOTS}" \
-  --max_test_samples "${MAX_TEST_SAMPLES}" \
-  --seed "${SEED}" \
+  --data_file "${data_file}" \
   --pred_file "${PWD}/${pred_file}" \
   --summary_out "${PWD}/${summary_out}" \
   "${stop_flag[@]}"
