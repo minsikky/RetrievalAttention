@@ -28,6 +28,20 @@ def load_helmet_data(args):
     os.chdir(HELMET_DIR)  # HELMET test_files are repo-relative
     from data import load_data  # noqa: E402
 
+    # HELMET's load_qa samples questions via the GLOBAL random module
+    # (data.py: random.sample) and relies on its runner seeding it at
+    # startup. Without this, every load draws a different question
+    # subset (observed: two identical loads shared zero overlap).
+    import random as _random
+
+    _random.seed(int(args.seed))
+    try:
+        import numpy as _np
+
+        _np.random.seed(int(args.seed))
+    except Exception:
+        pass
+
     ns = SimpleNamespace(
         max_test_samples=int(args.max_test_samples),
         shots=int(args.shots),

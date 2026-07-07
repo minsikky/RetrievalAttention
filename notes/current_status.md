@@ -1,5 +1,44 @@
 # Current Status
 
+## 2026-07-07 Stage-2 Closed + Guard Band + Qwen-1M Enabled + HELMET First Pair
+
+- **Issue #7 CLOSED — stage-2 goldens delivered, RTL-validated 12/12.**
+  Two corrections along the way: (1) the dump parser dropped kd/vd
+  de-escalation trace entries (different syntax); truth is 8/12 golden
+  rows de-escalate — the down-step is the COMMON case at the frozen
+  operating point (39/96 across all heads). Fixed + regenerated
+  (9d38a04). (2) Selection contract pinned: base rides ON TOP of the
+  budget (prefix = min(budget, n_eligible) after excluding base;
+  V exact_count = raw rung); hw_arch §5 bytes were always
+  selected-set-measured, so no undercount. RTL's integer proxy-mass c
+  (histogram + 24-bit exp ROM) matches fp exactly, |Δc| = 0 on 12/12.
+- **Decision guard band frozen (spec §4 item 6)**: RTL quantizes probe
+  weights to 17 b; measured over 34,999 canonical comparisons, 2.00% of
+  decode steps have a comparison within 2e-5 of threshold →
+  eps_band = 2e-5, in-band decisions implementation-defined (±1 rung
+  equivalence class). RTL's proposed 1e-4 band REJECTED (7.93% of
+  steps, 4× looser than 17 b needs). Goldens deterministic (min margin
+  1.69e-4). RTL froze 17 b against it; no banked slack.
+- **Qwen2.5-7B-Instruct-1M enabled in the runner** (da82c5e): AutoModel
+  load (patch layer verified identical on Qwen2), qwen-chat RULER
+  template. **Landmine defused**: config ships sliding_window=32768
+  with use_sliding_window=false, and transformers 4.49's mask builder
+  gates on sliding_window alone — past 32k KV it silently band-masks
+  older tokens (0.25 max logit error on toy repro). Fix: null
+  config.sliding_window post-load; verified bit-exact. Dense spike
+  chain submitted: niah_single_1 at 256k/512k/1M on gpu-rtx6000 96 GB
+  (53027427/28/29, chained).
+- **HELMET kilt_nq first pair (128k, first 16 depth-rows)**: dense
+  subEM 0.3125, **frontier τ0.004 subEM 0.3750** — frontier ≥ dense on
+  a hard RAG task (dense confidently answers distractors at several
+  gold depths). Two eval bugs fixed en route: (1) HELMET's HF reload is
+  NOT order-stable across processes (two identical loads share zero
+  question overlap — load_qa uses the unseeded global random module);
+  scoring now joins directly against the converted validation.jsonl
+  (65aa712), and the loader is seeded for reproducible draws.
+  (2) Wrapper generated only MAX_TEST_SAMPLES rows of the 6×-expanded
+  kilt file; full 96-row pair resubmitted (53030961/62).
+
 ## 2026-07-06 RTL Gates Closed + e4m3 Verdict + Phase A First Scores + 1M Path
 
 - **All three RTL gates resolved at full spectrum** (issues #2/#3/#4 closed):
