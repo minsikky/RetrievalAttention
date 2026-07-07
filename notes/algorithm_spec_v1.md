@@ -104,6 +104,22 @@ relL2(a,b) = ||a-b||_2 / max(||b||_2, eps) on the 128-dim attention output.
    different delta and is NOT covered by the eps_band clause without a
    measured decision-flip study. The int8 commit test is inside every
    compared output; the commit bit is per-token static.
+   **K-move crossing structure (pinned 2026-07-07)**: on a K move, s_i
+   changes on exactly two K-rank intervals — the marginal band
+   (B_lo, B_hi] (e4m3 tail → int8 lo; the hi boundary cannot reach it
+   for adjacent rungs) and the hi-boundary band
+   (ceil(0.1·B_lo), ceil(0.1·B_hi)] (int8 → exact). All other exp(s_i)
+   are bit-identical, so p rescales by one scalar (den ratio), the risk
+   order among non-crossers is invariant, and the exact Vcorr rebuild =
+   scalar rescale + crossing fixups + rank-boundary deltas. kd reverses
+   the same intervals. Exact — not an approximation (so the frozen-V-set
+   study above is moot; RTL adopted the exact rebuild).
+   **Exact-domain weight budget**: exact-tier w = exp(s − band_max) must
+   land within 2^-17 relative of the fp64 reference after a single RNE
+   quantization (same budget as bin-domain w17; requires fp32-class
+   pre-quantization exp error). The eps_band = 2e-5 study bounds
+   per-token weight error domain-independently, so no new guard band.
+   Golden reference: fp32 exp at run level, fp64 in Item-2 partials.
 6. **Decision guard band (FROZEN 2026-07-07, issue #7 thread)**: the RTL
    probe path quantizes the per-token weight w = exp(s − s_maxbin) once
    to 17 bits (RNE, exact fixed-point accumulation), giving hardware
