@@ -1290,6 +1290,113 @@ _STAGE2_DEESC_RE = re.compile(
 )
 
 
+def rebuild_vcorr_accs_from_operands(
+    *,
+    band_tokens: np.ndarray,
+    band_v_fp32: np.ndarray,
+    band_values_lo_fp32: np.ndarray,
+    band_vhat_fp32: np.ndarray,
+    band_commit: np.ndarray,
+    band_p_settled: np.ndarray,
+    marginal_tokens: np.ndarray,
+    marginal_p: np.ndarray,
+    marginal_offsets: np.ndarray,
+    hiboundary_tokens: np.ndarray,
+    hiboundary_p: np.ndarray,
+    hiboundary_offsets: np.ndarray,
+    settled_hi_tokens: np.ndarray,
+    settled_lo_tokens: np.ndarray,
+    base_output_fp32: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """Issue #7 item-7 option-A G3 rebuild: reconstruct EVERY Vcorr accumulator
+    (marginal / hi-boundary per V-probe record, and the settled total; both the
+    REF fp64-operand domain and the HW one-fp16-cast domain) from the serialized
+    RAW operands alone -- per-token exact-V rows ``band_v_fp32``, the plane-A
+    int8 dequant ``band_values_lo_fp32``, the V-PQ centroid rows
+    ``band_vhat_fp32`` (v_pq, reconstructed from the all-sealed-pages
+    codebook+codes), the static fp16 commit bit, and the per-token softmax
+    weights.
+
+    Mirrors the operand construction in ``_write_stage2_golden`` EXACTLY: one
+    fp16 RNE cast per (token, dim, tier); the hi-boundary contribution rounds
+    EACH tier before subtracting (``diff16_hi - commit*diff16_lo``), never one
+    rounding of the algebraic difference (fp16 rounding does not distribute over
+    subtraction). Plane-B and the dual-plane recon are recomputed here from the
+    raw operands via ``_quantize_rows_symmetric`` (the literal plane-B rule,
+    8-bit absmax, independent of the lo tier's storage mode). KEEP IN SYNC with
+    the item-7 dump block below and with
+    verify_stage2_key_regen._rebuild_vcorr_accs."""
+    hd = int(band_v_fp32.shape[1]) if band_v_fp32.ndim == 2 else 0
+    order = np.argsort(np.asarray(band_tokens, dtype=np.int64), kind="stable")
+    tok_sorted = np.asarray(band_tokens, dtype=np.int64)[order]
+    v = np.asarray(band_v_fp32, dtype=np.float32)[order]
+    vlo = np.asarray(band_values_lo_fp32, dtype=np.float32)[order]
+    vhat64 = np.asarray(band_vhat_fp32, dtype=np.float32)[order].astype(np.float64)
+    commit = np.asarray(band_commit).astype(bool)[order]
+    p_settled = np.asarray(band_p_settled, dtype=np.float64)[order]
+    # Per-token operands in both domains (fp64 accumulation).
+    residual_hi = v.astype(np.float64) - vhat64                 # REF hi: v_fp16 - v_pq
+    residual_lo = vlo.astype(np.float64) - vhat64               # REF lo: v_int8 - v_pq
+    plane_b = _quantize_rows_symmetric((v - vlo), 8)            # plane-B dequant (8b absmax)
+    recon64 = vlo.astype(np.float64) + plane_b.astype(np.float64)   # dual-plane recon (fp64 sum)
+    diff16_hi = (recon64 - vhat64).astype(np.float16).astype(np.float64)          # HW hi: one RNE
+    diff16_lo = (vlo.astype(np.float64) - vhat64).astype(np.float16).astype(np.float64)  # HW lo: one RNE
+    ops = {"ref": (residual_hi, residual_lo), "hw": (diff16_hi, diff16_lo)}
+
+    def _rows(tok: np.ndarray) -> np.ndarray:
+        pos = np.searchsorted(tok_sorted, np.asarray(tok, dtype=np.int64))
+        if pos.size and (
+            bool(np.any(pos >= tok_sorted.size))
+            or bool(np.any(tok_sorted[np.minimum(pos, tok_sorted.size - 1)] != np.asarray(tok, dtype=np.int64)))
+        ):
+            raise AssertionError("vcorr rebuild: band-member token missing from operand union")
+        return pos
+
+    marg_off = np.asarray(marginal_offsets, dtype=np.int64)
+    hib_off = np.asarray(hiboundary_offsets, dtype=np.int64)
+    R = int(marg_off.size - 1)
+    marg_tok = np.asarray(marginal_tokens, dtype=np.int64)
+    marg_p = np.asarray(marginal_p, dtype=np.float64)
+    hib_tok = np.asarray(hiboundary_tokens, dtype=np.int64)
+    hib_p = np.asarray(hiboundary_p, dtype=np.float64)
+    hi_s = np.sort(np.asarray(settled_hi_tokens, dtype=np.int64))
+    lo_s = np.sort(np.asarray(settled_lo_tokens, dtype=np.int64))
+    base64 = np.asarray(base_output_fp32, dtype=np.float32).astype(np.float64)
+
+    out: dict[str, np.ndarray] = {}
+    for dom, (op_hi, op_lo) in ops.items():
+        acc_marg = np.zeros((R, hd), dtype=np.float64)
+        acc_hib = np.zeros((R, hd), dtype=np.float64)
+        for r in range(R):
+            m0, m1 = int(marg_off[r]), int(marg_off[r + 1])
+            if m1 > m0:
+                mr = _rows(marg_tok[m0:m1])
+                w = commit[mr]
+                if bool(np.any(w)):
+                    acc_marg[r] = marg_p[m0:m1][w] @ op_lo[mr][w]
+            h0, h1 = int(hib_off[r]), int(hib_off[r + 1])
+            if h1 > h0:
+                hr = _rows(hib_tok[h0:h1])
+                wh = commit[hr]
+                xr = op_hi[hr] - (wh.astype(np.float64)[:, None] * op_lo[hr])
+                acc_hib[r] = hib_p[h0:h1] @ xr
+        out[f"marginal_{dom}"] = acc_marg
+        out[f"hiboundary_{dom}"] = acc_hib
+        # Settled total = out(settled) - base(settled): reproduce the fp64
+        # base-cancellation (base + hi + lo) - base sequentially so the residual
+        # base rounding matches _compose_sum's stored acc bit-for-bit. base is
+        # the stored fp32 base widened (base_output_by_k is fp32 -- see run()).
+        s = base64.copy()
+        if hi_s.size:
+            hr = _rows(hi_s)
+            s = s + p_settled[hr] @ op_hi[hr]
+        if lo_s.size:
+            lr = _rows(lo_s)
+            s = s + p_settled[lr] @ op_lo[lr]
+        out[f"settled_{dom}"] = s - base64
+    return out
+
+
 def _write_stage2_golden(
     out_dir: str,
     *,
@@ -1796,6 +1903,87 @@ def _write_stage2_golden(
         item7["vexact_residual_scale_fp64"] = scaleB.reshape(-1).astype(np.float64)
         item7["vexact_recon_max_abs_err"] = float(recon_max)
 
+        # 3e (issue #7 option A -- RTL operand-serialization blocker): the RAW
+        # Vcorr operands for EVERY band member across BOTH V probes AND the
+        # settled set, so G3 rebuilds vcorr_acc_{marginal,hiboundary,settled}
+        # _{ref,hw} from operands and hard-asserts bit-tight (item-6 grade).
+        # Coverage hole (2) fix: vexact_* alone covers only the settled n_exact
+        # set; vexact_band_* here extends to the deepest probe's N_hi -- the
+        # union of {settled exact, every marginal-band token, every hi-boundary
+        # -band token}. Coverage hole (1) fix (multi-page vhat / v_pq) lives in
+        # _write_stage2_vpage, which now dumps codebook+codes for ALL sealed
+        # pages; the verifier rebuilds v_pq per band token from those pages.
+        # Operands are stored at full float32/float64 precision so BOTH the REF
+        # (fp64-operand) and HW (one-fp16-cast) accumulators rebuild bit-exact:
+        #   vexact_band_v_fp32          raw exact-V rows (REF hi operand v_fp16)
+        #   vexact_band_values_lo_fp32  plane-A int8 dequant (lo operand + recon
+        #                               plane A; plane B + dual-plane recon are
+        #                               recomputed from these two by the rebuild)
+        #   vexact_band_commit          static fp16 commit bit per token
+        #   vexact_band_p_settled_fp64  softmax weight at the settled ki (the
+        #                               per-probe weights are already dumped as
+        #                               vcorr_marginal_p / vcorr_hiboundary_p).
+        union_tokens = np.array(
+            sorted(
+                set(int(t) for t in vtok.tolist())
+                | set(int(t) for t in marg_tok)
+                | set(int(t) for t in hib_tok)
+                | set(int(t) for t in np.flatnonzero(hm_s).tolist())
+                | set(int(t) for t in np.flatnonzero(lm_s).tolist())
+            ),
+            dtype=np.int64,
+        )
+        band_v = np.asarray(values_fp16, dtype=np.float32)[union_tokens]
+        band_vlo = (
+            np.asarray(values_lo, dtype=np.float32)[union_tokens]
+            if values_lo is not None
+            else np.zeros((union_tokens.size, hd), dtype=np.float32)
+        )
+        band_commit = commit_full[union_tokens].astype(np.uint8)
+        band_p_settled = probs_by_k[int(settled_ki)][union_tokens].astype(np.float64)
+        item7["vexact_band_tokens"] = union_tokens
+        item7["vexact_band_v_fp32"] = band_v
+        item7["vexact_band_values_lo_fp32"] = band_vlo
+        item7["vexact_band_commit"] = band_commit
+        item7["vexact_band_p_settled_fp64"] = band_p_settled
+
+        # Dump-time self-check (raise on fail, like the other item-7 checks):
+        # rebuild every stored acc from the SERIALIZED operands (with the true
+        # v_pq rows) and hard-assert bit-tight. The external verifier repeats
+        # this with v_pq rebuilt from the all-sealed-page codebook+codes.
+        _rebuilt = rebuild_vcorr_accs_from_operands(
+            band_tokens=union_tokens,
+            band_v_fp32=band_v,
+            band_values_lo_fp32=band_vlo,
+            band_vhat_fp32=vhat_f[union_tokens].astype(np.float32),
+            band_commit=band_commit,
+            band_p_settled=band_p_settled,
+            marginal_tokens=item7["vcorr_marginal_tokens"],
+            marginal_p=item7["vcorr_marginal_p"],
+            marginal_offsets=item7["vcorr_marginal_offsets"],
+            hiboundary_tokens=item7["vcorr_hiboundary_tokens"],
+            hiboundary_p=item7["vcorr_hiboundary_p"],
+            hiboundary_offsets=item7["vcorr_hiboundary_offsets"],
+            settled_hi_tokens=np.flatnonzero(hm_s),
+            settled_lo_tokens=np.flatnonzero(lm_s),
+            base_output_fp32=base_output_by_k[int(settled_ki)],
+        )
+        for _key, _stored in (
+            ("marginal_ref", item7["vcorr_acc_marginal_ref"]),
+            ("marginal_hw", item7["vcorr_acc_marginal_hw"]),
+            ("hiboundary_ref", item7["vcorr_acc_hiboundary_ref"]),
+            ("hiboundary_hw", item7["vcorr_acc_hiboundary_hw"]),
+            ("settled_ref", item7["vcorr_settled_acc_ref"]),
+            ("settled_hw", item7["vcorr_settled_acc_hw"]),
+        ):
+            _st = np.asarray(_stored, dtype=np.float64)
+            _err = float(np.max(np.abs(_rebuilt[_key] - _st))) if _st.size else 0.0
+            if _err > 1e-9:
+                raise AssertionError(
+                    f"vcorr option-A operand rebuild mismatch q{qidx} h{head} {_key}: "
+                    f"max_abs={_err}"
+                )
+
         # 3d: first-kd K-move fixup (fields present only when the trace
         # de-escalates on the K axis). kd is a one-rung down move.
         kd_j = next((j for j, k in enumerate(kinds) if k == "kd"), None)
@@ -1929,8 +2117,21 @@ def _write_stage2_vpage(
     code_error: np.ndarray,
     precision_v_lo_err: np.ndarray | None,
 ) -> None:
-    """One V-PQ page block per (kv_head, context): value codebook + codes for
-    the LAST sealed page, with the two per-token sidecars over its range."""
+    """One V-PQ page block per (kv_head, context).
+
+    Legacy single-page fields (kept byte-identical for back-compat): the value
+    codebook + codes for the LAST sealed page, with the two per-token sidecars
+    over its range.
+
+    Issue #7 option A -- coverage hole (1) fix: item-7 correction/probe-band
+    tokens span EVERY sealed page, so v_pq (the V-PQ centroid row) was
+    unrecoverable for all but the last page. We now ALSO dump codebook + codes
+    for ALL sealed pages (RTL's preferred hardware form -- the centroid-
+    factorization datapath multiplies centroid rows per page), in a ragged
+    layout following the README offsets convention. The verifier reconstructs
+    v_pq[t] = all_value_codebooks_fp32[p, sub, code[t, sub]] via a searchsorted
+    page lookup -- bit-identical to _vpq_values_for_tokens (the source of the
+    vhat used in the accumulators)."""
     from benchmark.selector_eval.runners.diagnose_layer_heads import _build_value_vpq_sidecars
 
     out = Path(out_dir)
@@ -1950,6 +2151,34 @@ def _write_stage2_vpage(
     page = index.pages[page_id]
     codebook, page_codes = sidecars[int(page_id)]
     s, e = int(page.start), int(page.start) + int(page.size)
+
+    # All-sealed-pages ragged block (issue #7 option A, hole (1)). Include every
+    # page that actually holds tokens (size > 0 and a non-empty codebook).
+    all_ids: list[int] = []
+    all_starts: list[int] = []
+    all_sizes: list[int] = []
+    all_codebooks: list[np.ndarray] = []
+    codes_flat: list[np.ndarray] = []
+    ce_flat: list[np.ndarray] = []
+    i8_flat: list[np.ndarray] = []
+    codes_off: list[int] = [0]
+    for pid, pg in enumerate(index.pages):
+        cb, pc = sidecars[int(pid)]
+        ps, psz = int(pg.start), int(pg.size)
+        if psz <= 0 or np.asarray(cb).size == 0 or np.asarray(pc).size == 0:
+            continue
+        all_ids.append(int(pid))
+        all_starts.append(ps)
+        all_sizes.append(psz)
+        all_codebooks.append(np.asarray(cb, dtype=np.float32))
+        codes_flat.append(np.asarray(pc, dtype=np.uint8))
+        codes_off.append(int(codes_off[-1] + psz))
+        ce_flat.append(np.asarray(code_error[ps : ps + psz], dtype=np.float64))
+        i8_flat.append(
+            np.asarray(precision_v_lo_err[ps : ps + psz], dtype=np.float64)
+            if precision_v_lo_err is not None
+            else np.zeros(psz, dtype=np.float64)
+        )
     np.savez_compressed(
         path,
         kv_head=int(kv_head),
@@ -1964,6 +2193,31 @@ def _write_stage2_vpage(
         int8_err_fp64=(
             np.asarray(precision_v_lo_err[s:e], dtype=np.float64)
             if precision_v_lo_err is not None
+            else np.zeros(0, dtype=np.float64)
+        ),
+        all_num_pages=int(len(all_ids)),
+        all_page_ids=np.asarray(all_ids, dtype=np.int64),
+        all_page_starts=np.asarray(all_starts, dtype=np.int64),
+        all_page_sizes=np.asarray(all_sizes, dtype=np.int64),
+        all_value_codebooks_fp32=(
+            np.stack(all_codebooks).astype(np.float32)
+            if all_codebooks
+            else np.zeros((0, 0, 0, 0), dtype=np.float32)
+        ),
+        all_value_codes_u8=(
+            np.concatenate(codes_flat).astype(np.uint8)
+            if codes_flat
+            else np.zeros((0, max(1, int(value_subvecs))), dtype=np.uint8)
+        ),
+        all_value_codes_offsets=np.asarray(codes_off, dtype=np.int64),
+        all_code_error_fp64=(
+            np.concatenate(ce_flat).astype(np.float64)
+            if ce_flat
+            else np.zeros(0, dtype=np.float64)
+        ),
+        all_int8_err_fp64=(
+            np.concatenate(i8_flat).astype(np.float64)
+            if i8_flat
             else np.zeros(0, dtype=np.float64)
         ),
     )
