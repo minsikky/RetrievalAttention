@@ -95,6 +95,21 @@ def main() -> None:
             fout.write(json.dumps(row, ensure_ascii=False) + "\n")
             n += 1
     print(f"[prepare_helmet_data] wrote {n} rows -> {out_path}")
+    # Record the exact dataset args so the eval step can reload the SAME
+    # dataset regardless of the evaluating job's environment (a reused
+    # data file scored under different test_file joins wrong gold rows).
+    meta = {
+        "dataset": args.dataset,
+        "test_file": args.test_file,
+        "demo_file": args.demo_file,
+        "shots": int(args.shots),
+        "max_test_samples": int(args.max_test_samples),
+        "seed": int(args.seed),
+        "input_max_length": int(args.input_max_length),
+        "generation_max_length": int(args.generation_max_length),
+        "rows": n,
+    }
+    (out_path.parent / "meta.json").write_text(json.dumps(meta, indent=2))
 
 
 if __name__ == "__main__":
