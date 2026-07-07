@@ -15,6 +15,13 @@ set -euo pipefail
 
 cd /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention
 
+# The prebuilt selector_paged_pq CUDA extension is ABI-matched to the
+# cu128 venv (torch 2.11.0+cu128); .venv (torch 2.5.1+cu124) fails its
+# import with an undefined c10 symbol. Default to cu128 like the other
+# frontier wrappers so bare submissions cannot pick the wrong env.
+export HF_VENV_DIR="${HF_VENV_DIR:-.venv_cu128}"
+export HF_EXTRA_PYTHONPATH="${HF_EXTRA_PYTHONPATH:-.hf_pydeps_cu128}"
+
 export MODE="${MODE:-pagedpq_batched}"
 export OUTPUT_ROOT="${OUTPUT_ROOT:-ruler_eval_result/frontier_batched}"
 export TASK_NAME="${TASK_NAME:-niah_single_1}"
