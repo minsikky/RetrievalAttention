@@ -98,7 +98,7 @@ page (5632 x 128 fp16), V-PQ codebook, err + int8-err sidecars. Amortized over
 |---|---|---|
 | PQ LUT | 2 KB x 4 q-heads | rebuilt per page |
 | Codebook staging | 64 KB double-buffered = 128 KB | stream from DRAM |
-| Logit buffer | 1 B x 128k = 128 KB x 4 q-heads = 512 KB | M4 DONE: 8-bit is free (job 53003124); e4m3 format pending #6 |
+| Logit buffer | 1 B x 128k = 128 KB x 4 q-heads = 512 KB | M4 DONE (53003124); format FROZEN = fp8-e4m3 (#6 ack, 53008051: +0.93% MB, quality equal-or-better; code = histogram index; scale-free write) |
 | Rank histogram | 1 KB | 256 bins x 4B |
 | Band partials | ~6 KB x 4 q-heads | <=12 rungs x (max,sum,acc[128] fp32) |
 | Output/accum | ~2 KB x 4 q-heads | |

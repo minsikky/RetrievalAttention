@@ -167,10 +167,13 @@ calibrated on evidence up to ctx 134.8k; hardware targets 1M+ (issue #8).
 Interim risk assessment: `notes/ctx_scaling_1m_memo.md` (e4m3 range
 low-risk; proxy-mass clamp becomes the mainline path at 1M; boundary
 ties ~linear). Real 1M validation planned:
-`benchmark_differentiation_plan.md` Phase E. OPEN items: logit-buffer
-FORMAT (fp8-e4m3 vs absmax int8, issue #6 — semantics settled either way:
-8-bit monotone quantization, 256-bin histogram select).
-RESOLVED: M4 (8-bit logit buffer FREE at full spectrum, job 53003124:
+`benchmark_differentiation_plan.md` Phase E. OPEN items: none.
+RESOLVED: logit-buffer FORMAT = **fp8-e4m3 FROZEN** (issue #6 ack
+2026-07-07; job 53008051: quality equal-or-better than absmax int8 —
+max relL2 0.00784 vs 0.00864 @ tau=0.004 — at +0.93% aggregate MB
+concentrated in head 0 +7.5%; scale-free write-during-scan, monotone
+code doubles as the 256-bin histogram index; absmax int8 remains the
+validated fallback); M4 (8-bit logit buffer FREE at full spectrum, job 53003124:
 ±0.05% MB, relL2 identical; buffer is 1 B/token); M5 (256-bin histogram
 select + exact boundary-bin refine, exact fractional prefix counts, golden
 CSVs authoritative — issue #4); OPEN-1 (tau=0.004 frozen); OPEN-2 (int8 dual-plane storage, Sec.
