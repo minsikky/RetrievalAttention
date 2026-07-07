@@ -126,6 +126,20 @@ risk uses code_error; the V commit test is
 `fp16(int8_err) < fp16(code_error)` (strict; the stored sidecars are the
 pre-rounding fp64 reference values).
 
+**ALL-sealed-pages block (issue #7 option A, 2026-07-07).** The legacy
+fields above cover the LAST sealed page only, but item-7 band members span
+every sealed page — so `_write_stage2_vpage` also dumps a ragged
+all-pages block (legacy single-page fields kept byte-identical):
+`all_num_pages` = P; `all_page_ids` / `all_page_starts` / `all_page_sizes`
+(int64, P); `all_value_codebooks_fp32` (P × subvecs × 2^subbits × subdim);
+`all_value_codes_u8` flat (Σ page_size × subvecs) indexed by
+`all_value_codes_offsets` (int64, P+1); `all_code_error_fp64` and
+`all_int8_err_fp64` flat (Σ page_size) same offsets. v_pq[t] for any token
+t in any sealed page = `all_value_codebooks_fp32[pg, :, all_value_codes_u8[
+off[pg] + (t − all_page_starts[pg])]]` reduced over subvecs (searchsorted
+on `all_page_starts`); non-paged band members fall back to the raw value
+(the golden `vhat := raw value` rule).
+
 ## Item 7 — Vcorr (V-correction) goldens
 
 New fields the dump helper asserts at write time; the RTL harness pins the
@@ -191,11 +205,32 @@ fixups, direction reversed); if RTL wants golden vectors for the up-move
 rebuild, the 3d block will be re-pointed at the first accepted K
 escalation in a follow-up regen (pending their answer on #7).
 
+**3e — full band-coverage operands (issue #7 option A, 2026-07-07).**
+Sections 3c dumps exact-V operands for the SETTLED set only, and the legacy
+page_v block covers one page — so RTL's G3 accumulator recompute could not
+rebuild the marginal/hi-boundary bands (their members fall outside the
+settled set and span multiple pages). 3e closes both holes with per-token
+operands over the union `U = {settled exact ∪ every marginal-band member ∪
+every hi-boundary member}` across BOTH probes: `vexact_band_tokens` (int64,
+U), `vexact_band_v_fp32` (float32, U×128 — raw exact-V = the REF hi
+operand), `vexact_band_values_lo_fp32` (float32, U×128 — plane-A int8
+dequant = the lo operand), `vexact_band_commit` (uint8, U),
+`vexact_band_p_settled_fp64` (float64, U — the per-token weight). With these
+plus the all-pages V-PQ block (v_pq), G3 rebuilds every
+`vcorr_acc_{marginal,hiboundary,settled}_{ref,hw}` from operands alone:
+per-token `diff16 = fp16(exact − v_pq)` (hi) or `fp16(lo_dequant − v_pq)`
+(lo commit winner), fix24 accumulation weighted by p, hi-boundary as the
+two-rounding `diff16_hi − commit·diff16_lo`. Verified bit-tight: regen job
+53073318, max|rebuilt − stored| = 0.0 across all six band/domains on all 12
+rows.
+
 The verifier (`verify_stage2_key_regen.py`) requires every item-7 field
 (3d conditional on the row's trace having kd — vacuous in this set),
 reports moved item-6 key-mask token diffs (frozen vs regen) instead of
 asserting them, and flags (nonfatal) any record with |dv_hw − dv_ref| >
-1e-5.
+1e-5. **The G3 gate** rebuilds every band acc from the 3e operands + the
+all-pages V-PQ block and hard-asserts equality to the stored acc
+(`--g3_tol`, default 1e-9; measured 0.0).
 
 ## Provenance / regeneration
 
