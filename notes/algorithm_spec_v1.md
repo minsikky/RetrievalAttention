@@ -53,7 +53,12 @@ Budget rungs are fractions of context length:
 - K: {0.10, 0.30, 0.50, 0.70, 0.90, 1.0}
 - V: {0.05, 0.10, 0.20, 0.40, 0.60, 0.80, 1.0}
 Finer grids are Pareto-NEUTRAL (validated); do not add rungs for quality.
-A selected-K prefix at rung ki = base ∪ first (K_frac*ctx) ranked tokens.
+A selected-K prefix at rung ki = base ∪ prefix, where prefix = the first
+min(ceil(K_frac·ctx), n_eligible) tokens of the ranked list AFTER
+excluding base tokens (base rides ON TOP of the budget, never inside
+it — `_selected_for_budget`, run_layer_quality_eval.py). V analog:
+v_exact_count = min(ceil(V_frac·ctx), ctx) raw, chosen globally by risk.
+Confirmed against RTL 12/12 golden fit, issue #7 (2026-07-07).
 
 ## 4. Budget controller (the novel control block)
 
