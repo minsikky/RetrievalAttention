@@ -91,6 +91,21 @@ if [ -n "${JOINT_KV_DEESCALATE:-}" ] || [ -n "${JOINT_KV_PRECISION_TIERS:-}" ]; 
   # frontier runs already validated the all-torch configuration.
   export SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE=0
   export SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE=0
+  # Bisection escape hatch: FROZEN_SIM_FLAG_SET="NAME=1 NAME=0" (space- or
+  # comma-separated; use spaces inside sbatch --export, whose own separator
+  # is the comma) re-sets individual flags AFTER the hard zeros. A plain env
+  # default here would not work: the batched wrapper sources
+  # frontier_canonical_env.sh (all native flags default 1) before this
+  # block, so ${VAR:-0} would silently keep the canonical 1s and turn the
+  # frozen-sim override into a no-op.
+  if [ -n "${FROZEN_SIM_FLAG_SET:-}" ]; then
+    IFS=', ' read -ra _fs_pairs <<< "${FROZEN_SIM_FLAG_SET}"
+    for _fs in "${_fs_pairs[@]}"; do
+      [ -n "${_fs}" ] || continue
+      export "${_fs%%=*}=${_fs#*=}"
+      echo "[pagedpq_stream_smoke] frozen-sim flag override: ${_fs}"
+    done
+  fi
 fi
 export TOKENIZERS_PARALLELISM=false
 
