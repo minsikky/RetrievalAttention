@@ -3489,6 +3489,33 @@ def run() -> None:
                                 v_state_mb = float(v_state_mb_by_pair[(ki, vi)])
                                 total_mb_no_state = float(k_mb_by_idx[ki] + v_path_mb)
                                 total_mb = float(step_mb_by_pair[(ki, vi)])
+                                # Faithful walk accounting (no de-escalation
+                                # refund): every escalation probe READS its
+                                # lookahead band on both axes, and bands are
+                                # nested, so a step's DRAM cost is set by the
+                                # deepest band read during the walk, not the
+                                # settled state. kd/vd probes read nothing new.
+                                # Cross-K-move V crossing fixups are not
+                                # modeled (small undercount).
+                                walk_k_read = int(ki)
+                                walk_v_mb = float(v_path_mb)
+                                for seg in policy_trace:
+                                    m_e = _STAGE2_TRACE_RE.match(str(seg))
+                                    if not m_e:
+                                        continue
+                                    p_ki_i = int(m_e.group(2))
+                                    p_vi_i = int(m_e.group(3))
+                                    if p_ki_i + 1 < len(k_budgets):
+                                        walk_k_read = max(walk_k_read, p_ki_i + 1)
+                                    else:
+                                        walk_k_read = max(walk_k_read, p_ki_i)
+                                    v_read_i = min(p_vi_i + 1, len(v_budgets) - 1)
+                                    walk_v_mb = max(walk_v_mb, float(v_mb_by_pair[(p_ki_i, v_read_i)]))
+                                walk_total_mb = (
+                                    float(k_mb_by_idx[walk_k_read])
+                                    + float(walk_v_mb)
+                                    + (float(total_mb) - float(k_mb_by_idx[ki]) - float(v_path_mb))
+                                )
                                 v_rule_meta = v_rule_meta_by_pair[(ki, vi)]
                                 la_fields: dict[str, object] = {}
                                 if la_active and la_test_log is not None:
@@ -3676,6 +3703,8 @@ def run() -> None:
                                     "step_MB_no_v_state_per_head": float(total_mb_no_state),
                                     "step_MB_with_v_state_per_head": float(total_mb),
                                     "step_MB_per_head": float(total_mb),
+                                    "walk_k_read_max_idx": int(walk_k_read),
+                                    "walk_step_MB_per_head": float(walk_total_mb),
                                     "head_attention_relative_L2": float(metric["output_relative_l2"]),
                                     "head_attention_cosine": float(metric["output_cosine"]),
                                     "policy_trace": " | ".join(policy_trace),
@@ -3900,6 +3929,12 @@ def run() -> None:
                     "mean_step_MB_with_v_state_per_head": float(np.mean([float(r["step_MB_with_v_state_per_head"]) for r in choices])),
                     "mean_step_MB_per_head": float(np.mean([float(r["step_MB_per_head"]) for r in choices])),
                     "max_step_MB_per_head": float(np.max([float(r["step_MB_per_head"]) for r in choices])),
+                    "mean_walk_step_MB_per_head": float(
+                        np.mean([float(r.get("walk_step_MB_per_head", r["step_MB_per_head"])) for r in choices])
+                    ),
+                    "max_walk_step_MB_per_head": float(
+                        np.max([float(r.get("walk_step_MB_per_head", r["step_MB_per_head"])) for r in choices])
+                    ),
                 }
             )
 
@@ -3990,6 +4025,9 @@ def run() -> None:
                 "mean_step_MB_with_v_state_per_head": float(np.mean([float(r["mean_step_MB_with_v_state_per_head"]) for r in rows])),
                 "mean_step_MB_per_head": float(np.mean([float(r["mean_step_MB_per_head"]) for r in rows])),
                 "max_step_MB_per_head": float(np.max([float(r["max_step_MB_per_head"]) for r in rows])),
+                "mean_walk_step_MB_per_head": float(
+                    np.mean([float(r.get("mean_walk_step_MB_per_head", r["mean_step_MB_per_head"])) for r in rows])
+                ),
             }
         )
     summary = {
