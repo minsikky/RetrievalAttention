@@ -16,17 +16,20 @@ v_budgets`.
 
 **Item 1 — controller trace** (FSM transition golden): parallel arrays
 `probe_kind` (k / v / kd / vd / stop), `probe_ki, probe_vi` (rung state
-AFTER the transition), `probe_dk, probe_dv` (the adjacent-band relL2
-deltas the test read), `probe_tk, probe_tv` (the sqrt-scaled thresholds
-compared against). `start_ki/start_vi` → walk → `settled_ki/settled_vi`.
-Rows whose trace contains `kd`/`vd` entries are the de-escalation cases.
-**Coverage note:** in this 12-row set, 0 rows de-escalate (the proxy-mass
-start never overshot); 8 rows stop immediately, 4 escalate (k, v, or
-both). A supplementary de-escalating row will be added under
-`supplement_deesc/` when found — until then the kd/vd replay path has no
-golden trace and must be verified via the band-subtraction identity
-(remove one band from the Item-2 partials and check against the
-recombine of the remaining bands).
+AT PROBE TIME, i.e. before the action the entry records), `probe_dk,
+probe_dv` (the adjacent-band relL2 deltas the test read), `probe_tk,
+probe_tv` (the sqrt-scaled thresholds compared against).
+`start_ki/start_vi` → escalation walk → `stop` → de-escalation walk →
+`settled_ki/settled_vi`. Escalation entries (k/v/stop) read both axis
+deltas; de-escalation entries (kd/vd) read only their own axis — the
+other axis's delta/threshold are NaN. A `kd` at probe state (ki, vi)
+moves ki→ki−1 (vd analogously); the state after the last entry equals
+`settled_ki/settled_vi`.
+**Coverage:** 8/12 rows de-escalate at the frozen operating point
+(de-escalation is the COMMON case, not the exception: the escalation
+phase stops one rung above where the down-walk settles whenever the
+last band it read contributed under threshold). All five probe kinds
+appear in this set.
 
 **Item 2 — band partials** at the settled K state (S5 recombine golden):
 `band_labels` = [base, band0..band<settled_ki>, tail]; per band:

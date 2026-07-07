@@ -1200,7 +1200,12 @@ def initial_budget_indices(
 
 
 _STAGE2_TRACE_RE = re.compile(
-    r"^(k|v|kd|vd|stop):k(\d+)/v(\d+):dk=([^:]+):dv=([^:]+):tk=([^:]+):tv=([^:]+)$"
+    r"^(k|v|stop):k(\d+)/v(\d+):dk=([^:]+):dv=([^:]+):tk=([^:]+):tv=([^:]+)$"
+)
+# De-escalation walk entries use a different syntax (see simulate_policy):
+#   kd:k{from}->k{to}:d={delta}:t={threshold}   (and vd:v{from}->v{to}:...)
+_STAGE2_DEESC_RE = re.compile(
+    r"^(kd|vd):[kv](\d+)->[kv](\d+):d=([^:]+):t=([^:]+)$"
 )
 
 
@@ -1252,17 +1257,42 @@ def _write_stage2_golden(
     p_dv: list[float] = []
     p_tk: list[float] = []
     p_tv: list[float] = []
+    cur_ki = -1
+    cur_vi = -1
     for seg in policy_trace:
         m = _STAGE2_TRACE_RE.match(str(seg))
-        if not m:
+        if m:
+            kinds.append(m.group(1))
+            cur_ki = int(m.group(2))
+            cur_vi = int(m.group(3))
+            p_ki.append(cur_ki)
+            p_vi.append(cur_vi)
+            p_dk.append(float(m.group(4)))
+            p_dv.append(float(m.group(5)))
+            p_tk.append(float(m.group(6)))
+            p_tv.append(float(m.group(7)))
             continue
-        kinds.append(m.group(1))
-        p_ki.append(int(m.group(2)))
-        p_vi.append(int(m.group(3)))
-        p_dk.append(float(m.group(4)))
-        p_dv.append(float(m.group(5)))
-        p_tk.append(float(m.group(6)))
-        p_tv.append(float(m.group(7)))
+        md = _STAGE2_DEESC_RE.match(str(seg))
+        if not md:
+            continue
+        # Down-step probe evaluated at (cur_ki, cur_vi); the axis moves
+        # from->to, the other axis's delta/threshold are not read (NaN).
+        kind = md.group(1)
+        kinds.append(kind)
+        p_ki.append(cur_ki)
+        p_vi.append(cur_vi)
+        if kind == "kd":
+            p_dk.append(float(md.group(4)))
+            p_tk.append(float(md.group(5)))
+            p_dv.append(float("nan"))
+            p_tv.append(float("nan"))
+            cur_ki = int(md.group(3))
+        else:
+            p_dv.append(float(md.group(4)))
+            p_tv.append(float(md.group(5)))
+            p_dk.append(float("nan"))
+            p_tk.append(float("nan"))
+            cur_vi = int(md.group(3))
 
     # Item 4: proxy-mass scalars from the literal start rule.
     c = _softmax_prefix_count(
