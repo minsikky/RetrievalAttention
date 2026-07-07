@@ -73,6 +73,9 @@ if [ -n "${JOINT_KV_DEESCALATE:-}" ] || [ -n "${JOINT_KV_PRECISION_TIERS:-}" ]; 
   # earlier. COLLAPSE_DUP_K_ROWS must be off so the ranked prefix covers
   # every K budget for the lo-tier substitution.
   echo "[pagedpq_stream_smoke] frozen-sim flags set: forcing canonical torch grid path"
+  # The canonical-GPU assertion layer requires every native kernel ON; the
+  # frozen-sim arms deliberately run all-torch, so drop the assertion too.
+  export FRONTIER_CANONICAL_GPU=0
   export SELECTOR_PQ_JOINT_GROUPED_RISK_PREFIX=0
   export SELECTOR_PQ_JOINT_NATIVE_RISK_PREFIX=0
   export SELECTOR_PQ_JOINT_NATIVE_SCORE_GRID=0
