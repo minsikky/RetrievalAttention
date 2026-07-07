@@ -42,7 +42,34 @@ frozen algorithm itself:
 - Next after smokes pass: rerun Phase A tasks + kilt_nq as the
   frozen-sim arm (deesc + e4m3 + tiers) vs existing frontier and dense
   arms — that table becomes the frozen algorithm's accuracy, not an
-  upper bound.
+  upper bound. One-command launcher: scripts/launch_frozen_sim_phase_a.sh.
+- **First smoke pair FAILED on an env landmine, root-caused + fixed
+  (517ebb8)**: the prebuilt selector_paged_pq _C.so is ABI-matched to
+  .venv_cu128 (torch 2.11.0+cu128; c10_cuda_check_implementation takes
+  unsigned line param there, int in .venv's torch 2.5.1+cu124 —
+  undefined symbol at import). Every other frontier wrapper pins
+  HF_VENV_DIR=.venv_cu128 + HF_EXTRA_PYTHONPATH=.hf_pydeps_cu128
+  (transformers 5.10.0.dev0); run_frontier_ruler_batched_one.sh relied
+  on caller env and bare submissions got .venv. Wrapper now pins it.
+  Resubmitted: 53033446 (deesc+e4m3) -> 53033447 (+tiers, afterany).
+  Also: the canonical CPU goldens use --kv_storage_format fp16 (not
+  int8_dualplane), which independently confirms the GPU frozen-sim's
+  skip-the-dualplane-cache-rewrite decision.
+
+- **Risk-rank key precision study for RTL (#7) in flight** (b1ece68,
+  job 53033569 on standard): RTL wants to rank V risk on a quantized
+  monotone key ({exp window, M mantissa}); measured from the goldens'
+  fp64 risk vectors the WINDOW binds first — hi boundaries <= 31.7 oct
+  below max risk, deep-N boundaries at 0.6/0.8 rungs reach 47-55 oct
+  among positive risks at 128k, so 5 b cannot ship (posted on #7 with
+  the boundary table). Zero-risk bin == non-paged rows exactly
+  (residual == 0; verified set equality) -> dedicated bottom bin,
+  stream-order ties reproduce the golden, output-exact. Sweep runs
+  E:M in {5:10, 6:6, 6:8, 6:10, 6:12, 7:10} vs fp64 reference,
+  decision-level flip classification vs eps_band = 2e-5 + 12-golden
+  hard gate + regenerated-reference determinism check vs the frozen
+  golden dir. Functional smoke: E6M8 decisions identical, key-induced
+  probe-delta perturbation 2.8e-5 on the test step.
 
 ## 2026-07-07 Stage-2 Closed + Guard Band + Qwen-1M Enabled + HELMET First Pair
 
