@@ -2,11 +2,17 @@
 
 Same 12 trace rows as `../s2_s3_20260706/` (heads 0/8/16/24 × ctx
 14.8k/38.8k/134.8k). **Producing config = the frozen operating point**:
-de-escalating controller, k_first_alternating, proxy_mass_m0p9 start,
-τ = 0.004 (sqrt-scaled), progressive precision (0.1, 0.1), logit buffer
-**fp8-e4m3** (frozen per issue #6). One npz per row
-(`golden2_q<qidx>_h<head>.npz`) plus one V-PQ page block per
+ESCALATION-ONLY controller (de-escalation REMOVED from the frozen
+algorithm 2026-07-07 — see spec §4; regen job 53061660), k_first_alternating,
+proxy_mass_m0p9 start, τ = 0.004 (sqrt-scaled), progressive precision
+(0.1, 0.1), logit buffer **fp8-e4m3** (frozen per issue #6). One npz per
+row (`golden2_q<qidx>_h<head>.npz`) plus one V-PQ page block per
 (kv_head, ctx) (`page_v_ctx<ctx>_kv<kv>.npz`).
+Regen provenance: the escalation-only traces are byte-identical PREFIXES
+of the previous (de-escalating) goldens truncated at the escalate stop —
+verified per row on every probe array; only kd/vd tails were removed.
+The 4 rows that never de-escalated are bit-identical to the previous
+set; page blocks bit-identical.
 
 ## golden2 npz fields
 
@@ -15,21 +21,13 @@ sealed_end page_size head_dim threshold policy start_strategy k_budgets
 v_budgets`.
 
 **Item 1 — controller trace** (FSM transition golden): parallel arrays
-`probe_kind` (k / v / kd / vd / stop), `probe_ki, probe_vi` (rung state
+`probe_kind` (k / v / stop), `probe_ki, probe_vi` (rung state
 AT PROBE TIME, i.e. before the action the entry records), `probe_dk,
 probe_dv` (the adjacent-band relL2 deltas the test read), `probe_tk,
 probe_tv` (the sqrt-scaled thresholds compared against).
-`start_ki/start_vi` → escalation walk → `stop` → de-escalation walk →
-`settled_ki/settled_vi`. Escalation entries (k/v/stop) read both axis
-deltas; de-escalation entries (kd/vd) read only their own axis — the
-other axis's delta/threshold are NaN. A `kd` at probe state (ki, vi)
-moves ki→ki−1 (vd analogously); the state after the last entry equals
-`settled_ki/settled_vi`.
-**Coverage:** 8/12 rows de-escalate at the frozen operating point
-(de-escalation is the COMMON case, not the exception: the escalation
-phase stops one rung above where the down-walk settles whenever the
-last band it read contributed under threshold). All five probe kinds
-appear in this set.
+`start_ki/start_vi` → escalation walk → `stop` = `settled_ki/settled_vi`
+(the walk is escalation-only; kd/vd probe kinds no longer exist —
+de-escalation removed 2026-07-07). All entries read both axis deltas.
 
 **Item 2 — band partials** at the settled K state (S5 recombine golden):
 `band_labels` = [base, band0..band<settled_ki>, tail]; per band:
@@ -45,9 +43,7 @@ PQ for the tail; all in the post-1/sqrt(d) domain.
 Combine identity (self-checked at dump time, `combine_rel_err` stored,
 asserted < 1e-5): with M = max_b band_max,
   output = Σ_b band_acc_b·exp(band_max_b − M) / Σ_b band_sumexp_b·exp(band_max_b − M)
-must equal `base_output_fp32` (also stored, = probs @ vhat). A
-de-escalation replays this with one band REMOVED — subtraction, not
-accumulation.
+must equal `base_output_fp32` (also stored, = probs @ vhat).
 
 **Item 3 — tail sum**: the `tail` row of the band arrays. The histogram-
 derived tail unit (bin counts × exp table) must match `band_sumexp[tail]`
@@ -171,18 +167,20 @@ mirrors `_int8_dualplane_rows`) `vexact_residual_codes` (int8) +
 Self-check: dequant(A)+dequant(B) reconstructs v_fp16 within
 0.5·scaleB + fp32 slack per element.
 
-**3d — first-kd K-move fixup** (present only when the trace de-escalates on
-K): `kmove_ki_from`, `kmove_ki_to` (= from−1), `kmove_vi`; `kmove_den_old`,
-`kmove_den_new` (softmax denominators, computed in run()'s float32-normalized
-domain so probs == exp(s−max)/den to fp64 roundoff);
-`kmove_crossing_out_tokens` / `kmove_crossing_in_tokens` (exact-set
-key-rank membership changes across the two K states, keys recomputed per
-state); `kmove_acc_post_{ref,hw}` (128) = Vcorr total at (ki_to, vi_cur).
+**3d — K-move fixup: RETIRED with de-escalation (2026-07-07).** The
+`kmove_*` fields (den_old/den_new scalar rescale, crossing token lists,
+post-move Vcorr) were gated on the first kd probe and are absent from the
+escalation-only goldens. The K-move Vcorr REBUILD structure itself
+survives in the algorithm for K UP-moves (same scalar rescale + crossing
+fixups, direction reversed); if RTL wants golden vectors for the up-move
+rebuild, the 3d block will be re-pointed at the first accepted K
+escalation in a follow-up regen (pending their answer on #7).
 
 The verifier (`verify_stage2_key_regen.py`) requires every item-7 field
-(3d conditional on the row's trace having kd), reports moved item-6
-key-mask token diffs (frozen vs regen) instead of asserting them, and
-flags (nonfatal) any record with |dv_hw − dv_ref| > 1e-5.
+(3d conditional on the row's trace having kd — vacuous in this set),
+reports moved item-6 key-mask token diffs (frozen vs regen) instead of
+asserting them, and flags (nonfatal) any record with |dv_hw − dv_ref| >
+1e-5.
 
 ## Provenance / regeneration
 
@@ -194,4 +192,10 @@ superset of this dir). The V-selection recompute in the dump helper
 mirrors the selection block in run(); both live in the same file with a
 keep-in-sync comment. History: key-domain fields (item 6) added
 2026-07-07 as a pure superset — every pre-existing field verified
-bit-identical to the original delivery.
+bit-identical to the original delivery. 2026-07-07 (later): regenerated
+escalation-only after de-escalation was removed from the frozen
+algorithm (job 53061660): 8/12 rows had kd/vd tails and their
+settled-state fields moved accordingly; per-row prefix-identity check
+confirmed every probe array is the previous trace truncated at the
+escalate stop (fatal=0); 4/12 rows and all 12 page blocks bit-identical;
+max |dv_hw − dv_ref| = 4.0e-7, flagged records 0.
