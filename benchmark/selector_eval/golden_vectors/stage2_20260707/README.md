@@ -88,8 +88,9 @@ the key domain: `v_exact_mask_key_packed`, `v_hi_mask_key_packed`,
 `v_lo_mask_key_packed`, `v_dropped_reads_key`, `v_risk_key_cutoff_q`,
 plus `v_risk_key_exp_bits`/`v_risk_key_mantissa_bits` (= 6/12). The lo
 commit test is unchanged (fp-domain static bit). fp-vs-key mask diffs on
-these 12 rows: 2-token boundary swaps on 3 rows, all at near-equal-risk
-cutoffs (in-band by the #7 uniform-bound argument).
+these 12 rows: 2-token boundary swaps on 2 rows (q223_h16 hi<->lo,
+q287_h16 exact-set), all at near-equal-risk cutoffs (in-band by the #7
+uniform-bound argument).
 
 ## page_v npz fields (one per kv_head × ctx, LAST sealed page)
 
