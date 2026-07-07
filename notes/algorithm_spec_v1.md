@@ -165,6 +165,21 @@ round(x_row/s)*s, s = absmax(x_row)/127, stored as int8 codes + fp16 scale
 (`_quantize_rows_symmetric`, line ~1045).
 - K: ranked prefix beyond the top hi_frac=0.1 of the selected set reads the
   int8 tier (128 B + scale instead of 256 B). No commit test needed.
+  **Hi/lo split is FROZEN once per step** at the start rung's hi_count =
+  ceil(hi_frac·kb[start]) (`--precision_split_freeze start`, adopted
+  2026-07-07 for RTL #2 Q1), NOT recomputed per K rung. This removes the
+  mid-walk plane-B upgrade re-fetch path (hardware simplification) at no
+  quality cost: on the escalation-only population (job 53070218, 96
+  head-steps) freezing is quality-neutral (meanL2 +0.06%) and slightly
+  cheaper on walk traffic (−2.40%; the growing split accrues plane-B
+  upgrades on deep low-weight rungs that do not affect the output).
+  Freezing at ceil(hi_frac·max(k_budgets)) (`kbmax`) is dominated
+  (+6.4% walk for a noise-level quality change). Golden impact of the
+  switch (job 53070220 vs the escalation-only goldens): 11/12 rows move
+  only `probe_dk` (recorded stability margins shift with the int8-QDQ
+  ranking; no escalation decision flips, masks/outputs bit-identical); 1
+  row (q159_h8) has a selected token cross the frozen-vs-growing boundary
+  → outputs + Vcorr move, key-selection masks unchanged, dv 2.1e-7.
 - V: exact-V reads beyond the top hi_frac=0.1 by risk read int8 ONLY where
   `int8_err[i] < vpq_code_error[i]` (commit test, per token); tokens failing
   the test keep V-PQ (no row read at all). Naive int8-for-all-V is a

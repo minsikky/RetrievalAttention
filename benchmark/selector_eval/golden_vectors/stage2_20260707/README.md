@@ -14,6 +14,21 @@ verified per row on every probe array; only kd/vd tails were removed.
 The 4 rows that never de-escalated are bit-identical to the previous
 set; page blocks bit-identical.
 
+**FROZEN PRECISION SPLIT adopted 2026-07-07 (RTL #2 Q1; regen job
+53070220, `--precision_split_freeze start`).** The K-side hi/lo precision
+boundary is frozen once per step at the start rung's hi_count rather than
+recomputed per K rung (spec §6) — hardware owes no mid-walk plane-B
+upgrade re-fetch. Golden delta vs the escalation-only set above: 11/12
+rows move ONLY `probe_dk` (the recorded stability-margin deltas shift with
+the int8-QDQ ranking; no escalation decision flips → `probe_ki/vi`, masks,
+outputs, and all Vcorr fields bit-identical). 1 row (q159_h8) has a
+selected token cross the frozen-vs-growing precision boundary →
+`combined/base_output_fp32`, `risk_scores`, `v_w17_fp64`, `vexact_*`, and
+`vcorr_acc_{marginal,hiboundary,settled}_{ref,hw}` move; key-selection
+masks (`moved_key`) unchanged, dv_hw−ref max 2.1e-7. All 12 `page_v_*`
+blocks bit-identical. dv operand-domain max across all rows 4.03e-7, zero
+records flagged (>1e-5).
+
 ## golden2 npz fields
 
 Identity/config: `qidx head kv_head position context_len dynamic_start
