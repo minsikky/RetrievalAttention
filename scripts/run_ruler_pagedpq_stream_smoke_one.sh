@@ -220,11 +220,15 @@ fi
   "${ALLOW_TF32_SELECTOR_ARG[@]}" \
   "${NATIVE_DECODE_TAIL_ARG[@]}"
 
-pushd benchmark/ruler >/dev/null
-python -u eval/evaluate.py \
-  --data_dir "../../${PRED_DIR}" \
-  --benchmark synthetic
-popd >/dev/null
+if [ "${SKIP_RULER_EVAL:-0}" != "1" ]; then
+  pushd benchmark/ruler >/dev/null
+  python -u eval/evaluate.py \
+    --data_dir "../../${PRED_DIR}" \
+    --benchmark synthetic
+  popd >/dev/null
+else
+  echo "[pagedpq_stream_smoke] SKIP_RULER_EVAL=1 (non-RULER data; score externally)"
+fi
 
 "${HF_VENV_DIR}/bin/python" - <<PY
 import csv
