@@ -1,6 +1,20 @@
 # Current Status
 
-## 2026-07-07 METRIC CORRECTION: settled-state MB was not faithful walk traffic — de-escalation saves ZERO DRAM
+## 2026-07-07 DE-ESCALATION REMOVED FROM THE FROZEN ALGORITHM (user decision)
+
+Consequence of the metric correction below: on the (logical walk traffic,
+quality) Pareto frontier de-escalation is strictly dominated — walk MB
+identical to escalation-only (the climb reads the same bands; job 53050088:
+6.930 vs 6.930 MB), quality slightly worse (relL2 0.00358 vs 0.00274 @
+tau=0.004). Removed from spec §4 (kd/vd probes retired), canonical configs
+(golden regen sbatch, Phase A launcher), and the hw_arch controller FSM
+(no WALK-DOWN). The walk-basis operating point 4.509 MB/head-query is
+UNCHANGED by the removal; quality improves slightly. `--budget_deescalate`
+stays in the runner for reproducing historical arms. Stage-2 goldens
+regenerated escalation-only (kd rows retired — the item-7 K-move fixup
+vectors may be re-pointed at K UP-moves if RTL wants that coverage; their
+V-rebuild-on-K-move machinery survives for escalations). RTL notified on
+#7; their kd/vd sequencer work is cancelled (a simplification for them).: settled-state MB was not faithful walk traffic — de-escalation saves ZERO DRAM
 
 `step_MB_per_head` charges the settled (ki,vi) state, but the faithful
 hardware walk pays for the deepest band READ on each axis: every

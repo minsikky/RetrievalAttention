@@ -48,7 +48,6 @@ mkdir -p "$DUMP" "${ROOT}/gold_run"
   --stability_thresholds 0.004 \
   --threshold_mode budget_delta_frac --threshold_reference_frac 0.2 \
   --threshold_scale_shape sqrt --threshold_min_scale 0.0 --threshold_max_scale 1.5 \
-  --budget_deescalate \
   --precision_k_hi_frac 0.1 --precision_v_hi_frac 0.1 \
   --precision_lo_mode int8 --precision_lo_bits 8 \
   --v_selection_rules global_residual_risk --v_local_block_size 1024 \

@@ -80,30 +80,31 @@ relL2(a,b) = ||a-b||_2 / max(||b||_2, eps) on the 128-dim attention output.
 3. **Escalate walk**: k_first_alternating — alternate preferred axis each
    step, escalate the preferred failing axis, stop when both axes pass
    (`choose_action` line ~531, `simulate_policy` line ~576).
-4. **De-escalate walk** (after stop): repeatedly step DOWN any axis whose
-   adjacent-band delta is within its scaled threshold (same formula). The
-   same pair-delta governs both directions => no oscillation.
-   simulate_policy `deescalate=True` branch. [CORRECTED 2026-07-07: the
-   previously quoted MB savings (-5.7% @0.002, -16.6% @0.004) were
-   settled-state accounting and are RETRACTED — the down-walk reads no
-   DRAM and refunds none; faithful walk traffic (deepest band read per
-   axis) is identical with de-escalation on or off. De-escalation's
-   validated value is start-insensitivity (eliminates the warm-start
-   ratchet) and a leaner settled output state, not bandwidth.]
-5. Output at settle = out(ki, vi). Down-probes MUST be implemented via
-   stored per-band partial accumulators (max, sum, acc[128]) — recombine,
-   do not re-read DRAM.
+4. **De-escalation: REMOVED from the frozen algorithm (2026-07-07).**
+   The walk is escalation-only; the step ends at the escalate-walk stop
+   state. Rationale: under faithful walk accounting the down-walk saves
+   zero DRAM (the bands it abandons were already read during the climb
+   — the previously quoted -5.7%/-16.6% MB savings were a settled-state
+   accounting artifact), and its quality is slightly WORSE than
+   escalation-only at the same tau (relL2 0.00358 vs 0.00274 at 0.004)
+   — strictly dominated on the (logical traffic, quality) frontier. Its
+   only surviving property (start-insensitivity for warm-start designs)
+   belongs to an unspecced budget-carry extension, not the frozen
+   per-step algorithm. `--budget_deescalate` remains in the runner for
+   reproduction of historical arms; canonical configs and goldens are
+   escalation-only. kd/vd probes no longer exist.
+5. Output at stop = out(ki, vi) at the escalate-walk stop state.
 5b. **Probe-delta producers (pinned 2026-07-07, #7 thread)**. The
    compared quantity is out(ki,vi) = base_output(ki) + Vcorr(ki,vi),
    Vcorr = Σ_hi p·(v_fp16 − v_pq) + Σ_lo p·(v_int8 − v_pq), p = softmax
-   row at ki. relL2 denominator = the RICHER rung's output (escalation:
-   next; de-escalation: current). V probes (fixed ki) are acc-only
+   row at ki. relL2 denominator = the RICHER rung's output (= the next
+   rung; de-escalation removed 2026-07-07). V probes (fixed ki) are acc-only
    (numerator) differences over TWO risk-rank intervals: the marginal
    band (N_lo, N_hi] (commit-winners contribute v_int8 − v_pq; losers
    contribute zero) and the hi-boundary band
    (ceil(0.1·N_lo), ceil(0.1·N_hi)] (v_fp16 minus int8-or-pq per the
    static commit bit). Risk = p²·code_error is frozen across the V walk
-   at a given ki and REBUILT whenever ki changes — so K probes (dk/kd)
+   at a given ki and REBUILT whenever ki changes — so K probes (dk)
    change the K band, the normalization, AND the V correction (re-rank
    + p rescale); a frozen-V-set approximation during K probes is a
    different delta and is NOT covered by the eps_band clause without a
@@ -116,9 +117,10 @@ relL2(a,b) = ||a-b||_2 / max(||b||_2, eps) on the 128-dim attention output.
    (ceil(0.1·B_lo), ceil(0.1·B_hi)] (int8 → exact). All other exp(s_i)
    are bit-identical, so p rescales by one scalar (den ratio), the risk
    order among non-crossers is invariant, and the exact Vcorr rebuild =
-   scalar rescale + crossing fixups + rank-boundary deltas. kd reverses
-   the same intervals. Exact — not an approximation (so the frozen-V-set
-   study above is moot; RTL adopted the exact rebuild).
+   scalar rescale + crossing fixups + rank-boundary deltas. Exact — not
+   an approximation (so the frozen-V-set study above is moot; RTL
+   adopted the exact rebuild). [2026-07-07: kd removed with
+   de-escalation; the rebuild applies to K UP-moves only.]
    **Exact-domain weight budget**: exact-tier w = exp(s − band_max) must
    land within 2^-17 relative of the fp64 reference after a single RNE
    quantization (same budget as bin-domain w17; requires fp32-class
@@ -230,7 +232,10 @@ Interim risk assessment: `notes/ctx_scaling_1m_memo.md` (e4m3 range
 low-risk; proxy-mass clamp becomes the mainline path at 1M; boundary
 ties ~linear). Real 1M validation planned:
 `benchmark_differentiation_plan.md` Phase E. OPEN items: none.
-RESOLVED: logit-buffer FORMAT = **fp8-e4m3 FROZEN** (issue #6 ack
+RESOLVED: **de-escalation REMOVED (2026-07-07, user decision)** — walk is
+escalation-only (§4 item 4): zero walk-basis DRAM value, slightly worse
+quality, strictly dominated; kd/vd probes and the golden kd rows retired,
+stage-2 goldens regenerated escalation-only;
 2026-07-07; job 53008051: quality equal-or-better than absmax int8 —
 max relL2 0.00784 vs 0.00864 @ tau=0.004 — at +0.93% aggregate MB
 concentrated in head 0 +7.5%; scale-free write-during-scan, monotone

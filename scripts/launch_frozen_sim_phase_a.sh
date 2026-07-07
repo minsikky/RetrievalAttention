@@ -17,7 +17,6 @@ COMMON_ENV=(
   CONTEXT_LEN=131072
   NUM_SAMPLES=16
   JOINT_KV_STABILITY_THRESHOLD=0.004
-  JOINT_KV_DEESCALATE=1
   LOGIT_BUFFER_FORMAT=e4m3
   JOINT_KV_PRECISION_TIERS=1
   OUTPUT_ROOT=benchmark_suite_result/frozen_sim_20260707/runs
@@ -47,5 +46,5 @@ submit cwe            65536  frozensim_cwe_64k_n16
 
 echo "chain tail: ${DEP}"
 echo "NOTE: kilt_nq frozen-sim arm goes through scripts/run_helmet_frontier_one.sh"
-echo "with the same JOINT_KV_DEESCALATE/LOGIT_BUFFER_FORMAT/JOINT_KV_PRECISION_TIERS"
+echo "with the same LOGIT_BUFFER_FORMAT/JOINT_KV_PRECISION_TIERS"
 echo "env once the RULER chain drains (submit separately to stay under the cap)."

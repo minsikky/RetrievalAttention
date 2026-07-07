@@ -16,10 +16,11 @@ arithmetic on those; **[estimate]** is a sizing guess to be validated in RTL.
    codebooks demonstrably break the budget controller). Scan produces a PQ
    logit per token.
 2. **Budget controller**: predict start rung from proxy softmax mass (m0.9),
-   then escalate/de-escalate walk over rung grid K in {0.10,0.30,0.50,0.70,
+   then an ESCALATION-ONLY walk over rung grid K in {0.10,0.30,0.50,0.70,
    0.90,1.0} x ctx, V in {0.05,...,1.0} x ctx, stability test = output relL2
-   delta between adjacent rungs vs sqrt-scaled tau. De-escalation validated
-   as a Pareto improvement and makes the controller start-insensitive.
+   delta between adjacent rungs vs sqrt-scaled tau. [De-escalation REMOVED
+   2026-07-07: zero walk-basis DRAM value and slightly worse quality —
+   strictly dominated. No WALK-DOWN state, no kd/vd sequencing.]
 3. **Exact-K refinement**: gather K rows for the selected prefix, replace PQ
    logits with exact logits; tail keeps PQ logits scaled 1/sqrt(d) (mixed
    probabilities).
@@ -81,15 +82,14 @@ number in this document.
                 (int8 plane if commit test passes, else fp16; else V-PQ LUT)
 ```
 
-Controller FSM wraps S4-S6: PREDICT -> {VERIFY, WALK-UP, WALK-DOWN} -> COMMIT.
+Controller FSM wraps S4-S6: PREDICT -> {VERIFY, WALK-UP} -> COMMIT.
 A walk step = process one marginal band through S4-S5, compare combined
-output vs previous rung (relL2 on 128-dim fp32, trivial). **Down-probes are
-free of DRAM traffic**: recombine the band-partial tree without the top band
-— de-escalation costs nothing extra in bytes. [CORRECTED 2026-07-07: it also
-SAVES nothing — the bands it walks away from were already read during the
-climb, and the step is over when it settles. Charging the settled state was
-an accounting error; per-step traffic = deepest band read on each axis. See
-Sec. 5 correction.]
+output vs previous rung (relL2 on 128-dim fp32, trivial). [De-escalation
+and the WALK-DOWN state REMOVED 2026-07-07: the down-walk read no DRAM but
+also saved none — the bands it abandoned were already read during the
+climb — and its quality was slightly worse. Per-step traffic = deepest
+band read on each axis (Sec. 5 correction). Band partials (max, sum,
+acc[128]) remain the probe-compare mechanism for the up-walk.]
 var4 certify (optional) sits before S4 and can skip a band read entirely.
 
 Page seal unit (background, off critical path): 3-iter k-means on the sealed
@@ -215,13 +215,15 @@ competitor is a *tier*, not an alternative.
 
 ## 8. Open questions / measurement TODOs (ordered)
 
-- **M1 DONE (2026-07-06)**: tau sweep all-100.0 -> operating point FROZEN at
-  deescalate+precision @ tau=0.004 (288-pos spectrum). Traffic REQUOTED
-  2026-07-07 on walk basis (job 53051141): **4.509 MB/head-query** (settled
-  2.857 retained only as the golden-field lower bound). The frozen CONFIG
-  stands; note tau=0.004's MB advantage over 0.002 is -7.1% on walk basis
-  (was -18% settled) — the operating-point choice rests on task validation,
-  not on a large MB margin.
+- **M1 DONE (2026-07-06)**: tau sweep all-100.0 -> operating point FROZEN;
+  2026-07-07 de-escalation REMOVED, so the canonical config is
+  **escalation-only + precision(0.1,0.1) @ tau=0.004**. Traffic on walk
+  basis (job 53051141): **4.509 MB/head-query** — unchanged by the deesc
+  removal (walk traffic is identical with the down-walk on or off; job
+  53050088 cross-check), and quality slightly improves (relL2 0.00274 vs
+  0.00358 on the 288-pos subset). tau=0.004's MB advantage over 0.002 is
+  -7.1% on walk basis (was -18% settled) — the operating-point choice
+  rests on task validation, not on a large MB margin.
 - **M2 DONE (job 52989540)**: GQA union/sum across the 4-head group: K
   0.35-0.44, V 0.49-0.57 (short ctx -> 128k). Gather-engine DRAM traffic =
   per-head bytes x union factor; ~5x system-level reduction at 128k
