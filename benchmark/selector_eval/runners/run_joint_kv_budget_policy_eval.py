@@ -1089,6 +1089,33 @@ def _truncate_fp16_msb(x: np.ndarray) -> np.ndarray:
     return u.view(np.float16).astype(np.float32, copy=False)
 
 
+def _quantize_risk_key(risk: np.ndarray, exp_bits: int, mantissa_bits: int) -> np.ndarray:
+    """Emulate the S3-style monotone risk-rank key (issue #7): keep a
+    floor(log2) exponent inside a 2^exp_bits-octave window anchored at the
+    per-state max positive risk plus mantissa_bits RNE mantissa bits.
+    Positive values below the window floor collapse to one shared
+    bottom-of-window key (the downstream stable sorts then resolve them in
+    stream order, matching the hardware histogram's boundary-bin rule);
+    exact zeros stay zero (the structural non-paged bin, which the stable
+    sort already leaves in stream order). Monotone: quantized keys never
+    reorder values whose keys differ."""
+    r = np.asarray(risk, dtype=np.float64)
+    out = np.zeros_like(r)
+    pos = r > 0.0
+    if not np.any(pos):
+        return out
+    rp = r[pos]
+    with np.errstate(divide="ignore"):
+        e = np.floor(np.log2(rp))
+    floor_e = float(np.max(e)) - (float(1 << int(exp_bits)) - 1.0)
+    below = e < floor_e
+    step = np.exp2(np.maximum(e, floor_e) - float(int(mantissa_bits)))
+    q = np.round(rp / step) * step
+    q[below] = np.exp2(floor_e)
+    out[pos] = q
+    return out
+
+
 def _precision_lo_tokens(
     base: list[int],
     ranked_cpu: np.ndarray,
@@ -1240,6 +1267,7 @@ def _write_stage2_golden(
     code_error: np.ndarray,
     precision_v_hi_frac: float,
     precision_v_lo_err: np.ndarray | None,
+    v_risk_key_bits: tuple[int, int] | None = None,
 ) -> None:
     """Stage-2 goldens (issue #7): controller trace, per-band flash partials
     at the settled state, quantized-domain tail sum, proxy-mass scalars, and
@@ -1362,6 +1390,8 @@ def _write_stage2_golden(
     # run() (global_residual_risk + precision hi/lo split + commit test).
     probs = probs_by_k[settled_ki]
     risk = (probs * probs) * code_error
+    if v_risk_key_bits is not None:
+        risk = _quantize_risk_key(risk, int(v_risk_key_bits[0]), int(v_risk_key_bits[1]))
     exact_count = max(0, min(int(v_budgets[settled_vi]), n))
     exact_mask = top_mask(risk, exact_count)
     risk_cutoff = float(np.min(risk[exact_mask])) if bool(np.any(exact_mask)) else 0.0
@@ -1673,6 +1703,23 @@ def run() -> None:
     )
     parser.add_argument("--precision_lo_bits", type=int, default=8)
     parser.add_argument(
+        "--v_risk_key_exp_bits",
+        type=int,
+        default=0,
+        help=(
+            "Risk-rank key precision study (issue #7): >0 ranks/splits the "
+            "V axis on a quantized monotone risk key with a "
+            "2^exp_bits-octave exponent window anchored at the per-state "
+            "max risk. 0 disables (full-precision ranking)."
+        ),
+    )
+    parser.add_argument(
+        "--v_risk_key_mantissa_bits",
+        type=int,
+        default=8,
+        help="Mantissa bits (RNE) of the quantized risk-rank key.",
+    )
+    parser.add_argument(
         "--precision_lo_mode",
         choices=["int8", "fp16msb"],
         default="int8",
@@ -1860,6 +1907,18 @@ def run() -> None:
     score_proxy_variants = parse_csv_names(args.score_proxy_variants)
     start_strategies = parse_csv_names(args.start_strategies)
     v_selection_rules = parse_csv_names(args.v_selection_rules)
+    if int(args.v_risk_key_exp_bits) > 0:
+        unsupported_rules = [
+            rule
+            for rule in v_selection_rules
+            if str(rule).strip().lower()
+            not in {"", "global", "global_residual_risk", "residual_risk"}
+        ]
+        if unsupported_rules:
+            raise ValueError(
+                "--v_risk_key_exp_bits only supports the global_residual_risk "
+                f"V rule (frozen); got: {unsupported_rules}"
+            )
     lookahead_decision_variants = parse_csv_names(args.lookahead_decision_variants)
     for dv in lookahead_decision_variants:
         if dv not in LOOKAHEAD_VARIANTS or dv == "charge_all":
@@ -2584,6 +2643,15 @@ def run() -> None:
                     for ki in range(len(k_budgets)):
                         probs = probs_by_k[ki]
                         risk_scores = (probs * probs) * code_error
+                        if int(args.v_risk_key_exp_bits) > 0:
+                            # Risk-rank key precision study (issue #7): rank,
+                            # split, and select on the quantized monotone key;
+                            # probabilities and outputs stay full precision.
+                            risk_scores = _quantize_risk_key(
+                                risk_scores,
+                                int(args.v_risk_key_exp_bits),
+                                int(args.v_risk_key_mantissa_bits),
+                            )
                         la_masks: list[np.ndarray] = []
                         if la_active and ki + 1 < len(k_budgets):
                             # Tokens whose logits upgrade from PQ to exact when the
@@ -2940,6 +3008,11 @@ def run() -> None:
                                         code_error=code_error,
                                         precision_v_hi_frac=float(precision_v_hi_frac),
                                         precision_v_lo_err=precision_v_lo_err,
+                                        v_risk_key_bits=(
+                                            (int(args.v_risk_key_exp_bits), int(args.v_risk_key_mantissa_bits))
+                                            if int(args.v_risk_key_exp_bits) > 0
+                                            else None
+                                        ),
                                     )
                                     _write_stage2_vpage(
                                         str(args.golden_dump_stage2_dir),
