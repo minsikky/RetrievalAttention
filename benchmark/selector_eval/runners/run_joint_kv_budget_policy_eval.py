@@ -1090,15 +1090,19 @@ def _truncate_fp16_msb(x: np.ndarray) -> np.ndarray:
 
 
 def _quantize_risk_key(risk: np.ndarray, exp_bits: int, mantissa_bits: int) -> np.ndarray:
-    """Emulate the S3-style monotone risk-rank key (issue #7): keep a
-    floor(log2) exponent inside a 2^exp_bits-octave window anchored at the
-    per-state max positive risk plus mantissa_bits RNE mantissa bits.
-    Positive values below the window floor collapse to one shared
-    bottom-of-window key (the downstream stable sorts then resolve them in
-    stream order, matching the hardware histogram's boundary-bin rule);
-    exact zeros stay zero (the structural non-paged bin, which the stable
-    sort already leaves in stream order). Monotone: quantized keys never
-    reorder values whose keys differ."""
+    """Monotone risk-rank key, the built hardware unit's literal map (issue
+    #7; E = exp_bits, M = mantissa_bits). Each positive value is RNE
+    mantissa-quantized at ITS OWN exponent (step = 2^(e_pre − M), the carry
+    lands on the next power of two naturally); membership is decided on the
+    POST-round exponent e_post = floor(log2(q)). The window spans 2^E − 2
+    mantissa-bearing octaves anchored at the max positive value's exponent:
+    ebase = e_pre(max) − (2^E − 2). Post-round exponents e_post ≤ ebase
+    collapse to the single disjoint bottom bin 2^ebase (one tie class,
+    strictly below the smallest in-window key 2^(ebase+1) so it never
+    aliases an in-window key); in-window keys keep q (a carry at the anchor
+    octave yields q = 2^(e_pre_max+1) and ranks top with no special case).
+    Exact zeros stay zero (the structural non-paged bin). Downstream stable
+    sorts resolve equal keys in stream order."""
     r = np.asarray(risk, dtype=np.float64)
     out = np.zeros_like(r)
     pos = r > 0.0
@@ -1106,12 +1110,14 @@ def _quantize_risk_key(risk: np.ndarray, exp_bits: int, mantissa_bits: int) -> n
         return out
     rp = r[pos]
     with np.errstate(divide="ignore"):
-        e = np.floor(np.log2(rp))
-    floor_e = float(np.max(e)) - (float(1 << int(exp_bits)) - 1.0)
-    below = e < floor_e
-    step = np.exp2(np.maximum(e, floor_e) - float(int(mantissa_bits)))
+        e_pre = np.floor(np.log2(rp))
+    step = np.exp2(e_pre - float(int(mantissa_bits)))
     q = np.round(rp / step) * step
-    q[below] = np.exp2(floor_e)
+    with np.errstate(divide="ignore"):
+        e_post = np.floor(np.log2(q))
+    ebase = float(np.max(e_pre)) - (float(1 << int(exp_bits)) - 2.0)
+    below = e_post <= ebase
+    q[below] = np.exp2(ebase)
     out[pos] = q
     return out
 
@@ -1140,6 +1146,15 @@ def _rne_significand(x: np.ndarray, bits: int) -> np.ndarray:
     step = np.exp2(e - float(int(bits) - 1))
     out[pos] = np.round(rp / step) * step
     return out
+
+
+def _fp16_commit_mask(int8_err: np.ndarray, code_error: np.ndarray) -> np.ndarray:
+    """V commit test in the 2-byte sidecar domain (hardware-pinned): the
+    lo-tier int8 plane commits where fp16(int8_err) < fp16(code_error),
+    STRICT, both RNE casts of the fp64 stats. Inputs are nonnegative, so the
+    IEEE fp16 compare yields the pinned edges naturally: ce16 == 0 loses;
+    an int8_err that underflows to fp16 0 with ce16 > 0 wins."""
+    return np.asarray(int8_err, dtype=np.float16) < np.asarray(code_error, dtype=np.float16)
 
 
 def _precision_lo_tokens(
@@ -1293,6 +1308,8 @@ def _write_stage2_golden(
     code_error: np.ndarray,
     precision_v_hi_frac: float,
     precision_v_lo_err: np.ndarray | None,
+    values_fp16: np.ndarray,
+    values_lo: np.ndarray | None,
     v_risk_key_bits: tuple[int, int] | None = None,
 ) -> None:
     """Stage-2 goldens (issue #7): controller trace, per-band flash partials
@@ -1473,12 +1490,361 @@ def _write_stage2_golden(
         key_order = exact_idx_key[np.argsort(-key_q[exact_idx_key], kind="stable")]
         lo_candidates_key = key_order[hi_target_key:]
         commit_key = lo_candidates_key[
-            precision_v_lo_err[lo_candidates_key]
-            < code_error[lo_candidates_key].astype(np.float64, copy=False)
+            _fp16_commit_mask(
+                precision_v_lo_err[lo_candidates_key], code_error[lo_candidates_key]
+            )
         ]
         hi_mask_key[key_order[:hi_target_key]] = True
         lo_mask_key[commit_key] = True
         dropped_key = int(lo_candidates_key.size - commit_key.size)
+
+    # Item 7 (issue #7): V-correction (Vcorr) goldens in the E6M12 KEY
+    # domain with the fp16 commit test. All accumulation fp64; the key is
+    # recomputed per K state (probs move). Emitted only when the lo tier is
+    # live (values_lo / precision_v_lo_err present); off-tier rows omit
+    # every item-7 field. The composition mirrors
+    # output_from_base_and_split_masks (v_fp16 hi tier, v_int8 lo tier).
+    item7: dict[str, object] = {}
+    tiny = 1e-20
+    hd = int(vhat.shape[1])
+    have_lo = values_lo is not None and precision_v_lo_err is not None
+    if have_lo:
+        vhat_f = vhat.astype(np.float64, copy=False)
+        commit_full = _fp16_commit_mask(precision_v_lo_err, code_error)
+        # REF operand domain (fp64, the raw-fp16 / plane-A operands the
+        # controller trace was produced with): hi reads the raw fp16 row,
+        # lo reads plane-A dequant.
+        residual_hi = np.asarray(values_fp16, dtype=np.float64) - vhat_f
+        residual_int8 = np.asarray(values_lo, dtype=np.float64) - vhat_f
+        # HW operand domain (RTL pin 2026-07-07): one fp16 RNE cast per
+        # (token, dim, tier). hi reads the dualplane reconstruction
+        # (plane-A + plane-B dequant, fp64 sum) minus vhat, single fp16 cast;
+        # lo reads plane-A dequant minus vhat, single fp16 cast.
+        v_np_f32 = np.asarray(values_fp16, dtype=np.float32)
+        dqA_full = np.asarray(values_lo, dtype=np.float32)  # == _quantize_rows_symmetric(values_np, 8)
+        _rA = (v_np_f32 - dqA_full).astype(np.float32)
+        _sB = np.maximum(np.max(np.abs(_rA), axis=1, keepdims=True) / 127.0, 1e-12)
+        _dqB = (np.round(_rA / _sB) * _sB).astype(np.float32)  # plane-B dequant, mirrors _int8_dualplane_rows
+        _recon_f64 = dqA_full.astype(np.float64) + _dqB.astype(np.float64)
+        diff16_hi = (_recon_f64 - vhat_f).astype(np.float16).astype(np.float64)
+        diff16_lo = (dqA_full.astype(np.float64) - vhat_f).astype(np.float16).astype(np.float64)
+
+        _key_cache: dict[int, np.ndarray] = {}
+
+        def _key_for_ki(ki_: int) -> np.ndarray:
+            cached = _key_cache.get(ki_)
+            if cached is not None:
+                return cached
+            p_ = probs_by_k[ki_].astype(np.float64, copy=False)
+            pm_ = float(np.max(p_)) if p_.size else 0.0
+            w_ = p_ / pm_ if pm_ > 0.0 else np.zeros(n, dtype=np.float64)
+            w17_ = _rne_significand(w_, 17)
+            rk_ = (w17_ * w17_) * code_error.astype(np.float16).astype(np.float64)
+            kq_ = _quantize_risk_key(
+                rk_, _FROZEN_V_RISK_KEY_EXP_BITS, _FROZEN_V_RISK_KEY_MANTISSA_BITS
+            )
+            _key_cache[ki_] = kq_
+            return kq_
+
+        _key_cache[int(settled_ki)] = key_q
+
+        def _key_masks(ki_: int, vi_: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            kq_ = _key_for_ki(ki_)
+            ne_ = max(0, min(int(v_budgets[vi_]), n))
+            em_ = top_mask(kq_, ne_)
+            hm_ = np.zeros(n, dtype=bool)
+            lm_ = np.zeros(n, dtype=bool)
+            if precision_v_hi_frac < 1.0 and bool(np.any(em_)):
+                eidx_ = np.flatnonzero(em_)
+                ht_ = int(math.ceil(float(eidx_.size) * float(precision_v_hi_frac)))
+                ko_ = eidx_[np.argsort(-kq_[eidx_], kind="stable")]
+                loc_ = ko_[ht_:]
+                cm_ = loc_[_fp16_commit_mask(precision_v_lo_err[loc_], code_error[loc_])]
+                hm_[ko_[:ht_]] = True
+                lm_[cm_] = True
+            else:
+                hm_ = em_.copy()
+            return kq_, hm_, lm_
+
+        def _compose_sum(
+            ki_: int, hm_: np.ndarray, lm_: np.ndarray, *, hw: bool
+        ) -> np.ndarray:
+            hi_op = diff16_hi if hw else residual_hi
+            lo_op = diff16_lo if hw else residual_int8
+            s_ = base_output_by_k[ki_].astype(np.float64, copy=True)
+            p_ = probs_by_k[ki_]
+            if bool(np.any(hm_)):
+                s_ += p_[hm_].astype(np.float64, copy=False) @ hi_op[hm_]
+            if bool(np.any(lm_)):
+                s_ += p_[lm_].astype(np.float64, copy=False) @ lo_op[lm_]
+            return s_
+
+        # 3a: per-probed-V-state band partials. One record per probe entry
+        # that reads the V axis: k/v/stop read (ki,vi)->(ki,vi+1); vd reads
+        # (ki,vi-1)->(ki,vi). vi_hi out of range (top-V k/v/stop) is skipped.
+        rec_kind: list[str] = []
+        rec_ki: list[int] = []
+        rec_vlo: list[int] = []
+        rec_vhi: list[int] = []
+        rec_dv_ref: list[float] = []
+        rec_dv_hw: list[float] = []
+        rec_dv_trace_delta: list[float] = []
+        acc_marg_ref: list[np.ndarray] = []
+        acc_hib_ref: list[np.ndarray] = []
+        acc_marg_hw: list[np.ndarray] = []
+        acc_hib_hw: list[np.ndarray] = []
+        marg_tok: list[int] = []
+        marg_p: list[float] = []
+        marg_off: list[int] = [0]
+        hib_tok: list[int] = []
+        hib_p: list[float] = []
+        hib_off: list[int] = [0]
+
+        def _band_acc(mtok_, htok_, ki_, hi_op, lo_op):
+            # marginal band: new exact tokens read the lo operand (commit
+            # winners contribute, losers 0). hi-boundary band: tier upgrade
+            # lo/pq -> hi, per token p*(hi_op - x) with x = lo_op if winner
+            # else 0 (both operands pre-rounded; the hw domain rounds each
+            # tier once before this subtraction).
+            am_ = np.zeros(hd, dtype=np.float64)
+            if mtok_.size:
+                wm_ = commit_full[mtok_]
+                if bool(np.any(wm_)):
+                    am_ = probs_by_k[ki_][mtok_][wm_].astype(np.float64, copy=False) @ lo_op[mtok_][wm_]
+            ah_ = np.zeros(hd, dtype=np.float64)
+            if htok_.size:
+                wh_ = commit_full[htok_]
+                xr_ = hi_op[htok_] - (wh_.astype(np.float64)[:, None] * lo_op[htok_])
+                ah_ = probs_by_k[ki_][htok_].astype(np.float64, copy=False) @ xr_
+            return am_, ah_
+
+        for j, knd in enumerate(kinds):
+            ki_j = int(p_ki[j])
+            vi_j = int(p_vi[j])
+            if knd in ("k", "v", "stop"):
+                vlo, vhi = vi_j, vi_j + 1
+                if vhi >= len(v_budgets):
+                    continue
+            elif knd == "vd":
+                vlo, vhi = vi_j - 1, vi_j
+                if vlo < 0:
+                    continue
+            else:  # kd, or non-V-reading kinds
+                continue
+            trace_dv = float(p_dv[j])
+            kq_j = _key_for_ki(ki_j)
+            order = np.argsort(-kq_j, kind="stable")
+            n0 = max(0, min(int(v_budgets[vlo]), n))
+            n1 = max(0, min(int(v_budgets[vhi]), n))
+            h0 = int(math.ceil(float(n0) * float(precision_v_hi_frac)))
+            h1 = int(math.ceil(float(n1) * float(precision_v_hi_frac)))
+            mtok = order[n0:n1].astype(np.int64)
+            htok = order[h0:h1].astype(np.int64)
+            _, hm_hi, lm_hi = _key_masks(ki_j, vhi)
+            _, hm_lo, lm_lo = _key_masks(ki_j, vlo)
+            am_ref, ah_ref = _band_acc(mtok, htok, ki_j, residual_hi, residual_int8)
+            am_hw, ah_hw = _band_acc(mtok, htok, ki_j, diff16_hi, diff16_lo)
+            # SELF-CHECK (per domain): band sum reconstructs the full-precision
+            # difference out(vi_hi) - out(vi_lo). The 4-sig-digit trace match
+            # applies to the REF dv only (the trace used fp64 raw operands).
+            dvs: dict[str, float] = {}
+            for tag, (am_, ah_, hi_op, lo_op) in {
+                "ref": (am_ref, ah_ref, residual_hi, residual_int8),
+                "hw": (am_hw, ah_hw, diff16_hi, diff16_lo),
+            }.items():
+                is_hw = tag == "hw"
+                s_hi = _compose_sum(ki_j, hm_hi, lm_hi, hw=is_hw)
+                s_lo = _compose_sum(ki_j, hm_lo, lm_lo, hw=is_hw)
+                diff = s_hi - s_lo
+                rel = float(
+                    np.linalg.norm((am_ + ah_) - diff) / max(float(np.linalg.norm(diff)), tiny)
+                )
+                if rel > 1e-5:
+                    raise AssertionError(
+                        f"vcorr 3a {tag} band-sum mismatch q{qidx} h{head} rec{len(rec_kind)}: rel={rel}"
+                    )
+                dvs[tag] = rel_l2(s_lo.astype(np.float32), s_hi.astype(np.float32))
+            # The trace's probe_dv came from the run's RISK-domain selection;
+            # the item-7 REF dv is the KEY-domain composition. Boundary-token
+            # swaps between the two orders perturb dv within the eps_band
+            # equivalence class (spec #4 item 6) — record the delta and bound
+            # it there rather than demanding 4-sig-digit identity.
+            dv_trace_delta = float(dvs["ref"]) - float(trace_dv)
+            if abs(dv_trace_delta) > 2e-5:
+                raise AssertionError(
+                    f"vcorr 3a dv/trace divergence beyond eps_band q{qidx} h{head} "
+                    f"rec{len(rec_kind)}: dv_ref={dvs['ref']:.6g} trace={trace_dv:.4g}"
+                )
+            rec_kind.append(str(knd))
+            rec_ki.append(ki_j)
+            rec_vlo.append(int(vlo))
+            rec_vhi.append(int(vhi))
+            rec_dv_ref.append(float(dvs["ref"]))
+            rec_dv_hw.append(float(dvs["hw"]))
+            rec_dv_trace_delta.append(dv_trace_delta)
+            acc_marg_ref.append(am_ref)
+            acc_hib_ref.append(ah_ref)
+            acc_marg_hw.append(am_hw)
+            acc_hib_hw.append(ah_hw)
+            marg_tok.extend(int(t) for t in mtok.tolist())
+            marg_p.extend(float(x) for x in probs_by_k[ki_j][mtok].astype(np.float64).tolist())
+            marg_off.append(len(marg_tok))
+            hib_tok.extend(int(t) for t in htok.tolist())
+            hib_p.extend(float(x) for x in probs_by_k[ki_j][htok].astype(np.float64).tolist())
+            hib_off.append(len(hib_tok))
+        rr = len(rec_kind)
+
+        def _stack(rows: list[np.ndarray]) -> np.ndarray:
+            return np.stack(rows).astype(np.float64) if rows else np.zeros((0, hd), dtype=np.float64)
+
+        item7["vcorr_probe_record_kind"] = np.asarray(rec_kind, dtype="<U4")
+        item7["vcorr_probe_ki"] = np.asarray(rec_ki, dtype=np.int64)
+        item7["vcorr_probe_vi_lo"] = np.asarray(rec_vlo, dtype=np.int64)
+        item7["vcorr_probe_vi_hi"] = np.asarray(rec_vhi, dtype=np.int64)
+        item7["vcorr_dv_ref_fp64"] = np.asarray(rec_dv_ref, dtype=np.float64)
+        item7["vcorr_dv_hw_fp64"] = np.asarray(rec_dv_hw, dtype=np.float64)
+        item7["vcorr_dv_trace_delta"] = np.asarray(rec_dv_trace_delta, dtype=np.float64)
+        item7["vcorr_acc_marginal_ref"] = _stack(acc_marg_ref)
+        item7["vcorr_acc_hiboundary_ref"] = _stack(acc_hib_ref)
+        item7["vcorr_acc_marginal_hw"] = _stack(acc_marg_hw)
+        item7["vcorr_acc_hiboundary_hw"] = _stack(acc_hib_hw)
+        item7["vcorr_marginal_tokens"] = np.asarray(marg_tok, dtype=np.int64)
+        item7["vcorr_marginal_p"] = np.asarray(marg_p, dtype=np.float64)
+        item7["vcorr_marginal_offsets"] = np.asarray(marg_off, dtype=np.int64)
+        item7["vcorr_hiboundary_tokens"] = np.asarray(hib_tok, dtype=np.int64)
+        item7["vcorr_hiboundary_p"] = np.asarray(hib_p, dtype=np.float64)
+        item7["vcorr_hiboundary_offsets"] = np.asarray(hib_off, dtype=np.int64)
+
+        # 3b: settled-state Vcorr total = out(settled) - base(settled), both
+        # domains. REF is cross-checked against the item-5 composition path
+        # (output_from_base_and_split_masks) to fp32-exact equality.
+        _, hm_s, lm_s = _key_masks(int(settled_ki), int(settled_vi))
+        base_s = base_output_by_k[int(settled_ki)].astype(np.float64, copy=False)
+        settled_acc_ref = _compose_sum(int(settled_ki), hm_s, lm_s, hw=False) - base_s
+        settled_acc_hw = _compose_sum(int(settled_ki), hm_s, lm_s, hw=True) - base_s
+        check_s = output_from_base_and_split_masks(
+            base_output=base_output_by_k[int(settled_ki)],
+            probs=probs_by_k[int(settled_ki)],
+            residual=residual_hi,
+            residual_lo=residual_int8,
+            hi_mask=hm_s,
+            lo_mask=lm_s,
+        )
+        if not np.array_equal((settled_acc_ref + base_s).astype(np.float32), check_s):
+            raise AssertionError(f"vcorr 3b settled composition mismatch q{qidx} h{head}")
+        item7["vcorr_settled_acc_ref"] = settled_acc_ref.astype(np.float64)
+        item7["vcorr_settled_acc_hw"] = settled_acc_hw.astype(np.float64)
+
+        # 3c: settled exact-V operands in key-rank order. Plane A is the
+        # literal _quantize_rows_symmetric(values_np, 8) (per-row absmax int8,
+        # float32 scale); plane B mirrors _int8_dualplane_rows' residual plane.
+        order_s = np.argsort(-key_q, kind="stable")
+        vtok = order_s[: int(exact_count)].astype(np.int64)
+        vrows = np.asarray(values_fp16, dtype=np.float32)[vtok]
+        levels = float((1 << (8 - 1)) - 1)  # 127, mirrors _quantize_rows_symmetric
+        scaleA = np.maximum(np.max(np.abs(vrows), axis=1, keepdims=True) / levels, 1e-12)
+        codesA_f = np.round(vrows / scaleA)
+        dqA = (codesA_f * scaleA).astype(np.float32)
+        codesA = np.clip(codesA_f, -127, 127).astype(np.int8)
+        r_res = (vrows - dqA).astype(np.float32)
+        scaleB = np.maximum(np.max(np.abs(r_res), axis=1, keepdims=True) / levels, 1e-12)
+        codesB_f = np.round(r_res / scaleB)
+        dqB = (codesB_f * scaleB).astype(np.float32)
+        codesB = np.clip(codesB_f, -127, 127).astype(np.int8)
+        recon = (dqA + dqB).astype(np.float32)
+        # SELF-CHECK: two-plane reconstruction of v_fp16. Sound per-element
+        # bound = 0.5*scaleB (plane-B RNE half-step) + fp32 accumulation slack.
+        recon_max = 0.0
+        if vtok.size:
+            err_elt = np.abs(recon.astype(np.float64) - vrows.astype(np.float64))
+            absmax_v = np.max(np.abs(vrows), axis=1, keepdims=True).astype(np.float64)
+            bound = (
+                0.5 * scaleB.astype(np.float64)
+                + 8.0 * float(np.finfo(np.float32).eps) * absmax_v
+                + 1e-12
+            )
+            if bool(np.any(err_elt > bound)):
+                raise AssertionError(
+                    f"vcorr 3c reconstruction bound exceeded q{qidx} h{head}: "
+                    f"max={float(err_elt.max())} bound_min={float(bound.min())}"
+                )
+            recon_max = float(err_elt.max())
+        item7["vexact_tokens"] = vtok
+        item7["vexact_v_fp16"] = vrows.astype(np.float16)
+        item7["vexact_int8_codes"] = codesA
+        item7["vexact_int8_scale"] = scaleA.reshape(-1).astype(np.float16)
+        item7["vexact_int8_scale_fp64"] = scaleA.reshape(-1).astype(np.float64)
+        item7["vexact_int8_err_fp16"] = np.asarray(
+            precision_v_lo_err[vtok], dtype=np.float16
+        )
+        item7["vexact_commit"] = commit_full[vtok].astype(np.uint8)
+        item7["vexact_residual_codes"] = codesB
+        item7["vexact_residual_scale"] = scaleB.reshape(-1).astype(np.float16)
+        item7["vexact_residual_scale_fp64"] = scaleB.reshape(-1).astype(np.float64)
+        item7["vexact_recon_max_abs_err"] = float(recon_max)
+
+        # 3d: first-kd K-move fixup (fields present only when the trace
+        # de-escalates on the K axis). kd is a one-rung down move.
+        kd_j = next((j for j, k in enumerate(kinds) if k == "kd"), None)
+        if kd_j is not None:
+            ki_from = int(p_ki[kd_j])
+            ki_to = ki_from - 1
+            vi_cur = int(p_vi[kd_j])
+
+            def _den_checked(ki_: int) -> float:
+                # Denominator run() actually normalized by: fp32 exp / fp32
+                # sum. probs_by_k == exp(s-max)/den to fp64 roundoff (rel~0);
+                # a pure fp64 den would miss at ~1e-8 (probs were fp32 path).
+                s_ = scores_by_k[ki_]
+                e_ = np.exp(s_ - float(np.max(s_)))
+                den_ = max(float(np.sum(e_)), tiny)
+                p_ref = (e_ / den_).astype(np.float64)
+                p_st = probs_by_k[ki_].astype(np.float64, copy=False)
+                relp = float(
+                    np.max(np.abs(p_ref - p_st)) / max(float(np.max(np.abs(p_st))), tiny)
+                )
+                if relp > 1e-12:
+                    raise AssertionError(
+                        f"vcorr 3d probs/den mismatch q{qidx} h{head} ki{ki_}: rel={relp}"
+                    )
+                return float(den_)
+
+            ne_cur = max(0, min(int(v_budgets[vi_cur]), n))
+            set_from = set(np.argsort(-_key_for_ki(ki_from), kind="stable")[:ne_cur].tolist())
+            set_to = set(np.argsort(-_key_for_ki(ki_to), kind="stable")[:ne_cur].tolist())
+            _, hm_t, lm_t = _key_masks(ki_to, vi_cur)
+            base_t = base_output_by_k[ki_to].astype(np.float64, copy=False)
+            acc_post_ref = _compose_sum(ki_to, hm_t, lm_t, hw=False) - base_t
+            acc_post_hw = _compose_sum(ki_to, hm_t, lm_t, hw=True) - base_t
+            check_t = output_from_base_and_split_masks(
+                base_output=base_output_by_k[ki_to],
+                probs=probs_by_k[ki_to],
+                residual=residual_hi,
+                residual_lo=residual_int8,
+                hi_mask=hm_t,
+                lo_mask=lm_t,
+            )
+            if not np.array_equal((acc_post_ref + base_t).astype(np.float32), check_t):
+                raise AssertionError(
+                    f"vcorr 3d post-move composition mismatch q{qidx} h{head}"
+                )
+            item7["kmove_ki_from"] = int(ki_from)
+            item7["kmove_ki_to"] = int(ki_to)
+            item7["kmove_vi"] = int(vi_cur)
+            item7["kmove_den_old"] = _den_checked(ki_from)
+            item7["kmove_den_new"] = _den_checked(ki_to)
+            item7["kmove_crossing_out_tokens"] = np.asarray(
+                sorted(set_from - set_to), dtype=np.int64
+            )
+            item7["kmove_crossing_in_tokens"] = np.asarray(
+                sorted(set_to - set_from), dtype=np.int64
+            )
+            item7["kmove_acc_post_ref"] = acc_post_ref.astype(np.float64)
+            item7["kmove_acc_post_hw"] = acc_post_hw.astype(np.float64)
+
+        # 2b: full-context fp16 commit mask and the int8-error sidecar.
+        item7["v_commit_mask_packed"] = np.packbits(commit_full)
+        item7["v_int8_err_fp16"] = np.asarray(precision_v_lo_err, dtype=np.float16)
 
     np.savez_compressed(
         out / f"golden2_q{int(qidx)}_h{int(head)}.npz",
@@ -1533,6 +1899,7 @@ def _write_stage2_golden(
         v_hi_mask_key_packed=np.packbits(hi_mask_key),
         v_lo_mask_key_packed=np.packbits(lo_mask_key),
         v_dropped_reads_key=int(dropped_key),
+        **item7,
     )
 
 
@@ -2490,6 +2857,7 @@ def run() -> None:
                     / math.sqrt(float(trace.head_dim))
                 ).astype(np.float32, copy=False)
             precision_v_lo_err: np.ndarray | None = None
+            values_lo: np.ndarray | None = None
             if precision_v_hi_frac < 1.0:
                 values_lo = (
                     _truncate_fp16_msb(values_np)
@@ -2820,11 +3188,14 @@ def run() -> None:
                                 lo_candidates = risk_order[hi_target:]
                                 # Commit the MSB-plane read only where it beats the
                                 # V-PQ reconstruction it replaces; otherwise skip
-                                # the read and keep the V-PQ value (per-token
-                                # stored int8-error stat vs code-error stat).
+                                # the read and keep the V-PQ value. Commit test in
+                                # the 2-byte sidecar domain (fp16 int8-error vs
+                                # fp16 code-error), the hardware contract.
                                 commit = lo_candidates[
-                                    precision_v_lo_err[lo_candidates]
-                                    < code_error[lo_candidates].astype(np.float64, copy=False)
+                                    _fp16_commit_mask(
+                                        precision_v_lo_err[lo_candidates],
+                                        code_error[lo_candidates],
+                                    )
                                 ]
                                 v_hi_mask = np.zeros((int(context_len),), dtype=bool)
                                 v_lo_mask = np.zeros((int(context_len),), dtype=bool)
@@ -3085,6 +3456,8 @@ def run() -> None:
                                         code_error=code_error,
                                         precision_v_hi_frac=float(precision_v_hi_frac),
                                         precision_v_lo_err=precision_v_lo_err,
+                                        values_fp16=values_np,
+                                        values_lo=values_lo,
                                         v_risk_key_bits=(
                                             (int(args.v_risk_key_exp_bits), int(args.v_risk_key_mantissa_bits))
                                             if int(args.v_risk_key_exp_bits) > 0

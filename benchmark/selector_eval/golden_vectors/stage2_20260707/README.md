@@ -77,20 +77,32 @@ domain and stored per token:
 RNE in the value domain, 1.0 exact at the max token, common denominator
 scaled out; `v_code_error_fp16` = fp16(code_error) (RNE cast;
 range-verified: no overflow/underflow on these contexts). Key:
-`v_risk_key_q_fp64` = E6M12 window quantization of w17² · ce16 — the fp64
-product is EXACT (≤ 45 mantissa bits), so this equals a single RNE of the
-exact integer product to 12 fraction bits, window = 64 octaves anchored
-at floor(log2(max positive risk)); below-window positives share one
-bottom-bin value 2^floor_e; zeros (w17 == 0 or ce16 == 0) stay 0 — the
-zero set equals the structural non-paged set exactly. Ranking: key
-descending, stable ⇒ ties in stream order. Masks/scalars mirror item 5 in
-the key domain: `v_exact_mask_key_packed`, `v_hi_mask_key_packed`,
+`v_risk_key_q_fp64` = E6M12 map of risk_hw = w17² · ce16 — the fp64
+product is EXACT (≤ 45 mantissa bits). The built hardware map (E=6, M=12;
+`e_pre = floor(log2(v))`, `e_post = floor(log2(RNE13(v)))`,
+`ebase = e_pre(max positive risk) − 62`):
+
+| e-field | m-field | meaning | membership / value |
+|---|---|---|---|
+| e=0 | m=0 | structural zero bin | v == 0 (w17==0 or ce16==0) → key 0 |
+| e=0 | m=1 | below-window bottom tie class | `e_post ≤ ebase` → key `2^ebase` (one class) |
+| e∈[1..62] | mantissa-bearing | in-window octaves | key `q = RNE13(v)` at v's own exponent |
+| e=63 | top tie class | anchor-octave carry | `q = 2^(e_pre_max+1)`, ranks top, order-exact |
+
+Membership is decided POST-round (`e_post`), so the 2^E−2 = 62
+mantissa-bearing octaves span `e_post ∈ (ebase, e_pre_max]`; the bottom
+bin `2^ebase` is strictly below the smallest in-window key `2^(ebase+1)`
+(no aliasing), and a mantissa carry at the anchor octave yields
+`2^(e_pre_max+1)` with no special case. Ranking: key descending, stable ⇒
+ties in stream order. Commit domain (fp16-vs-fp16, hardware-pinned): the
+lo-tier int8 plane commits where `fp16(int8_err) < fp16(code_error)`,
+STRICT, both RNE casts of the fp64 sidecars. Edges (natural under IEEE
+fp16 compare on nonnegatives): `ce16 == 0` loses; an `int8_err` that
+underflows fp16 to 0 with `ce16 > 0` wins; an exact fp16 tie loses
+(strict <). Masks/scalars mirror item 5 in the key domain:
+`v_exact_mask_key_packed`, `v_hi_mask_key_packed`,
 `v_lo_mask_key_packed`, `v_dropped_reads_key`, `v_risk_key_cutoff_q`,
-plus `v_risk_key_exp_bits`/`v_risk_key_mantissa_bits` (= 6/12). The lo
-commit test is unchanged (fp-domain static bit). fp-vs-key mask diffs on
-these 12 rows: 2-token boundary swaps on 2 rows (q223_h16 hi<->lo,
-q287_h16 exact-set), all at near-equal-risk cutoffs (in-band by the #7
-uniform-bound argument).
+plus `v_risk_key_exp_bits`/`v_risk_key_mantissa_bits` (= 6/12).
 
 ## page_v npz fields (one per kv_head × ctx, LAST sealed page)
 
@@ -99,7 +111,78 @@ uniform-bound argument).
 (the two 2 B/token sidecars, dumped fp64 over the page range; hardware
 stores them fp16 — these are the pre-rounding reference values),
 `page_start`, geometry. Reconstruction: vhat[t] = codebook[0, code[t]];
-risk uses code_error; the V commit test is int8_err < code_error.
+risk uses code_error; the V commit test is
+`fp16(int8_err) < fp16(code_error)` (strict; the stored sidecars are the
+pre-rounding fp64 reference values).
+
+## Item 7 — Vcorr (V-correction) goldens
+
+New fields the dump helper asserts at write time; the RTL harness pins the
+hardware V-correction against them. Emitted only when the lo tier is live.
+
+**Change 2b — full-context commit sidecars**: `v_commit_mask_packed`
+(np.packbits of `fp16(int8_err) < fp16(code_error)` over the whole
+context), `v_int8_err_fp16` (fp16 cast of the per-token int8-error stat;
+`v_code_error_fp16` from item 6 is the code-error twin).
+
+**Dual operand domain (RTL pin 2026-07-07).** Every Vcorr accumulator and
+dv is dumped in two operand domains: `_ref` uses fp64 raw-fp16 / plane-A
+operands (the domain the controller trace was produced in); `_hw` uses one
+fp16 RNE cast per (token, dim, tier) — hi-tier reads
+`fp16(dualplane_recon − vhat)` (plane-A+B dequant summed fp64, single
+cast), lo-tier reads `fp16(dequantA − vhat)`. Hi-boundary per-token
+contribution rounds each tier before subtracting (`diff16_hi −
+diff16_prev`, never one rounding of the algebraic difference).
+
+**3a — per-probe band partials** (ragged, flat arrays + offsets). One
+record per probe entry that READS the V axis: k/v/stop compare
+(ki,vi)→(ki,vi+1), vd compares (ki,vi−1)→(ki,vi). Per record (length R):
+`vcorr_probe_record_kind`, `vcorr_probe_ki`, `vcorr_probe_vi_lo`,
+`vcorr_probe_vi_hi`, `vcorr_dv_ref_fp64`, `vcorr_dv_hw_fp64`;
+`vcorr_acc_marginal_{ref,hw}` and `vcorr_acc_hiboundary_{ref,hw}` (R×128).
+Marginal band = key-rank positions (N_lo, N_hi] (commit winners read the lo
+operand, losers 0); hi-boundary band = positions
+(ceil(0.1·N_lo), ceil(0.1·N_hi)] (tier upgrade lo/pq→hi). Band members are
+flat with offsets: `vcorr_marginal_tokens` / `vcorr_marginal_p` indexed by
+`vcorr_marginal_offsets` (R+1; record r spans [off[r], off[r+1])), same
+trio for `vcorr_hiboundary_*`. Self-checks (raise on fail): in EACH domain
+out(vi_hi) − out(vi_lo) == acc_marginal + acc_hiboundary (rel ≤ 1e-5); and
+|REF dv − trace probe value| ≤ eps_band = 2e-5. The trace dv came from the
+run's RISK-domain selection while item-7 composes the KEY-domain sets, so
+boundary-token swaps legitimately perturb dv inside the band — the signed
+delta is stored per record as `vcorr_dv_trace_delta` (length R) and the
+regen verifier reports each row's max.
+
+**3b — settled total**: `vcorr_settled_acc_{ref,hw}` (128) =
+out(settled) − base(settled). Self-check: REF + base, cast fp32, matches
+the item-5 `output_from_base_and_split_masks` path with the key-domain
+masks.
+
+**3c — settled exact-V operands** (key-rank order, length n_exact):
+`vexact_tokens` (int64), `vexact_v_fp16` (raw rows, float16),
+`vexact_int8_codes` (int8) + `vexact_int8_scale` (float16) /
+`vexact_int8_scale_fp64` — plane A is the literal
+`_quantize_rows_symmetric(values_np, 8)` (per-row absmax int8, **float32
+scale**; the fp64 twin is that float32 value widened, so
+codes·scale reproduces plane A bit-exactly only in float32);
+`vexact_int8_err_fp16`, `vexact_commit` (uint8); plane B (residual plane,
+mirrors `_int8_dualplane_rows`) `vexact_residual_codes` (int8) +
+`vexact_residual_scale` (float16) / `_fp64`; `vexact_recon_max_abs_err`.
+Self-check: dequant(A)+dequant(B) reconstructs v_fp16 within
+0.5·scaleB + fp32 slack per element.
+
+**3d — first-kd K-move fixup** (present only when the trace de-escalates on
+K): `kmove_ki_from`, `kmove_ki_to` (= from−1), `kmove_vi`; `kmove_den_old`,
+`kmove_den_new` (softmax denominators, computed in run()'s float32-normalized
+domain so probs == exp(s−max)/den to fp64 roundoff);
+`kmove_crossing_out_tokens` / `kmove_crossing_in_tokens` (exact-set
+key-rank membership changes across the two K states, keys recomputed per
+state); `kmove_acc_post_{ref,hw}` (128) = Vcorr total at (ki_to, vi_cur).
+
+The verifier (`verify_stage2_key_regen.py`) requires every item-7 field
+(3d conditional on the row's trace having kd), reports moved item-6
+key-mask token diffs (frozen vs regen) instead of asserting them, and
+flags (nonfatal) any record with |dv_hw − dv_ref| > 1e-5.
 
 ## Provenance / regeneration
 

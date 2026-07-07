@@ -39,7 +39,7 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_vprefix impo
 # OPEN-2/M6): the top 10% of the K ranked prefix / V risk-ranked exact set
 # reads full precision; the rest reads the per-row absmax-int8 plane, with
 # V lo reads additionally gated by the per-token commit test
-# (int8_err < code_error). Mirrors --precision_k_hi_frac 0.1
+# (fp16(int8_err) < fp16(code_error)). Mirrors --precision_k_hi_frac 0.1
 # --precision_v_hi_frac 0.1 --precision_lo_mode int8 --precision_lo_bits 8
 # in run_joint_kv_budget_policy_eval.py — keep in sync.
 _FROZEN_PRECISION_K_HI_FRAC = 0.1
@@ -972,14 +972,15 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         scores_lo_h_t = (queries_h @ _rowwise_int8_qdq(keys32_t).transpose(0, 1)) / sqrt_dim
         del keys32_t
         # V lo tier: int8-plane values, per-token commit test against the
-        # V-PQ code-error stat (both fp64, matching the CPU reference
-        # compare), and the committed lo residual pre-zeroed on failed
-        # commits so the V grid can fold it into one cumsum.
+        # V-PQ code-error stat in the 2-byte sidecar domain (fp16 int8-error
+        # vs fp16 code-error, matching the CPU reference compare), and the
+        # committed lo residual pre-zeroed on failed commits so the V grid
+        # can fold it into one cumsum.
         values32_t = values_t.to(device=device, dtype=torch.float32)
         values_lo_t = _rowwise_int8_qdq(values32_t)
         int8_err_t = (values32_t - values_lo_t).pow(2).sum(dim=1, dtype=torch.float64)
         del values32_t
-        v_commit_mask_t = int8_err_t < code_error_t.to(dtype=torch.float64)
+        v_commit_mask_t = int8_err_t.to(dtype=torch.float16) < code_error_t.to(dtype=torch.float16)
         residual_lo_commit_t = torch.where(
             v_commit_mask_t.reshape(-1, 1),
             values_lo_t - vhat_all_t.to(dtype=torch.float32),
