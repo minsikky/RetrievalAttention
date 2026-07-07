@@ -88,6 +88,23 @@ relL2(a,b) = ||a-b||_2 / max(||b||_2, eps) on the 128-dim attention output.
 5. Output at settle = out(ki, vi). Down-probes MUST be implemented via
    stored per-band partial accumulators (max, sum, acc[128]) — recombine,
    do not re-read DRAM.
+6. **Decision guard band (FROZEN 2026-07-07, issue #7 thread)**: the RTL
+   probe path quantizes the per-token weight w = exp(s − s_maxbin) once
+   to 17 bits (RNE, exact fixed-point accumulation), giving hardware
+   probe deltas within ≤ ~2e-5 absolute of the fp64 reference.
+   Comparisons with |delta − threshold| < eps_band = **2e-5** are
+   implementation-defined: either decision is legal; an in-band flip
+   moves the walk at most one rung on that axis, and every legal settled
+   state satisfies the stopping predicate within eps_band (quality
+   impact bounded by ~tau by construction — at-threshold rungs are
+   equivalence-class members, not errors). Measured at tau = 0.004
+   across 4,704 canonical decode steps (ladder/compose/e4m3 sweeps +
+   96-row scan): 2.00% of steps contain >= 1 in-band comparison; a 1e-4
+   band was REJECTED as needlessly loose (7.93% of steps). The 12
+   stage-2 golden rows have min margin 1.69e-4 — every golden decision
+   is deterministic under the band; trace-replay validation is
+   unaffected. Any future quantization change that widens the hardware
+   delta error beyond 2e-5 must renegotiate this clause explicitly.
 
 ## 5. Mixed attention output at rung (ki, vi)
 
