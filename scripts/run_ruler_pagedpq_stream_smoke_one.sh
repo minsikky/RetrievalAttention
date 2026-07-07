@@ -62,6 +62,33 @@ if [ -d "${HF_EXTRA_PYTHONPATH:-}/numpy.libs" ]; then
   export LD_LIBRARY_PATH="${HF_EXTRA_PYTHONPATH}/numpy.libs:${LD_LIBRARY_PATH:-}"
 fi
 export LD_LIBRARY_PATH="$PWD/${HF_VENV_DIR}/lib/python3.10/site-packages/torch/lib:/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
+
+if [ -n "${JOINT_KV_DEESCALATE:-}" ] || [ -n "${JOINT_KV_PRECISION_TIERS:-}" ]; then
+  # Frozen-sim arms must run the canonical torch grid path: the
+  # de-escalation walk lives in the torch policy (the grouped path
+  # requires the escalation-only native policy kernel) and the precision
+  # tiers live in the torch score grid + sorted V-prefix (the native
+  # score-grid/risk-prefix kernels are single-tier). These exports win
+  # over frontier_canonical_env.sh, which the batched wrapper sources
+  # earlier. COLLAPSE_DUP_K_ROWS must be off so the ranked prefix covers
+  # every K budget for the lo-tier substitution.
+  echo "[pagedpq_stream_smoke] frozen-sim flags set: forcing canonical torch grid path"
+  export SELECTOR_PQ_JOINT_GROUPED_RISK_PREFIX=0
+  export SELECTOR_PQ_JOINT_NATIVE_RISK_PREFIX=0
+  export SELECTOR_PQ_JOINT_NATIVE_SCORE_GRID=0
+  export SELECTOR_PQ_JOINT_NATIVE_POLICY=0
+  export SELECTOR_PQ_JOINT_NATIVE_V_PREFIX=0
+  export SELECTOR_PQ_JOINT_COMPACT_VPQ_RISK_PREFIX=0
+  export SELECTOR_PQ_JOINT_COLLAPSE_DUP_K_ROWS=0
+  export SELECTOR_PQ_JOINT_MERGE_RISK_POLICY=0
+  export SELECTOR_PQ_JOINT_FUSED_MIXED_POLICY=0
+  export SELECTOR_PQ_JOINT_STAGED_KV_PREFIX=0
+  # Keep softmax/base in torch as well: native softmax/base over a
+  # torch-built score grid is an untested combination, and the HELMET
+  # frontier runs already validated the all-torch configuration.
+  export SELECTOR_PQ_JOINT_NATIVE_SOFTMAX_BASE=0
+  export SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE=0
+fi
 export TOKENIZERS_PARALLELISM=false
 
 PROFILE_NATIVE_OPS_ARG=()
