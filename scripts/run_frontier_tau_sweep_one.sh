@@ -34,7 +34,10 @@ export HF_EXTRA_PYTHONPATH="${PWD}/.hf_pydeps_cu128:${PWD}/.hf_pydeps_cu128_scip
 # scipy's bundled BLAS needs libgfortran from numpy.libs (same fix as the
 # noise-calibration script); without it transformers' import chain dies.
 export LD_LIBRARY_PATH="${PWD}/.venv/lib/python3.10/site-packages/numpy.libs:${PWD}/.hf_pydeps_cu128_scipy/scipy.libs:${LD_LIBRARY_PATH:-}"
-export PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-16384}"
+export PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-8192}"
+# 128k on 44GB GPUs sits at the memory edge; expandable segments avoids
+# the fragmentation OOM seen in jobs 52996326-28.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK="${FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK:-1}"
 
 TASK_NAME="${TASK_NAME:-niah_multikey_2}"
