@@ -68,6 +68,29 @@ context; = probs² × vpq_code_error at settled ki), `v_exact_count`,
 exact-read set is hi ∪ lo, which may be smaller than the top-count mask.
 Unpack: np.unpackbits(x)[:context_len].astype(bool).
 
+**Item 6 — key-domain V selection** (frozen E=6/M=12 risk-rank key,
+RTL-acked 2026-07-07; the contract the hardware ranker implements —
+`validate_stage2` should hard-assert THESE masks, the item-5 fp-domain
+masks stay as reference). Inputs, pinned to the golden's quantized-weight
+domain and stored per token:
+`v_w17_fp64` = RNE_17(probs / max(probs)) — floating 17-bit-significand
+RNE in the value domain, 1.0 exact at the max token, common denominator
+scaled out; `v_code_error_fp16` = fp16(code_error) (RNE cast;
+range-verified: no overflow/underflow on these contexts). Key:
+`v_risk_key_q_fp64` = E6M12 window quantization of w17² · ce16 — the fp64
+product is EXACT (≤ 45 mantissa bits), so this equals a single RNE of the
+exact integer product to 12 fraction bits, window = 64 octaves anchored
+at floor(log2(max positive risk)); below-window positives share one
+bottom-bin value 2^floor_e; zeros (w17 == 0 or ce16 == 0) stay 0 — the
+zero set equals the structural non-paged set exactly. Ranking: key
+descending, stable ⇒ ties in stream order. Masks/scalars mirror item 5 in
+the key domain: `v_exact_mask_key_packed`, `v_hi_mask_key_packed`,
+`v_lo_mask_key_packed`, `v_dropped_reads_key`, `v_risk_key_cutoff_q`,
+plus `v_risk_key_exp_bits`/`v_risk_key_mantissa_bits` (= 6/12). The lo
+commit test is unchanged (fp-domain static bit). fp-vs-key mask diffs on
+these 12 rows: 2-token boundary swaps on 3 rows, all at near-equal-risk
+cutoffs (in-band by the #7 uniform-bound argument).
+
 ## page_v npz fields (one per kv_head × ctx, LAST sealed page)
 
 `value_codebook_fp32` (subvecs × 2^subbits × subdim = 1 × 16 × 128),
@@ -80,6 +103,11 @@ risk uses code_error; the V commit test is int8_err < code_error.
 ## Provenance / regeneration
 
 `run_joint_kv_budget_policy_eval.py --golden_dump_stage2_dir <dir>` with
-the frozen-config flags (see `notes/algorithm_spec_v1.md` §8/§9). The
-V-selection recompute in the dump helper mirrors the selection block in
-run(); both live in the same file with a keep-in-sync comment.
+the frozen-config flags (see `notes/algorithm_spec_v1.md` §8/§9), or
+`sbatch scripts/run_stage2_key_regen.sbatch` which also runs
+`verify_stage2_key_regen.py` (hard-asserts the regen is a bit-exact
+superset of this dir). The V-selection recompute in the dump helper
+mirrors the selection block in run(); both live in the same file with a
+keep-in-sync comment. History: key-domain fields (item 6) added
+2026-07-07 as a pure superset — every pre-existing field verified
+bit-identical to the original delivery.

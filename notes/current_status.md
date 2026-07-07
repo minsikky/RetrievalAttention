@@ -86,6 +86,17 @@ frozen algorithm itself:
   — same shape as the e4m3 bin-domain K-ranking semantics. Regenerated
   fp64 reference matched the frozen golden dir 12/12 (pipeline
   determinism confirmed).
+- **Key-domain goldens DELIVERED (RTL acked E6M12 + regen on #7).**
+  Input domains pinned per RTL's proposal: w17 = RNE_17(probs/max(probs))
+  fp64 value-domain, ce16 = fp16(code_error) (range-verified safe).
+  w17^2*ce16 is exact in fp64 (<=45 mantissa bits) so the E6M12 window
+  key equals a single RNE of the exact integer product — verified vs a
+  big-int rational reference incl. half-ulp ties. `_write_stage2_golden`
+  now emits item 6 (inputs + keys + key-domain masks) always; regen job
+  53037039: all 12 rows + 12 page blocks bit-identical on every frozen
+  field (pure superset, `verify_stage2_key_regen.py` fatal=0). fp-vs-key
+  mask diffs: 2-token boundary swaps on 3 rows (in-band class).
+  Goldens updated in place in golden_vectors/stage2_20260707/.
 
 ## 2026-07-07 Stage-2 Closed + Guard Band + Qwen-1M Enabled + HELMET First Pair
 
