@@ -1163,11 +1163,24 @@ def _precision_lo_tokens(
     budget: int,
     context_len: int,
     hi_frac: float,
+    frozen_hi_count: int | None = None,
 ) -> np.ndarray:
-    """Ranked-prefix tokens beyond the hi-precision fraction (base excluded)."""
+    """Ranked-prefix tokens beyond the hi-precision fraction (base excluded).
+
+    Default (frozen_hi_count is None): the hi/lo split boundary is
+    ceil(len(add) * hi_frac) against the CURRENT rung's ranked prefix, so the
+    boundary grows on every K escalation (--precision_split_freeze none).
+    When frozen_hi_count is supplied the split is fixed once per step at that
+    count (start-rung or kb_max, see caller), clamped to the current prefix
+    length so a frozen count larger than a lower rung's selected-token count
+    degenerates to 'everything hi' (no lo tokens) rather than indexing past
+    the prefix."""
     base_set = set(int(tok) for tok in base)
     add = [int(tok) for tok in ranked_cpu.tolist() if int(tok) < int(context_len) and int(tok) not in base_set][: int(budget)]
-    hi_count = int(math.ceil(len(add) * float(hi_frac)))
+    if frozen_hi_count is None:
+        hi_count = int(math.ceil(len(add) * float(hi_frac)))
+    else:
+        hi_count = min(int(frozen_hi_count), len(add))
     return np.asarray(add[hi_count:], dtype=np.int64)
 
 
@@ -2147,6 +2160,21 @@ def run() -> None:
     )
     parser.add_argument("--precision_lo_bits", type=int, default=8)
     parser.add_argument(
+        "--precision_split_freeze",
+        choices=["none", "start", "kbmax"],
+        default="none",
+        help=(
+            "K-side progressive-precision hi/lo split policy (RTL issue #2). "
+            "none: current behavior, hi_count=ceil(hi_frac*prefix) recomputed "
+            "per K rung so the boundary grows on every escalation. start: "
+            "freeze the K-side hi_count once per step at ceil(hi_frac*kb[start]) "
+            "where start is the proxy-mass start rung chosen before the walk. "
+            "kbmax: freeze at ceil(hi_frac*max(k_budgets)). Frozen counts are "
+            "clamped to the current rung's prefix length. V-side split is "
+            "unchanged."
+        ),
+    )
+    parser.add_argument(
         "--v_risk_key_exp_bits",
         type=int,
         default=0,
@@ -2372,6 +2400,7 @@ def run() -> None:
     precision_k_hi_frac = float(args.precision_k_hi_frac)
     precision_v_hi_frac = float(args.precision_v_hi_frac)
     precision_lo_bits = int(args.precision_lo_bits)
+    precision_split_freeze = str(args.precision_split_freeze)
     precision_active = precision_k_hi_frac < 1.0 or precision_v_hi_frac < 1.0
     if not (0.0 <= precision_k_hi_frac <= 1.0 and 0.0 <= precision_v_hi_frac <= 1.0):
         raise ValueError("--precision_k_hi_frac/--precision_v_hi_frac must be in [0, 1]")
@@ -2943,6 +2972,34 @@ def run() -> None:
                     seed=2025 + 4093 * int(kv_head) + 31 * int(head) + int(context_len),
                 )
 
+                # K-side progressive-precision split freeze (RTL issue #2).
+                # Fix the K hi/lo boundary ONCE per step for the whole walk
+                # (all rungs, incl. de-escalation probes) so hardware owes no
+                # plane-B upgrade re-fetch mid-walk. Computed here, before the
+                # rung precompute loop and the walk, so every rung's lo-token
+                # set (and thus k_mb_by_idx / k_lo_counts_by_idx) uses the same
+                # count. None => current per-rung ceil(hi_frac*prefix).
+                precision_frozen_hi_count: int | None = None
+                if precision_k_hi_frac < 1.0 and precision_split_freeze != "none":
+                    if precision_split_freeze == "kbmax":
+                        kb_max = int(max(int(b) for b in k_budgets))
+                        precision_frozen_hi_count = int(
+                            math.ceil(float(kb_max) * float(precision_k_hi_frac))
+                        )
+                    else:  # "start": proxy-mass start rung chosen before the walk
+                        _freeze_start_ki, _ = initial_budget_indices(
+                            strategy=str(start_strategies[0]),
+                            context_len=int(context_len),
+                            ranked_scores_cpu=variant_ranked_scores_cpu,
+                            query_dim=int(trace.head_dim),
+                            k_budgets=k_budgets,
+                            v_budgets=v_budgets,
+                            previous_fraction=None,
+                        )
+                        precision_frozen_hi_count = int(
+                            math.ceil(float(int(k_budgets[int(_freeze_start_ki)])) * float(precision_k_hi_frac))
+                        )
+
                 k_mb_by_idx: list[float] = []
                 selected_counts_by_idx: list[int] = []
                 k_lo_counts_by_idx: list[int] = []
@@ -2980,6 +3037,7 @@ def run() -> None:
                             budget=int(k_budget),
                             context_len=context_len,
                             hi_frac=precision_k_hi_frac,
+                            frozen_hi_count=precision_frozen_hi_count,
                         )
                         if lo_tokens.size:
                             score_vec = score_vec.astype(np.float32, copy=True)
