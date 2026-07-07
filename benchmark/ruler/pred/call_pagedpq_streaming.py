@@ -780,8 +780,9 @@ def run() -> None:
     parser.add_argument("--joint_kv_start_strategy", default="proxy_mass_m0p9")
     parser.add_argument("--joint_kv_deescalate", action="store_true",
                         help="frozen-spec de-escalation walk after the escalation stop")
-    parser.add_argument("--logit_buffer_format", choices=["fp", "e4m3"], default="fp",
-                        help="e4m3 = frozen-sim: quantize the PQ score row to the fp8-e4m3 buffer grid before ranking/decisions (issue #6)")
+    parser.add_argument("--logit_buffer_format", choices=["fp", "e4m3", "absmax_int"], default="fp",
+                        help="e4m3 = frozen-sim: quantize the PQ score row to the fp8-e4m3 buffer grid before ranking/decisions (issue #6); "
+                             "absmax_int = per-row symmetric absmax int8 buffer (the M4 arm, bits hardwired to 8 to match the CPU reference default)")
     parser.add_argument("--joint_kv_precision_tiers", action="store_true",
                         help="frozen-sim: int8 lo-tier K logits beyond the top-10%% ranked prefix + "
                              "V hi/lo split with the per-token int8 commit test (spec OPEN-2/M6)")

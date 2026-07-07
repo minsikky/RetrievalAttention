@@ -54,6 +54,37 @@ def _quantize_e4m3_torch(x: torch.Tensor) -> torch.Tensor:
     return q.clamp_(-448.0, 448.0)
 
 
+def _quantize_absmax_int_torch(x: torch.Tensor, bits: int = 8) -> torch.Tensor:
+    """Per-row symmetric absmax integer quantization of the PQ score row (the
+    M4 logit buffer). Torch mirror of the absmax_int (else) branch in
+    run_joint_kv_budget_policy_eval.py: lb_levels = 2**(bits-1)-1,
+    lb_absmax = max(|x|) over the row, lb_scale = lb_absmax / lb_levels, then
+    round(x / lb_scale) * lb_scale. The GPU config carries no logit_buffer_bits,
+    so bits is hardwired to 8 to match the CPU default.
+
+    Bit-exact dtype flow (verified against the CPU path on 192k samples): the
+    CPU divides a float32 score array by a Python-float lb_scale. Under NumPy
+    value-based casting, float32_array / python_float stays FLOAT32, so the
+    divide, round, and rescale all happen in float32 with lb_scale cast to
+    float32. Only the scale itself is formed in float64 (float(absmax) / levels)
+    and then narrowed to float32. Mirror exactly: max is order-independent (so
+    reduction order is irrelevant), np.round and torch.round are both
+    round-half-to-even. Rows with absmax == 0 pass through unchanged (CPU
+    zero-absmax guard). torch.abs handles sign symmetrically, so negative PQ
+    scores quantize the same as the CPU path. Keep the two in sync — this is the
+    frozen logit buffer format (issue #6, M4 arm)."""
+    x32 = x.to(dtype=torch.float32)
+    lb_levels = float((1 << (int(bits) - 1)) - 1)
+    lb_absmax = x32.abs().amax(dim=-1, keepdim=True)  # float32, per row
+    nonzero = lb_absmax > 0.0
+    # scale formed in float64 (mirrors float(absmax) / levels), then narrowed
+    # to float32 so the divide/round/rescale run in float32 like the CPU path.
+    lb_scale32 = (lb_absmax.to(dtype=torch.float64) / lb_levels).to(dtype=torch.float32)
+    safe_scale = torch.where(nonzero, lb_scale32, torch.ones_like(lb_scale32))
+    q = torch.round(x32 / safe_scale) * lb_scale32
+    return torch.where(nonzero, q, x32)
+
+
 @dataclass(frozen=True)
 class JointKVDecodeContext:
     args: Any
@@ -269,15 +300,20 @@ def approximate_joint_kv_all_heads(
                     int(selector_rank_budget),
                 )
                 allhead_dense_pq_scores_t = allhead_dense_pq_scores_t.to(device=device, dtype=torch.float32)
-                if str(getattr(args, "logit_buffer_format", "fp")) == "e4m3":
-                    # Frozen-sim: the ranking/decision domain is the e4m3
-                    # logit buffer (issue #6). Quantize the PQ score row at
-                    # the source so start indices, softmax base, risk, and
-                    # tail all inherit the buffer format — and re-derive
-                    # the rank prefix from the QUANTIZED values (stable
-                    # sort => ties in token order, matching the CPU golden
-                    # ranked_cpu ordering).
-                    allhead_dense_pq_scores_t = _quantize_e4m3_torch(allhead_dense_pq_scores_t)
+                _logit_buffer_format = str(getattr(args, "logit_buffer_format", "fp"))
+                if _logit_buffer_format in ("e4m3", "absmax_int"):
+                    # Frozen-sim: the ranking/decision domain is the logit
+                    # buffer (issue #6). Quantize the PQ score row at the
+                    # source so start indices, softmax base, risk, and tail
+                    # all inherit the buffer format — and re-derive the rank
+                    # prefix from the QUANTIZED values (stable sort => ties in
+                    # token order, matching the CPU golden ranked_cpu
+                    # ordering). e4m3 is the scale-free fp8 grid; absmax_int is
+                    # the per-row symmetric absmax int8 buffer (M4 arm).
+                    if _logit_buffer_format == "e4m3":
+                        allhead_dense_pq_scores_t = _quantize_e4m3_torch(allhead_dense_pq_scores_t)
+                    else:
+                        allhead_dense_pq_scores_t = _quantize_absmax_int_torch(allhead_dense_pq_scores_t)
                     if int(selector_rank_budget) > 0:
                         _sorted = torch.sort(
                             allhead_dense_pq_scores_t, dim=-1, descending=True, stable=True
