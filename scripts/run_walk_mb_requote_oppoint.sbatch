@@ -8,11 +8,13 @@
 #SBATCH --account=zhengya0
 #SBATCH --partition=standard
 
-# Requote the FROZEN OPERATING POINT (deesc + precision(0.1,0.1), 288-pos
-# spectrum, heads 0/8/16/24 — the config of job 52987561 that produced the
-# 2.857 MB/head-query figure quoted in hw_arch Sec 5/8 and current_status)
-# with faithful walk accounting: per-step DRAM = deepest band READ on each
-# axis, no de-escalation refund. Args replicated verbatim from
+# Historical correction script: requote the old deesc + precision(0.1,0.1)
+# operating-point artifact with faithful walk accounting. This intentionally
+# enables --budget_deescalate to reproduce job 52987561 and prove that
+# de-escalation gives no DRAM refund. It is NOT the current frozen run recipe.
+#
+# Per-step DRAM = deepest band READ on each axis, no de-escalation refund.
+# Args replicated from
 # attention_efficiency_result/joint_kv_ladder_grid_20260706/deesc_precision_compose/args.json.
 set -euo pipefail
 cd /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention

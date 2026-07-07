@@ -12,6 +12,8 @@
 # quantized monotone risk key vs the fp64 reference at tau = 0.004,
 # swept over exponent-window x mantissa configs, classified against
 # eps_band = 2e-5, plus the 12-golden hard gate per config.
+# Current frozen policy is escalation-only; do not enable
+# --budget_deescalate here.
 set -euo pipefail
 cd /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention
 module purge
@@ -54,7 +56,6 @@ run_eval() {
     --stability_thresholds 0.004 \
     --threshold_mode budget_delta_frac --threshold_reference_frac 0.2 \
     --threshold_scale_shape sqrt --threshold_min_scale 0.0 --threshold_max_scale 1.5 \
-    --budget_deescalate \
     --precision_k_hi_frac 0.1 --precision_v_hi_frac 0.1 \
     --precision_lo_mode int8 --precision_lo_bits 8 \
     --v_selection_rules global_residual_risk --v_local_block_size 1024 \

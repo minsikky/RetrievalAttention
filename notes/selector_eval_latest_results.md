@@ -4,7 +4,43 @@ Keep this page compact. Archive full tables and stale variants instead of append
 
 ## Active Goal
 
-End state: one benchmark-ready canonical GPU implementation of the current CPU frontier decode algorithm. It keeps dense prefill, approximates decode only after sealed PQ pages are active, matches CPU frontier semantics, and is fast enough to run real dense-vs-frontier task benchmarks.
+End state: one frozen decode-attention algorithm and hardware contract that
+is task-validated, bandwidth-accounted on faithful walk traffic, and backed
+by RTL goldens.
+
+Current frozen algorithm, as of 2026-07-07:
+
+- Dense prefill; approximate decode only after sealed PQ pages are active.
+- Per-page K-PQ fullscan selector, raw uncalibrated PQ tail logits.
+- Escalation-only adaptive K/V budget walk; de-escalation is removed from
+  the frozen algorithm and remains reproduction-only.
+- `tau = 0.004`, budget-jump-aware stability threshold, `k_first_alternating`.
+- e4m3 PQ logit buffer, progressive K/V precision tiers, global residual-risk
+  exact-V selection, and V-PQ reconstruction for non-exact V rows.
+- Faithful bandwidth metric is `walk_step_MB_per_head`, not settled
+  `step_MB_per_head`.
+
+Current headline numbers:
+
+| artifact | result |
+| --- | --- |
+| Walk-basis spectrum mean | `4.509 MB/head-query` @ tau `0.004` |
+| 140k bucket | `13.98 MB/head-query` vs dense `~67 MB`, about `4.8x` lower |
+| Phase A RULER-hard | tau `0.004` matches dense on non-floored tasks and beats dense on `fwe` |
+| HELMET `kilt_nq`, n=96, 128k | frontier equals dense on subEM/EM/F1 to 6 decimals |
+| RTL goldens | stage-2 escalation-only goldens regenerated in `benchmark/selector_eval/golden_vectors/stage2_20260707/` |
+
+Important correction: May/June `step_MB_per_head` values below are settled-state
+lower bounds. Use `walk_step_MB_per_head` for DRAM/bandwidth claims. The older
+sections below are retained as experiment history; they are not the current
+frozen contract.
+
+Current contract docs:
+
+- `notes/algorithm_spec_v1.md`
+- `notes/hw_arch_v0.md`
+- `notes/current_status.md`
+- `benchmark/selector_eval/COST_MODEL.md`
 
 ## Streaming Exact-V Read-Union Variant - 2026-06-02
 

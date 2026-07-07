@@ -1,8 +1,8 @@
 #!/bin/bash
-# Launch the frozen-sim arm (deesc + e4m3 + precision tiers, tau 0.004)
+# Launch the frozen-sim arm (escalation-only + e4m3 + precision tiers, tau 0.004)
 # across the Phase A task set at 128k, n=16 — the accuracy-of-the-frozen-
-# algorithm reruns. Run ONLY after the frozen-sim smokes
-# (53032068 deesc+e4m3, 53032533 +tiers) validate.
+# algorithm reruns. De-escalation is intentionally not enabled; it is
+# historical/repro-only after the 2026-07-07 walk-MB correction.
 #
 # Respects the 6-concurrent-job cap by chaining every job after the
 # previous one with --dependency=afterany (they contend for the same

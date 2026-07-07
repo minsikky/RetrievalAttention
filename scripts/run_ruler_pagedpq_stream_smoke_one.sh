@@ -64,11 +64,11 @@ fi
 export LD_LIBRARY_PATH="$PWD/${HF_VENV_DIR}/lib/python3.10/site-packages/torch/lib:/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
 
 if [ -n "${JOINT_KV_DEESCALATE:-}" ] || [ -n "${JOINT_KV_PRECISION_TIERS:-}" ]; then
-  # Frozen-sim arms must run the canonical torch grid path: the
-  # de-escalation walk lives in the torch policy (the grouped path
-  # requires the escalation-only native policy kernel) and the precision
-  # tiers live in the torch score grid + sorted V-prefix (the native
-  # score-grid/risk-prefix kernels are single-tier). These exports win
+  # Frozen-sim precision tiers currently require the canonical torch grid
+  # path: the precision tiers live in the torch score grid + sorted
+  # V-prefix, while the native score-grid/risk-prefix kernels are
+  # single-tier. JOINT_KV_DEESCALATE is historical/repro-only but also
+  # needs the torch policy path if explicitly enabled. These exports win
   # over frontier_canonical_env.sh, which the batched wrapper sources
   # earlier. COLLAPSE_DUP_K_ROWS must be off so the ranked prefix covers
   # every K budget for the lo-tier substitution.

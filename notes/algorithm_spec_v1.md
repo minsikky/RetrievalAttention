@@ -206,11 +206,13 @@ seed; beware torch-bundled-numpy interop if editing the runner):
 scripts/run_joint_kv_budget_policy_eval_one.sh with:
   DECODE_LENGTHS=all HEADS=0,8,16,24 STABILITY_THRESHOLDS=0.002,0.004
   POLICIES=k_first_alternating START_STRATEGIES=proxy_mass_m0p9
-  BUDGET_DEESCALATE=1 [PRECISION_K_HI_FRAC=0.1 PRECISION_V_HI_FRAC=0.1]
+  PRECISION_K_HI_FRAC=0.1 PRECISION_V_HI_FRAC=0.1
 ```
-Golden runs already in-repo (gitignored artifacts, regenerate as needed):
-`attention_efficiency_result/joint_kv_ladder_grid_20260706/ladder_deescalate/`
-and (composition) `deesc_precision_compose/`. Per-row fields to match:
+Golden runs already in-repo (gitignored artifacts, regenerate as needed).
+Historical de-escalation runs such as `ladder_deescalate/` and
+`deesc_precision_compose/` are reproduction artifacts only; current stage-2
+RTL goldens are escalation-only under
+`benchmark/selector_eval/golden_vectors/stage2_20260707/`. Per-row fields to match:
 `selected_k_tokens`, `v_exact_reads`, settled `k_budget`/`v_budget`,
 `policy_trace` (rung walk sequence), `step_MB_per_head` (byte accounting of
 the SETTLED state — well-defined as a golden match target, but NOT faithful
@@ -246,7 +248,8 @@ select + exact boundary-bin refine, exact fractional prefix counts, golden
 CSVs authoritative — issue #4); OPEN-1 (tau=0.004 frozen); OPEN-2 (int8 dual-plane storage, Sec.
 6 — fp16-equivalent capacity, +0.13% MB, quality identical); M2 (GQA union
 factors: K 0.35-0.44, V 0.49-0.57 across the 4-head group, rising with
-context); M3 (deesc x precision composition golden run
-`deesc_precision_compose/`: settled 2.857 MB/head-query at tau=0.004 on
-the 288-position spectrum; faithful walk traffic = **4.509 MB/head-query**
-(job 53051141), see hw_arch Sec. 5 correction).
+context); M3 (precision composition measured on the historical
+`deesc_precision_compose/` artifact; de-escalation subsequently removed):
+settled 2.857 MB/head-query at tau=0.004 on the 288-position spectrum;
+faithful walk traffic = **4.509 MB/head-query** (job 53051141), see
+hw_arch Sec. 5 correction).

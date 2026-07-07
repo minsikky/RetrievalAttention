@@ -8,10 +8,11 @@
 #SBATCH --account=zhengya0
 #SBATCH --partition=standard
 
-# Requote the frontier per-step DRAM metric with faithful walk accounting
-# (no de-escalation refund): the walk's cost is the deepest band READ on
+# Historical correction script. Requotes the frontier per-step DRAM metric
+# with faithful walk accounting (no de-escalation refund): the walk's cost
+# is the deepest band READ on
 # each axis (escalation probes read their lookahead band), not the settled
-# state. Two arms over the canonical 96-head-step population at tau=0.004:
+# state. Two arms over the historical 96-head-step population at tau=0.004:
 # de-escalation on vs off. Expected: walk MB identical across arms (the
 # climb is the same; the down-walk reads nothing), settled MB lower on the
 # deesc arm by exactly the phantom refund.

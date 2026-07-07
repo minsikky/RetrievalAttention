@@ -8,9 +8,12 @@
 #SBATCH --account=zhengya0
 #SBATCH --partition=standard
 
-# Scan heads x ctx at the frozen operating point, dumping stage-2
-# goldens, to find rows whose controller trace de-escalates (kd/vd
-# probes) — supplement for issue #7 (the base 12-row set had 0).
+# Historical de-escalation reproduction helper. De-escalation was removed
+# from the frozen algorithm on 2026-07-07; this script intentionally enables
+# --budget_deescalate only to inspect old kd/vd probe cases.
+#
+# Scan heads x ctx, dumping stage-2 goldens, to find rows whose controller
+# trace de-escalates (kd/vd probes) — supplement for issue #7.
 # Env overrides: HUNT_TAG, HUNT_HEADS, HUNT_START (start strategy).
 set -euo pipefail
 cd /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention

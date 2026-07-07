@@ -4,9 +4,10 @@ Block-level goldens for the first RTL blocks, per issue #5 and
 `notes/algorithm_spec_v1.md` §8. One `golden_q<qidx>_h<head>.npz` per trace
 row: heads {0, 8, 16, 24}, decode lengths {8000, 32000, 128000} over the
 Llama-3.1-8B layer-16 trace (positions 14837 / 38837 / 134837 — context
-14.8k / 38.8k / 134.8k), frozen operating point config (deesc + precision
-(0.1,0.1) @ tau=0.004; neither affects these dumps — they are taken after
-the selector, before any policy simulation).
+14.8k / 38.8k / 134.8k). These S2/S3 dumps are taken after the selector and
+before any policy simulation, so they are unaffected by the later
+de-escalation removal or by precision tiers. Current frozen policy is
+escalation-only + precision(0.1,0.1) @ tau=0.004.
 
 ## npz contents
 

@@ -13,14 +13,16 @@ an adaptive, stability-certified budget with exact-KV escalation does not,
 at comparable bytes/token.* Every phase below either finds the workloads
 where (b) happens or produces the matched-budget comparison for (c).
 
-## Phase A — RULER-hard knee finding (RUNNING, jobs 52996323-28 + qa pending)
+## Phase A — RULER-hard knee finding (COMPLETE for first pass)
 
 Tasks chosen for known non-saturation at 128k with Llama-3.1-8B: `qa_2`
 (HotpotQA multi-hop in haystack), `qa_1` (SQuAD), `cwe`, `fwe` (aggregation
 — attention spread across ALL pages; our own page-pruning negative says
 these stress token selection hardest), `niah_multikey_3` (uuid keys).
 Arms per task at 131072/n16: dense reference, frontier tau=0.004 (operating
-point), frontier tau=0.016 (deliberate stress).
+point), frontier tau=0.016 (deliberate stress). First-pass results are in
+`notes/current_status.md`: tau=0.004 matches dense on the non-floored tasks
+and beats dense on `fwe`; tau=0.016 gives back that `fwe` gain.
 Reading the result:
 - dense high + 0.004 == dense + 0.016 < dense -> task is a DIFFERENTIATOR
   (sensitive to KV error, our operating point holds): paper task set.
@@ -33,7 +35,8 @@ Reading the result:
 ## Phase B — matched-budget baseline matrix (mostly OUR harness, config-only)
 
 Prior-work archetypes reproduced as arms of the trace/GPU runners, all at
-MATCHED mean bytes/token to our operating point (2.86 MB/head-query class):
+MATCHED faithful-walk bytes/token to our frozen operating point
+(4.509 MB/head-query spectrum mean; 13.98 MB/head-query in the 140k bucket):
 1. **Fixed top-k (Quest-class)**: selector ranking + fixed rung, no ladder
    (predict-only mode already exists; pick rung to match bytes).
 2. **Eviction (H2O/SnapKV-class)**: irreversible keep-set — approximate with
@@ -41,7 +44,7 @@ MATCHED mean bytes/token to our operating point (2.86 MB/head-query class):
    0.102 at staleness 2100; on tasks this becomes the eviction column).
 3. **Uniform quantization (KIVI-class)**: all-lo tier (k0p0_v0p0 exists;
    4-bit lo4 arm exists, relL2 0.007-0.018 at trace level).
-4. **Ours**: deescalate + precision @ tau=0.004.
+4. **Ours**: escalation-only + precision tiers + e4m3 logit buffer @ tau=0.004.
 These four columns on the Phase-A differentiator tasks = the paper's main
 table. External codebases (real Quest/H2O/KIVI) only needed for camera-ready
 credibility on 1-2 rows; the archetype arms tell us first whether the
@@ -91,9 +94,10 @@ Consequences for the evaluation set:
   untouched. Hardware-relevant twist: Qwen GQA is 7:1 vs Llama 4:1, which
   stresses the kv-lane sharing design; do this BEFORE RTL freezes lane
   arithmetic.
-- **One frozen config everywhere**: deesc + precision @ tau=0.004 for every
-  accuracy number in the paper; no per-task tuning. Arch reviewers check
-  consistency with the hardware-eval config, not benchmark count.
+- **One frozen config everywhere**: escalation-only + precision tiers + e4m3
+  logit buffer @ tau=0.004 for every accuracy number in the paper; no
+  per-task tuning. Arch reviewers check consistency with the hardware-eval
+  config, not benchmark count.
 - **Skip** (venue-inappropriate effort): InfiniteBench, BABILong,
   ZeroSCROLLS, LV-Eval; exhaustive author-code baselines beyond Quest +
   KIVI. The load-bearing pillars are matched-bytes iso-accuracy (B),
@@ -137,9 +141,10 @@ Steps (each gated on the previous):
    matched samples vs the dense arm.
 4. **1M trace capture** for the CPU golden model: K/V/q dump at 1M (4 kv
    heads x 1M x 128 fp16 ~= 2 GB/layer — cheap), then the full
-   rung/proxy-mass/deesc analysis at 1M. Closes the spec-extrapolation gap
-   (rung tables, proxy-mass starts, controller walk MEASURED at the chip's
-   target context) and feeds hw_arch Sec. 5 with 1M bandwidth rows.
+   rung/proxy-mass/escalation-walk analysis at 1M. Closes the
+   spec-extrapolation gap (rung tables, proxy-mass starts, controller walk
+   MEASURED at the chip's target context) and feeds hw_arch Sec. 5 with 1M
+   bandwidth rows.
 
 Chip-story split: algorithm validated at 1M on real tasks (GPU, this
 phase); silicon demonstrates the same selection algorithm at 1M with DRAM
@@ -151,10 +156,11 @@ Standing constraint: at most ~6 concurrent Slurm jobs on zhengya0 (account
 cap 12, shared with labmates) — chain extra submissions with
 `--dependency=afterany:<jobid>`.
 
-- Tonight (this window): Phase A jobs (8 GPU jobs, ~4-8h each, submitted /
-  pending qa data download); analysis when they land.
-- Next session: Phase A knee analysis -> pick 3-4 differentiator tasks;
-  Phase B GPU arms on those tasks; HELMET harness adaptation (C).
+- Current next step: rerun Phase A/HELMET with the frozen-sim arm
+  (escalation-only + e4m3 + precision tiers) so the task table measures the
+  frozen hardware contract, not the earlier frontier upper-bound arm.
+- Then: Phase B GPU arms on the differentiator tasks; HELMET expansion (C);
+  1M Qwen spike and trace capture (E).
 - Paper table: rows = {dense, ours, fixed-topk, eviction, 4-bit}, columns =
   {RULER-hard picks, HELMET rerank/rag/longqa, longdecode drift}, all at
   matched bytes/token, plus the bytes-vs-quality Pareto per task.
