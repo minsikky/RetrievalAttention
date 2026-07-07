@@ -88,6 +88,22 @@ relL2(a,b) = ||a-b||_2 / max(||b||_2, eps) on the 128-dim attention output.
 5. Output at settle = out(ki, vi). Down-probes MUST be implemented via
    stored per-band partial accumulators (max, sum, acc[128]) — recombine,
    do not re-read DRAM.
+5b. **Probe-delta producers (pinned 2026-07-07, #7 thread)**. The
+   compared quantity is out(ki,vi) = base_output(ki) + Vcorr(ki,vi),
+   Vcorr = Σ_hi p·(v_fp16 − v_pq) + Σ_lo p·(v_int8 − v_pq), p = softmax
+   row at ki. relL2 denominator = the RICHER rung's output (escalation:
+   next; de-escalation: current). V probes (fixed ki) are acc-only
+   (numerator) differences over TWO risk-rank intervals: the marginal
+   band (N_lo, N_hi] (commit-winners contribute v_int8 − v_pq; losers
+   contribute zero) and the hi-boundary band
+   (ceil(0.1·N_lo), ceil(0.1·N_hi)] (v_fp16 minus int8-or-pq per the
+   static commit bit). Risk = p²·code_error is frozen across the V walk
+   at a given ki and REBUILT whenever ki changes — so K probes (dk/kd)
+   change the K band, the normalization, AND the V correction (re-rank
+   + p rescale); a frozen-V-set approximation during K probes is a
+   different delta and is NOT covered by the eps_band clause without a
+   measured decision-flip study. The int8 commit test is inside every
+   compared output; the commit bit is per-token static.
 6. **Decision guard band (FROZEN 2026-07-07, issue #7 thread)**: the RTL
    probe path quantizes the per-token weight w = exp(s − s_maxbin) once
    to 17 bits (RNE, exact fixed-point accumulation), giving hardware
