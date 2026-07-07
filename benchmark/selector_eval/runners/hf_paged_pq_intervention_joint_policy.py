@@ -299,6 +299,8 @@ def _walk_incremental_grid(
         else:
             raise AssertionError(action)
         steps += 1
+    if bool(getattr(runtime.args, "joint_kv_deescalate", False)):
+        ki, vi = _deescalate_walk(runtime, local_head_i, ki, vi)
     return ki, vi
 
 
@@ -403,6 +405,59 @@ def _select_with_torch_policy(
     return selected
 
 
+def _band_threshold_between(runtime: JointPolicyRuntime, lo_budget: int, hi_budget: int) -> float:
+    if str(runtime.threshold_mode) != "budget_delta_frac":
+        return float(runtime.threshold)
+    frac = float(max(0, int(hi_budget) - int(lo_budget))) / max(float(runtime.context_len), 1.0)
+    return _scaled_budget_delta_threshold(
+        base_threshold=float(runtime.threshold),
+        budget_delta_frac=float(frac),
+        reference_frac=float(runtime.threshold_reference_frac),
+        shape=str(runtime.threshold_scale_shape),
+        min_scale=float(runtime.threshold_min_scale),
+        max_scale=float(runtime.threshold_max_scale),
+    )
+
+
+def _deescalate_walk(runtime: JointPolicyRuntime, local_head_i: int, ki: int, vi: int) -> tuple[int, int]:
+    """Frozen-spec down-walk (spec §4 step 4): after the escalation stop,
+    step DOWN any axis whose adjacent-band delta is within its scaled
+    threshold. Mirrors simulate_policy(deescalate=True) in
+    run_joint_kv_budget_policy_eval.py — K probe then V probe each round,
+    same band-threshold formula in both directions (no oscillation)."""
+    while True:
+        moved = False
+        if int(ki) > 0:
+            d = float(
+                _rel_l2_torch(
+                    runtime.output_for_budget(int(ki) - 1, int(vi))[int(local_head_i)],
+                    runtime.output_for_budget(int(ki), int(vi))[int(local_head_i)],
+                )
+            )
+            thr_k = _band_threshold_between(
+                runtime, runtime.active_k_budgets[int(ki) - 1], runtime.active_k_budgets[int(ki)]
+            )
+            if d <= thr_k:
+                ki -= 1
+                moved = True
+        if int(vi) > 0:
+            d = float(
+                _rel_l2_torch(
+                    runtime.output_for_budget(int(ki), int(vi) - 1)[int(local_head_i)],
+                    runtime.output_for_budget(int(ki), int(vi))[int(local_head_i)],
+                )
+            )
+            thr_v = _band_threshold_between(
+                runtime, runtime.v_budgets[int(vi) - 1], runtime.v_budgets[int(vi)]
+            )
+            if d <= thr_v:
+                vi -= 1
+                moved = True
+        if not moved:
+            break
+    return int(ki), int(vi)
+
+
 def _walk_lazy_outputs(runtime: JointPolicyRuntime, local_head_i: int) -> tuple[int, int]:
     ki, vi = _head_start_indices(runtime, local_head_i)
     steps = 0
@@ -446,4 +501,6 @@ def _walk_lazy_outputs(runtime: JointPolicyRuntime, local_head_i: int) -> tuple[
         else:
             raise AssertionError(action)
         steps += 1
+    if bool(getattr(runtime.args, "joint_kv_deescalate", False)):
+        ki, vi = _deescalate_walk(runtime, local_head_i, ki, vi)
     return ki, vi

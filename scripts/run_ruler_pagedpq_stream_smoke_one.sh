@@ -181,6 +181,8 @@ fi
   --joint_kv_threshold_min_scale "${JOINT_KV_THRESHOLD_MIN_SCALE:-0.0}" \
   --joint_kv_threshold_max_scale "${JOINT_KV_THRESHOLD_MAX_SCALE:-1.5}" \
   --joint_kv_start_strategy "${JOINT_KV_START_STRATEGY:-proxy_mass_m0p9}" \
+  --logit_buffer_format "${LOGIT_BUFFER_FORMAT:-fp}" \
+  ${JOINT_KV_DEESCALATE:+--joint_kv_deescalate} \
   --selected_value_mode "${SELECTED_VALUE_MODE:-vpq_value}" \
   --selected_value_exact_rule "${SELECTED_VALUE_EXACT_RULE:-global_residual_risk}" \
   --selected_value_exact_top "${SELECTED_VALUE_EXACT_TOP:-0}" \

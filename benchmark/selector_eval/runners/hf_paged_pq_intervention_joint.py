@@ -41,6 +41,19 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_forward_state impo
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_stats import ApproxStats
 
 
+def _quantize_e4m3_torch(x: torch.Tensor) -> torch.Tensor:
+    """Round fp32 values to the OCP fp8-e4m3 grid (round-nearest-even),
+    saturating to +-448, subnormal floor 2^-9. Torch mirror of
+    _quantize_e4m3 in run_joint_kv_budget_policy_eval.py (frozen logit
+    buffer format, issue #6) — keep the two in sync."""
+    out = x.to(dtype=torch.float32).clamp(-448.0, 448.0)
+    absx = out.abs()
+    e = torch.floor(torch.log2(absx.clamp_min(1e-45))).clamp_(-6.0, 8.0)
+    step = torch.exp2(e - 3.0)
+    q = torch.round(out / step) * step
+    return q.clamp_(-448.0, 448.0)
+
+
 @dataclass(frozen=True)
 class JointKVDecodeContext:
     args: Any
@@ -255,9 +268,23 @@ def approximate_joint_kv_all_heads(
                     int(group_size),
                     int(selector_rank_budget),
                 )
+                allhead_dense_pq_scores_t = allhead_dense_pq_scores_t.to(device=device, dtype=torch.float32)
+                if str(getattr(args, "logit_buffer_format", "fp")) == "e4m3":
+                    # Frozen-sim: the ranking/decision domain is the e4m3
+                    # logit buffer (issue #6). Quantize the PQ score row at
+                    # the source so start indices, softmax base, risk, and
+                    # tail all inherit the buffer format — and re-derive
+                    # the rank prefix from the QUANTIZED values (stable
+                    # sort => ties in token order, matching the CPU golden
+                    # ranked_cpu ordering).
+                    allhead_dense_pq_scores_t = _quantize_e4m3_torch(allhead_dense_pq_scores_t)
+                    if int(selector_rank_budget) > 0:
+                        _sorted = torch.sort(
+                            allhead_dense_pq_scores_t, dim=-1, descending=True, stable=True
+                        )
+                        _top_tokens_t = _sorted.indices[:, : int(selector_rank_budget)]
                 if int(selector_rank_budget) > 0:
                     allhead_selector_rank_prefix_t = _top_tokens_t.to(device=device, dtype=torch.long).contiguous()
-                allhead_dense_pq_scores_t = allhead_dense_pq_scores_t.to(device=device, dtype=torch.float32)
                 allhead_selector_mb = (
                     selector_bytes_fullscan(
                         allhead_indexes[0],

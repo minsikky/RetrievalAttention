@@ -778,6 +778,10 @@ def run() -> None:
     parser.add_argument("--joint_kv_threshold_min_scale", type=float, default=0.0)
     parser.add_argument("--joint_kv_threshold_max_scale", type=float, default=1.5)
     parser.add_argument("--joint_kv_start_strategy", default="proxy_mass_m0p9")
+    parser.add_argument("--joint_kv_deescalate", action="store_true",
+                        help="frozen-spec de-escalation walk after the escalation stop")
+    parser.add_argument("--logit_buffer_format", choices=["fp", "e4m3"], default="fp",
+                        help="e4m3 = frozen-sim: quantize the PQ score row to the fp8-e4m3 buffer grid before ranking/decisions (issue #6)")
     parser.add_argument("--tail_blend", type=float, default=1.0)
     parser.add_argument("--prefill_tail_blend", type=float, default=None)
     parser.add_argument("--decode_tail_blend", type=float, default=None)
@@ -1025,6 +1029,8 @@ def run() -> None:
             "joint_kv_threshold_min_scale": float(getattr(args, "joint_kv_threshold_min_scale", 0.0)),
             "joint_kv_threshold_max_scale": float(getattr(args, "joint_kv_threshold_max_scale", 0.0)),
             "joint_kv_start_strategy": str(getattr(args, "joint_kv_start_strategy", "")),
+            "joint_kv_deescalate": bool(getattr(args, "joint_kv_deescalate", False)),
+            "logit_buffer_format": str(getattr(args, "logit_buffer_format", "fp")),
             "tail_blend": float(args.tail_blend),
             "selected_value_mode": str(args.selected_value_mode),
             "selected_value_exact_rule": str(args.selected_value_exact_rule),

@@ -203,6 +203,14 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         dense_score_rows_t = allhead_dense_pq_scores_t[head_start_i:head_end_i]
         selector_mb = float(allhead_selector_mb)
     else:
+        if str(getattr(args, "logit_buffer_format", "fp")) == "e4m3":
+            # e4m3 quantization + rank-prefix rebuild only happens on the
+            # allhead precompute path; running the fallback would silently
+            # rank on fp scores.
+            raise RuntimeError(
+                "logit_buffer_format=e4m3 requires the allhead PQ score "
+                "precompute path (SELECTOR_PQ_JOINT_ALLHEAD_PRECOMPUTE=1)"
+            )
         selector_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
         if bool(getattr(args, "profile_native_ops", False)):
             _sync_if_cuda(device)
