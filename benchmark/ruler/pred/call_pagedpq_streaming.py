@@ -20,6 +20,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from benchmark.ruler.pred.dense_kv_offload import (
+    DenseKVOffloadCache,
+    patched_qwen2_dense_kv_offload,
+)
 from benchmark.ruler.pred.utils import load_data
 from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import parse_csv_ints
 from benchmark.selector_eval.runners.hf_attn_output_noise import (
@@ -531,24 +535,36 @@ def prefill_batched(
     *,
     device: torch.device,
     prefill_chunk_size: int,
+    past_key_values=None,
+    dense_kv_offload: bool = False,
 ):
     prompt_len = int(input_ids.shape[1])
     chunk_size = int(prefill_chunk_size)
     if chunk_size <= 0 or chunk_size >= prompt_len:
-        log_cuda_memory("prefill.oneshot.start", device, reset_peak=True)
-        out = model_forward_last_logits(model, input_ids.to(device), use_cache=True)
+        label = "offload.prefill.oneshot" if dense_kv_offload else "prefill.oneshot"
+        log_cuda_memory(f"{label}.start", device, reset_peak=True)
+        if dense_kv_offload:
+            out = model_forward_last_logits(
+                model,
+                input_ids.to(device),
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+        else:
+            out = model_forward_last_logits(model, input_ids.to(device), use_cache=True)
         sync_cuda_if_needed(device)
-        log_cuda_memory("prefill.oneshot.forward_done", device)
+        log_cuda_memory(f"{label}.forward_done", device)
         return out
 
     log_cuda_memory(f"prefill.chunked.start.chunk{chunk_size}", device, reset_peak=True)
     out = None
-    past_key_values = None
     set_pagedpq_prefill_sidecar_warm_deferred(model, True)
     try:
         for start in range(0, prompt_len, chunk_size):
             stop = min(prompt_len, start + chunk_size)
             chunk = input_ids[:, start:stop].to(device)
+            if dense_kv_offload:
+                log_cuda_memory(f"offload.prefill.chunk.{start}_{stop}.start", device)
             out = model_forward_last_logits(
                 model,
                 chunk,
@@ -557,7 +573,12 @@ def prefill_batched(
             )
             past_key_values = out.past_key_values
             sync_cuda_if_needed(device)
-            log_cuda_memory(f"prefill.chunk.{start}_{stop}.done", device)
+            memory_label = (
+                f"offload.prefill.chunk.{start}_{stop}.done"
+                if dense_kv_offload
+                else f"prefill.chunk.{start}_{stop}.done"
+            )
+            log_cuda_memory(memory_label, device)
             maybe_empty_cache_after_prefill_chunk(
                 device,
                 f"prefill.chunk.{start}_{stop}.empty_cache.done",
@@ -579,6 +600,11 @@ def generate_batched(
     *,
     device: torch.device,
     prefill_chunk_size: int | None = None,
+    dense_kv_offload: bool = False,
+    dense_kv_block_tokens: int = 8192,
+    dense_kv_staging_buffers: int = 2,
+    dense_kv_query_block_tokens: int = 2048,
+    greedy_logit_trace: list[torch.Tensor] | None = None,
 ) -> tuple[list[int], dict[str, float | int]]:
     if input_ids.ndim != 2 or int(input_ids.shape[0]) != 1:
         raise ValueError("batched runner currently expects batch size 1")
@@ -588,30 +614,57 @@ def generate_batched(
         if prefill_chunk_size is None
         else int(prefill_chunk_size)
     )
+    offload_cache = None
+    if dense_kv_offload:
+        if prefill_chunk_size_i <= 0:
+            raise ValueError("dense KV offload requires a positive prefill_chunk_size")
+        offload_cache = DenseKVOffloadCache(
+            num_layers=len(model.model.layers),
+            max_cache_len=prompt_len + int(max_new_tokens),
+            kv_block_tokens=int(dense_kv_block_tokens),
+            staging_buffers=int(dense_kv_staging_buffers),
+            query_block_tokens=int(dense_kv_query_block_tokens),
+            device=device,
+        )
     sync_cuda_if_needed(device)
     prompt_start = time.perf_counter()
-    out = prefill_batched(model, input_ids, device=device, prefill_chunk_size=prefill_chunk_size_i)
+    out = prefill_batched(
+        model,
+        input_ids,
+        device=device,
+        prefill_chunk_size=prefill_chunk_size_i,
+        past_key_values=offload_cache,
+        dense_kv_offload=dense_kv_offload,
+    )
     sync_cuda_if_needed(device)
     past_key_values = out.past_key_values
     warm_pagedpq_decode_sidecars(model, past_key_values, device)
     maybe_empty_cache_after_prefill(device)
     next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
+    if greedy_logit_trace is not None and int(max_new_tokens) > 0:
+        greedy_logit_trace.append(out.logits[:, -1, :].detach().cpu())
     prompt_seconds = time.perf_counter() - prompt_start
 
     generated: list[int] = []
     log_cuda_memory("decode.start", device, reset_peak=True)
     sync_cuda_if_needed(device)
     decode_start = time.perf_counter()
-    for _ in range(int(max_new_tokens)):
+    for step in range(int(max_new_tokens)):
         token_id = int(next_token.item())
         generated.append(token_id)
+        if dense_kv_offload:
+            log_cuda_memory(f"offload.decode.step.{step}.start", device)
         out = model_forward_last_logits(model, next_token.to(device), past_key_values=past_key_values, use_cache=True)
         past_key_values = out.past_key_values
         next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
+        if greedy_logit_trace is not None and step + 1 < int(max_new_tokens):
+            greedy_logit_trace.append(out.logits[:, -1, :].detach().cpu())
+        if dense_kv_offload:
+            log_cuda_memory(f"offload.decode.step.{step}.done", device)
     sync_cuda_if_needed(device)
     decode_seconds = time.perf_counter() - decode_start
     log_cuda_memory("decode.done", device)
-    return generated, {
+    timing = {
         "prompt_tokens": int(prompt_len),
         "generated_tokens": int(len(generated)),
         "stream_prefill_seconds": float(prompt_seconds),
@@ -620,6 +673,14 @@ def generate_batched(
         "stream_prefill_tokens_per_second": float(prompt_len / max(prompt_seconds, 1e-9)),
         "stream_decode_tokens_per_second": float(len(generated) / max(decode_seconds, 1e-9)),
     }
+    if offload_cache is not None:
+        timing["dense_kv_offload_h2d_bytes"] = int(offload_cache.h2d_bytes)
+        log(
+            "dense KV offload streamed "
+            f"{offload_cache.h2d_bytes} H2D bytes "
+            f"({offload_cache.h2d_bytes / (1024.0 ** 4):.3f} TiB)"
+        )
+    return generated, timing
 
 
 @torch.inference_mode()
@@ -817,6 +878,19 @@ def run() -> None:
     parser.add_argument("--page_size", type=int, default=5632)
     parser.add_argument("--prefill_chunk_size", type=int, default=0)
     parser.add_argument(
+        "--dense_kv_offload",
+        action="store_true",
+        help="opt in to exact Qwen2 attention with a pinned-CPU bf16 KV cache",
+    )
+    parser.add_argument("--dense_kv_block_tokens", type=int, default=8192)
+    parser.add_argument("--dense_kv_staging_buffers", type=int, default=2)
+    parser.add_argument("--dense_kv_query_block_tokens", type=int, default=2048)
+    parser.add_argument(
+        "--greedy_logit_trace_file",
+        default="",
+        help="optional torch-save path for per-step logits used by greedy A/B validation",
+    )
+    parser.add_argument(
         "--prefill_selector_backend",
         choices=["native", "native_fused", "torch_lut", "torch_lut_fp16", "torch_lut_streaming", "torch_lut_batched", "torch_matmul"],
         default="native",
@@ -864,6 +938,15 @@ def run() -> None:
     )
     args = parser.parse_args()
     setattr(args, "approx_prefill", bool(args.approx_prefill) and str(args.mode) == "pagedpq_batched")
+    if bool(args.dense_kv_offload):
+        if str(args.mode) != "dense_batched":
+            parser.error("--dense_kv_offload requires --mode dense_batched")
+        if int(args.prefill_chunk_size) <= 0:
+            parser.error("--dense_kv_offload requires --prefill_chunk_size > 0")
+        if int(args.dense_kv_block_tokens) <= 0 or int(args.dense_kv_query_block_tokens) <= 0:
+            parser.error("dense KV block sizes must be positive")
+        if int(args.dense_kv_staging_buffers) < 2:
+            parser.error("--dense_kv_staging_buffers must be at least 2")
 
     torch.manual_seed(int(args.seed))
     np.random.seed(int(args.seed))
@@ -932,11 +1015,14 @@ def run() -> None:
     attn_noise_config = None
     if str(args.mode) in {"pagedpq_stream", "pagedpq_batched"}:
         context = patched_paged_pq_attention(model, layer_ids, args, approx_stats)
+    elif bool(args.dense_kv_offload):
+        context = patched_qwen2_dense_kv_offload(model)
     else:
         context, attn_noise_config = maybe_attn_output_noise_patch(model)
         if attn_noise_config is not None:
             log(f"attn_output_noise active: {attn_noise_config}")
 
+    logit_trace_records = [] if str(args.greedy_logit_trace_file) else None
     with context as context_value:
         if attn_noise_config is not None:
             attn_noise_counters = context_value
@@ -946,14 +1032,36 @@ def run() -> None:
                     reset_paged_pq_attention_state(model)
                 input_ids = tokenizer(str(sample["input"]), return_tensors="pt").input_ids
                 generate_fn = generate_batched if str(args.mode) in {"dense_batched", "pagedpq_batched"} else generate_streaming
-                generated, timing = generate_fn(
-                    model=model,
-                    tokenizer=tokenizer,
-                    input_ids=input_ids,
-                    max_new_tokens=max_new_tokens,
-                    device=device,
-                    prefill_chunk_size=int(args.prefill_chunk_size),
-                )
+                generate_kwargs = {
+                    "model": model,
+                    "tokenizer": tokenizer,
+                    "input_ids": input_ids,
+                    "max_new_tokens": max_new_tokens,
+                    "device": device,
+                    "prefill_chunk_size": int(args.prefill_chunk_size),
+                }
+                sample_logit_trace = None
+                if bool(args.dense_kv_offload):
+                    generate_kwargs.update(
+                        dense_kv_offload=True,
+                        dense_kv_block_tokens=int(args.dense_kv_block_tokens),
+                        dense_kv_staging_buffers=int(args.dense_kv_staging_buffers),
+                        dense_kv_query_block_tokens=int(args.dense_kv_query_block_tokens),
+                    )
+                if logit_trace_records is not None:
+                    if generate_fn is not generate_batched:
+                        raise ValueError("greedy logit tracing is supported only by batched generation")
+                    sample_logit_trace = []
+                    generate_kwargs["greedy_logit_trace"] = sample_logit_trace
+                generated, timing = generate_fn(**generate_kwargs)
+                if logit_trace_records is not None:
+                    logit_trace_records.append(
+                        {
+                            "index": sample["index"],
+                            "token_ids": generated,
+                            "logits": torch.stack(sample_logit_trace, dim=0),
+                        }
+                    )
                 pred = tokenizer.decode(generated, skip_special_tokens=True)
                 item = {
                     "index": sample["index"],
@@ -1067,6 +1175,21 @@ def run() -> None:
         "cost_proxy": stats_payload(approx_stats),
         "cost_proxy_aggregate": aggregate_stats(approx_stats),
     }
+    if bool(args.dense_kv_offload):
+        total_h2d_bytes = int(sum(int(r.get("dense_kv_offload_h2d_bytes", 0)) for r in timing_rows))
+        summary["dense_kv_offload"] = {
+            "enabled": True,
+            "kv_block_tokens": int(args.dense_kv_block_tokens),
+            "query_block_tokens": int(args.dense_kv_query_block_tokens),
+            "staging_buffers": int(args.dense_kv_staging_buffers),
+            "h2d_bytes": total_h2d_bytes,
+            "h2d_tib": float(total_h2d_bytes / (1024.0 ** 4)),
+        }
+    if logit_trace_records is not None:
+        trace_path = Path(args.greedy_logit_trace_file)
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(logit_trace_records, trace_path)
+        log(f"wrote greedy logit trace {trace_path}")
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     log(f"wrote {out_path} and {summary_path}")
 
