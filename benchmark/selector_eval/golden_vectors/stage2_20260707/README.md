@@ -232,6 +232,49 @@ asserting them, and flags (nonfatal) any record with |dv_hw − dv_ref| >
 all-pages V-PQ block and hard-asserts equality to the stored acc
 (`--g3_tol`, default 1e-9; measured 0.0).
 
+## Item 8 — two-pass scan-domain V-selection (issue #9, RTL `two_pass_risk` adoption)
+
+RTL adopts the scan-domain two-pass cutoff as the V-selection rule (moves the
+cutoff to scan time and makes pass-2 a tile-local compare — breaks the
+post-walk RANK serialization and tiles for multi-page decode; ranks
+identically to the item-6 key since `log_risk = log(p²·err) + const_step`).
+Emitted per row at the SETTLED operating point when
+`--two_pass_cutoff_frac_bits > 0`. **Adopted grid: 6 fractional bits (LSB
+2⁻⁶), round-to-nearest-even, signed; `--two_pass_cutoff_int_bits 16`** — the
+effective log-risk range needs ≈10 integer bits (+sign), so a 16-bit total
+register suffices; `two_pass_logrisk_min/max` carry the observed range for
+tight sizing. Fields (all `two_pass_*`, additive; item-1/6/7/`all_*`
+byte-identical):
+
+- `two_pass_frac_bits`, `two_pass_int_bits` — the fixed-point grid (6, 16).
+- `two_pass_cutoff_q_fp64` — pass-1 scalar cutoff = the
+  `two_pass_cutoff_rank`-th largest QUANTIZED pass-1 log-risk.
+- `two_pass_cutoff_rank` — the settled exact-V budget (f_mult 1.0).
+- `two_pass_pass1_tokens` / `two_pass_pass1_logrisk_q_fp64` — pass-1 build
+  operands (quantized `2·logit_scan + log err`, finite only; −∞ zero-error
+  sentinels excluded). Rebuild cutoff = rank-th largest of these.
+- `two_pass_commit_tokens` / `two_pass_commit_logrisk_q_fp64` — pass-2
+  tile-local operands (quantized commit-domain log-risk at settled_ki,
+  finite only). Rebuild committed set = commit_tokens where
+  `q_log_risk ≥ cutoff`.
+- `two_pass_committed_tokens` (sorted) + `two_pass_committed_mask_packed`
+  (np.packbits over context_len) — the committed exact-V set.
+- `two_pass_logrisk_min_fp64` / `two_pass_logrisk_max_fp64` — observed
+  UNquantized pass-1 log-risk finite range (size the RTL integer field).
+
+Commit semantics: pure `≥` threshold (what the RTL compare datapath does);
+run()'s `exact_count ≥ context_len` all-ones short-circuit is intentionally
+NOT replicated — it never triggers on these 12 rows (max `n_committed`
+13,629 at ctx 134,838), so item-8 equals run()'s two-pass mask exactly here.
+**The two_pass gate** (`verify_stage2_key_regen.py --two_pass_tol`, default 0
+= exact) rebuilds cutoff + committed set + unpacked mask from operands alone
+and hard-asserts exact: verified bit-exact (max|rebuilt−stored cutoff| = 0.0,
+0 committed/mask mismatches, all 12 rows; regen job 53143233). Fixed-point
+precision chosen from the cutoff sweep (job 53138777): f=6 is quality-neutral
+vs fp64 (relL2 within 0.1%, walk-MB within 0.06%, exact-V reads within
++0.28%). Selection quality validated in `two_pass_risk` sweeps 52950302 /
+52950295 (+0.5% MB, relL2 identical vs global residual-risk).
+
 ## Provenance / regeneration
 
 `run_joint_kv_budget_policy_eval.py --golden_dump_stage2_dir <dir>` with
@@ -248,4 +291,10 @@ algorithm (job 53061660): 8/12 rows had kd/vd tails and their
 settled-state fields moved accordingly; per-row prefix-identity check
 confirmed every probe array is the previous trace truncated at the
 escalate stop (fatal=0); 4/12 rows and all 12 page blocks bit-identical;
-max |dv_hw − dv_ref| = 4.0e-7, flagged records 0.
+max |dv_hw − dv_ref| = 4.0e-7, flagged records 0. 2026-07-09: item-8
+`two_pass_*` selection goldens added (issue #9) as a pure superset via
+`sbatch scripts/run_stage2_two_pass_goldens_regen.sbatch` (job 53143233,
+same config as the item-7 regen + `--two_pass_cutoff_frac_bits 6
+--two_pass_cutoff_int_bits 16`): 12/12 golden2 + 12/12 page_v pure
+supersets (existing fields byte-identical), G3 bit-tight 0.0, two_pass gate
+bit-exact 0.0.

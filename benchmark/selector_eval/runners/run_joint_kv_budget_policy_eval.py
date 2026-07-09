@@ -1122,6 +1122,48 @@ def _quantize_risk_key(risk: np.ndarray, exp_bits: int, mantissa_bits: int) -> n
     return out
 
 
+def _quantize_log_risk_fixed_point(log_risk: np.ndarray, frac_bits: int, int_bits: int) -> np.ndarray:
+    """Signed fixed-point quantizer for the SIGNED log-risk domain
+    (2*logit + log V-error), i.e. the HW tile-local compare grid used by
+    two_pass_risk. This is a DIFFERENT map from _quantize_risk_key (that one
+    is a float E/M quantizer for the POSITIVE LINEAR key p^2*err); here the
+    key is signed and already in the log domain, so a uniform two's-
+    complement fixed point is the literal hardware datapath.
+
+    Grid: LSB step = 2^(-frac_bits). Each finite value is rounded to the
+    nearest grid point by round-to-nearest-even -- np.round breaks .5 ties to
+    the even neighbor, matching the RTL RNE quantizer (this is the reason we
+    use np.round rather than floor(x+0.5)). The integer part is a signed
+    two's-complement field of `int_bits` bits, so the representable closed
+    range is [-(2^(int_bits-1)), 2^(int_bits-1) - step]; finite values below
+    the low endpoint or above the high endpoint clamp to the nearest
+    representable endpoint (both endpoints lie on the grid).
+
+    The map is monotone non-decreasing (RNE rounding, the positive-scale
+    multiply, and the symmetric clamp are each order-preserving), so ranking
+    and threshold semantics are preserved -- the pass-1 cutoff pick and the
+    pass-2 `>=` commit give the same ordering they would in fp64, just on the
+    coarser grid.
+
+    Non-finite inputs pass through UNCHANGED: -inf (the sentinel for zero
+    V-error tokens), +inf, and NaN are copied through verbatim; only finite
+    entries are quantized. This keeps the -inf sentinels and every downstream
+    isfinite() mask bit-exact. Input shape is preserved and the result is
+    float64.
+    """
+    x = np.asarray(log_risk, dtype=np.float64)
+    out = x.astype(np.float64, copy=True)
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return out
+    step = 2.0 ** (-int(frac_bits))
+    lo = -(2.0 ** (int(int_bits) - 1))
+    hi = 2.0 ** (int(int_bits) - 1) - step
+    q = np.round(x[finite] / step) * step
+    out[finite] = np.clip(q, lo, hi)
+    return out
+
+
 # Frozen risk-rank key precision (issue #7, RTL-acked 2026-07-07): 6-bit
 # exponent window anchored at the per-state max positive risk, 12 RNE
 # mantissa bits, below-window positives collapse to one bottom bin, exact
@@ -1431,6 +1473,12 @@ def _write_stage2_golden(
     values_fp16: np.ndarray,
     values_lo: np.ndarray | None,
     v_risk_key_bits: tuple[int, int] | None = None,
+    resident_base_cpu: np.ndarray | None = None,
+    ranked_cpu: np.ndarray | None = None,
+    exact_scores_np: np.ndarray | None = None,
+    two_pass_calibrate: bool = False,
+    two_pass_frac_bits: int = 0,
+    two_pass_int_bits: int = 16,
 ) -> None:
     """Stage-2 goldens (issue #7): controller trace, per-band flash partials
     at the settled state, quantized-domain tail sum, proxy-mass scalars, and
@@ -2047,6 +2095,96 @@ def _write_stage2_golden(
         item7["v_commit_mask_packed"] = np.packbits(commit_full)
         item7["v_int8_err_fp16"] = np.asarray(precision_v_lo_err, dtype=np.float16)
 
+    # Item 8 (issue #9): two_pass_risk scan-domain V-selection cutoff at the
+    # SETTLED operating point (settled_ki, settled_vi). Reproduces run()'s
+    # two_pass path BIT-FOR-BIT for that (ki, vi) so RTL can validate its
+    # two-pass datapath against the model:
+    #   log-risk = 2*logit + log(V-error); V-error==0 -> -inf sentinel (never
+    #   committed). Pass 1 builds a scalar cutoff = the cutoff_rank-th largest
+    #   QUANTIZED pass-1 log-risk (pass-1 logit = mixed_scores: PQ for
+    #   non-resident, exact for resident base), cutoff_rank = exact-V budget *
+    #   f_mult with f_mult=1.0. Pass 2 commits exact-V tile-locally iff the
+    #   QUANTIZED pass-2 log-risk (2*scores_by_k[settled_ki] + log V-error) >=
+    #   cutoff. Both passes quantize on the adopted signed fixed-point grid via
+    #   _quantize_log_risk_fixed_point (frac_bits/int_bits). The block is
+    #   ADDITIVE: it writes only two_pass_* keys and mutates no existing array.
+    #   Gated on the fixed-point grid being active (frac_bits > 0) -- frac_bits
+    #   == 0 is the documented "byte-for-byte unchanged" mode, so nothing is
+    #   emitted then -- and on the mixed-score prerequisites being present; if
+    #   any is unavailable the block is omitted for that row (never crash), like
+    #   item-7 omits off-tier rows. V-error is code_error (always present), so
+    #   there is NO have_lo gating here (item-8 does not read the lo tier).
+    item8: dict[str, object] = {}
+    two_pass_ok = (
+        int(two_pass_frac_bits) > 0
+        and resident_base_cpu is not None
+        and ranked_cpu is not None
+        and exact_scores_np is not None
+    )
+    if two_pass_ok:
+        tp_frac = int(two_pass_frac_bits)
+        tp_int = int(two_pass_int_bits)
+        # log V-error, -inf sentinel where V-error == 0 (never committed).
+        code_error_f64 = np.asarray(code_error, dtype=np.float64).reshape(-1)
+        log_code_error = np.full((n,), -np.inf, dtype=np.float64)
+        positive_err = code_error_f64 > 0.0
+        log_code_error[positive_err] = np.log(code_error_f64[positive_err])
+        # Pass 1: mixed/approximate scan logits, IDENTICAL inputs to run()'s
+        # pass-1 mixed_scores call (resident base = selected_cpu, variant
+        # ranked stream, exact scores fallback, same calibrate flag).
+        pass1_scores, _p1m, _p1s, _p1b = mixed_scores(
+            context_len=n,
+            selected_cpu=np.asarray(resident_base_cpu, dtype=np.int64),
+            ranked_cpu=np.asarray(ranked_cpu, dtype=np.int64),
+            ranked_scores_cpu=ranked_scores_cpu,
+            exact_scores_np=exact_scores_np,
+            query_dim=int(head_dim),
+            calibrate=bool(two_pass_calibrate),
+        )
+        # UNquantized pass-1 log-risk (finite range sizes the RTL integer field).
+        pass1_log_risk_raw = 2.0 * np.asarray(pass1_scores, dtype=np.float64) + log_code_error
+        p1_raw_finite = pass1_log_risk_raw[np.isfinite(pass1_log_risk_raw)]
+        tp_lr_min = float(np.min(p1_raw_finite)) if p1_raw_finite.size else float("inf")
+        tp_lr_max = float(np.max(p1_raw_finite)) if p1_raw_finite.size else float("-inf")
+        # Quantize pass-1 onto the adopted grid BEFORE deriving the cutoff, so
+        # the scalar cutoff is itself a grid value (mirrors run() line ~3440).
+        pass1_log_risk = _quantize_log_risk_fixed_point(pass1_log_risk_raw, tp_frac, tp_int)
+        p1_finite = np.isfinite(pass1_log_risk)
+        pass1_finite_sorted = np.sort(pass1_log_risk[p1_finite])[::-1]
+        # Cutoff at (settled_ki, settled_vi): cutoff_rank = round(exact_count *
+        # f_mult), f_mult = 1.0 (adopted). Mirrors run() lines ~3446-3458.
+        exact_count_v = max(0, min(int(v_budgets[int(settled_vi)]), n))
+        cutoff_rank = min(n, int(round(float(exact_count_v) * 1.0)))
+        if exact_count_v <= 0 or cutoff_rank <= 0 or pass1_finite_sorted.size == 0:
+            tp_cutoff = float("inf")
+        else:
+            tp_cutoff = float(
+                pass1_finite_sorted[min(int(cutoff_rank), int(pass1_finite_sorted.size)) - 1]
+            )
+        # Pass 2: commit-domain log-risk at settled_ki, same grid (mirrors run()
+        # lines ~3509-3539). Commit iff finite and quantized log-risk >= cutoff.
+        pass2_log_risk = (
+            2.0 * scores_by_k[int(settled_ki)].astype(np.float64, copy=False) + log_code_error
+        )
+        pass2_log_risk = _quantize_log_risk_fixed_point(pass2_log_risk, tp_frac, tp_int)
+        p2_finite = np.isfinite(pass2_log_risk)
+        commit_tokens = np.flatnonzero(p2_finite).astype(np.int64)
+        committed_mask = p2_finite & (pass2_log_risk >= tp_cutoff)
+        committed_tokens = np.flatnonzero(committed_mask).astype(np.int64)  # sorted asc
+        p1_tokens = np.flatnonzero(p1_finite).astype(np.int64)
+        item8["two_pass_frac_bits"] = int(tp_frac)
+        item8["two_pass_int_bits"] = int(tp_int)
+        item8["two_pass_cutoff_q_fp64"] = float(tp_cutoff)
+        item8["two_pass_cutoff_rank"] = int(cutoff_rank)
+        item8["two_pass_pass1_tokens"] = p1_tokens
+        item8["two_pass_pass1_logrisk_q_fp64"] = pass1_log_risk[p1_finite].astype(np.float64)
+        item8["two_pass_commit_tokens"] = commit_tokens
+        item8["two_pass_commit_logrisk_q_fp64"] = pass2_log_risk[p2_finite].astype(np.float64)
+        item8["two_pass_committed_tokens"] = committed_tokens
+        item8["two_pass_committed_mask_packed"] = np.packbits(committed_mask)
+        item8["two_pass_logrisk_min_fp64"] = float(tp_lr_min)
+        item8["two_pass_logrisk_max_fp64"] = float(tp_lr_max)
+
     np.savez_compressed(
         out / f"golden2_q{int(qidx)}_h{int(head)}.npz",
         qidx=int(qidx),
@@ -2101,6 +2239,7 @@ def _write_stage2_golden(
         v_lo_mask_key_packed=np.packbits(lo_mask_key),
         v_dropped_reads_key=int(dropped_key),
         **item7,
+        **item8,
     )
 
 
@@ -2444,6 +2583,28 @@ def run() -> None:
         type=int,
         default=8,
         help="Mantissa bits (RNE) of the quantized risk-rank key.",
+    )
+    parser.add_argument(
+        "--two_pass_cutoff_frac_bits",
+        type=int,
+        default=0,
+        help=(
+            "two_pass_risk log-risk fixed-point study: fractional bits of the "
+            "signed fixed-point grid on which the pass-1 cutoff is built and "
+            "the pass-2 >= commit is compared (models the HW tile-local "
+            "compare, RNE rounding). 0 disables -> exact fp64 behavior, "
+            "byte-for-byte unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--two_pass_cutoff_int_bits",
+        type=int,
+        default=16,
+        help=(
+            "Signed integer bits of the two_pass_risk log-risk fixed point "
+            "(range clamp [-(2^(int_bits-1)), 2^(int_bits-1)-step]). Only "
+            "consulted when --two_pass_cutoff_frac_bits > 0."
+        ),
     )
     parser.add_argument(
         "--precision_lo_mode",
@@ -3369,6 +3530,15 @@ def run() -> None:
                         positive_err = code_error_f64 > 0.0
                         log_code_error[positive_err] = np.log(code_error_f64[positive_err])
                         pass1_log_risk = 2.0 * np.asarray(pass1_scores, dtype=np.float64) + log_code_error
+                        if int(args.two_pass_cutoff_frac_bits) > 0:
+                            # Log-risk fixed-point study: quantize onto the HW
+                            # compare grid BEFORE deriving the cutoff, so the
+                            # scalar per-V-budget cutoff is itself a grid value.
+                            pass1_log_risk = _quantize_log_risk_fixed_point(
+                                pass1_log_risk,
+                                int(args.two_pass_cutoff_frac_bits),
+                                int(args.two_pass_cutoff_int_bits),
+                            )
                         pass1_finite_sorted = np.sort(pass1_log_risk[np.isfinite(pass1_log_risk)])[::-1]
                         for v_budget in v_budgets:
                             exact_count = max(0, min(int(v_budget), int(context_len)))
@@ -3436,6 +3606,14 @@ def run() -> None:
                             two_pass_true_log_risk = (
                                 2.0 * scores_by_k[ki].astype(np.float64, copy=False) + log_code_error
                             )
+                            if int(args.two_pass_cutoff_frac_bits) > 0:
+                                # Same grid as the pass-1 cutoff, so the tile-
+                                # local >= compare below matches the hardware.
+                                two_pass_true_log_risk = _quantize_log_risk_fixed_point(
+                                    two_pass_true_log_risk,
+                                    int(args.two_pass_cutoff_frac_bits),
+                                    int(args.two_pass_cutoff_int_bits),
+                                )
                         streaming_v_results: dict[int, tuple[np.ndarray, int]] | None = None
                         streaming_v_block = _v_selection_block_size(str(v_selection_rule_raw), int(args.v_local_block_size))
                         if str(v_selection_rule_raw).strip().lower().startswith("streaming_global_risk"):
@@ -3462,6 +3640,8 @@ def run() -> None:
                                     "v_selection_exact_target": int(exact_count),
                                     "v_selection_exact_reads": int(np.count_nonzero(exact_mask)),
                                     "v_selection_cutoff_rank": int(two_pass_cutoff_ranks[vi]),
+                                    "two_pass_cutoff_frac_bits": int(args.two_pass_cutoff_frac_bits),
+                                    "two_pass_cutoff_int_bits": int(args.two_pass_cutoff_int_bits),
                                 }
                             elif streaming_v_results is None:
                                 exact_mask, rule_meta = exact_v_mask_for_rule(
@@ -3775,6 +3955,19 @@ def run() -> None:
                                             if int(args.v_risk_key_exp_bits) > 0
                                             else None
                                         ),
+                                        # Item-8 two_pass_risk inputs: SAME
+                                        # operands run()'s pass-1 mixed_scores
+                                        # uses (resident base, variant ranked
+                                        # stream, exact scores, calibrate flag)
+                                        # plus the adopted fixed-point grid.
+                                        resident_base_cpu=np.asarray(base, dtype=np.int64),
+                                        ranked_cpu=variant_ranked_cpu,
+                                        exact_scores_np=scores_np,
+                                        two_pass_calibrate=(
+                                            str(args.tail_score_calibration) == "affine_selected"
+                                        ),
+                                        two_pass_frac_bits=int(args.two_pass_cutoff_frac_bits),
+                                        two_pass_int_bits=int(args.two_pass_cutoff_int_bits),
                                     )
                                     _write_stage2_vpage(
                                         str(args.golden_dump_stage2_dir),

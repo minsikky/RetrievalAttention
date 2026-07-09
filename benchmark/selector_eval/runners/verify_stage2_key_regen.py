@@ -282,6 +282,14 @@ def main() -> None:
         help="max |rebuilt acc - stored acc| tolerance for the G3 operand "
         "rebuild (fp64; expected bit-tight ~0).",
     )
+    ap.add_argument(
+        "--two_pass_tol",
+        type=float,
+        default=0.0,
+        help="max |rebuilt cutoff - stored cutoff| tolerance for the issue #9 "
+        "two_pass_risk rebuild gate (default 0 -> exact). The committed-set and "
+        "packed-mask rebuilds are always required to match exactly.",
+    )
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -455,6 +463,104 @@ def main() -> None:
     report["g3"]["max_abs_by_band_domain"] = g3_max
     report["g3"]["worst"] = {"key": g3_worst, "max_abs": (g3_worst_val if g3_worst_val >= 0 else 0.0)}
 
+    # Two-pass gate (issue #9): for EVERY regen row carrying the two_pass_*
+    # fields, rebuild the pass-1 cutoff and the pass-2 committed set from the
+    # serialized operands ALONE and hard-assert bit-exact against the stored
+    # cutoff / committed tokens / packed mask. Mirrors _write_stage2_golden's
+    # item-8 semantics: (a) cutoff = the cutoff_rank-th largest of the QUANTIZED
+    # pass-1 log-risk two_pass_pass1_logrisk_q_fp64 (finite operands only, the
+    # -inf sentinels are excluded); (b) commit iff the QUANTIZED pass-2 log-risk
+    # two_pass_commit_logrisk_q_fp64 >= cutoff. Fatal; cutoff tolerance is
+    # --two_pass_tol (default 0 = exact), the set/mask rebuilds must match
+    # exactly. Rows without the fields (frozen goldens, frac_bits==0 dumps) are
+    # skipped -- purely additive, like the G3 gate skips lo-off rows.
+    tp = {
+        "rows": [],
+        "checked": 0,
+        "max_abs_cutoff": 0.0,
+        "max_committed_mismatch": 0,
+        "worst": None,
+    }
+    tp_worst_val = -1.0
+    for regen_path in sorted(glob.glob(os.path.join(args.regen, "golden2_*.npz"))):
+        name = os.path.basename(regen_path)
+        b = np.load(regen_path, allow_pickle=True)
+        if "two_pass_cutoff_q_fp64" not in b.files:
+            continue
+        tprow: dict = {
+            "row": name,
+            "cutoff_abs": 0.0,
+            "committed_mismatch": 0,
+            "mask_mismatch": 0,
+            "n_committed": None,
+            "error": None,
+        }
+        try:
+            rank = int(b["two_pass_cutoff_rank"])
+            p1 = np.asarray(b["two_pass_pass1_logrisk_q_fp64"], dtype=np.float64)
+            # (a) rebuild the pass-1 cutoff = rank-th largest quantized log-risk.
+            if rank <= 0 or p1.size == 0:
+                rebuilt_cutoff = float("inf")
+            else:
+                sd = np.sort(p1)[::-1]
+                rebuilt_cutoff = float(sd[min(rank, sd.size) - 1])
+            stored_cutoff = float(b["two_pass_cutoff_q_fp64"])
+            if rebuilt_cutoff == stored_cutoff:
+                cutoff_abs = 0.0  # covers the inf == inf sentinel case
+            elif np.isfinite(rebuilt_cutoff) and np.isfinite(stored_cutoff):
+                cutoff_abs = abs(rebuilt_cutoff - stored_cutoff)
+            else:
+                cutoff_abs = float("inf")  # inf-vs-finite: a real mismatch
+            tprow["cutoff_abs"] = float(cutoff_abs)
+            # (b) rebuild the committed set = commit_tokens with quantized
+            # commit-domain log-risk >= rebuilt cutoff.
+            commit_lr = np.asarray(b["two_pass_commit_logrisk_q_fp64"], dtype=np.float64)
+            commit_tok = np.asarray(b["two_pass_commit_tokens"], dtype=np.int64)
+            rebuilt_committed = np.sort(commit_tok[commit_lr >= rebuilt_cutoff]).astype(np.int64)
+            stored_committed = np.asarray(b["two_pass_committed_tokens"], dtype=np.int64)
+            committed_mismatch = int(np.setxor1d(rebuilt_committed, stored_committed).size)
+            tprow["committed_mismatch"] = committed_mismatch
+            tprow["n_committed"] = int(stored_committed.size)
+            # cross-check: the packed mask unpacks to the same committed set.
+            n_ctx = int(b["context_len"])
+            mask = np.unpackbits(
+                np.asarray(b["two_pass_committed_mask_packed"], dtype=np.uint8)
+            )[:n_ctx].astype(bool)
+            mask_tokens = np.flatnonzero(mask).astype(np.int64)
+            mask_mismatch = int(np.setxor1d(mask_tokens, stored_committed).size)
+            tprow["mask_mismatch"] = mask_mismatch
+            errs: list[str] = []
+            if cutoff_abs > float(args.two_pass_tol):
+                errs.append(f"cutoff rebuild abs={cutoff_abs:.3e} > tol {args.two_pass_tol:.1e}")
+            if committed_mismatch > 0:
+                errs.append(f"committed-set mismatch ({committed_mismatch} tokens)")
+            if mask_mismatch > 0:
+                errs.append(f"packed-mask mismatch ({mask_mismatch} tokens)")
+            if errs:
+                tprow["error"] = "; ".join(errs)
+                report["fatal"] += 1
+            row_worst = max(
+                cutoff_abs if np.isfinite(cutoff_abs) else 1e300,
+                float(committed_mismatch),
+                float(mask_mismatch),
+            )
+            if row_worst > tp_worst_val:
+                tp_worst_val = row_worst
+                tp["worst"] = name
+            if np.isfinite(cutoff_abs):
+                tp["max_abs_cutoff"] = max(tp["max_abs_cutoff"], cutoff_abs)
+            else:
+                tp["max_abs_cutoff"] = float("inf")
+            tp["max_committed_mismatch"] = max(
+                tp["max_committed_mismatch"], committed_mismatch, mask_mismatch
+            )
+        except Exception as exc:  # rebuild failure is fatal
+            tprow["error"] = f"{type(exc).__name__}: {exc}"
+            report["fatal"] += 1
+        tp["rows"].append(tprow)
+        tp["checked"] += 1
+    report["two_pass"] = tp
+
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, sort_keys=True)
 
@@ -493,6 +599,16 @@ def main() -> None:
     for g3row in g3["rows"]:
         if g3row.get("error"):
             print(f"  G3 FAIL {g3row['row']}: {g3row['error']}")
+    tp = report["two_pass"]
+    print(
+        f"two_pass rebuild: checked {tp['checked']} rows; "
+        f"max|rebuilt-stored cutoff|={tp['max_abs_cutoff']:.2e}, "
+        f"max committed/mask mismatch={tp['max_committed_mismatch']} "
+        f"(worst row {tp['worst']})"
+    )
+    for tprow in tp["rows"]:
+        if tprow.get("error"):
+            print(f"  two_pass FAIL {tprow['row']}: {tprow['error']}")
     print(f"fatal={report['fatal']}")
     sys.exit(0 if report["fatal"] == 0 else 1)
 

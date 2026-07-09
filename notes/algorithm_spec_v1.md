@@ -154,9 +154,22 @@ relL2(a,b) = ||a-b||_2 / max(||b||_2, eps) on the 128-dim attention output.
 - V side at rung vi: tokens ordered by risk_i = p_i^2 * vpq_code_error_i
   (p = current softmax prob). Top-(V_frac*ctx) get exact V rows; the rest of
   the SELECTED set uses V-PQ reconstruction; base tokens always exact.
-  Two-pass threshold variant (threshold from pass-1 stats, tile-stream
-  pass-2) is validated equivalent — the tile-compatible form RTL should use
-  (`two_pass_risk` rule; see current_status.md 2026-07-05 Two-Pass section).
+  **Two-pass scan-domain cutoff ADOPTED as the RTL V-selection rule (issue #9,
+  2026-07-09).** Pass-1 rides the selector scan and keeps a scalar cutoff =
+  the (V_frac·ctx)-th largest log-risk `2·logit + log(vpq_code_error)`
+  (scan/approximate logits: PQ for non-resident, exact for resident base;
+  zero-error tokens → −∞, never committed). Pass-2 commits exact-V tile-locally
+  iff `log_risk ≥ cutoff`. **Fixed-point cutoff: 6 fractional bits (LSB 2⁻⁶),
+  round-to-nearest-even, signed; ≈10 integer bits + sign → 16-bit register.**
+  Ranks identically to `p²·err` (`log_risk = log(p²·err) + const_step`), so it
+  selects the same set as the item-6 key while moving the cutoff to scan time
+  and pass-2 to a tile-local compare (breaks the post-walk RANK serialization,
+  tiles for multi-page). Quality-neutral: cutoff-precision sweep job 53138777
+  (f=6: relL2 within 0.1%, walk-MB within 0.06%, exact-V reads +0.28% vs fp64);
+  rule validation jobs 52950302/52950295 (+0.5% MB, relL2 identical vs global
+  residual-risk). Golden fields `two_pass_*` per §8 / golden README item-8
+  (per-step cutoff + committed set + pass-1/2 operands + bit-exact rebuild
+  gate).
 
 ## 6. Progressive precision (int8 tier)
 
