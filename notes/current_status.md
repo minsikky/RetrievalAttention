@@ -1,5 +1,35 @@
 # Current Status
 
+## 2026-07-09 Issue #10 — feed-forward budget predictor FEASIBLE (positive)
+
+Can a scan-domain statistic predict the escalation loop's final stopping
+rung (collapse the iterative K-escalation to a feed-forward budget)? YES.
+Population study `scripts/run_escalation_predictor_study.sbatch` (job
+`53162616`, frozen controller = global_residual_risk / escalation-only /
+proxy_mass_m0p9 start, 32 heads × 3 ctx × threshold grid incl. a 10.0 arm
+that forces stop-at-start = the one-shot baseline). Output
+`benchmark_suite_result/escalation_predictor_20260709/pop`.
+
+- **Q1 (one-shot):** the `proxy_mass_m0p9` start rung (already computed at
+  scan time) predicts the adaptive settled rung — exact 77/85/**94**/99%
+  at τ 0.001/0.002/**0.004**/0.008, **within ±1 = 99–100% at every
+  threshold**, corr 0.92–0.995. Alternative scan stats are weaker
+  (entropy_approx r≈0.33, approx_top512_mass r≈−0.5), so proxy-mass is the
+  best single predictor.
+- **Q2 (tight upper bound):** escalation-only ⇒ `settled ≥ start` = 100%;
+  `P(settled ≤ start+1)` = 99–100% at every threshold. So
+  **`proxy_mass_start + 1` is a provable feed-forward budget** that is ≥ the
+  true rung with ~certainty → removes the loop entirely (0 refinements).
+- **Q3 (quality cost):** one-shot=start costs mean ΔrelL2 +0.0007 @ τ0.004
+  (0.00223 vs adaptive 0.00155), p90 +0.0026, while *saving* 3.9% walk-MB
+  (under-provisions the escalating tail); start+1 gives quality ≥ adaptive
+  at a bounded over-provision (one extra rung on the ~majority where start
+  sufficed). At the operating point the loop is near-vestigial (0 iters
+  78%, ≤1 refine 97%).
+- **Scope caveat:** layer 16, one model, n=96 per threshold (1 query
+  position per head×ctx — trace limit). Strong single-layer signal, not a
+  full-grid guarantee. Posted to RTL #10.
+
 ## 2026-07-07 Current Frozen-Sim Eval Queued
 
 Submitted the current frozen algorithm task-quality reruns under the
