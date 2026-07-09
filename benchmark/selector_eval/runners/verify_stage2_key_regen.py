@@ -479,6 +479,8 @@ def main() -> None:
         "checked": 0,
         "max_abs_cutoff": 0.0,
         "max_committed_mismatch": 0,
+        "occupancy_checked": 0,
+        "max_occupancy_mismatch": 0,
         "worst": None,
     }
     tp_worst_val = -1.0
@@ -492,6 +494,8 @@ def main() -> None:
             "cutoff_abs": 0.0,
             "committed_mismatch": 0,
             "mask_mismatch": 0,
+            "distinct_mismatch": 0,
+            "hist_mismatch": 0,
             "n_committed": None,
             "error": None,
         }
@@ -529,6 +533,30 @@ def main() -> None:
             mask_tokens = np.flatnonzero(mask).astype(np.int64)
             mask_mismatch = int(np.setxor1d(mask_tokens, stored_committed).size)
             tprow["mask_mismatch"] = mask_mismatch
+            # (c) occupancy rebuild (issue #9): only for rows carrying the new
+            # fields -- old dumps / int_bits=16 frozen goldens lack them, so
+            # skip gracefully (purely additive). Rebuild the distinct-value
+            # count and the 256-bin histogram from the SAME finite quantized
+            # pass-1 operand p1, using the STORED lo/hi anchors and the same
+            # q_min==q_max special case as the writer.
+            has_occ = "two_pass_distinct_q_count" in b.files
+            distinct_mismatch = 0
+            hist_mismatch = 0
+            if has_occ:
+                distinct_q = int(np.unique(p1).size)
+                stored_distinct = int(b["two_pass_distinct_q_count"])
+                distinct_mismatch = 1 if distinct_q != stored_distinct else 0
+                tprow["distinct_mismatch"] = distinct_mismatch
+                lo = float(b["two_pass_occupancy_hist_lo_fp64"])
+                hi = float(b["two_pass_occupancy_hist_hi_fp64"])
+                if p1.size and lo != hi:
+                    rebuilt_hist = np.histogram(p1, bins=256, range=(lo, hi))[0].astype(np.uint32)
+                else:
+                    rebuilt_hist = np.zeros(256, dtype=np.uint32)
+                    rebuilt_hist[0] = np.uint32(p1.size)
+                stored_hist = np.asarray(b["two_pass_occupancy_hist256"], dtype=np.uint32)
+                hist_mismatch = int(np.count_nonzero(rebuilt_hist != stored_hist))
+                tprow["hist_mismatch"] = hist_mismatch
             errs: list[str] = []
             if cutoff_abs > float(args.two_pass_tol):
                 errs.append(f"cutoff rebuild abs={cutoff_abs:.3e} > tol {args.two_pass_tol:.1e}")
@@ -536,6 +564,12 @@ def main() -> None:
                 errs.append(f"committed-set mismatch ({committed_mismatch} tokens)")
             if mask_mismatch > 0:
                 errs.append(f"packed-mask mismatch ({mask_mismatch} tokens)")
+            if distinct_mismatch:
+                errs.append(
+                    f"distinct-q mismatch (rebuilt {distinct_q} != stored {stored_distinct})"
+                )
+            if hist_mismatch > 0:
+                errs.append(f"occupancy-hist mismatch ({hist_mismatch} bins)")
             if errs:
                 tprow["error"] = "; ".join(errs)
                 report["fatal"] += 1
@@ -554,6 +588,11 @@ def main() -> None:
             tp["max_committed_mismatch"] = max(
                 tp["max_committed_mismatch"], committed_mismatch, mask_mismatch
             )
+            if has_occ:
+                tp["occupancy_checked"] += 1
+                tp["max_occupancy_mismatch"] = max(
+                    tp["max_occupancy_mismatch"], distinct_mismatch, hist_mismatch
+                )
         except Exception as exc:  # rebuild failure is fatal
             tprow["error"] = f"{type(exc).__name__}: {exc}"
             report["fatal"] += 1
@@ -600,11 +639,14 @@ def main() -> None:
         if g3row.get("error"):
             print(f"  G3 FAIL {g3row['row']}: {g3row['error']}")
     tp = report["two_pass"]
+    occ_ok = tp["max_occupancy_mismatch"] == 0
     print(
         f"two_pass rebuild: checked {tp['checked']} rows; "
         f"max|rebuilt-stored cutoff|={tp['max_abs_cutoff']:.2e}, "
         f"max committed/mask mismatch={tp['max_committed_mismatch']} "
-        f"(worst row {tp['worst']})"
+        f"(worst row {tp['worst']}); "
+        f"occupancy {'ok' if occ_ok else 'FAIL'} "
+        f"({tp['occupancy_checked']} rows, max mismatch {tp['max_occupancy_mismatch']})"
     )
     for tprow in tp["rows"]:
         if tprow.get("error"):

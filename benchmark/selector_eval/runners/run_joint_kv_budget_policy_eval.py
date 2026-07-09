@@ -2184,6 +2184,30 @@ def _write_stage2_golden(
         item8["two_pass_committed_mask_packed"] = np.packbits(committed_mask)
         item8["two_pass_logrisk_min_fp64"] = float(tp_lr_min)
         item8["two_pass_logrisk_max_fp64"] = float(tp_lr_max)
+        # Occupancy metadata (issue #9, RTL flat-histogram cutoff microarch
+        # sizing): distinct-value count + a 256-bin occupancy histogram of the
+        # SAME finite quantized pass-1 values written above
+        # (two_pass_pass1_logrisk_q_fp64). Bins span [q_min, q_max] of the
+        # QUANTIZED finite values so the histogram is exactly rebuildable from
+        # the stored operand + the lo/hi anchors; no data-dependent epsilons.
+        p1_q_vals = pass1_log_risk[p1_finite].astype(np.float64)
+        item8["two_pass_distinct_q_count"] = int(np.unique(p1_q_vals).size)
+        if p1_q_vals.size and float(np.min(p1_q_vals)) != float(np.max(p1_q_vals)):
+            q_min = float(np.min(p1_q_vals))
+            q_max = float(np.max(p1_q_vals))
+            occ_hist = np.histogram(p1_q_vals, bins=256, range=(q_min, q_max))[0].astype(
+                np.uint32
+            )
+        else:
+            # All finite quantized values equal (or none): np.histogram handles
+            # range=(a, a) poorly, so pin every count into bin 0.
+            q_min = float(np.min(p1_q_vals)) if p1_q_vals.size else 0.0
+            q_max = float(np.max(p1_q_vals)) if p1_q_vals.size else 0.0
+            occ_hist = np.zeros(256, dtype=np.uint32)
+            occ_hist[0] = np.uint32(p1_q_vals.size)
+        item8["two_pass_occupancy_hist256"] = occ_hist
+        item8["two_pass_occupancy_hist_lo_fp64"] = float(q_min)
+        item8["two_pass_occupancy_hist_hi_fp64"] = float(q_max)
 
     np.savez_compressed(
         out / f"golden2_q{int(qidx)}_h{int(head)}.npz",

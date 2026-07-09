@@ -159,8 +159,13 @@ relL2(a,b) = ||a-b||_2 / max(||b||_2, eps) on the 128-dim attention output.
   the (V_frac·ctx)-th largest log-risk `2·logit + log(vpq_code_error)`
   (scan/approximate logits: PQ for non-resident, exact for resident base;
   zero-error tokens → −∞, never committed). Pass-2 commits exact-V tile-locally
-  iff `log_risk ≥ cutoff`. **Fixed-point cutoff: 6 fractional bits (LSB 2⁻⁶),
-  round-to-nearest-even, signed; ≈10 integer bits + sign → 16-bit register.**
+  iff `log_risk ≥ cutoff`. **Fixed-point cutoff: Q7.6 — int_bits=7 (integer
+  field width, sign included: clamp ±2^(int_bits−1) = ±64), frac_bits=6 (LSB
+  2⁻⁶, additional), round-to-nearest-even → total register = int_bits +
+  frac_bits = 13-bit signed.** Clamp dead on observed data (log-risk range
+  [−42.2, +3.8]). Precision from the cutoff sweeps: frac=6 job 53138777,
+  int-width job 53183387 (±16 over-commits +722% reads, ±32 empirical floor,
+  ±64 adopted with 1M margin; re-validate at Phase E 1M).
   Ranks identically to `p²·err` (`log_risk = log(p²·err) + const_step`), so it
   selects the same set as the item-6 key while moving the cutoff to scan time
   and pass-2 to a tile-local compare (breaks the post-walk RANK serialization,

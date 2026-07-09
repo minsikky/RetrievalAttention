@@ -13,10 +13,13 @@
 # run_stage2_item7_operands_regen.sbatch (escalation-only, --precision_split_freeze
 # start, E6M12 keys, fp16 commit, item-7 all_*/vexact_band operands) PLUS the
 # adopted two-pass cutoff fixed point (--two_pass_cutoff_frac_bits 6
-# --two_pass_cutoff_int_bits 16). The runner now ALSO dumps, per row, the
-# two_pass_* block: pass-1 quantized-log-risk cutoff, committed exact-V set
-# (tokens + packed mask), pass-1/pass-2 quantized-log-risk operands, and the
-# observed log-risk range. Existing item-1/6/7/all_* fields are additive-only
+# --two_pass_cutoff_int_bits 7 -> Q7.6, 13-bit total signed, clamp +/-64). The
+# runner now ALSO dumps, per row, the two_pass_* block: pass-1
+# quantized-log-risk cutoff, committed exact-V set (tokens + packed mask),
+# pass-1/pass-2 quantized-log-risk operands, the observed log-risk range, and
+# the occupancy metadata (distinct quantized-value count + 256-bin occupancy
+# histogram with lo/hi anchors for RTL flat-histogram cutoff sizing). Existing
+# item-1/6/7/all_* fields are additive-only
 # (byte-identical superset). Verify does THREE things: (a) superset vs the
 # blessed goldens, (b) G3 operand-rebuild gate (bit-tight), (c) the item-8
 # two_pass rebuild gate (cutoff + committed set rebuilt from operands, exact).
@@ -58,7 +61,7 @@ mkdir -p "$DUMP" "${ROOT}/gold_run"
   --precision_lo_mode int8 --precision_lo_bits 8 \
   --precision_split_freeze start \
   --v_selection_rules global_residual_risk --v_local_block_size 1024 \
-  --two_pass_cutoff_frac_bits 6 --two_pass_cutoff_int_bits 16 \
+  --two_pass_cutoff_frac_bits 6 --two_pass_cutoff_int_bits 7 \
   --logit_buffer_bits 8 --logit_buffer_format e4m3 \
   --tail_score_calibration none \
   --score_proxy_variants baseline \

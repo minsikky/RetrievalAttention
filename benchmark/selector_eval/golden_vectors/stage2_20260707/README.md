@@ -239,14 +239,35 @@ cutoff to scan time and makes pass-2 a tile-local compare — breaks the
 post-walk RANK serialization and tiles for multi-page decode; ranks
 identically to the item-6 key since `log_risk = log(p²·err) + const_step`).
 Emitted per row at the SETTLED operating point when
-`--two_pass_cutoff_frac_bits > 0`. **Adopted grid: 6 fractional bits (LSB
-2⁻⁶), round-to-nearest-even, signed; `--two_pass_cutoff_int_bits 16`** — the
-effective log-risk range needs ≈10 integer bits (+sign), so a 16-bit total
-register suffices; `two_pass_logrisk_min/max` carry the observed range for
-tight sizing. Fields (all `two_pass_*`, additive; item-1/6/7/`all_*`
-byte-identical):
+`--two_pass_cutoff_frac_bits > 0`.
 
-- `two_pass_frac_bits`, `two_pass_int_bits` — the fixed-point grid (6, 16).
+**Fixed-point semantics (explicit).** `two_pass_int_bits` is the INTEGER-field
+width (sign included): clamp range ±2^(int_bits−1); `two_pass_frac_bits` is
+additional; total register = int_bits + frac_bits. **Adopted: int_bits=7,
+frac_bits=6 → Q7.6, 13-bit total signed, RNE, clamp ±64 (dead on observed
+data: log-risk range [−42.2, +3.8]).** `two_pass_logrisk_min/max` carry the
+observed UNquantized range so RTL can re-check the clamp margin.
+
+**Int-width sweep (job 53183387).** int_bits=5 (±16) catastrophically
+over-commits (+722% exact-V reads, +87% MB — the clamp floor rises above the
+cutoffs at −12…−21 and the clamped tie-class commits wholesale); int_bits=6
+(±32) is the empirical floor at ≤128k (identical to the old 22-bit dump:
+ΔrelL2 −0.10%, ΔMB +0.056%, Δreads +0.28%, flat across ctx 8k/32k/128k);
+int_bits=7 (±64) adds one guard bit → the clamp is DEAD on all observed data
+with ≥3× log-margin over the 1M cutoff-deepening trend (deepest cutoff
+−16.6→−19.6→−20.6 across ctx 14.8k/38.8k/134.8k, ~−24 extrapolated at 1M).
+±64 is adopted with that 1M margin; to be re-validated at the Phase E 1M
+trace. **Correction:** the prior delivery (commit e76a371) shipped
+int_bits=16 (22-bit total) while the prose claimed a "16-bit total" register
+— that MIS-NARRATED the semantics (int_bits is the integer field, not the
+total). Corrected here to Q7.6. The quantized values are byte-identical at
+int_bits=7 vs 16 on this data (the clamp is dead in both), so re-dumping at
+int_bits=7 leaves every `two_pass_*` operand value unchanged.
+
+Fields (all `two_pass_*`, additive; item-1/6/7/`all_*` byte-identical):
+
+- `two_pass_frac_bits`, `two_pass_int_bits` — the fixed-point grid (6, 7 →
+  Q7.6, 13-bit total signed, clamp ±64).
 - `two_pass_cutoff_q_fp64` — pass-1 scalar cutoff = the
   `two_pass_cutoff_rank`-th largest QUANTIZED pass-1 log-risk.
 - `two_pass_cutoff_rank` — the settled exact-V budget (f_mult 1.0).
@@ -261,6 +282,23 @@ byte-identical):
   (np.packbits over context_len) — the committed exact-V set.
 - `two_pass_logrisk_min_fp64` / `two_pass_logrisk_max_fp64` — observed
   UNquantized pass-1 log-risk finite range (size the RTL integer field).
+- `two_pass_distinct_q_count` (int) — number of DISTINCT quantized pass-1
+  log-risk values (`np.unique(two_pass_pass1_logrisk_q_fp64).size`).
+- `two_pass_occupancy_hist256` (uint32[256]) — histogram of the finite
+  quantized pass-1 values over 256 UNIFORM bins spanning the quantized value
+  range, `np.histogram(vals, bins=256, range=(q_min, q_max))`; if all values
+  are equal (`q_min == q_max`) every count lands in bin 0.
+- `two_pass_occupancy_hist_lo_fp64` / `two_pass_occupancy_hist_hi_fp64`
+  (float64) — the histogram bin-range anchors `q_min` / `q_max` (min/max of
+  the QUANTIZED finite pass-1 values), so the histogram is exactly
+  rebuildable. The two_pass gate rebuilds `distinct_q = np.unique(p1).size`
+  and the 256-bin histogram from `two_pass_pass1_logrisk_q_fp64` with the
+  stored lo/hi anchors (same call + same `q_min == q_max` special case) and
+  hard-asserts both against the stored fields. These occupancy fields exist
+  for RTL's flat-histogram cutoff microarch sizing: the observed worst pass-1
+  span is 2,894 grid values / 1,547 distinct at ctx 128k — flat-friendly and
+  ≪ the 8–16k distinct-value threshold that would force a non-flat cutoff
+  structure.
 
 Commit semantics: pure `≥` threshold (what the RTL compare datapath does);
 run()'s `exact_count ≥ context_len` all-ones short-circuit is intentionally
@@ -297,4 +335,12 @@ max |dv_hw − dv_ref| = 4.0e-7, flagged records 0. 2026-07-09: item-8
 same config as the item-7 regen + `--two_pass_cutoff_frac_bits 6
 --two_pass_cutoff_int_bits 16`): 12/12 golden2 + 12/12 page_v pure
 supersets (existing fields byte-identical), G3 bit-tight 0.0, two_pass gate
-bit-exact 0.0.
+bit-exact 0.0. 2026-07-09 (later): width contract corrected to Q7.6
+(`--two_pass_cutoff_int_bits 7`, 13-bit total) after the int-width sweep
+(job 53183387: ±16 cliff +722% reads, ±32 empirical floor, ±64 adopted with
+1M margin) and the occupancy metadata fields (`two_pass_distinct_q_count`,
+`two_pass_occupancy_hist256`, `two_pass_occupancy_hist_lo/hi_fp64`) added for
+RTL's flat-histogram cutoff sizing (issue #9). The clamp is dead at both
+int_bits=7 and 16 on this data, so every quantized `two_pass_*` operand value
+is byte-identical to the int_bits=16 delivery; only the prose/regen-flag
+width contract and the additive occupancy fields change.
