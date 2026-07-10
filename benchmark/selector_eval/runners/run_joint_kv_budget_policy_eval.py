@@ -2386,6 +2386,564 @@ def _write_stage2_vpage(
     )
 
 
+# ---------------------------------------------------------------------------
+# Dependency epoch trace (issue #11, Phase 1). Pure observer: reconstructs the
+# realized escalation walk into per-event ("epoch") records from arrays the
+# runner already computed at the committed operating point. Emits NOTHING that
+# feeds back into any numeric output -- when --epoch_trace_dir is unset none of
+# this runs, and when it is set every existing output stays byte-identical.
+# ---------------------------------------------------------------------------
+
+# event_kind codes stored in the npz (see README written by _finalize_epoch_trace)
+_EPOCH_KIND_START_EVAL = 0
+_EPOCH_KIND_K_UP = 1
+_EPOCH_KIND_V_UP = 2
+_EPOCH_KIND_COMMIT = 3
+_EPOCH_KIND_NAMES = {
+    _EPOCH_KIND_START_EVAL: "start_eval",
+    _EPOCH_KIND_K_UP: "k_up",
+    _EPOCH_KIND_V_UP: "v_up",
+    _EPOCH_KIND_COMMIT: "commit",
+}
+
+# Descriptive per-token logical-byte region widths. Phase 1 records token ids +
+# token counts + these widths; the physical line/burst mapping is Phase 2 and is
+# deliberately NOT applied here. Widths derive from the run config so they stay
+# consistent with the sim's own MB accounting.
+_EPOCH_REGION_NAMES = (
+    "k_plane_a_lo",   # int8 lo plane, head_dim * precision_lo_bytes
+    "k_plane_b_hi",   # residual plane lifting lo->exact, head_dim * (key_bytes - lo)
+    "kpq_codes",      # subvecs * kpq_code_bytes
+    "v_plane_a_lo",   # head_dim * v_lo_bytes
+    "v_plane_b_hi",   # head_dim * (value_bytes - v_lo)
+    "vpq_codes",      # value_subvecs * vpq_code_bytes
+    "code_error_sc",  # V-PQ code_error sidecar, code_stat_bytes/token
+    "int8_err_sc",    # int8 residual-error sidecar, code_stat_bytes/token
+)
+
+
+def _epoch_softmax_den(scores_by_k: dict[int, np.ndarray], ki: int) -> float:
+    """Softmax denominator the sim normalized rung ki by (fp32 exp / fp32 sum);
+    read-only, mirrors probs_by_k construction at the escalation site."""
+    s = scores_by_k[int(ki)]
+    e = np.exp(s - float(np.max(s)))
+    return float(max(float(np.sum(e)), 1e-20))
+
+
+def _epoch_events_from_walk(
+    *,
+    policy_trace: list[str],
+    start_ki: int,
+    start_vi: int,
+    settled_ki: int,
+    settled_vi: int,
+    k_budgets: list[int],
+    v_budgets: list[int],
+    k_mb_by_idx: list[float],
+    v_mb_by_pair: dict[tuple[int, int], float],
+    v_path_mb: float,
+    total_mb: float,
+) -> list[dict[str, object]]:
+    """Parse the realized escalate-only walk into ordered epoch events.
+
+    One epoch per _STAGE2_TRACE_RE segment of policy_trace (the SAME segment set
+    the runner's walk_step_MB_per_head loop iterates), so the per-epoch walk-MB
+    contributions reconcile to walk_step_MB_per_head by construction:
+
+      event_kind = "k_up"/"v_up" for an escalation segment (action k/v),
+                   "commit" for the terminal stop segment;
+      is_start_eval flags the first segment (the start-rung evaluation), which
+                   the runner's loop also visits first.
+
+    Each segment READS its lookahead bands: the K stability pair (seg_ki,
+    seg_ki+1) and the marginal V band (seg_ki, seg_vi+1), charged as the deepest
+    band per axis with no refund. walk_mb_contribution is the incremental max of
+    those band costs, seeded EXACTLY as the runner seeds it (settled rung), and
+    the settled committed cost (total_mb) is attached to the commit epoch, so
+    sum(contribution) == walk_step_MB_per_head to float roundoff.
+    """
+    n_k = len(k_budgets)
+    n_v = len(v_budgets)
+    last_v = n_v - 1
+
+    def _band_k_idx(seg_ki: int) -> int:
+        return seg_ki + 1 if seg_ki + 1 < n_k else seg_ki
+
+    def _v_read_idx(seg_vi: int) -> int:
+        return min(seg_vi + 1, last_v)
+
+    segs: list[tuple[str, int, int]] = []
+    for seg in policy_trace:
+        m = _STAGE2_TRACE_RE.match(str(seg))
+        if m is None:
+            # de-escalation (kd/vd) / "frozen_budget": not on the escalate-only
+            # walk basis the runner charges. Skip (matches runner's MB loop).
+            continue
+        segs.append((str(m.group(1)), int(m.group(2)), int(m.group(3))))
+
+    events: list[dict[str, object]] = []
+    # Runner seeds the running deepest-band cost at the SETTLED rung.
+    run_k_mb = float(k_mb_by_idx[int(settled_ki)])
+    run_v_mb = float(v_path_mb)
+
+    if not segs:
+        # frozen_budget / empty walk: one commit epoch at the settled rung.
+        segs = [("stop", int(settled_ki), int(settled_vi))]
+
+    for i, (action, seg_ki, seg_vi) in enumerate(segs):
+        band_k = _band_k_idx(seg_ki)
+        v_read_vi = _v_read_idx(seg_vi)
+        k_read_mb = float(k_mb_by_idx[band_k])
+        v_read_mb = float(v_mb_by_pair[(seg_ki, v_read_vi)])
+        dk = max(0.0, k_read_mb - run_k_mb)
+        dv = max(0.0, v_read_mb - run_v_mb)
+        run_k_mb = max(run_k_mb, k_read_mb)
+        run_v_mb = max(run_v_mb, v_read_mb)
+        if action == "k":
+            kind = _EPOCH_KIND_K_UP
+            ki_after, vi_after = seg_ki + 1, seg_vi
+        elif action == "v":
+            kind = _EPOCH_KIND_V_UP
+            ki_after, vi_after = seg_ki, seg_vi + 1
+        else:  # stop
+            kind = _EPOCH_KIND_COMMIT
+            ki_after, vi_after = seg_ki, seg_vi
+        events.append(
+            {
+                "epoch_id": int(i),
+                "parent_epoch_id": int(i - 1),
+                "kind": int(_EPOCH_KIND_START_EVAL if i == 0 else kind),
+                "true_action_kind": int(kind),
+                "is_start_eval": bool(i == 0),
+                "ki_before": int(seg_ki),
+                "vi_before": int(seg_vi),
+                "ki_after": int(ki_after),
+                "vi_after": int(vi_after),
+                "k_read_rung": int(band_k),
+                "v_read_ki": int(seg_ki),
+                "v_read_vi": int(v_read_vi),
+                "k_read_mb": float(k_read_mb),
+                "v_read_mb": float(v_read_mb),
+                "walk_mb_contribution": float(dk + dv),
+            }
+        )
+    # Attach the settled committed cost to the terminal (commit) epoch.
+    events[-1]["walk_mb_contribution"] = float(events[-1]["walk_mb_contribution"]) + float(total_mb)
+    return events
+
+
+def _write_epoch_trace(
+    out_root: Path,
+    *,
+    qidx: int,
+    head: int,
+    kv_head: int,
+    position: int,
+    context_len: int,
+    page_size: int,
+    head_dim: int,
+    policy: str,
+    threshold: float,
+    start_strategy: str,
+    start_ki: int,
+    start_vi: int,
+    settled_ki: int,
+    settled_vi: int,
+    policy_trace: list[str],
+    k_budgets: list[int],
+    v_budgets: list[int],
+    k_mb_by_idx: list[float],
+    v_mb_by_pair: dict[tuple[int, int], float],
+    v_path_mb: float,
+    v_state_mb: float,
+    total_mb: float,
+    walk_total_mb: float,
+    selected_by_k: dict[int, np.ndarray],
+    selected_counts_by_idx: list[int],
+    exact_mask_by_pair: dict[tuple[int, int], np.ndarray],
+    scores_by_k: dict[int, np.ndarray],
+    precision_frozen_hi_count: int | None,
+    precision_k_hi_frac: float,
+    precision_v_hi_frac: float,
+    precision_lo_bits: int,
+    precision_lo_bytes: float,
+    v_lo_reads: int,
+    v_dropped_reads: int,
+    key_bytes: int,
+    value_bytes: int,
+    subvecs: int,
+    kpq_code_bytes: int,
+    value_subvecs: int,
+    vpq_code_bytes: int,
+    code_stat_bytes: int,
+    n_pages: int,
+    lo_tokens_fn,
+) -> dict[str, object]:
+    """Build + write one per-(qidx, head) epoch-trace npz; return an index row.
+
+    Pure observer. Reconstructs realized-walk epochs and, per epoch, the
+    token-level reads on the walk basis (deepest band per axis, no refund),
+    the K-move crossing structure, rank-candidate sizes and compute-op counts.
+    """
+    events = _epoch_events_from_walk(
+        policy_trace=policy_trace,
+        start_ki=int(start_ki),
+        start_vi=int(start_vi),
+        settled_ki=int(settled_ki),
+        settled_vi=int(settled_vi),
+        k_budgets=k_budgets,
+        v_budgets=v_budgets,
+        k_mb_by_idx=k_mb_by_idx,
+        v_mb_by_pair=v_mb_by_pair,
+        v_path_mb=float(v_path_mb),
+        total_mb=float(total_mb),
+    )
+    n_ep = len(events)
+    hd = int(head_dim)
+    k_lo_w = float(hd * float(precision_lo_bytes))
+    k_hi_w = float(hd * (float(key_bytes) - float(precision_lo_bytes)))
+    v_lo_w = float(hd * float(precision_lo_bytes))
+    v_hi_w = float(hd * (float(value_bytes) - float(precision_lo_bytes)))
+    kpq_w = float(int(subvecs) * int(kpq_code_bytes))
+    vpq_w = float(int(value_subvecs) * int(vpq_code_bytes))
+    sc_w = float(int(code_stat_bytes))
+
+    # per-epoch scalar columns
+    col = {
+        "epoch_id": np.zeros(n_ep, dtype=np.int32),
+        "parent_epoch_id": np.zeros(n_ep, dtype=np.int32),
+        "event_kind_code": np.zeros(n_ep, dtype=np.int8),
+        "true_action_kind_code": np.zeros(n_ep, dtype=np.int8),
+        "is_start_eval": np.zeros(n_ep, dtype=bool),
+        "ki_before": np.zeros(n_ep, dtype=np.int32),
+        "vi_before": np.zeros(n_ep, dtype=np.int32),
+        "ki_after": np.zeros(n_ep, dtype=np.int32),
+        "vi_after": np.zeros(n_ep, dtype=np.int32),
+        "k_read_rung": np.zeros(n_ep, dtype=np.int32),
+        "v_read_ki": np.zeros(n_ep, dtype=np.int32),
+        "v_read_vi": np.zeros(n_ep, dtype=np.int32),
+        "k_read_mb": np.zeros(n_ep, dtype=np.float64),
+        "v_read_mb": np.zeros(n_ep, dtype=np.float64),
+        "walk_mb_contribution": np.zeros(n_ep, dtype=np.float64),
+        "rank_candidate_set_size": np.zeros(n_ep, dtype=np.int32),
+        "n_dot_products": np.zeros(n_ep, dtype=np.int64),
+        "n_band_accumulations": np.zeros(n_ep, dtype=np.int64),
+        "n_k_marginal": np.zeros(n_ep, dtype=np.int32),
+        "n_v_marginal": np.zeros(n_ep, dtype=np.int32),
+        "n_k_exact_cum": np.zeros(n_ep, dtype=np.int32),
+        "n_v_exact_cum": np.zeros(n_ep, dtype=np.int32),
+        "n_hi_boundary": np.zeros(n_ep, dtype=np.int32),
+        "kmove_den_old": np.full(n_ep, np.nan, dtype=np.float64),
+        "kmove_den_new": np.full(n_ep, np.nan, dtype=np.float64),
+    }
+    region_ntokens = np.zeros((n_ep, len(_EPOCH_REGION_NAMES)), dtype=np.int64)
+    region_logical_bytes = np.zeros((n_ep, len(_EPOCH_REGION_NAMES)), dtype=np.float64)
+
+    k_marg_parts: list[np.ndarray] = []
+    k_marg_off = [0]
+    v_marg_parts: list[np.ndarray] = []
+    v_marg_off = [0]
+    hib_parts: list[np.ndarray] = []
+    hib_off = [0]
+
+    def _hi_set(rung: int) -> np.ndarray:
+        # exact-K hi (plane-B/exact) token set at a rung = selected minus the lo
+        # tokens the sim assigns (frozen split when precision_frozen_hi_count).
+        sel = np.asarray(selected_by_k[int(rung)], dtype=np.int64)
+        if precision_k_hi_frac >= 1.0:
+            return sel
+        lo = np.asarray(
+            lo_tokens_fn(int(k_budgets[int(rung)]), precision_frozen_hi_count),
+            dtype=np.int64,
+        )
+        if lo.size == 0:
+            return sel
+        return np.setdiff1d(sel, lo, assume_unique=False)
+
+    for e in events:
+        i = int(e["epoch_id"])
+        seg_ki = int(e["ki_before"])
+        band_k = int(e["k_read_rung"])
+        v_read_ki = int(e["v_read_ki"])
+        v_read_vi = int(e["v_read_vi"])
+        col["epoch_id"][i] = int(e["epoch_id"])
+        col["parent_epoch_id"][i] = int(e["parent_epoch_id"])
+        col["event_kind_code"][i] = int(e["kind"])
+        col["true_action_kind_code"][i] = int(e["true_action_kind"])
+        col["is_start_eval"][i] = bool(e["is_start_eval"])
+        col["ki_before"][i] = seg_ki
+        col["vi_before"][i] = int(e["vi_before"])
+        col["ki_after"][i] = int(e["ki_after"])
+        col["vi_after"][i] = int(e["vi_after"])
+        col["k_read_rung"][i] = band_k
+        col["v_read_ki"][i] = v_read_ki
+        col["v_read_vi"][i] = v_read_vi
+        col["k_read_mb"][i] = float(e["k_read_mb"])
+        col["v_read_mb"][i] = float(e["v_read_mb"])
+        col["walk_mb_contribution"][i] = float(e["walk_mb_contribution"])
+
+        # K marginal band read (stability-pair lookahead seg_ki -> band_k).
+        sel_here = np.asarray(selected_by_k[int(seg_ki)], dtype=np.int64)
+        sel_read = np.asarray(selected_by_k[int(band_k)], dtype=np.int64)
+        k_marg = np.setdiff1d(sel_read, sel_here, assume_unique=False) if band_k != seg_ki else np.zeros(0, dtype=np.int64)
+        # V marginal band read (seg_ki, seg_vi -> v_read_vi).
+        v_here = np.flatnonzero(np.asarray(exact_mask_by_pair[(seg_ki, int(e["vi_before"]))], dtype=bool)).astype(np.int64)
+        v_read = np.flatnonzero(np.asarray(exact_mask_by_pair[(v_read_ki, v_read_vi)], dtype=bool)).astype(np.int64)
+        v_marg = np.setdiff1d(v_read, v_here, assume_unique=False) if v_read_vi != int(e["vi_before"]) else np.zeros(0, dtype=np.int64)
+
+        col["n_k_marginal"][i] = int(k_marg.size)
+        col["n_v_marginal"][i] = int(v_marg.size)
+        col["n_k_exact_cum"][i] = int(sel_read.size)
+        col["n_v_exact_cum"][i] = int(v_read.size)
+        col["rank_candidate_set_size"][i] = int(selected_counts_by_idx[int(band_k)])
+        # compute-op definitions (documented in README):
+        #  n_dot_products      = exact q.k logits newly computed for the K
+        #                        lookahead band read at this epoch (marginal set).
+        #  n_band_accumulations = prob*V-row accumulations newly performed for the
+        #                        V lookahead band read at this epoch (marginal set).
+        col["n_dot_products"][i] = int(k_marg.size)
+        col["n_band_accumulations"][i] = int(v_marg.size)
+
+        # K-move crossing structure (only for a realized K up-move).
+        hi_b = np.zeros(0, dtype=np.int64)
+        if int(e["true_action_kind"]) == _EPOCH_KIND_K_UP and band_k != seg_ki:
+            col["kmove_den_old"][i] = _epoch_softmax_den(scores_by_k, seg_ki)
+            col["kmove_den_new"][i] = _epoch_softmax_den(scores_by_k, band_k)
+            if precision_k_hi_frac < 1.0:
+                hi_b = np.setdiff1d(_hi_set(band_k), _hi_set(seg_ki), assume_unique=False)
+        col["n_hi_boundary"][i] = int(hi_b.size)
+
+        # descriptive per-region reads for the marginal bands (logical bytes).
+        rn = {name: idx for idx, name in enumerate(_EPOCH_REGION_NAMES)}
+        # K marginal tokens enter as int8 lo under the frozen split (plane A +
+        # PQ codes + int8-err sidecar); hi-boundary tokens additionally lift to
+        # exact (plane B). code_error sidecar accompanies the V read.
+        region_ntokens[i, rn["k_plane_a_lo"]] = int(k_marg.size)
+        region_ntokens[i, rn["kpq_codes"]] = int(k_marg.size)
+        region_ntokens[i, rn["int8_err_sc"]] = int(k_marg.size)
+        region_ntokens[i, rn["k_plane_b_hi"]] = int(hi_b.size)
+        region_ntokens[i, rn["v_plane_a_lo"]] = int(v_marg.size)
+        region_ntokens[i, rn["vpq_codes"]] = int(v_marg.size)
+        region_ntokens[i, rn["code_error_sc"]] = int(v_marg.size)
+        region_logical_bytes[i, rn["k_plane_a_lo"]] = float(k_marg.size) * k_lo_w
+        region_logical_bytes[i, rn["k_plane_b_hi"]] = float(hi_b.size) * k_hi_w
+        region_logical_bytes[i, rn["kpq_codes"]] = float(k_marg.size) * kpq_w
+        region_logical_bytes[i, rn["int8_err_sc"]] = float(k_marg.size) * sc_w
+        region_logical_bytes[i, rn["v_plane_a_lo"]] = float(v_marg.size) * v_lo_w
+        region_logical_bytes[i, rn["vpq_codes"]] = float(v_marg.size) * vpq_w
+        region_logical_bytes[i, rn["code_error_sc"]] = float(v_marg.size) * sc_w
+
+        k_marg_parts.append(k_marg)
+        k_marg_off.append(k_marg_off[-1] + int(k_marg.size))
+        v_marg_parts.append(v_marg)
+        v_marg_off.append(v_marg_off[-1] + int(v_marg.size))
+        hib_parts.append(hi_b)
+        hib_off.append(hib_off[-1] + int(hi_b.size))
+
+    committed_k = np.asarray(selected_by_k[int(settled_ki)], dtype=np.int64)
+    committed_v = np.flatnonzero(
+        np.asarray(exact_mask_by_pair[(int(settled_ki), int(settled_vi))], dtype=bool)
+    ).astype(np.int64)
+    start_k = np.asarray(selected_by_k[int(start_ki)], dtype=np.int64)
+
+    recon_sum = float(np.sum(col["walk_mb_contribution"])) if n_ep else float(total_mb)
+    recon_abs_err = abs(recon_sum - float(walk_total_mb))
+
+    out_root.mkdir(parents=True, exist_ok=True)
+    fname = f"epoch_q{int(qidx)}_h{int(head)}.npz"
+    np.savez_compressed(
+        out_root / fname,
+        # ---- file-level meta ----
+        qidx=np.int64(qidx),
+        head=np.int64(head),
+        kv_head=np.int64(kv_head),
+        position=np.int64(position),
+        context_len=np.int64(context_len),
+        page_size=np.int64(page_size),
+        head_dim=np.int64(head_dim),
+        policy=str(policy),
+        threshold=np.float64(threshold),
+        start_strategy=str(start_strategy),
+        start_ki=np.int64(start_ki),
+        start_vi=np.int64(start_vi),
+        settled_ki=np.int64(settled_ki),
+        settled_vi=np.int64(settled_vi),
+        settled_k_budget=np.int64(k_budgets[int(settled_ki)]),
+        settled_v_budget=np.int64(v_budgets[int(settled_vi)]),
+        n_epochs=np.int64(n_ep),
+        total_MB=np.float64(total_mb),
+        v_path_MB=np.float64(v_path_mb),
+        v_state_MB=np.float64(v_state_mb),
+        k_exact_MB=np.float64(k_mb_by_idx[int(settled_ki)]),
+        walk_step_MB_per_head=np.float64(walk_total_mb),
+        walk_mb_reconstructed_sum=np.float64(recon_sum),
+        walk_mb_reconstruction_abs_err=np.float64(recon_abs_err),
+        precision_frozen_hi_count=np.int64(-1 if precision_frozen_hi_count is None else int(precision_frozen_hi_count)),
+        precision_k_hi_frac=np.float64(precision_k_hi_frac),
+        precision_v_hi_frac=np.float64(precision_v_hi_frac),
+        precision_lo_bits=np.int64(precision_lo_bits),
+        precision_lo_bytes=np.float64(precision_lo_bytes),
+        v_lo_reads=np.int64(v_lo_reads),
+        v_dropped_reads=np.int64(v_dropped_reads),
+        # region byte-width metadata (logical; Phase-2 maps to physical lines)
+        region_names=np.asarray(_EPOCH_REGION_NAMES),
+        region_byte_widths=np.asarray(
+            [k_lo_w, k_hi_w, kpq_w, v_lo_w, v_hi_w, vpq_w, sc_w, sc_w], dtype=np.float64
+        ),
+        n_pages=np.int64(n_pages),
+        # ---- per-epoch columns ----
+        **{f"epoch_{k}": v for k, v in col.items()},
+        epoch_region_ntokens=region_ntokens,
+        epoch_region_logical_bytes=region_logical_bytes,
+        # ---- CSR token sets ----
+        k_marginal_tokens=(np.concatenate(k_marg_parts) if k_marg_parts else np.zeros(0, dtype=np.int64)),
+        k_marginal_offsets=np.asarray(k_marg_off, dtype=np.int64),
+        v_marginal_tokens=(np.concatenate(v_marg_parts) if v_marg_parts else np.zeros(0, dtype=np.int64)),
+        v_marginal_offsets=np.asarray(v_marg_off, dtype=np.int64),
+        hi_boundary_tokens=(np.concatenate(hib_parts) if hib_parts else np.zeros(0, dtype=np.int64)),
+        hi_boundary_offsets=np.asarray(hib_off, dtype=np.int64),
+        # ---- committed / start full sets (Phase-2 + gqa-union reproduction) ----
+        start_k_tokens=start_k,
+        committed_k_tokens=committed_k,
+        committed_v_tokens=committed_v,
+    )
+    return {
+        "file": fname,
+        "qidx": int(qidx),
+        "position": int(position),
+        "context_len": int(context_len),
+        "head": int(head),
+        "kv_head": int(kv_head),
+        "policy": str(policy),
+        "threshold": float(threshold),
+        "start_strategy": str(start_strategy),
+        "start_ki": int(start_ki),
+        "start_vi": int(start_vi),
+        "settled_ki": int(settled_ki),
+        "settled_vi": int(settled_vi),
+        "n_epochs": int(n_ep),
+        "n_k_escalations": int(np.count_nonzero(col["true_action_kind_code"] == _EPOCH_KIND_K_UP)),
+        "n_v_escalations": int(np.count_nonzero(col["true_action_kind_code"] == _EPOCH_KIND_V_UP)),
+        "committed_k_tokens": int(committed_k.size),
+        "committed_v_tokens": int(committed_v.size),
+        "total_MB": float(total_mb),
+        "walk_step_MB_per_head": float(walk_total_mb),
+        "walk_mb_reconstructed_sum": float(recon_sum),
+        "walk_mb_reconstruction_abs_err": float(recon_abs_err),
+    }
+
+
+def _finalize_epoch_trace(out_root: Path, index_rows: list[dict[str, object]], config_meta: dict[str, object]) -> None:
+    """Write the cross-head index (CSV + JSONL) and a README documenting every
+    field and the frozen config used for the run."""
+    if not index_rows:
+        return
+    out_root.mkdir(parents=True, exist_ok=True)
+    fieldnames: list[str] = list(index_rows[0].keys())
+    seen = set(fieldnames)
+    for r in index_rows[1:]:
+        for k in r.keys():
+            if k not in seen:
+                fieldnames.append(k)
+                seen.add(k)
+    with (out_root / "epoch_trace_index.csv").open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(index_rows)
+    with (out_root / "epoch_trace_index.jsonl").open("w", encoding="utf-8") as f:
+        for r in index_rows:
+            f.write(json.dumps(r, sort_keys=True))
+            f.write("\n")
+    readme = _EPOCH_TRACE_README.format(config=json.dumps(config_meta, indent=2, sort_keys=True))
+    (out_root / "README.md").write_text(readme, encoding="utf-8")
+
+
+_EPOCH_TRACE_README = """# Dependency epoch trace (issue #11, Phase 1)
+
+Pure-observer trace of the realized escalation walk in the golden NumPy sim
+(`run_joint_kv_budget_policy_eval.py`). Enabling `--epoch_trace_dir` adds these
+files and changes NO other output (byte-identical with the flag off/on).
+
+## Files
+- `epoch_q{{qidx}}_h{{head}}.npz` -- one per (qidx, head); compact arrays below.
+- `epoch_trace_index.csv` / `.jsonl` -- one row per (qidx, head) file.
+- `README.md` -- this file.
+
+## Epoch model
+One epoch per realized walk segment (the SAME segments the runner's
+`walk_step_MB_per_head` accumulator iterates). `event_kind_code`:
+`0=start_eval, 1=k_up, 2=v_up, 3=commit`. `event_kind_code` is `start_eval`
+for the first segment (start-rung evaluation) and otherwise equals the
+segment action; `true_action_kind_code` always carries the raw segment action
+(so a first-segment K up-move reads `event_kind=start_eval`,
+`true_action_kind=k_up`, `is_start_eval=True`). The terminal `stop` segment is
+`commit`. De-escalation (`kd`/`vd`) and `frozen_budget` segments are OFF the
+escalate-only walk basis and are skipped, matching the runner.
+
+Each segment READS its lookahead bands with no refund (deepest band per axis):
+the K stability pair `(ki, ki+1)` and the marginal V band `(vi, vi+1)`.
+
+## Walk-MB reconciliation (gate 2)
+`epoch_walk_mb_contribution` is the incremental max of the K/V band costs,
+seeded at the settled rung exactly as the runner seeds it; the settled
+committed cost `total_MB` is attached to the commit epoch. Therefore
+`sum(epoch_walk_mb_contribution) == walk_step_MB_per_head` to float roundoff.
+`walk_mb_reconstructed_sum` and `walk_mb_reconstruction_abs_err` record the
+realized reconstruction error per file (expected ~1e-12 MB or 0).
+
+## GQA union reproduction (gate 3)
+`committed_k_tokens` = `selected_by_k[settled_ki]` and `committed_v_tokens` =
+`flatnonzero(exact_mask[(settled_ki, settled_vi)])` are the EXACT arrays the
+runner's `--gqa_union_stats` accumulates, so K/V union-over-sum recomputed per
+4-head group from these reproduces `gqa_union_stats.csv` exactly.
+
+## npz fields
+File meta: qidx, head, kv_head, position, context_len, page_size, head_dim,
+policy, threshold, start_strategy, start_ki/vi, settled_ki/vi,
+settled_k/v_budget, n_epochs, total_MB, v_path_MB, v_state_MB, k_exact_MB,
+walk_step_MB_per_head, walk_mb_reconstructed_sum, walk_mb_reconstruction_abs_err,
+precision_frozen_hi_count (-1 == not frozen), precision_k/v_hi_frac,
+precision_lo_bits/bytes, v_lo_reads, v_dropped_reads, region_names,
+region_byte_widths, n_pages.
+
+Per-epoch columns (prefix `epoch_`, length n_epochs): epoch_id,
+parent_epoch_id, event_kind_code, true_action_kind_code, is_start_eval,
+ki_before, vi_before, ki_after, vi_after, k_read_rung, v_read_ki, v_read_vi,
+k_read_mb, v_read_mb, walk_mb_contribution, rank_candidate_set_size,
+n_dot_products, n_band_accumulations, n_k_marginal, n_v_marginal,
+n_k_exact_cum, n_v_exact_cum, n_hi_boundary, kmove_den_old, kmove_den_new
+(NaN unless a realized K up-move).
+
+Compute-op definitions: `n_dot_products` = exact q.k logits newly computed for
+the epoch's K lookahead band (marginal K set size); `n_band_accumulations` =
+prob*V-row accumulations newly performed for the epoch's V lookahead band
+(marginal V set size). `rank_candidate_set_size` = selected-K count at the
+read rung.
+
+K-move crossing (per §4 item 5b): for a realized K up-move, the marginal band
+`(B_lo, B_hi]` (new exact-K tokens) is `k_marginal_tokens` for that epoch and
+enters as int8 lo under the frozen split; the hi-boundary band
+`(ceil(0.1*B_lo), ceil(0.1*B_hi)]` that lifts int8->exact is
+`hi_boundary_tokens` (empty under `--precision_split_freeze start`, which
+freezes the hi count for the whole walk). `kmove_den_old`/`kmove_den_new` are
+the softmax denominators the Vcorr scalar rescale uses.
+
+Region logical bytes: `epoch_region_ntokens` and `epoch_region_logical_bytes`
+(shape n_epochs x len(region_names)) give the per-region MARGINAL-band token
+counts and LOGICAL bytes (token count * region_byte_widths). These are pre-
+physical-line-mapping (Phase 2); no line/burst widths are invented here.
+
+CSR token sets (concat + offsets, length n_epochs+1): k_marginal_tokens,
+v_marginal_tokens, hi_boundary_tokens. File-level sets: start_k_tokens,
+committed_k_tokens, committed_v_tokens.
+
+## Frozen run config
+```json
+{config}
+```
+"""
+
+
 def run() -> None:
     parser = argparse.ArgumentParser(description="Joint K/V budget policy simulation on saved QKV traces.")
     parser.add_argument("--qkv_trace", required=True)
@@ -2692,6 +3250,20 @@ def run() -> None:
         ),
     )
     parser.add_argument(
+        "--epoch_trace_dir",
+        default="",
+        help=(
+            "If set, write a pure-observer dependency epoch trace (issue #11): "
+            "one npz per (qidx, head) reconstructing the realized escalation "
+            "walk into per-event records (start_eval / k_up / v_up / commit) "
+            "with token-level per-region reads on the walk basis, K-move "
+            "crossing structure, rank-candidate sizes and compute-op counts, "
+            "plus a cross-head index (CSV/JSONL) and a README. Observer only: "
+            "does not change any numeric output. Run with a single (policy, "
+            "threshold, start) combination."
+        ),
+    )
+    parser.add_argument(
         "--golden_dump_dir",
         default="",
         help=(
@@ -2872,6 +3444,9 @@ def run() -> None:
     kv_storage_dualplane = str(args.kv_storage_format) == "int8_dualplane"
     temporal_reuse_max_stale = int(args.temporal_reuse_max_stale)
     temporal_cache_stats = bool(args.temporal_cache_stats)
+    epoch_trace_stats = bool(str(args.epoch_trace_dir))
+    epoch_trace_dir = Path(str(args.epoch_trace_dir)) if epoch_trace_stats else None
+    epoch_trace_index_rows: list[dict[str, object]] = []
     temporal_budget_frozen = str(args.temporal_reuse_budget) == "frozen"
     if temporal_budget_frozen and temporal_reuse_max_stale <= 0:
         raise ValueError("--temporal_reuse_budget frozen requires --temporal_reuse_max_stale > 0")
@@ -3752,7 +4327,7 @@ def run() -> None:
                                     residual=residual,
                                     exact_mask=exact_mask,
                                 )
-                            if temporal_cache_stats or gqa_union_stats:
+                            if temporal_cache_stats or gqa_union_stats or epoch_trace_stats:
                                 exact_mask_by_pair[(ki, vi)] = np.asarray(exact_mask, dtype=bool)
                             if la_active:
                                 la_masks.append(np.asarray(exact_mask, dtype=bool))
@@ -4245,6 +4820,71 @@ def run() -> None:
                                 head_rows.append(row)
                                 head_choices[key].append(row)
 
+                                if epoch_trace_stats and epoch_trace_dir is not None:
+                                    # Pure observer: reconstruct the realized walk
+                                    # into epoch records. Reads only arrays already
+                                    # computed above; writes only under
+                                    # --epoch_trace_dir.
+                                    def _epoch_lo_tokens(budget: int, frozen_hi_count: int | None) -> np.ndarray:
+                                        if scores_lo_np is None or precision_k_hi_frac >= 1.0:
+                                            return np.zeros(0, dtype=np.int64)
+                                        return _precision_lo_tokens(
+                                            base=base,
+                                            ranked_cpu=variant_ranked_cpu,
+                                            budget=int(budget),
+                                            context_len=int(context_len),
+                                            hi_frac=precision_k_hi_frac,
+                                            frozen_hi_count=frozen_hi_count,
+                                        )
+                                    epoch_trace_index_rows.append(
+                                        _write_epoch_trace(
+                                            epoch_trace_dir,
+                                            qidx=int(qidx),
+                                            head=int(head),
+                                            kv_head=int(kv_head),
+                                            position=int(position),
+                                            context_len=int(context_len),
+                                            page_size=int(args.page_size),
+                                            head_dim=int(trace.head_dim),
+                                            policy=str(policy),
+                                            threshold=float(threshold),
+                                            start_strategy=str(start_strategy),
+                                            start_ki=int(start_ki),
+                                            start_vi=int(start_vi),
+                                            settled_ki=int(ki),
+                                            settled_vi=int(vi),
+                                            policy_trace=list(policy_trace),
+                                            k_budgets=k_budgets,
+                                            v_budgets=v_budgets,
+                                            k_mb_by_idx=k_mb_by_idx,
+                                            v_mb_by_pair=v_mb_by_pair,
+                                            v_path_mb=float(v_path_mb),
+                                            v_state_mb=float(v_state_mb),
+                                            total_mb=float(total_mb),
+                                            walk_total_mb=float(walk_total_mb),
+                                            selected_by_k=selected_by_k,
+                                            selected_counts_by_idx=selected_counts_by_idx,
+                                            exact_mask_by_pair=exact_mask_by_pair,
+                                            scores_by_k=scores_by_k,
+                                            precision_frozen_hi_count=precision_frozen_hi_count,
+                                            precision_k_hi_frac=float(precision_k_hi_frac),
+                                            precision_v_hi_frac=float(precision_v_hi_frac),
+                                            precision_lo_bits=int(precision_lo_bits),
+                                            precision_lo_bytes=float(precision_lo_bytes),
+                                            v_lo_reads=int(v_lo_by_pair.get((ki, vi), 0)),
+                                            v_dropped_reads=int(v_dropped_by_pair.get((ki, vi), 0)),
+                                            key_bytes=int(args.key_bytes),
+                                            value_bytes=int(args.value_bytes),
+                                            subvecs=int(args.subvecs),
+                                            kpq_code_bytes=(1 if int(args.subbits) <= 8 else 2),
+                                            value_subvecs=int(actual_value_subvecs),
+                                            vpq_code_bytes=int(code_bytes),
+                                            code_stat_bytes=int(args.code_stat_bytes),
+                                            n_pages=int(len(index.pages)),
+                                            lo_tokens_fn=_epoch_lo_tokens,
+                                        )
+                                    )
+
                                 if la_active:
                                     for dv in lookahead_decision_variants:
                                         dv_test_log: list[tuple[int, int, bool, bool, float, float, float, float]] = []
@@ -4584,6 +5224,45 @@ def run() -> None:
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
     print(f"[joint_kv_budget_policy_eval] wrote {out_dir}")
+
+    if epoch_trace_stats and epoch_trace_dir is not None:
+        _finalize_epoch_trace(
+            epoch_trace_dir,
+            epoch_trace_index_rows,
+            {
+                "qkv_trace": str(args.qkv_trace),
+                "heads": [int(h) for h in heads],
+                "decode_lengths": str(args.decode_lengths),
+                "max_qidx_per_decode": int(args.max_qidx_per_decode),
+                "qidx_traced": sorted({int(r["qidx"]) for r in epoch_trace_index_rows}),
+                "page_size": int(args.page_size),
+                "static_prefix": int(args.static_prefix),
+                "static_suffix": int(args.static_suffix),
+                "policies": [str(p) for p in policies],
+                "start_strategies": [str(s) for s in start_strategies],
+                "thresholds": [float(t) for t in thresholds],
+                "threshold_mode": str(args.threshold_mode),
+                "threshold_reference_frac": float(args.threshold_reference_frac),
+                "threshold_scale_shape": str(args.threshold_scale_shape),
+                "threshold_min_scale": float(args.threshold_min_scale),
+                "threshold_max_scale": float(args.threshold_max_scale),
+                "precision_k_hi_frac": float(precision_k_hi_frac),
+                "precision_v_hi_frac": float(precision_v_hi_frac),
+                "precision_lo_mode": str(args.precision_lo_mode),
+                "precision_lo_bits": int(precision_lo_bits),
+                "precision_split_freeze": str(precision_split_freeze),
+                "logit_buffer_bits": int(args.logit_buffer_bits),
+                "logit_buffer_format": str(args.logit_buffer_format),
+                "temporal_reuse_mode": str(args.temporal_reuse_mode),
+                "temporal_reuse_budget": str(args.temporal_reuse_budget),
+                "score_proxy_variants": [str(v) for v in score_proxy_variants],
+                "v_selection_rules": [str(r) for r in v_selection_rules],
+                "k_budget_fracs": [float(x) for x in k_budget_fracs],
+                "v_budget_fracs": [float(x) for x in v_budget_fracs],
+                "n_files": int(len(epoch_trace_index_rows)),
+            },
+        )
+        print(f"[joint_kv_budget_policy_eval] wrote epoch trace {epoch_trace_dir}")
 
 
 if __name__ == "__main__":
