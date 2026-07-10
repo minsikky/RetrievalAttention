@@ -2745,6 +2745,17 @@ def _write_epoch_trace(
         np.asarray(exact_mask_by_pair[(int(settled_ki), int(settled_vi))], dtype=bool)
     ).astype(np.int64)
     start_k = np.asarray(selected_by_k[int(start_ki)], dtype=np.int64)
+    # Phase-2 replay fields (issue #11): the physical replay needs the start
+    # V read set and the K hi-tier (plane A+B) token identity, which the
+    # marginal-band records alone do not pin. Under the frozen split the hi
+    # set is constant across the walk (frozen count over nested ranked
+    # prefixes + the same base); both endpoints are stored so the consumer
+    # can verify rather than assume.
+    start_v = np.flatnonzero(
+        np.asarray(exact_mask_by_pair[(int(start_ki), int(start_vi))], dtype=bool)
+    ).astype(np.int64)
+    k_hi_settled = np.asarray(_hi_set(int(settled_ki)), dtype=np.int64)
+    k_hi_start = np.asarray(_hi_set(int(start_ki)), dtype=np.int64)
 
     recon_sum = float(np.sum(col["walk_mb_contribution"])) if n_ep else float(total_mb)
     recon_abs_err = abs(recon_sum - float(walk_total_mb))
@@ -2806,6 +2817,11 @@ def _write_epoch_trace(
         start_k_tokens=start_k,
         committed_k_tokens=committed_k,
         committed_v_tokens=committed_v,
+        # ---- Phase-2 physical-replay fields (trace_format_version >= 2) ----
+        trace_format_version=np.int64(2),
+        start_v_tokens=start_v,
+        k_hi_tokens=k_hi_settled,
+        k_hi_tokens_start=k_hi_start,
     )
     return {
         "file": fname,
@@ -2936,6 +2952,12 @@ physical-line-mapping (Phase 2); no line/burst widths are invented here.
 CSR token sets (concat + offsets, length n_epochs+1): k_marginal_tokens,
 v_marginal_tokens, hi_boundary_tokens. File-level sets: start_k_tokens,
 committed_k_tokens, committed_v_tokens.
+
+Phase-2 physical-replay fields (trace_format_version >= 2): start_v_tokens
+(exact V set at the start rung -- the V read the start_eval epoch charges),
+k_hi_tokens / k_hi_tokens_start (K hi-tier = plane A+B token identity at the
+settled / start rung; equal under --precision_split_freeze start, both stored
+so the consumer verifies constancy instead of assuming it).
 
 ## Frozen run config
 ```json
@@ -3264,6 +3286,42 @@ def run() -> None:
         ),
     )
     parser.add_argument(
+        "--v_threshold_lab_dir",
+        default="",
+        help=(
+            "Absolute-V-threshold lab (issues #12-#18): if set, at each "
+            "committed operating point evaluate the local predicate "
+            "exact_V_i = finite_i && (p_pq^2 * V_error_i >= theta) over the "
+            "--v_threshold_grid, alongside the canonical global top-B rule, "
+            "and log per-theta exact-V count / bytes / o-proj relL2 / "
+            "false-negative and false-positive risk mass, plus a per-head-step "
+            "risk-curve summary (quantile grid, near-cutoff exact values, "
+            "total risk mass) and PQ-scan summary features. Pure ADDITION: "
+            "with this unset behavior is byte-identical. p_pq is the deployable "
+            "scan-domain PQ/softmax probability (no dense probabilities)."
+        ),
+    )
+    parser.add_argument(
+        "--v_threshold_grid",
+        default="",
+        help=(
+            "Comma-separated list of absolute risk thresholds theta for the "
+            "--v_threshold_lab_dir sweep (fixed across all heads/positions)."
+        ),
+    )
+    parser.add_argument(
+        "--v_threshold_lab_nearcut_halfwidth",
+        type=int,
+        default=64,
+        help="Half-width (in ranks) of the exact near-cutoff risk window logged per head-step.",
+    )
+    parser.add_argument(
+        "--v_threshold_lab_quantiles",
+        type=int,
+        default=257,
+        help="Number of log-spaced rank-quantile points sampled from the sorted risk curve per head-step.",
+    )
+    parser.add_argument(
         "--golden_dump_dir",
         default="",
         help=(
@@ -3358,6 +3416,19 @@ def run() -> None:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2, sort_keys=True), encoding="utf-8")
+
+    # ---- Absolute-V-threshold lab (issues #12-#18), pure observer ----
+    v_threshold_lab_stats = bool(str(args.v_threshold_lab_dir))
+    v_threshold_lab_dir = Path(str(args.v_threshold_lab_dir)) if v_threshold_lab_stats else None
+    v_threshold_grid = sorted(parse_csv_floats(args.v_threshold_grid)) if v_threshold_lab_stats else []
+    v_lab_theta_rows: list[dict[str, object]] = []
+    v_lab_headstep_rows: list[dict[str, object]] = []
+    v_lab_curve_qidx: list[int] = []
+    v_lab_curve_head: list[int] = []
+    v_lab_curve_quant: list[np.ndarray] = []
+    v_lab_curve_nearcut: list[np.ndarray] = []
+    if v_threshold_lab_stats and v_threshold_lab_dir is not None:
+        v_threshold_lab_dir.mkdir(parents=True, exist_ok=True)
 
     trace = load_trace(args.qkv_trace)
     if str(args.decode_lengths).strip().lower() == "all":
@@ -4327,7 +4398,7 @@ def run() -> None:
                                     residual=residual,
                                     exact_mask=exact_mask,
                                 )
-                            if temporal_cache_stats or gqa_union_stats or epoch_trace_stats:
+                            if temporal_cache_stats or gqa_union_stats or epoch_trace_stats or v_threshold_lab_stats:
                                 exact_mask_by_pair[(ki, vi)] = np.asarray(exact_mask, dtype=bool)
                             if la_active:
                                 la_masks.append(np.asarray(exact_mask, dtype=bool))
@@ -4820,6 +4891,207 @@ def run() -> None:
                                 head_rows.append(row)
                                 head_choices[key].append(row)
 
+                                if v_threshold_lab_stats:
+                                    # Absolute-V-threshold lab (issues #12-#18),
+                                    # pure observer at the committed (ki, vi).
+                                    # Deployable normalized risk: p_pq is the
+                                    # scan-domain softmax prob (mixed exact/PQ
+                                    # logits, e4m3 logit buffer) -- NO dense
+                                    # probabilities. Same array the canonical
+                                    # global top-B rule ranks on, so the
+                                    # predicate compares rule-vs-rule in one
+                                    # domain. Dense only scores relL2.
+                                    hd = int(trace.head_dim)
+                                    vbytes = int(args.value_bytes)
+                                    lo_bytes = float(precision_lo_bytes)
+                                    lab_probs = probs_by_k[ki].astype(np.float64, copy=False)
+                                    lab_ce = np.asarray(code_error, dtype=np.float64).reshape(-1)
+                                    lab_risk = (lab_probs * lab_probs) * lab_ce
+                                    if int(args.v_risk_key_exp_bits) > 0:
+                                        lab_risk = _quantize_risk_key(
+                                            lab_risk,
+                                            int(args.v_risk_key_exp_bits),
+                                            int(args.v_risk_key_mantissa_bits),
+                                        )
+                                    lab_finite = np.isfinite(lab_risk) & (lab_risk > 0.0)
+                                    total_risk_mass = float(lab_risk[lab_finite].sum())
+                                    n_ctx = int(context_len)
+
+                                    def _lab_eval_mask(sel_mask: np.ndarray) -> tuple[int, int, np.ndarray, float]:
+                                        reads_sel = int(np.count_nonzero(sel_mask))
+                                        if (
+                                            precision_v_hi_frac < 1.0
+                                            and residual_lo is not None
+                                            and precision_v_lo_err is not None
+                                            and reads_sel > 0
+                                        ):
+                                            exact_idx = np.flatnonzero(sel_mask)
+                                            hi_target = int(math.ceil(float(exact_idx.size) * precision_v_hi_frac))
+                                            risk_order = exact_idx[
+                                                np.argsort(-lab_risk[exact_idx].astype(np.float64, copy=False), kind="stable")
+                                            ]
+                                            lo_candidates = risk_order[hi_target:]
+                                            commit = lo_candidates[
+                                                _fp16_commit_mask(
+                                                    precision_v_lo_err[lo_candidates],
+                                                    lab_ce[lo_candidates],
+                                                )
+                                            ]
+                                            v_hi_mask = np.zeros((n_ctx,), dtype=bool)
+                                            v_lo_mask = np.zeros((n_ctx,), dtype=bool)
+                                            v_hi_mask[risk_order[:hi_target]] = True
+                                            v_lo_mask[commit] = True
+                                            eff_reads = int(hi_target + commit.size)
+                                            out_l = output_from_base_and_split_masks(
+                                                base_output=base_output_by_k[ki],
+                                                probs=lab_probs,
+                                                residual=residual,
+                                                residual_lo=residual_lo,
+                                                hi_mask=v_hi_mask,
+                                                lo_mask=v_lo_mask,
+                                            )
+                                            v_mb_l = v_path_mb_for_exact_reads(eff_reads) - float(
+                                                int(commit.size) * hd * (vbytes - lo_bytes)
+                                            ) / MB
+                                        else:
+                                            eff_reads = reads_sel
+                                            out_l = output_from_base_and_exact_mask(
+                                                base_output=base_output_by_k[ki],
+                                                probs=lab_probs,
+                                                residual=residual,
+                                                exact_mask=sel_mask,
+                                            )
+                                            v_mb_l = v_path_mb_for_exact_reads(eff_reads)
+                                        return reads_sel, eff_reads, out_l, float(v_mb_l)
+
+                                    canonical_count = max(0, min(int(v_budgets[vi]), n_ctx))
+                                    canon_sel_mask = top_mask(lab_risk, canonical_count)
+                                    canon_reads, canon_eff, canon_out, canon_v_mb = _lab_eval_mask(canon_sel_mask)
+                                    canon_cutoff = (
+                                        float(np.min(lab_risk[canon_sel_mask]))
+                                        if bool(np.any(canon_sel_mask))
+                                        else float("inf")
+                                    )
+                                    canon_rell2 = rel_l2(dense_head, canon_out)
+                                    canon_risk_mass_sel = float(lab_risk[canon_sel_mask].sum())
+
+                                    # PQ-scan summary features (issue #14 predictor inputs).
+                                    sv = scores_by_k[ki].astype(np.float64, copy=False)
+                                    sv_max = float(np.max(sv))
+                                    lse = float(sv_max + np.log(np.sum(np.exp(sv - sv_max))))
+                                    p_desc = np.sort(lab_probs)[::-1]
+                                    p_cumsum = np.cumsum(p_desc)
+                                    proxy90 = int(np.searchsorted(p_cumsum, 0.9, side="left")) + 1
+                                    entropy = float(-np.sum(lab_probs * np.log(np.clip(lab_probs, 1e-300, None))))
+                                    ce_pos = lab_ce[lab_ce > 0.0]
+                                    ce_mean = float(np.mean(lab_ce)) if lab_ce.size else 0.0
+                                    ce_p50 = float(np.percentile(ce_pos, 50)) if ce_pos.size else 0.0
+                                    ce_p95 = float(np.percentile(ce_pos, 95)) if ce_pos.size else 0.0
+                                    ce_max = float(np.max(lab_ce)) if lab_ce.size else 0.0
+                                    ctx_bucket = (
+                                        "0-16k" if n_ctx < 16000
+                                        else "16-48k" if n_ctx < 48000
+                                        else "48-96k" if n_ctx < 96000
+                                        else "96-160k"
+                                    )
+
+                                    hs_base = {
+                                        "qidx": int(qidx),
+                                        "position": int(position),
+                                        "decode_length": int(decode_tokens),
+                                        "context_len": n_ctx,
+                                        "context_bucket": ctx_bucket,
+                                        "head": int(head),
+                                        "kv_head": int(kv_head),
+                                        "layer": int(layer_idx),
+                                        "policy": str(policy),
+                                        "threshold": float(threshold),
+                                        "start_strategy": str(start_strategy),
+                                        "settled_ki": int(ki),
+                                        "settled_vi": int(vi),
+                                        "settled_k_budget": int(k_budgets[ki]),
+                                        "settled_v_budget": int(v_budgets[vi]),
+                                    }
+                                    v_lab_headstep_rows.append({
+                                        **hs_base,
+                                        "canonical_selected_count": int(canonical_count),
+                                        "canonical_effective_reads": int(canon_eff),
+                                        "canonical_cutoff_risk": float(canon_cutoff),
+                                        "canonical_relL2": float(canon_rell2),
+                                        "canonical_row_relL2": float(metric["output_relative_l2"]),
+                                        "canonical_v_path_MB": float(canon_v_mb),
+                                        "canonical_logical_v_bytes": float(canonical_count * hd * vbytes),
+                                        "canonical_risk_mass_selected": float(canon_risk_mass_sel),
+                                        "total_risk_mass": float(total_risk_mass),
+                                        "finite_risk_tokens": int(np.count_nonzero(lab_finite)),
+                                        "pq_lse": float(lse),
+                                        "pq_max_logit": float(sv_max),
+                                        "pq_entropy": float(entropy),
+                                        "proxy_mass_90_count": int(proxy90),
+                                        "code_error_mean": ce_mean,
+                                        "code_error_p50": ce_p50,
+                                        "code_error_p95": ce_p95,
+                                        "code_error_max": ce_max,
+                                    })
+
+                                    for theta in v_threshold_grid:
+                                        theta_sel = lab_finite & (lab_risk >= float(theta))
+                                        t_reads, t_eff, t_out, t_v_mb = _lab_eval_mask(theta_sel)
+                                        t_rell2 = rel_l2(dense_head, t_out)
+                                        _t_full = output_from_base_and_exact_mask(
+                                            base_output=base_output_by_k[ki],
+                                            probs=lab_probs,
+                                            residual=residual,
+                                            exact_mask=theta_sel,
+                                        )
+                                        _dbg_full = rel_l2(dense_head, _t_full)
+                                        fn_mask = canon_sel_mask & (~theta_sel)
+                                        fp_mask = theta_sel & (~canon_sel_mask)
+                                        v_lab_theta_rows.append({
+                                            **hs_base,
+                                            "theta": float(theta),
+                                            "exact_selected_count": int(t_reads),
+                                            "exact_effective_reads": int(t_eff),
+                                            "logical_v_bytes": float(t_reads * hd * vbytes),
+                                            "v_path_MB": float(t_v_mb),
+                                            "relL2": float(t_rell2),
+                                            "relL2_full_noSplit": float(_dbg_full),
+                                            "false_negative_risk_mass": float(lab_risk[fn_mask].sum()),
+                                            "false_positive_risk_mass": float(lab_risk[fp_mask].sum()),
+                                            "false_negative_count": int(np.count_nonzero(fn_mask)),
+                                            "false_positive_count": int(np.count_nonzero(fp_mask)),
+                                            "canonical_selected_count": int(canonical_count),
+                                            "canonical_relL2": float(canon_rell2),
+                                            "canonical_cutoff_risk": float(canon_cutoff),
+                                            "total_risk_mass": float(total_risk_mass),
+                                        })
+
+                                    # Per-head-step risk-curve summary (issues
+                                    # #16/#17): descending sorted risk sampled on
+                                    # a log-spaced rank grid PLUS exact values in
+                                    # a rank window around the canonical cutoff.
+                                    r_desc = np.sort(lab_risk[lab_finite].astype(np.float64, copy=False))[::-1]
+                                    nfin = int(r_desc.size)
+                                    n_q = max(2, int(args.v_threshold_lab_quantiles))
+                                    quant_curve = np.zeros((n_q,), dtype=np.float32)
+                                    if nfin > 0:
+                                        rank_frac = np.logspace(
+                                            math.log10(1.0 / float(nfin)), 0.0, num=n_q
+                                        )
+                                        idx_q = np.clip((rank_frac * nfin).astype(np.int64) - 1, 0, nfin - 1)
+                                        quant_curve = r_desc[idx_q].astype(np.float32, copy=False)
+                                    hw = max(1, int(args.v_threshold_lab_nearcut_halfwidth))
+                                    nearcut = np.zeros((2 * hw + 1,), dtype=np.float32)
+                                    if nfin > 0:
+                                        c0 = int(canonical_count)
+                                        for j, rk in enumerate(range(c0 - hw, c0 + hw + 1)):
+                                            rj = min(max(rk, 1), nfin) - 1
+                                            nearcut[j] = np.float32(r_desc[rj])
+                                    v_lab_curve_qidx.append(int(qidx))
+                                    v_lab_curve_head.append(int(head))
+                                    v_lab_curve_quant.append(quant_curve)
+                                    v_lab_curve_nearcut.append(nearcut)
+
                                 if epoch_trace_stats and epoch_trace_dir is not None:
                                     # Pure observer: reconstruct the realized walk
                                     # into epoch records. Reads only arrays already
@@ -5223,6 +5495,52 @@ def run() -> None:
         "summary": summary_rows,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+
+    if v_threshold_lab_stats and v_threshold_lab_dir is not None:
+        for fname, lab_rows in (
+            ("v_threshold_theta.csv", v_lab_theta_rows),
+            ("v_threshold_headstep.csv", v_lab_headstep_rows),
+        ):
+            if not lab_rows:
+                continue
+            with (v_threshold_lab_dir / fname).open("w", newline="", encoding="utf-8") as f:
+                fieldnames = list(lab_rows[0].keys())
+                seen = set(fieldnames)
+                for r in lab_rows[1:]:
+                    for k in r.keys():
+                        if k not in seen:
+                            fieldnames.append(k)
+                            seen.add(k)
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(lab_rows)
+        if v_lab_curve_quant:
+            np.savez_compressed(
+                v_threshold_lab_dir / "v_threshold_curves.npz",
+                qidx=np.asarray(v_lab_curve_qidx, dtype=np.int64),
+                head=np.asarray(v_lab_curve_head, dtype=np.int64),
+                risk_quantiles=np.stack(v_lab_curve_quant, axis=0),
+                near_cutoff_risk=np.stack(v_lab_curve_nearcut, axis=0),
+                theta_grid=np.asarray(v_threshold_grid, dtype=np.float64),
+                nearcut_halfwidth=np.int64(int(args.v_threshold_lab_nearcut_halfwidth)),
+            )
+        (v_threshold_lab_dir / "lab_meta.json").write_text(
+            json.dumps(
+                {
+                    "theta_grid": list(v_threshold_grid),
+                    "n_headsteps": int(len(v_lab_headstep_rows)),
+                    "n_theta_rows": int(len(v_lab_theta_rows)),
+                    "canonical_v_selection_rule": str(args.v_selection_rules),
+                    "layer_idx": int(layer_idx),
+                    "nearcut_halfwidth": int(args.v_threshold_lab_nearcut_halfwidth),
+                    "quantile_points": int(args.v_threshold_lab_quantiles),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        print(f"[joint_kv_budget_policy_eval] wrote v_threshold_lab -> {v_threshold_lab_dir}")
     print(f"[joint_kv_budget_policy_eval] wrote {out_dir}")
 
     if epoch_trace_stats and epoch_trace_dir is not None:
