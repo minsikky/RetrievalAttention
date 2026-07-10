@@ -1,5 +1,18 @@
 # Current Status
 
+## 2026-07-10 Frozen-sim decode select round 2 (CPU-complete, GPU gates pending)
+
+The Torch precision V-prefix now has a default 1600 MiB transient ceiling.
+It preserves the original six-K batch shape at 32k and processes one K rung
+at a time at 128k, projecting the 32.8 GiB warmed base plus 1.5-2.0 GiB select
+transient (about 34.3-34.8 GiB total). Score rows and V-budget projections are
+batched without changing their reductions; transient V-PQ reconstruction uses
+one shared workspace. Default-off fused prefix/risk-sort, compile, bf16, and
+TF32 diagnostics are wired for GPU A/B. Python compilation, the memory-bounded
+V-PQ suite, and the 16k CPU parity smoke pass; CUDA extension build, 32k
+identity/timing, and 128k fit remain pending. Full decomposition and flags:
+`notes/frozensim_decode_perf_round2_20260710.md`.
+
 ## 2026-07-09 Frozen-sim 128k MIG40 memory fix
 
 The precision-tier frozen simulator no longer retains full-context float32
