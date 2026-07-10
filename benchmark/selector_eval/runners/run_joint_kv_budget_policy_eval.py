@@ -2977,6 +2977,18 @@ def run() -> None:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--decode_lengths", default="500,1000,2000,4000,8000,16000,32000,64000,128000")
     parser.add_argument("--max_qidx_per_decode", type=int, default=1)
+    parser.add_argument(
+        "--qidx_slice_start",
+        type=int,
+        default=0,
+        help="Start index (inclusive) of a contiguous slice over the resolved query-index list, for splitting a sweep across jobs. Default 0.",
+    )
+    parser.add_argument(
+        "--qidx_slice_stop",
+        type=int,
+        default=-1,
+        help="Stop index (exclusive) of the query-index slice; -1 keeps all. Default -1 (no-op).",
+    )
     parser.add_argument("--heads", default="")
     parser.add_argument("--k_budgets", default="4096,8192,14336,32768")
     parser.add_argument("--v_budgets", default="1024,2048,4096,6144,8192,12288,16384")
@@ -3445,6 +3457,13 @@ def run() -> None:
             limited.append(int(qidx))
             counts[int(decode)] = counts.get(int(decode), 0) + 1
         q_indices = limited
+    if int(args.qidx_slice_stop) >= 0 or int(args.qidx_slice_start) > 0:
+        # Contiguous slice of the resolved query-index list, for splitting a
+        # large position sweep across array-style jobs. Default (start 0,
+        # stop -1) is a no-op keeping the full list.
+        lo = max(0, int(args.qidx_slice_start))
+        hi = len(q_indices) if int(args.qidx_slice_stop) < 0 else int(args.qidx_slice_stop)
+        q_indices = q_indices[lo:hi]
     if not q_indices:
         raise ValueError("no query indices selected")
 
@@ -5038,13 +5057,18 @@ def run() -> None:
                                         theta_sel = lab_finite & (lab_risk >= float(theta))
                                         t_reads, t_eff, t_out, t_v_mb = _lab_eval_mask(theta_sel)
                                         t_rell2 = rel_l2(dense_head, t_out)
-                                        _t_full = output_from_base_and_exact_mask(
+                                        # relL2 of the same theta selection read at
+                                        # FULL fp16 (no int8 hi/lo split): isolates
+                                        # pure selection quality from the precision
+                                        # split so the absolute-rule verdict is not
+                                        # confounded by the commit stage.
+                                        t_out_full = output_from_base_and_exact_mask(
                                             base_output=base_output_by_k[ki],
                                             probs=lab_probs,
                                             residual=residual,
                                             exact_mask=theta_sel,
                                         )
-                                        _dbg_full = rel_l2(dense_head, _t_full)
+                                        t_rell2_full = rel_l2(dense_head, t_out_full)
                                         fn_mask = canon_sel_mask & (~theta_sel)
                                         fp_mask = theta_sel & (~canon_sel_mask)
                                         v_lab_theta_rows.append({
@@ -5055,7 +5079,7 @@ def run() -> None:
                                             "logical_v_bytes": float(t_reads * hd * vbytes),
                                             "v_path_MB": float(t_v_mb),
                                             "relL2": float(t_rell2),
-                                            "relL2_full_noSplit": float(_dbg_full),
+                                            "relL2_full_noSplit": float(t_rell2_full),
                                             "false_negative_risk_mass": float(lab_risk[fn_mask].sum()),
                                             "false_positive_risk_mass": float(lab_risk[fp_mask].sum()),
                                             "false_negative_count": int(np.count_nonzero(fn_mask)),
