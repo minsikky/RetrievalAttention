@@ -293,6 +293,10 @@ def reset_paged_pq_attention_state(model) -> None:
             "_pagedpq_gqa_value_vpq_pack_cache",
             "_pagedpq_gqa_value_vpq_pack_fast_cache",
             "_pagedpq_fast_decode_index_cache",
+            "_pagedpq_joint_vpq_sidecar_cache",
+            "_pagedpq_joint_grouped_vpq_sidecar_cache",
+            "_pagedpq_joint_compact_vpq_sidecar_cache",
+            "_pagedpq_precision_tier_row_cache",
         ):
             if hasattr(module, attr):
                 delattr(module, attr)

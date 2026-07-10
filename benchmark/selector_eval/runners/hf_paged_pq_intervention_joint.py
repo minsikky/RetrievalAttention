@@ -135,6 +135,7 @@ def approximate_joint_kv_all_heads(
     key_bytes = ctx.key_bytes
     value_bytes = ctx.value_bytes
     wall_profile_enabled = ctx.wall_profile_enabled
+    time_trace = getattr(self, "_pagedpq_joint_time_trace", None)
     prefix_index_for = ctx.forward_state.prefix_index_for
     gqa_native_fullscan_pack = ctx.forward_state.gqa_native_fullscan_pack
     joint_vpq_sidecars_for = ctx.forward_state.joint_vpq_sidecars_for
@@ -288,6 +289,7 @@ def approximate_joint_kv_all_heads(
                             default=0,
                         )
                 selector_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                scan_trace_start = time_trace.cuda_start("scan") if time_trace is not None else None
                 if bool(getattr(args, "profile_native_ops", False)):
                     _sync_if_cuda(device)
                     selector_t0 = time.perf_counter()
@@ -338,6 +340,8 @@ def approximate_joint_kv_all_heads(
                     stats[layer_id].add_joint_wall_timing(
                         selector_seconds=float(time.perf_counter() - selector_wall_t0)
                     )
+                if time_trace is not None:
+                    time_trace.cuda_end("scan", scan_trace_start)
             except Exception:
                 if str(args.selector_backend) == "cuda_ext":
                     raise
@@ -346,6 +350,9 @@ def approximate_joint_kv_all_heads(
         if allhead_indexes is not None and allhead_exact_precompute:
             try:
                 exact_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+                exact_trace_start = (
+                    time_trace.cuda_start("exact_logit") if time_trace is not None else None
+                )
                 if bool(getattr(args, "profile_native_ops", False)):
                     _sync_if_cuda(device)
                     exact_t0 = time.perf_counter()
@@ -419,6 +426,8 @@ def approximate_joint_kv_all_heads(
                     stats[layer_id].add_joint_wall_timing(
                         exact_logit_seconds=float(time.perf_counter() - exact_wall_t0)
                     )
+                if time_trace is not None:
+                    time_trace.cuda_end("exact_logit", exact_trace_start)
             except Exception:
                 if str(args.selector_backend) == "cuda_ext":
                     raise
@@ -446,6 +455,7 @@ def approximate_joint_kv_all_heads(
         grouped_strided_output_workspace_enabled=grouped_strided_output_workspace_enabled,
     )
     score_grid_workspace_for = joint_workspace.score_grid_workspace_for
+    torch_score_grid_workspace_for = joint_workspace.torch_score_grid_workspace_for
     grouped_score_grid_workspace_for = joint_workspace.grouped_score_grid_workspace_for
     softmax_base_workspace_for = joint_workspace.softmax_base_workspace_for
     grouped_output_workspace_for = joint_workspace.grouped_output_workspace_for
@@ -455,7 +465,10 @@ def approximate_joint_kv_all_heads(
     nocalib_score_grid_workspace_for = joint_workspace.nocalib_score_grid_workspace_for
     nocalib_scatter_score_grid_workspace_for = joint_workspace.nocalib_scatter_score_grid_workspace_for
     token_layout_for = joint_workspace.token_layout_for
-    allhead_rank_prefix_cache: dict[tuple[int, int, int, int], torch.Tensor] = {}
+    allhead_rank_prefix_cache: dict[
+        tuple[int, int, int, int],
+        tuple[torch.Tensor, torch.Tensor | None],
+    ] = {}
 
     grouped_vpq_vhat_groups_t: torch.Tensor | None = None
     grouped_vpq_residual_groups_t: torch.Tensor | None = None
@@ -620,6 +633,7 @@ def approximate_joint_kv_all_heads(
             nocalib_score_grid_workspace_for=nocalib_score_grid_workspace_for,
             nocalib_scatter_score_grid_workspace_for=nocalib_scatter_score_grid_workspace_for,
             score_grid_workspace_for=score_grid_workspace_for,
+            torch_score_grid_workspace_for=torch_score_grid_workspace_for,
             grouped_score_grid_workspace_for=grouped_score_grid_workspace_for,
             grouped_output_workspace_for=grouped_output_workspace_for,
             softmax_base_workspace_for=softmax_base_workspace_for,

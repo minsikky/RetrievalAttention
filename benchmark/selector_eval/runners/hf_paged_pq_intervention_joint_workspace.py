@@ -141,6 +141,52 @@ class JointKVWorkspace:
             self.model,
             "_pagedpq_joint_score_direct_workspace_cache",
         )
+        self.torch_score_grid_workspace_cache = _dict_attr(
+            self.model,
+            "_pagedpq_joint_torch_score_grid_workspace_cache",
+        )
+        self.position_ids_cache = _dict_attr(
+            self.model,
+            "_pagedpq_joint_position_ids_cache",
+        )
+
+    def torch_score_grid_workspace_for(
+        self,
+        *,
+        k_count: int,
+        heads: int,
+        context_len: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """One stream-ordered workspace shared by Torch head groups/layers."""
+
+        key = (str(self.device), int(k_count), int(heads), str(dtype))
+        cached = self.torch_score_grid_workspace_cache.get(key)
+        capacity = int(cached[0]) if cached is not None else 0
+        if cached is None or capacity < int(context_len):
+            capacity = int(context_len) + 256
+            buffer = torch.empty(
+                (int(k_count) * int(heads) * int(capacity),),
+                dtype=dtype,
+                device=self.device,
+            )
+            cached = (int(capacity), buffer)
+            self.torch_score_grid_workspace_cache[key] = cached
+        view_count = int(k_count) * int(heads) * int(context_len)
+        return cached[1][:view_count].reshape(int(k_count), int(heads), int(context_len))
+
+    def position_ids_for(self, count: int) -> torch.Tensor:
+        """Return an immutable arange view without rebuilding it every step."""
+
+        key = (str(self.device),)
+        cached = self.position_ids_cache.get(key)
+        capacity = int(cached[0]) if cached is not None else 0
+        if cached is None or capacity < int(count):
+            capacity = int(count) + 256
+            positions = torch.arange(capacity, dtype=torch.long, device=self.device)
+            cached = (int(capacity), positions)
+            self.position_ids_cache[key] = cached
+        return cached[1][: int(count)]
 
     def nocalib_score_grid_workspace_for(
         self,
@@ -769,21 +815,26 @@ class JointKVWorkspace:
         ):
             # Preserve unique_tokens(static_tokens + pending) order:
             # prefix, suffix, then pending.
+            position_ids_t = self.position_ids_for(context_len_i) if self.device.type == "cuda" else None
+
+            def position_range(start: int, end: int) -> torch.Tensor:
+                if position_ids_t is not None:
+                    return position_ids_t[int(start): int(end)]
+                return torch.arange(start, end, dtype=torch.long, device=self.device)
+
             indexed_tokens_layout_t = (
-                torch.arange(prefix_end_i, sealed_end_i, dtype=torch.long, device=self.device)
+                position_range(prefix_end_i, sealed_end_i)
                 if sealed_end_i > prefix_end_i
                 else torch.empty((0,), dtype=torch.long, device=self.device)
             )
             base_parts_t = []
             if prefix_end_i > 0:
-                base_parts_t.append(torch.arange(0, prefix_end_i, dtype=torch.long, device=self.device))
+                base_parts_t.append(position_range(0, prefix_end_i))
             if context_len_i > suffix_start_i:
-                base_parts_t.append(torch.arange(suffix_start_i, context_len_i, dtype=torch.long, device=self.device))
+                base_parts_t.append(position_range(suffix_start_i, context_len_i))
             pending_base_end_i = min(int(pending_end_i), int(suffix_start_i))
             if pending_base_end_i > pending_start_i:
-                base_parts_t.append(
-                    torch.arange(pending_start_i, pending_base_end_i, dtype=torch.long, device=self.device)
-                )
+                base_parts_t.append(position_range(pending_start_i, pending_base_end_i))
             base_layout_t = (
                 torch.cat(base_parts_t)
                 if base_parts_t

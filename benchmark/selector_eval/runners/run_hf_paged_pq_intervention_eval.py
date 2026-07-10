@@ -136,11 +136,17 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                     warm_dense_prefill_decode_sidecars(int(layer_id), self, cache_obj)
                 return out
 
-            if cache_position is not None and torch.numel(cache_position) > 0:
+            # The cache length is CPU metadata for the cache implementations
+            # used by this runner.  Prefer it over reading cache_position back
+            # from CUDA: the latter forced one device synchronization per
+            # layer and decode token merely to recover the same integer.
+            past_len = cache_sequence_length(cache_obj, int(layer_id))
+            if past_len is not None:
+                estimated_context_len = int(past_len) + query_len
+            elif cache_position is not None and torch.numel(cache_position) > 0:
                 estimated_context_len = int(cache_position.reshape(-1)[-1].item()) + 1
             else:
-                past_len = cache_sequence_length(cache_obj, int(layer_id))
-                estimated_context_len = (int(past_len) + query_len) if past_len is not None else query_len
+                estimated_context_len = query_len
             estimated_dynamic_start = min(max(0, int(args.static_prefix)), estimated_context_len)
             estimated_indexed_end = max(estimated_dynamic_start, estimated_context_len - max(0, int(args.static_suffix)))
             estimated_sealed_end = estimated_dynamic_start + (
@@ -190,6 +196,10 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                 return call_original_forward()
 
             stats[layer_id].add_approx_attention_call()
+            time_trace = getattr(self, "_pagedpq_joint_time_trace", None)
+            attention_trace_start = (
+                time_trace.cuda_start("attention") if time_trace is not None else None
+            )
             wall_profile_enabled = _env_truthy("SELECTOR_PQ_JOINT_WALL_PROFILE", "0")
             patched_attention_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
             if bool(getattr(args, "profile_native_ops", False)):
@@ -304,6 +314,8 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                 stats[layer_id].add_wall_patched_attention_timing(
                     time.perf_counter() - patched_attention_wall_t0
                 )
+            if time_trace is not None:
+                time_trace.cuda_end("attention", attention_trace_start)
             return attn_output, None
 
         return types.MethodType(forward, module)

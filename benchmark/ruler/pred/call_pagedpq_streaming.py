@@ -40,6 +40,66 @@ def env_truthy(name: str, default: str = "0") -> bool:
     return str(os.environ.get(name, default)).lower() not in {"0", "false", "no", "off", ""}
 
 
+class SelectorPQJointTimeTrace:
+    """Deferred CUDA-event timing for one sample; never synchronizes a phase."""
+
+    PHASES = (
+        "prefill",
+        "sidecar_warm",
+        "scan",
+        "select",
+        "commit",
+        "exact_logit",
+        "attention",
+        "lm_head",
+        "sync_wait",
+    )
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.stage = "setup"
+        self.cpu_seconds = {phase: 0.0 for phase in self.PHASES}
+        self.cuda_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {
+            phase: [] for phase in self.PHASES
+        }
+
+    def add_cpu(self, phase: str, seconds: float) -> None:
+        self.cpu_seconds[str(phase)] += float(seconds)
+
+    def cuda_start(self, phase: str):
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            return time.perf_counter()
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return start
+
+    def cuda_end(self, phase: str, start) -> None:
+        if isinstance(start, torch.cuda.Event):
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            self.cuda_events[str(phase)].append((start, end))
+        else:
+            self.add_cpu(str(phase), time.perf_counter() - float(start))
+
+    def totals(self) -> dict[str, float]:
+        out = dict(self.cpu_seconds)
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            for phase, pairs in self.cuda_events.items():
+                out[phase] += sum(float(start.elapsed_time(end)) for start, end in pairs) / 1000.0
+        return {f"{phase}_seconds": float(out[phase]) for phase in self.PHASES}
+
+
+def set_selector_time_trace(model: LlamaForCausalLM, trace: SelectorPQJointTimeTrace | None) -> None:
+    setattr(model, "_pagedpq_joint_time_trace", trace)
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if layers is None:
+        return
+    for layer in layers:
+        attn = getattr(layer, "self_attn", None)
+        if attn is not None:
+            setattr(attn, "_pagedpq_joint_time_trace", trace)
+
+
 def log_cuda_memory(label: str, device: torch.device, *, reset_peak: bool = False) -> None:
     if not env_truthy("SELECTOR_PQ_JOINT_MEMORY_TRACE", "0"):
         return
@@ -172,6 +232,7 @@ def joint_cuda_flags_config() -> dict[str, bool | int]:
             "0",
         ),
         "selector_pq_joint_wall_profile": env_truthy("SELECTOR_PQ_JOINT_WALL_PROFILE", "0"),
+        "selector_pq_joint_time_trace": env_truthy("SELECTOR_PQ_JOINT_TIME_TRACE", "0"),
     }
 
 
@@ -475,9 +536,15 @@ def model_forward_last_logits(model: LlamaForCausalLM, input_ids: torch.Tensor, 
         return model(input_ids, **kwargs)
 
 
-def sync_cuda_if_needed(device: torch.device) -> None:
+def sync_cuda_if_needed(
+    device: torch.device,
+    trace: SelectorPQJointTimeTrace | None = None,
+) -> None:
     if device.type == "cuda" and torch.cuda.is_available():
+        t0 = time.perf_counter() if trace is not None else 0.0
         torch.cuda.synchronize(device)
+        if trace is not None:
+            trace.add_cpu("sync_wait", time.perf_counter() - t0)
 
 
 def set_pagedpq_prefill_sidecar_warm_deferred(model: LlamaForCausalLM, enabled: bool) -> None:
@@ -490,7 +557,12 @@ def set_pagedpq_prefill_sidecar_warm_deferred(model: LlamaForCausalLM, enabled: 
             setattr(attn, "_pagedpq_defer_prefill_sidecar_warm", bool(enabled))
 
 
-def warm_pagedpq_decode_sidecars(model: LlamaForCausalLM, past_key_values, device: torch.device) -> None:
+def warm_pagedpq_decode_sidecars(
+    model: LlamaForCausalLM,
+    past_key_values,
+    device: torch.device,
+    trace: SelectorPQJointTimeTrace | None = None,
+) -> None:
     """Build paged-PQ decode sidecars after dense prefill, before decode timing."""
     if past_key_values is None:
         return
@@ -503,7 +575,7 @@ def warm_pagedpq_decode_sidecars(model: LlamaForCausalLM, past_key_values, devic
         warm = getattr(attn, "_pagedpq_warm_decode_sidecars", None)
         if callable(warm):
             warm(past_key_values)
-    sync_cuda_if_needed(device)
+    sync_cuda_if_needed(device, trace)
     log_cuda_memory("sidecar_warm.done", device)
 
 
@@ -531,13 +603,14 @@ def prefill_batched(
     *,
     device: torch.device,
     prefill_chunk_size: int,
+    trace: SelectorPQJointTimeTrace | None = None,
 ):
     prompt_len = int(input_ids.shape[1])
     chunk_size = int(prefill_chunk_size)
     if chunk_size <= 0 or chunk_size >= prompt_len:
         log_cuda_memory("prefill.oneshot.start", device, reset_peak=True)
         out = model_forward_last_logits(model, input_ids.to(device), use_cache=True)
-        sync_cuda_if_needed(device)
+        sync_cuda_if_needed(device, trace)
         log_cuda_memory("prefill.oneshot.forward_done", device)
         return out
 
@@ -556,7 +629,7 @@ def prefill_batched(
                 use_cache=True,
             )
             past_key_values = out.past_key_values
-            sync_cuda_if_needed(device)
+            sync_cuda_if_needed(device, trace)
             log_cuda_memory(f"prefill.chunk.{start}_{stop}.done", device)
             maybe_empty_cache_after_prefill_chunk(
                 device,
@@ -588,30 +661,91 @@ def generate_batched(
         if prefill_chunk_size is None
         else int(prefill_chunk_size)
     )
-    sync_cuda_if_needed(device)
-    prompt_start = time.perf_counter()
-    out = prefill_batched(model, input_ids, device=device, prefill_chunk_size=prefill_chunk_size_i)
-    sync_cuda_if_needed(device)
-    past_key_values = out.past_key_values
-    warm_pagedpq_decode_sidecars(model, past_key_values, device)
-    maybe_empty_cache_after_prefill(device)
-    next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
-    prompt_seconds = time.perf_counter() - prompt_start
+    trace = SelectorPQJointTimeTrace(device) if env_truthy("SELECTOR_PQ_JOINT_TIME_TRACE", "0") else None
+    set_selector_time_trace(model, trace)
+    lm_trace_stack: list[object] = []
+    lm_hook_handles = []
+    if trace is not None:
+        def lm_head_pre_hook(_module, _inputs):
+            if trace.stage == "decode":
+                lm_trace_stack.append(trace.cuda_start("lm_head"))
 
-    generated: list[int] = []
-    log_cuda_memory("decode.start", device, reset_peak=True)
-    sync_cuda_if_needed(device)
-    decode_start = time.perf_counter()
-    for _ in range(int(max_new_tokens)):
-        token_id = int(next_token.item())
-        generated.append(token_id)
-        out = model_forward_last_logits(model, next_token.to(device), past_key_values=past_key_values, use_cache=True)
+        def lm_head_post_hook(_module, _inputs, _output):
+            if trace.stage == "decode" and lm_trace_stack:
+                trace.cuda_end("lm_head", lm_trace_stack.pop())
+
+        lm_hook_handles = [
+            model.lm_head.register_forward_pre_hook(lm_head_pre_hook),
+            model.lm_head.register_forward_hook(lm_head_post_hook),
+        ]
+
+    try:
+        sync_cuda_if_needed(device, trace)
+        prompt_start = time.perf_counter()
+        if trace is not None:
+            trace.stage = "prefill"
+        prefill_start = time.perf_counter()
+        out = prefill_batched(
+            model,
+            input_ids,
+            device=device,
+            prefill_chunk_size=prefill_chunk_size_i,
+            trace=trace,
+        )
+        sync_cuda_if_needed(device, trace)
+        if trace is not None:
+            trace.add_cpu("prefill", time.perf_counter() - prefill_start)
         past_key_values = out.past_key_values
+        if trace is not None:
+            trace.stage = "sidecar_warm"
+        warm_start = time.perf_counter()
+        warm_pagedpq_decode_sidecars(model, past_key_values, device, trace)
+        if trace is not None:
+            trace.add_cpu("sidecar_warm", time.perf_counter() - warm_start)
+        maybe_empty_cache_after_prefill(device)
         next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
-    sync_cuda_if_needed(device)
-    decode_seconds = time.perf_counter() - decode_start
-    log_cuda_memory("decode.done", device)
-    return generated, {
+        prompt_seconds = time.perf_counter() - prompt_start
+
+        generated_tokens_t: list[torch.Tensor] = []
+        log_cuda_memory("decode.start", device, reset_peak=True)
+        sync_cuda_if_needed(device, trace)
+        if trace is not None:
+            trace.stage = "decode"
+        decode_start = time.perf_counter()
+        for _ in range(int(max_new_tokens)):
+            # Generation is fixed-length; no CPU control flow consumes this
+            # token.  Retain the tiny device tensors and copy all IDs after the
+            # final decode synchronization instead of forcing one sync/step.
+            generated_tokens_t.append(next_token.reshape(-1)[0].detach())
+            out = model_forward_last_logits(
+                model,
+                next_token.to(device),
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = out.past_key_values
+            next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
+        generated_ids_t = torch.stack(generated_tokens_t) if generated_tokens_t else None
+        sync_cuda_if_needed(device, trace)
+        generated = (
+            [int(v) for v in generated_ids_t.detach().cpu().tolist()]
+            if generated_ids_t is not None
+            else []
+        )
+        decode_seconds = time.perf_counter() - decode_start
+        log_cuda_memory("decode.done", device)
+        trace_totals = trace.totals() if trace is not None else {}
+        if trace is not None:
+            print(
+                "[selector-pq-joint-time] " + json.dumps(trace_totals, sort_keys=True),
+                flush=True,
+            )
+    finally:
+        for handle in lm_hook_handles:
+            handle.remove()
+        set_selector_time_trace(model, None)
+
+    timing = {
         "prompt_tokens": int(prompt_len),
         "generated_tokens": int(len(generated)),
         "stream_prefill_seconds": float(prompt_seconds),
@@ -620,6 +754,8 @@ def generate_batched(
         "stream_prefill_tokens_per_second": float(prompt_len / max(prompt_seconds, 1e-9)),
         "stream_decode_tokens_per_second": float(len(generated) / max(decode_seconds, 1e-9)),
     }
+    timing.update(trace_totals)
+    return generated, timing
 
 
 @torch.inference_mode()

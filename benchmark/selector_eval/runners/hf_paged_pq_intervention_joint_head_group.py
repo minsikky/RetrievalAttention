@@ -6,7 +6,10 @@ from typing import Any, Callable
 
 import torch
 
-from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_one_group import process_one_joint_kv_head
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_one_group import (
+    finish_deferred_joint_kv_heads,
+    process_one_joint_kv_head,
+)
 
 
 @dataclass
@@ -67,6 +70,7 @@ class JointKVHeadGroupRuntime:
     nocalib_score_grid_workspace_for: Callable
     nocalib_scatter_score_grid_workspace_for: Callable
     score_grid_workspace_for: Callable
+    torch_score_grid_workspace_for: Callable
     grouped_score_grid_workspace_for: Callable
     grouped_output_workspace_for: Callable
     softmax_base_workspace_for: Callable
@@ -74,9 +78,18 @@ class JointKVHeadGroupRuntime:
     wall_profile_enabled: bool
     kv_head_indices: list[int] | None = None
     grouped_geo_t0: float = 0.0
+    defer_torch_policy: bool = False
+    deferred_policy_records: list | None = None
 
 
 def process_joint_kv_head_groups(runtime: JointKVHeadGroupRuntime) -> bool:
+    runtime.defer_torch_policy = bool(
+        runtime.device.type == "cuda"
+        and bool(getattr(runtime.args, "joint_kv_precision_tiers", False))
+        and not bool(getattr(runtime.args, "profile_native_ops", False))
+        and not runtime.wall_profile_enabled
+    )
+    runtime.deferred_policy_records = [] if runtime.defer_torch_policy else None
     kv_head_indices = (
         list(runtime.kv_head_indices)
         if runtime.kv_head_indices is not None
@@ -85,4 +98,6 @@ def process_joint_kv_head_groups(runtime: JointKVHeadGroupRuntime) -> bool:
     for kv_head_i in kv_head_indices:
         if not process_one_joint_kv_head(runtime, int(kv_head_i)):
             return False
+    if runtime.deferred_policy_records:
+        return finish_deferred_joint_kv_heads(runtime)
     return True

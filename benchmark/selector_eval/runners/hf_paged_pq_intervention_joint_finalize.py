@@ -48,6 +48,7 @@ class JointFinalizeRuntime:
     precision_lo_bytes: int = 1
     k_lo_counts_by_ki: list[int] | None = None
     v_lo_reads_grid: torch.Tensor | None = None
+    v_lo_reads_rows: list[list[list[int]]] | None = None
 
 
 def finalize_joint_head_outputs(runtime: JointFinalizeRuntime) -> bool:
@@ -65,9 +66,10 @@ def finalize_joint_head_outputs(runtime: JointFinalizeRuntime) -> bool:
         ]
         return True
 
-    v_lo_reads_rows: list[list[list[int]]] | None = None
+    v_lo_reads_rows = runtime.v_lo_reads_rows
     if (
-        runtime.precision_tiers_enabled
+        v_lo_reads_rows is None
+        and runtime.precision_tiers_enabled
         and runtime.v_lo_reads_grid is not None
         and not bool(getattr(runtime.args, "disable_cost_stats", False))
     ):

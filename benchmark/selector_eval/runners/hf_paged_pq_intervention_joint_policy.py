@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -23,6 +24,8 @@ class JointPolicyResult:
     final_vi_by_head: list[int]
     final_idx_for_output: torch.Tensor | None = None
     final_output_grid: torch.Tensor | None = None
+    v_lo_reads_rows: list[list[list[int]]] | None = None
+    deferred_torch_policy: object | None = None
 
 
 @dataclass
@@ -45,8 +48,8 @@ class JointPolicyRuntime:
     threshold_scale_shape: str
     threshold_min_scale: float
     threshold_max_scale: float
-    start_ki_by_head: list[int] | None
-    start_vi_by_head: list[int] | None
+    start_ki_by_head: list[int] | torch.Tensor | None
+    start_vi_by_head: list[int] | torch.Tensor | None
     use_incremental_v_grid: bool
     grid_outputs: torch.Tensor | None
     grid_outputs_for_v_idx: Callable[[int], torch.Tensor] | None
@@ -55,6 +58,22 @@ class JointPolicyRuntime:
     grid_k_mb_by_idx: list[float] | None
     v_mb_by_idx: list[float] | None
     sim_start_seconds: float
+    v_lo_reads_grid: torch.Tensor | None = None
+    time_trace: object | None = None
+    defer_torch_policy: bool = False
+    d2h_owner: object | None = None
+    d2h_slot: int = 0
+
+
+@dataclass
+class PreparedTorchPolicy:
+    runtime: JointPolicyRuntime
+    packed_host: torch.Tensor | np.ndarray
+    k_delta_shape: tuple[int, ...]
+    v_delta_shape: tuple[int, ...]
+    tensor_starts_k: bool
+    tensor_starts_v: bool
+    v_lo_shape: tuple[int, ...] | None
 
 
 def select_joint_kv_budgets(runtime: JointPolicyRuntime) -> JointPolicyResult:
@@ -69,6 +88,8 @@ def select_joint_kv_budgets(runtime: JointPolicyRuntime) -> JointPolicyResult:
     final_vi_by_head: list[int] = []
     final_idx_for_output: torch.Tensor | None = None
     final_output_grid: torch.Tensor | None = None
+    v_lo_reads_rows: list[list[list[int]]] | None = None
+    deferred_torch_policy: PreparedTorchPolicy | None = None
 
     if runtime.use_incremental_v_grid and runtime.grid_outputs_for_v_idx is not None:
         k_mb_by_idx = _k_mb_by_index(runtime)
@@ -92,9 +113,16 @@ def select_joint_kv_budgets(runtime: JointPolicyRuntime) -> JointPolicyResult:
                     final_ki_by_head.append(int(row[0]))
                     final_vi_by_head.append(int(row[1]))
         else:
-            selected = _select_with_torch_policy(runtime, output_grid)
-            final_ki_by_head.extend(int(ki) for ki, _vi in selected)
-            final_vi_by_head.extend(int(vi) for _ki, vi in selected)
+            if runtime.defer_torch_policy:
+                deferred_torch_policy = _prepare_torch_policy(
+                    runtime,
+                    output_grid,
+                    non_blocking=True,
+                )
+            else:
+                selected, v_lo_reads_rows = _select_with_torch_policy(runtime, output_grid)
+                final_ki_by_head.extend(int(ki) for ki, _vi in selected)
+                final_vi_by_head.extend(int(vi) for _ki, vi in selected)
     else:
         for local_head_i in range(runtime.group_heads):
             ki, vi = _walk_lazy_outputs(runtime, local_head_i)
@@ -121,6 +149,8 @@ def select_joint_kv_budgets(runtime: JointPolicyRuntime) -> JointPolicyResult:
         final_vi_by_head=final_vi_by_head,
         final_idx_for_output=final_idx_for_output,
         final_output_grid=final_output_grid,
+        v_lo_reads_rows=v_lo_reads_rows,
+        deferred_torch_policy=deferred_torch_policy,
     )
 
 
@@ -143,13 +173,21 @@ def _extra_v_mb(runtime: JointPolicyRuntime, vi: int, v_can: bool) -> float:
     return float(runtime.v_mb_by_idx[int(vi) + 1] - runtime.v_mb_by_idx[int(vi)])
 
 
-def _head_start_indices(runtime: JointPolicyRuntime, local_head_i: int) -> tuple[int, int]:
+def _head_start_indices(
+    runtime: JointPolicyRuntime,
+    local_head_i: int,
+    *,
+    start_ki_by_head: list[int] | None = None,
+    start_vi_by_head: list[int] | None = None,
+) -> tuple[int, int]:
     ki = 0
     vi = 0
-    if runtime.start_ki_by_head is not None and int(local_head_i) < len(runtime.start_ki_by_head):
-        ki = int(runtime.start_ki_by_head[int(local_head_i)])
-    if runtime.start_vi_by_head is not None and int(local_head_i) < len(runtime.start_vi_by_head):
-        vi = int(runtime.start_vi_by_head[int(local_head_i)])
+    starts_k = runtime.start_ki_by_head if start_ki_by_head is None else start_ki_by_head
+    starts_v = runtime.start_vi_by_head if start_vi_by_head is None else start_vi_by_head
+    if starts_k is not None and int(local_head_i) < len(starts_k):
+        ki = int(starts_k[int(local_head_i)])
+    if starts_v is not None and int(local_head_i) < len(starts_v):
+        vi = int(starts_v[int(local_head_i)])
     ki = min(max(0, int(ki)), max(0, len(runtime.active_k_budgets) - 1))
     vi = min(max(0, int(vi)), max(0, len(runtime.v_budgets) - 1))
     return ki, vi
@@ -351,33 +389,130 @@ def _select_with_native_policy(
     return final_idx, None
 
 
-def _select_with_torch_policy(
+def _prepare_torch_policy(
     runtime: JointPolicyRuntime,
     output_grid: torch.Tensor,
-) -> list[tuple[int, int]]:
+    *,
+    non_blocking: bool,
+) -> PreparedTorchPolicy:
     output_grid64 = output_grid.to(dtype=torch.float64)
     if len(runtime.active_k_budgets) > 1:
         k_cur = output_grid64[:-1]
         k_next = output_grid64[1:]
-        k_delta_np = (
+        k_delta_t = (
             torch.linalg.vector_norm(k_cur - k_next, dim=-1)
             / torch.clamp_min(torch.linalg.vector_norm(k_next, dim=-1), 1e-20)
-        ).detach().cpu().numpy()
+        )
     else:
-        k_delta_np = np.empty((0, len(runtime.v_budgets), runtime.group_heads), dtype=np.float64)
+        k_delta_t = torch.empty(
+            (0, len(runtime.v_budgets), runtime.group_heads),
+            dtype=torch.float64,
+            device=runtime.device,
+        )
     if len(runtime.v_budgets) > 1:
         v_cur = output_grid64[:, :-1]
         v_next = output_grid64[:, 1:]
-        v_delta_np = (
+        v_delta_t = (
             torch.linalg.vector_norm(v_cur - v_next, dim=-1)
             / torch.clamp_min(torch.linalg.vector_norm(v_next, dim=-1), 1e-20)
-        ).detach().cpu().numpy()
+        )
     else:
-        v_delta_np = np.empty((len(runtime.active_k_budgets), 0, runtime.group_heads), dtype=np.float64)
+        v_delta_t = torch.empty(
+            (len(runtime.active_k_budgets), 0, runtime.group_heads),
+            dtype=torch.float64,
+            device=runtime.device,
+        )
+
+    # Start indices, policy deltas, and precision-tier accounting were four
+    # separate blocking D2H reads in the standard path.  Pack their already
+    # computed values into one float64 transfer; all integer fields are small
+    # enough to be represented exactly.
+    packed_parts = [k_delta_t.reshape(-1), v_delta_t.reshape(-1)]
+    tensor_starts_k = isinstance(runtime.start_ki_by_head, torch.Tensor)
+    tensor_starts_v = isinstance(runtime.start_vi_by_head, torch.Tensor)
+    if tensor_starts_k:
+        packed_parts.append(runtime.start_ki_by_head.to(dtype=torch.float64).reshape(-1))
+    if tensor_starts_v:
+        packed_parts.append(runtime.start_vi_by_head.to(dtype=torch.float64).reshape(-1))
+    if runtime.v_lo_reads_grid is not None:
+        packed_parts.append(runtime.v_lo_reads_grid.to(dtype=torch.float64).reshape(-1))
+    packed_t = torch.cat(packed_parts).detach()
+    if non_blocking and packed_t.device.type == "cuda":
+        if runtime.d2h_owner is None:
+            raise RuntimeError("deferred Torch policy requires a D2H buffer owner")
+        cache = getattr(runtime.d2h_owner, "_pagedpq_policy_d2h_buffer_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            setattr(runtime.d2h_owner, "_pagedpq_policy_d2h_buffer_cache", cache)
+        cache_key = (int(runtime.d2h_slot), int(packed_t.numel()), str(packed_t.dtype))
+        packed_host = cache.get(cache_key)
+        if packed_host is None:
+            packed_host = torch.empty(
+                (int(packed_t.numel()),),
+                dtype=packed_t.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            cache[cache_key] = packed_host
+        packed_host.copy_(packed_t, non_blocking=True)
+    else:
+        transfer_t0 = time.perf_counter() if runtime.time_trace is not None else 0.0
+        packed_host = packed_t.cpu().numpy()
+        if runtime.time_trace is not None:
+            runtime.time_trace.add_cpu("sync_wait", time.perf_counter() - transfer_t0)
+    return PreparedTorchPolicy(
+        runtime=runtime,
+        packed_host=packed_host,
+        k_delta_shape=tuple(k_delta_t.shape),
+        v_delta_shape=tuple(v_delta_t.shape),
+        tensor_starts_k=bool(tensor_starts_k),
+        tensor_starts_v=bool(tensor_starts_v),
+        v_lo_shape=(tuple(runtime.v_lo_reads_grid.shape) if runtime.v_lo_reads_grid is not None else None),
+    )
+
+
+def finish_prepared_torch_policy(
+    prepared: PreparedTorchPolicy,
+) -> tuple[list[tuple[int, int]], list[list[list[int]]] | None]:
+    runtime = prepared.runtime
+    packed_np = (
+        prepared.packed_host.numpy()
+        if isinstance(prepared.packed_host, torch.Tensor)
+        else prepared.packed_host
+    )
+    offset = 0
+    k_size = int(math.prod(prepared.k_delta_shape))
+    k_delta_np = packed_np[offset: offset + k_size].reshape(prepared.k_delta_shape)
+    offset += k_size
+    v_size = int(math.prod(prepared.v_delta_shape))
+    v_delta_np = packed_np[offset: offset + v_size].reshape(prepared.v_delta_shape)
+    offset += v_size
+    starts_k_cpu = runtime.start_ki_by_head if not prepared.tensor_starts_k else None
+    starts_v_cpu = runtime.start_vi_by_head if not prepared.tensor_starts_v else None
+    if prepared.tensor_starts_k:
+        starts_k_cpu = [int(v) for v in packed_np[offset: offset + runtime.group_heads]]
+        offset += runtime.group_heads
+    if prepared.tensor_starts_v:
+        starts_v_cpu = [int(v) for v in packed_np[offset: offset + runtime.group_heads]]
+        offset += runtime.group_heads
+    v_lo_reads_rows = None
+    if prepared.v_lo_shape is not None:
+        v_lo_size = int(math.prod(prepared.v_lo_shape))
+        v_lo_reads_rows = (
+            packed_np[offset: offset + v_lo_size]
+            .reshape(prepared.v_lo_shape)
+            .astype(np.int64, copy=False)
+            .tolist()
+        )
     k_mb_by_idx = _k_mb_by_index(runtime)
     selected: list[tuple[int, int]] = []
     for local_head_i in range(runtime.group_heads):
-        ki, vi = _head_start_indices(runtime, local_head_i)
+        ki, vi = _head_start_indices(
+            runtime,
+            local_head_i,
+            start_ki_by_head=starts_k_cpu,
+            start_vi_by_head=starts_v_cpu,
+        )
         steps = 0
         max_steps = len(runtime.active_k_budgets) + len(runtime.v_budgets) + 4
         while steps < max_steps:
@@ -437,7 +572,16 @@ def _select_with_torch_policy(
                 if not moved:
                     break
         selected.append((int(ki), int(vi)))
-    return selected
+    return selected, v_lo_reads_rows
+
+
+def _select_with_torch_policy(
+    runtime: JointPolicyRuntime,
+    output_grid: torch.Tensor,
+) -> tuple[list[tuple[int, int]], list[list[list[int]]] | None]:
+    return finish_prepared_torch_policy(
+        _prepare_torch_policy(runtime, output_grid, non_blocking=False)
+    )
 
 
 def _band_threshold_between(runtime: JointPolicyRuntime, lo_budget: int, hi_budget: int) -> float:

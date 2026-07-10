@@ -28,6 +28,7 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_fused_policy
 )
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_policy import (
     JointPolicyRuntime,
+    finish_prepared_torch_policy,
     select_joint_kv_budgets,
 )
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_vprefix import (
@@ -54,6 +55,58 @@ def _rowwise_int8_qdq(x32_t: torch.Tensor) -> torch.Tensor:
     1e-12, round-half-even codes."""
     scale_t = (x32_t.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min_(1e-12)
     return torch.round(x32_t / scale_t) * scale_t
+
+
+def _cached_precision_tier_value_error(
+    *,
+    module,
+    kv_head: int,
+    values32_t: torch.Tensor,
+    values_lo_t: torch.Tensor,
+) -> torch.Tensor:
+    """Cache the row-local fp16 V commit error for append-only CUDA KV."""
+
+    context_len = int(values32_t.shape[0])
+    cache = getattr(module, "_pagedpq_precision_tier_row_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(module, "_pagedpq_precision_tier_row_cache", cache)
+    entry = cache.get(int(kv_head))
+    dim = int(values32_t.shape[1])
+    if (
+        entry is None
+        or int(entry.get("dim", -1)) != dim
+        or str(entry.get("device", "")) != str(values32_t.device)
+        or int(entry.get("filled", 0)) > context_len
+    ):
+        entry = None
+
+    filled = int(entry.get("filled", 0)) if entry is not None else 0
+    capacity = int(entry.get("capacity", 0)) if entry is not None else 0
+    if entry is None or capacity < context_len:
+        new_capacity = context_len + 256
+        value_error16 = torch.empty((new_capacity,), dtype=torch.float16, device=values32_t.device)
+        if entry is not None and filled > 0:
+            value_error16[:filled].copy_(entry["value_error16"][:filled])
+        entry = {
+            "dim": dim,
+            "device": str(values32_t.device),
+            "capacity": int(new_capacity),
+            "filled": int(filled),
+            "value_error16": value_error16,
+        }
+        cache[int(kv_head)] = entry
+
+    if context_len > filled:
+        value_rows = values32_t[filled:context_len]
+        value_lo_new = values_lo_t[filled:context_len]
+        value_error16_new = (
+            (value_rows - value_lo_new).pow(2).sum(dim=1, dtype=torch.float64).to(dtype=torch.float16)
+        )
+        entry["value_error16"][filled:context_len].copy_(value_error16_new)
+        entry["filled"] = int(context_len)
+
+    return entry["value_error16"][:context_len]
 
 
 def _budget_index_at_least(budgets: list[int], target: float) -> int:
@@ -89,7 +142,9 @@ def _joint_start_indices_for_heads(
     sqrt_dim: float,
     k_budgets: list[int],
     v_budgets: list[int],
-) -> tuple[list[int], list[int]]:
+    sorted_dense_score_rows_t: torch.Tensor | None = None,
+    budget_tensors: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[list[int] | torch.Tensor, list[int] | torch.Tensor]:
     name = str(strategy).strip().lower()
     group_heads = int(dense_score_rows_t.shape[0])
     if name in {"", "min", "zero"}:
@@ -103,8 +158,33 @@ def _joint_start_indices_for_heads(
         return [int(ki) for _ in range(group_heads)], [int(vi) for _ in range(group_heads)]
     if name.startswith("proxy_mass_m"):
         mass = min(max(_fraction_suffix(name, "m", 0.5), 0.0), 0.999999)
-        sorted_logits = torch.sort(dense_score_rows_t.to(dtype=torch.float32) / float(sqrt_dim), dim=1, descending=True).values
-        counts = _softmax_prefix_counts_for_mass(sorted_logits, float(mass)).detach().cpu().tolist()
+        sorted_logits = (
+            sorted_dense_score_rows_t.to(dtype=torch.float32) / float(sqrt_dim)
+            if sorted_dense_score_rows_t is not None
+            else torch.sort(
+                dense_score_rows_t.to(dtype=torch.float32) / float(sqrt_dim),
+                dim=1,
+                descending=True,
+            ).values
+        )
+        counts_t = _softmax_prefix_counts_for_mass(sorted_logits, float(mass))
+        if dense_score_rows_t.device.type == "cuda":
+            # Keep the start state on device so it can share the policy's one
+            # packed D2H transfer instead of synchronizing here.
+            if budget_tensors is None:
+                k_budgets_t = torch.as_tensor(k_budgets, dtype=torch.long, device=counts_t.device)
+                v_budgets_t = torch.as_tensor(v_budgets, dtype=torch.float32, device=counts_t.device)
+            else:
+                k_budgets_t, v_budgets_t = budget_tensors
+            k_targets_t = torch.maximum(counts_t, k_budgets_t[0])
+            k_indices_t = torch.searchsorted(k_budgets_t, k_targets_t).clamp_max_(len(k_budgets) - 1)
+            v_targets_t = torch.maximum(
+                v_budgets_t[0],
+                k_targets_t.to(dtype=torch.float32) * 0.25,
+            )
+            v_indices_t = torch.searchsorted(v_budgets_t, v_targets_t).clamp_max_(len(v_budgets) - 1)
+            return k_indices_t, v_indices_t
+        counts = counts_t.detach().cpu().tolist()
         k_indices: list[int] = []
         v_indices: list[int] = []
         for count in counts:
@@ -175,11 +255,13 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     nocalib_score_grid_workspace_for = runtime.nocalib_score_grid_workspace_for
     nocalib_scatter_score_grid_workspace_for = runtime.nocalib_scatter_score_grid_workspace_for
     score_grid_workspace_for = runtime.score_grid_workspace_for
+    torch_score_grid_workspace_for = runtime.torch_score_grid_workspace_for
     grouped_score_grid_workspace_for = runtime.grouped_score_grid_workspace_for
     grouped_output_workspace_for = runtime.grouped_output_workspace_for
     softmax_base_workspace_for = runtime.softmax_base_workspace_for
     native_rank_prefix_tokens = runtime.native_rank_prefix_tokens
     wall_profile_enabled = runtime.wall_profile_enabled
+    time_trace = getattr(self, "_pagedpq_joint_time_trace", None)
     grouped_probs_workspace_t: torch.Tensor | None = None
     grouped_base_workspace_t: torch.Tensor | None = None
 
@@ -290,6 +372,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         and _env_truthy("SELECTOR_PQ_JOINT_SPARSE_DIRECT_SCORE_GRID", "0")
     )
     exact_scores_h: torch.Tensor | None
+    exact_keys32_t: torch.Tensor | None = None
     sparse_base_logits_t: torch.Tensor | None = None
     sparse_ranked_tokens_t: torch.Tensor | None = None
     sparse_ranked_logits_t: torch.Tensor | None = None
@@ -299,6 +382,9 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         exact_scores_h = None
     else:
         exact_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+        exact_trace_start = (
+            time_trace.cuda_start("exact_logit") if time_trace is not None else None
+        )
         if bool(getattr(args, "profile_native_ops", False)):
             _sync_if_cuda(device)
             exact_t0 = time.perf_counter()
@@ -312,6 +398,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             )
         else:
             keys_t = torch_k_cache[int(kv_head_i)][:context_len_i].to(device=device, dtype=torch.float32)
+            exact_keys32_t = keys_t
             exact_scores_h = (queries_h @ keys_t.transpose(0, 1)) / sqrt_dim
         if bool(getattr(args, "profile_native_ops", False)):
             _sync_if_cuda(device)
@@ -322,6 +409,8 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             stats[layer_id].add_joint_wall_timing(
                 exact_logit_seconds=float(time.perf_counter() - exact_wall_t0)
             )
+        if time_trace is not None:
+            time_trace.cuda_end("exact_logit", exact_trace_start)
 
     values_t = torch_v_cache[int(kv_head_i)][:context_len_i]
     vsidecar_t0 = 0.0
@@ -422,10 +511,11 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     partial_rank_takes_for_prefix = sorted({int(v) for v in partial_rank_takes if int(v) > 0})
     partial_rank_takes_t = (
         torch.as_tensor(partial_rank_takes_for_prefix, dtype=torch.long, device=device)
-        if partial_rank_takes_for_prefix
+        if partial_rank_takes_for_prefix and _env_truthy("SELECTOR_PQ_JOINT_NATIVE_RANK_PREFIX", "0")
         else None
     )
     ranked_prefix_tokens_t: torch.Tensor | None = None
+    sorted_ranked_score_rows_t: torch.Tensor | None = None
     if (
         max_rank_take > 0
         and _env_truthy("SELECTOR_PQ_JOINT_REUSE_MAX_TOPK", "1")
@@ -445,8 +535,10 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 int(indexed_count),
                 int(max_rank_take),
             )
-            allhead_ranked_prefix_t = allhead_rank_prefix_cache.get(rank_prefix_key)
-            if allhead_ranked_prefix_t is None:
+            cached_rank_prefix = allhead_rank_prefix_cache.get(rank_prefix_key)
+            if cached_rank_prefix is None:
+                allhead_ranked_prefix_t = None
+                allhead_sorted_scores_t = None
                 if (
                     allhead_selector_rank_prefix_t is not None
                     and int(allhead_selector_rank_prefix_t.shape[0]) >= int(num_heads)
@@ -469,13 +561,15 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                             partial_rank_takes_t,
                         )
                     else:
-                        allhead_order_t = torch.topk(
+                        allhead_topk_t = torch.topk(
                             allhead_dense_pq_scores_t[:num_heads, :indexed_count],
                             k=int(max_rank_take),
                             dim=1,
                             largest=True,
                             sorted=True,
-                        ).indices
+                        )
+                        allhead_order_t = allhead_topk_t.indices
+                        allhead_sorted_scores_t = allhead_topk_t.values
                         allhead_ranked_prefix_t = indexed_tokens_t.index_select(
                             0,
                             allhead_order_t.reshape(-1),
@@ -492,8 +586,20 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                         stats[layer_id].add_joint_wall_timing(
                             rank_prefix_seconds=float(time.perf_counter() - rank_prefix_wall_t0)
                         )
-                allhead_rank_prefix_cache[rank_prefix_key] = allhead_ranked_prefix_t
+                cached_rank_prefix = (allhead_ranked_prefix_t, allhead_sorted_scores_t)
+                allhead_rank_prefix_cache[rank_prefix_key] = cached_rank_prefix
+            allhead_ranked_prefix_t, allhead_sorted_scores_t = cached_rank_prefix
             ranked_prefix_tokens_t = allhead_ranked_prefix_t[head_start_i:head_end_i]
+            if (
+                device.type == "cuda"
+                and bool(getattr(args, "joint_kv_precision_tiers", False))
+                and allhead_sorted_scores_t is not None
+                and nonbase_mask_t is None
+                and int(allhead_sorted_scores_t.shape[1]) >= ranked_nonbase_count
+            ):
+                sorted_ranked_score_rows_t = allhead_sorted_scores_t[
+                    head_start_i:head_end_i, :ranked_nonbase_count
+                ]
             if _env_truthy("SELECTOR_PQ_JOINT_ALLHEAD_RANK_AUDIT", "0"):
                 audit_order_t = torch.topk(
                     ranked_nonbase_scores_t,
@@ -559,6 +665,9 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             for k_budget in active_joint_k_budgets
         )
         exact_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
+        exact_trace_start = (
+            time_trace.cuda_start("exact_logit") if time_trace is not None else None
+        )
         if bool(getattr(args, "profile_native_ops", False)):
             _sync_if_cuda(device)
             exact_t0 = time.perf_counter()
@@ -652,6 +761,8 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             stats[layer_id].add_joint_wall_timing(
                 exact_logit_seconds=float(time.perf_counter() - exact_wall_t0)
             )
+        if time_trace is not None:
+            time_trace.cuda_end("exact_logit", exact_trace_start)
 
     if exact_scores_h is None and not (
         use_sparse_direct_score_grid
@@ -732,7 +843,10 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         selected_batch_by_take[int(take)] = selected_out
         return selected_out
 
-    def mixed_scores_for_selected_batch(selected_t_i: torch.Tensor) -> torch.Tensor:
+    def mixed_scores_for_selected_batch(
+        selected_t_i: torch.Tensor,
+        out_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         selected_t_i = selected_t_i.to(device=device, dtype=torch.long)
         selected_t_i = torch.clamp(selected_t_i, min=0, max=max(0, context_len_i - 1))
         if (
@@ -809,7 +923,11 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             return score_grid_one_t[0].to(dtype=prob_dtype)
         if exact_scores_prob_t is None:
             raise RuntimeError("missing exact score table for non-native mixed-score path")
-        score_vec = exact_scores_prob_t.clone()
+        if out_t is None:
+            score_vec = exact_scores_prob_t.clone()
+        else:
+            score_vec = out_t
+            score_vec.copy_(exact_scores_prob_t)
         pq_logits = pq_logits_t if pq_logit_scale == 1.0 else pq_logits_t * pq_logit_scale
         if str(args.tail_score_calibration) == "affine_selected":
             if y_indexed_prob_t is None:
@@ -936,6 +1054,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     residual_lo_commit_t: torch.Tensor | None = None
     v_commit_mask_t: torch.Tensor | None = None
     if precision_tiers_enabled:
+        commit_trace_start = time_trace.cuda_start("commit") if time_trace is not None else None
         # The frozen tiers are implemented on the canonical torch grid
         # path only; fail loudly instead of silently running the old
         # single-tier composition on an optimized path.
@@ -967,28 +1086,56 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 "joint_kv_precision_tiers requires full V-PQ vhat/residual sidecars"
             )
         # K lo tier: per-row absmax-int8 QDQ of the cached keys, one extra
-        # (ctx, dim) pass + one GEMM per head group per decode step.
-        keys32_t = torch_k_cache[int(kv_head_i)][:context_len_i].to(
-            device=device, dtype=torch.float32
-        )
-        scores_lo_h_t = (queries_h @ _rowwise_int8_qdq(keys32_t).transpose(0, 1)) / sqrt_dim
-        del keys32_t
+        # (ctx, dim) pass + one GEMM per head group per decode step.  The fp16
+        # V commit error is an append-only row artifact on CUDA; cache old rows
+        # and compute only the newly appended token without retaining another
+        # context-by-head_dim plane.
+        if device.type == "cuda":
+            keys32_t = (
+                exact_keys32_t
+                if exact_keys32_t is not None
+                else torch_k_cache[int(kv_head_i)][:context_len_i].to(
+                    device=device, dtype=torch.float32
+                )
+            )
+            values32_t = values_t.to(device=device, dtype=torch.float32)
+            keys_lo_t = _rowwise_int8_qdq(keys32_t)
+            values_lo_t = _rowwise_int8_qdq(values32_t)
+            int8_err16_t = _cached_precision_tier_value_error(
+                module=self,
+                kv_head=int(kv_head_i),
+                values32_t=values32_t,
+                values_lo_t=values_lo_t,
+            )
+            v_commit_mask_t = int8_err16_t < code_error_t.to(dtype=torch.float16)
+            scores_lo_h_t = (queries_h @ keys_lo_t.transpose(0, 1)) / sqrt_dim
+            del keys32_t, keys_lo_t, values32_t
+        else:
+            # Keep the blessed CPU operation sequence unchanged byte-for-byte.
+            keys32_t = torch_k_cache[int(kv_head_i)][:context_len_i].to(
+                device=device, dtype=torch.float32
+            )
+            scores_lo_h_t = (queries_h @ _rowwise_int8_qdq(keys32_t).transpose(0, 1)) / sqrt_dim
+            del keys32_t
+            values32_t = values_t.to(device=device, dtype=torch.float32)
+            values_lo_t = _rowwise_int8_qdq(values32_t)
+            int8_err_t = (values32_t - values_lo_t).pow(2).sum(dim=1, dtype=torch.float64)
+            del values32_t
+            v_commit_mask_t = int8_err_t.to(dtype=torch.float16) < code_error_t.to(dtype=torch.float16)
+            del int8_err_t
         # V lo tier: int8-plane values, per-token commit test against the
         # V-PQ code-error stat in the 2-byte sidecar domain (fp16 int8-error
         # vs fp16 code-error, matching the CPU reference compare), and the
         # committed lo residual pre-zeroed on failed commits so the V grid
         # can fold it into one cumsum.
-        values32_t = values_t.to(device=device, dtype=torch.float32)
-        values_lo_t = _rowwise_int8_qdq(values32_t)
-        int8_err_t = (values32_t - values_lo_t).pow(2).sum(dim=1, dtype=torch.float64)
-        del values32_t
-        v_commit_mask_t = int8_err_t.to(dtype=torch.float16) < code_error_t.to(dtype=torch.float16)
         residual_lo_commit_t = torch.where(
             v_commit_mask_t.reshape(-1, 1),
             values_lo_t - vhat_all_t.to(dtype=torch.float32),
             torch.zeros((), dtype=torch.float32, device=device),
         )
-        del values_lo_t, int8_err_t
+        del values_lo_t
+        if time_trace is not None:
+            time_trace.cuda_end("commit", commit_trace_start)
     k_core_by_idx: dict[
         int,
         tuple[torch.Tensor, float, torch.Tensor, torch.Tensor, torch.Tensor],
@@ -1188,6 +1335,24 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         sim_t0 = time.perf_counter()
     policy_name = str(getattr(args, "joint_kv_policy", "k_first_alternating"))
     threshold_value = float(getattr(args, "joint_kv_stability_threshold", 0.001))
+    start_budget_tensors = None
+    if device.type == "cuda":
+        start_budget_cache = getattr(self, "_pagedpq_start_budget_tensor_cache", None)
+        if not isinstance(start_budget_cache, dict):
+            start_budget_cache = {}
+            setattr(self, "_pagedpq_start_budget_tensor_cache", start_budget_cache)
+        start_budget_key = (
+            str(device),
+            tuple(int(v) for v in active_joint_k_budgets),
+            tuple(int(v) for v in joint_v_budgets),
+        )
+        start_budget_tensors = start_budget_cache.get(start_budget_key)
+        if start_budget_tensors is None:
+            start_budget_tensors = (
+                torch.as_tensor(active_joint_k_budgets, dtype=torch.long, device=device),
+                torch.as_tensor(joint_v_budgets, dtype=torch.float32, device=device),
+            )
+            start_budget_cache[start_budget_key] = start_budget_tensors
     start_ki_by_head, start_vi_by_head = _joint_start_indices_for_heads(
         strategy=str(getattr(args, "joint_kv_start_strategy", "min")),
         context_len=int(context_len_i),
@@ -1195,6 +1360,8 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         sqrt_dim=float(sqrt_dim),
         k_budgets=active_joint_k_budgets,
         v_budgets=joint_v_budgets,
+        sorted_dense_score_rows_t=sorted_ranked_score_rows_t,
+        budget_tensors=start_budget_tensors,
     )
     final_ki_by_head: list[int] = []
     final_vi_by_head: list[int] = []
@@ -1209,6 +1376,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     grid_k_lo_counts_by_ki: list[int] | None = None
     grid_v_lo_reads_t: torch.Tensor | None = None
     use_incremental_v_grid = _env_truthy("SELECTOR_PQ_JOINT_INCREMENTAL_V_GRID", "0")
+    select_trace_start = time_trace.cuda_start("select") if time_trace is not None else None
     if _env_truthy("SELECTOR_PQ_JOINT_GRID_ARTIFACTS", "1"):
         joint_score_wall_t0 = time.perf_counter() if wall_profile_enabled else 0.0
         if bool(getattr(args, "profile_native_ops", False)):
@@ -1226,6 +1394,16 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         native_score_grid_enabled = (
             _env_truthy("SELECTOR_PQ_JOINT_NATIVE_SCORE_GRID", "0")
             and not use_unsorted_k_prefix
+        )
+        torch_score_grid_t = (
+            torch_score_grid_workspace_for(
+                k_count=len(active_joint_k_budgets),
+                heads=int(group_heads_i),
+                context_len=int(context_len_i),
+                dtype=prob_dtype,
+            )
+            if device.type == "cuda" and not native_score_grid_enabled
+            else None
         )
         fused_mixed_softmax_base_enabled = _env_truthy(
             "SELECTOR_PQ_JOINT_FUSED_SOFTMAX_BASE",
@@ -1303,7 +1481,13 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 if selected_t_i is None:
                     selected_t_i = selected_for_budget_batch(int(k_budget))
                     grid_selected_by_ki[-1] = selected_t_i
-                grid_score_rows.append(mixed_scores_for_selected_batch(selected_t_i))
+                if torch_score_grid_t is None:
+                    grid_score_rows.append(mixed_scores_for_selected_batch(selected_t_i))
+                else:
+                    mixed_scores_for_selected_batch(
+                        selected_t_i,
+                        out_t=torch_score_grid_t[int(ki_i)],
+                    )
         probs_grid_t: torch.Tensor | None = None
         base_output_grid_t: torch.Tensor | None = None
         score_grid_t: torch.Tensor | None = None
@@ -1750,7 +1934,11 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                         bool(str(args.tail_score_calibration) == "affine_selected"),
                     )
         else:
-            score_grid_t = torch.stack(grid_score_rows, dim=0)
+            score_grid_t = (
+                torch_score_grid_t
+                if torch_score_grid_t is not None
+                else torch.stack(grid_score_rows, dim=0)
+            )
         if bool(getattr(args, "profile_native_ops", False)):
             _sync_if_cuda(device)
             stats[layer_id].add_joint_detail_timing(
@@ -2065,6 +2253,16 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             grid_k_mb_by_idx=grid_k_mb_by_idx,
             v_mb_by_idx=v_mb_by_idx,
             sim_start_seconds=float(sim_t0),
+            v_lo_reads_grid=grid_v_lo_reads_t,
+            time_trace=time_trace,
+            defer_torch_policy=bool(
+                runtime.defer_torch_policy
+                and grid_outputs_t is not None
+                and grid_selected_counts_by_ki is not None
+                and grid_k_mb_by_idx is not None
+            ),
+            d2h_owner=self,
+            d2h_slot=int(kv_head_i),
         )
     )
     final_ki_by_head = policy_result.final_ki_by_head
@@ -2072,40 +2270,85 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     final_idx_t_for_output = policy_result.final_idx_for_output
     final_output_grid_t = policy_result.final_output_grid
 
-    return finalize_joint_head_outputs(
-        JointFinalizeRuntime(
-            args=args,
-            module=self,
-            layer_id=int(layer_id),
-            stats=stats,
-            device=device,
-            outputs_all=outputs_all,
-            head_start=int(head_start_i),
-            head_end=int(head_end_i),
-            group_heads=int(group_heads_i),
-            context_len=int(context_len_i),
-            key_bytes=int(key_bytes),
-            value_bytes=int(value_bytes),
-            selector_mb=float(selector_mb),
-            actual_value_subvecs=int(actual_value_subvecs),
-            code_bytes=int(code_bytes),
-            v_pq_codebook_mb=float(v_pq_codebook_mb),
-            metadata_mb=float(metadata_mb),
-            joint_v_budgets=joint_v_budgets,
-            final_ki_by_head=final_ki_by_head,
-            final_vi_by_head=final_vi_by_head,
-            final_idx_for_output=final_idx_t_for_output,
-            final_output_grid=final_output_grid_t,
-            grid_outputs=grid_outputs_t,
-            grid_outputs_for_v_idx=grid_outputs_for_v_idx,
-            grid_selected_counts_by_ki=grid_selected_counts_by_ki,
-            grid_selected_by_ki=grid_selected_by_ki,
-            k_artifacts=k_artifacts_batch,
-            output_for_budget=output_for_budget_batch,
-            precision_tiers_enabled=bool(precision_tiers_enabled),
-            precision_v_hi_frac=float(_FROZEN_PRECISION_V_HI_FRAC),
-            precision_lo_bytes=int(_FROZEN_PRECISION_LO_BYTES),
-            k_lo_counts_by_ki=grid_k_lo_counts_by_ki,
-            v_lo_reads_grid=grid_v_lo_reads_t,
-        )
+    finalize_runtime = JointFinalizeRuntime(
+        args=args,
+        module=self,
+        layer_id=int(layer_id),
+        stats=stats,
+        device=device,
+        outputs_all=outputs_all,
+        head_start=int(head_start_i),
+        head_end=int(head_end_i),
+        group_heads=int(group_heads_i),
+        context_len=int(context_len_i),
+        key_bytes=int(key_bytes),
+        value_bytes=int(value_bytes),
+        selector_mb=float(selector_mb),
+        actual_value_subvecs=int(actual_value_subvecs),
+        code_bytes=int(code_bytes),
+        v_pq_codebook_mb=float(v_pq_codebook_mb),
+        metadata_mb=float(metadata_mb),
+        joint_v_budgets=joint_v_budgets,
+        final_ki_by_head=final_ki_by_head,
+        final_vi_by_head=final_vi_by_head,
+        final_idx_for_output=final_idx_t_for_output,
+        final_output_grid=final_output_grid_t,
+        grid_outputs=grid_outputs_t,
+        grid_outputs_for_v_idx=grid_outputs_for_v_idx,
+        grid_selected_counts_by_ki=grid_selected_counts_by_ki,
+        grid_selected_by_ki=grid_selected_by_ki,
+        k_artifacts=k_artifacts_batch,
+        output_for_budget=output_for_budget_batch,
+        precision_tiers_enabled=bool(precision_tiers_enabled),
+        precision_v_hi_frac=float(_FROZEN_PRECISION_V_HI_FRAC),
+        precision_lo_bytes=int(_FROZEN_PRECISION_LO_BYTES),
+        k_lo_counts_by_ki=grid_k_lo_counts_by_ki,
+        v_lo_reads_grid=grid_v_lo_reads_t,
+        v_lo_reads_rows=policy_result.v_lo_reads_rows,
     )
+    if policy_result.deferred_torch_policy is not None:
+        if runtime.deferred_policy_records is None:
+            raise RuntimeError("missing deferred policy record list")
+        # The packed host record contains every CPU policy input.  Drop the
+        # lazy-output closures before retaining eight groups until the single
+        # layer-level wait; otherwise those closures keep context-sized
+        # temporaries alive and defeat the memory bound.
+        policy_result.deferred_torch_policy.runtime.output_for_budget = None
+        policy_result.deferred_torch_policy.runtime.k_artifacts = None
+        policy_result.deferred_torch_policy.runtime.grid_outputs = None
+        policy_result.deferred_torch_policy.runtime.v_lo_reads_grid = None
+        finalize_runtime.grid_selected_by_ki = None
+        finalize_runtime.k_artifacts = None
+        finalize_runtime.output_for_budget = None
+        runtime.deferred_policy_records.append(
+            (policy_result.deferred_torch_policy, finalize_runtime)
+        )
+        if time_trace is not None:
+            time_trace.cuda_end("select", select_trace_start)
+        return True
+    finalized = finalize_joint_head_outputs(finalize_runtime)
+    if time_trace is not None:
+        time_trace.cuda_end("select", select_trace_start)
+    return finalized
+
+
+def finish_deferred_joint_kv_heads(runtime) -> bool:
+    records = runtime.deferred_policy_records
+    if not records:
+        return True
+    time_trace = getattr(runtime.self, "_pagedpq_joint_time_trace", None)
+    wait_t0 = time.perf_counter() if time_trace is not None else 0.0
+    ready = torch.cuda.Event()
+    ready.record(torch.cuda.current_stream(runtime.device))
+    ready.synchronize()
+    if time_trace is not None:
+        time_trace.add_cpu("sync_wait", time.perf_counter() - wait_t0)
+    for prepared, finalize_runtime in records:
+        selected, v_lo_reads_rows = finish_prepared_torch_policy(prepared)
+        finalize_runtime.final_ki_by_head = [int(ki) for ki, _vi in selected]
+        finalize_runtime.final_vi_by_head = [int(vi) for _ki, vi in selected]
+        finalize_runtime.v_lo_reads_rows = v_lo_reads_rows
+        if not finalize_joint_head_outputs(finalize_runtime):
+            return False
+    records.clear()
+    return True

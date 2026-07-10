@@ -40,53 +40,11 @@ state: Any,
         "0",
     )
     cache_key = joint_vpq_cache_key_for(int(kv_head), values_t, index)
-    # The joint_vpq cache key is derived from page GEOMETRY (kv_head, page
-    # counts/starts/size) only -- it does NOT encode the values content. When
-    # several sequences share the same sealed-page geometry (e.g. RULER samples
-    # of equal length), the persistent/runtime sidecar caches would return the
-    # FIRST sequence's V-PQ vhat/residual/code_error for every later sequence,
-    # silently garbling all but the first sample. The grouped/native sidecar
-    # path avoids this by keying on the freshly-built pack tensors; mirror that
-    # here by folding a content fingerprint of the per-sequence V-PQ pack
-    # (built fresh per prefill index) into the cache key. Stable across decode
-    # steps of one sequence (same cached pack), distinct across sequences.
-    if use_joint_vpq_cache:
-        try:
-            _fp_pack = value_vpq_pack_torch(
-                index=index,
-                values=values_t,
-                value_subvecs=int(args.value_subvecs),
-                value_subbits=int(args.value_subbits)
-                if int(args.value_subbits) > 0
-                else int(args.subbits),
-                key_bytes=int(value_bytes),
-                device=values_t.device,
-            )
-        except Exception:
-            _fp_pack = None
-        if _fp_pack is not None:
-            _cb, _cd = _fp_pack[0], _fp_pack[1]
-            _sig = (
-                torch.stack(
-                    [
-                        _cb.double().sum(),
-                        _cb.double().square().sum(),
-                        _cd.double().sum(),
-                        _cd.double().square().sum(),
-                    ]
-                )
-                .detach()
-                .to("cpu")
-                .tolist()
-            )
-            cache_key = (
-                *cache_key,
-                tuple(int(v) for v in _cb.shape),
-                tuple(int(v) for v in _cd.shape),
-                int(_fp_pack[3]),
-                int(_fp_pack[4]),
-                tuple(float(v) for v in _sig),
-            )
+    # This geometry key is sequence-local. reset_paged_pq_attention_state()
+    # clears the persistent V-PQ cache before each independent sample, so the
+    # sidecar built during prefill warm is both content-safe and directly
+    # reusable by decode.  Do not fingerprint CUDA pack contents here: that
+    # defeated prewarming and forced reductions plus a D2H sync on every call.
     persistent_cache = getattr(module, "_pagedpq_joint_vpq_sidecar_cache", None)
     if use_persistent_vpq_cache and not isinstance(persistent_cache, dict):
         persistent_cache = {}
@@ -512,4 +470,3 @@ state: Any,
                     break
                 persistent_cache.pop(oldest_key, None)
     return out
-
