@@ -5,8 +5,8 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=128000m
 #SBATCH --time=01:00:00
-#SBATCH --account=zhengya98
-#SBATCH --partition=spgpu
+#SBATCH --account=zhengya0
+#SBATCH --partition=gpu_mig40,spgpu,gpu-rtx6000
 #SBATCH --gpus-per-node=1
 set -euo pipefail
 
@@ -42,7 +42,10 @@ export TAIL_PQ_RELRMSE_MAX="${TAIL_PQ_RELRMSE_MAX:-inf}"
 export RANKED_CONFIDENCE_COST_MODE="${RANKED_CONFIDENCE_COST_MODE:-exact}"
 export FRONTIER_EXACT_LOGIT_BACKEND="${FRONTIER_EXACT_LOGIT_BACKEND:-auto}"
 export FRONTIER_DENSE_SIM_MAX_CONTEXT_RATIO="${FRONTIER_DENSE_SIM_MAX_CONTEXT_RATIO:-2.0}"
-export FRONTIER_DENSE_KEY_T_CACHE="${FRONTIER_DENSE_KEY_T_CACHE:-1}"
+# Default FLIPS to 0 per the adopted standard config (keyT cache off on all
+# cards). Caller wins. A/B (jobs 53219181/53224181): predictions/scores
+# identical vs. cache-on, only MB counters move <=0.1%; A/A fully deterministic.
+export FRONTIER_DENSE_KEY_T_CACHE="${FRONTIER_DENSE_KEY_T_CACHE:-0}"
 export FRONTIER_DENSE_KEY_T_CACHE_MAX_GB="${FRONTIER_DENSE_KEY_T_CACHE_MAX_GB:-12.0}"
 export FRONTIER_CANONICAL_GPU="${FRONTIER_CANONICAL_GPU:-1}"
 export SELECTOR_PQ_PRECOMPUTE_RANK_WEIGHTS="${SELECTOR_PQ_PRECOMPUTE_RANK_WEIGHTS:-1}"

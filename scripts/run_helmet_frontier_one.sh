@@ -6,7 +6,7 @@
 #SBATCH --mem=128000m
 #SBATCH --time=10:00:00
 #SBATCH --account=zhengya0
-#SBATCH --partition=gpu-rtx6000,spgpu
+#SBATCH --partition=gpu_mig40,spgpu,gpu-rtx6000
 #SBATCH --gpus-per-node=1
 set -euo pipefail
 
@@ -68,6 +68,10 @@ export LD_LIBRARY_PATH="${PWD}/.venv/lib/python3.10/site-packages/numpy.libs:${P
 export PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-8192}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK="${FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK:-1}"
+# Standard config on all three eligible partitions (gpu_mig40/spgpu/gpu-rtx6000):
+# keyT cache off inherits from run_frontier_ruler_batched_one.sh's flipped
+# FRONTIER_DENSE_KEY_T_CACHE default (0); memory trace on for the ~34 GiB peak.
+export SELECTOR_PQ_JOINT_MEMORY_TRACE="${SELECTOR_PQ_JOINT_MEMORY_TRACE:-1}"
 
 export TASK_NAME="${DATASET}"
 export CONTEXT_LEN="${INPUT_MAX_LENGTH}"

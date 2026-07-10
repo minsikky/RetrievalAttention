@@ -13,15 +13,24 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 DEP="${1:-}"
+# Config decision: FRONTIER_DENSE_KEY_T_CACHE=0 is the adopted standard config
+# on ALL cards (keyT cache off). A/B (jobs 53219181/53224181): predictions and
+# scores identical vs. the cache-on run, only MB counters move <=0.1%; A/A path
+# is fully deterministic. With this config the measured-class peak @128k is
+# ~34 GiB, which fits all three eligible partitions: gpu_mig40 (39.25 GiB),
+# spgpu A40 (44.4 GiB), and gpu-rtx6000.
 COMMON_ENV=(
   CONTEXT_LEN=131072
   NUM_SAMPLES=16
   JOINT_KV_STABILITY_THRESHOLD=0.004
   LOGIT_BUFFER_FORMAT=e4m3
   JOINT_KV_PRECISION_TIERS=1
+  FRONTIER_DENSE_KEY_T_CACHE=0
+  PREFILL_CHUNK_SIZE=8192
+  SELECTOR_PQ_JOINT_MEMORY_TRACE=1
   OUTPUT_ROOT=benchmark_suite_result/frozen_sim_20260707/runs
 )
-SBATCH_ARGS=(--account=zhengya0 --partition=gpu-rtx6000,spgpu --time=08:00:00 --export=ALL)
+SBATCH_ARGS=(--account=zhengya0 --partition=gpu_mig40,spgpu,gpu-rtx6000 --time=08:00:00 --export=ALL)
 
 submit() {
   local task="$1" ctx="$2" run_name="$3"
