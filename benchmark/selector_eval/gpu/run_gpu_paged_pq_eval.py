@@ -32,6 +32,18 @@ def _sync_if_cuda(device: torch.device | str) -> None:
         torch.cuda.synchronize(dev)
 
 
+def _rowwise_mm(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Matrix-multiply matching batch rows with batch-count-invariant dispatch."""
+    out = torch.empty(
+        (int(left.shape[0]), int(left.shape[1]), int(right.shape[2])),
+        dtype=left.dtype,
+        device=left.device,
+    )
+    for row in range(int(left.shape[0])):
+        torch.mm(left[row], right[row], out=out[row])
+    return out
+
+
 def parse_csv_ints(text: str) -> list[int]:
     return [int(part.strip()) for part in str(text).split(",") if part.strip()]
 
@@ -321,14 +333,7 @@ def build_page_pq_torch(
         )
 
     num_pages = token_count // page_size
-    block = keys[dynamic_start:sealed_end].to(dtype=torch.float32).contiguous()
-    data = (
-        block.view(num_pages, page_size, subvecs, subdim)
-        .permute(0, 2, 1, 3)
-        .contiguous()
-        .view(num_pages * subvecs, page_size, subdim)
-    )
-
+    batch_count = num_pages * subvecs
     active_centroids = min(int(centroids), int(page_size))
     init_idx_np = np.empty((num_pages, subvecs, active_centroids), dtype=np.int64)
     pad_idx_np = (
@@ -353,44 +358,191 @@ def build_page_pq_torch(
                     replace=True,
                 )
     init_idx = torch.as_tensor(
-        init_idx_np.reshape(num_pages * subvecs, active_centroids),
+        init_idx_np.reshape(batch_count, active_centroids),
         dtype=torch.long,
         device=device,
     )
-    centers_active = torch.gather(data, 1, init_idx.unsqueeze(-1).expand(-1, -1, subdim)).clone()
-    if active_centroids < int(page_size):
-        assign = torch.zeros((data.shape[0], page_size), dtype=torch.long, device=device)
-        ones = torch.ones((data.shape[0], page_size), dtype=torch.float32, device=device)
-        for _ in range(max(1, int(kmeans_iters))):
-            dist = (
-                (data * data).sum(dim=2, keepdim=True)
-                + (centers_active * centers_active).sum(dim=2).unsqueeze(1)
-                - 2.0 * torch.bmm(data, centers_active.transpose(1, 2))
-            )
-            assign = torch.argmin(dist, dim=2)
-            sums = torch.zeros_like(centers_active)
-            sums.scatter_add_(1, assign.unsqueeze(-1).expand(-1, -1, subdim), data)
-            counts = torch.zeros((data.shape[0], active_centroids), dtype=torch.float32, device=device)
-            counts.scatter_add_(1, assign, ones)
-            centers_active = torch.where(counts.unsqueeze(-1) > 0, sums / counts.clamp_min(1.0).unsqueeze(-1), centers_active)
-
+    pad_idx = None
     if active_centroids < centroids:
         assert pad_idx_np is not None
         pad_idx = torch.as_tensor(
-            pad_idx_np.reshape(num_pages * subvecs, int(centroids) - active_centroids),
+            pad_idx_np.reshape(batch_count, int(centroids) - active_centroids),
             dtype=torch.long,
             device=device,
         )
-        pad = torch.gather(data, 1, pad_idx.unsqueeze(-1).expand(-1, -1, subdim))
-        centers = torch.cat([centers_active, pad], dim=1)
-    else:
-        centers = centers_active
-    dist = (
-        (data * data).sum(dim=2, keepdim=True)
-        + (centers * centers).sum(dim=2).unsqueeze(1)
-        - 2.0 * torch.bmm(data, centers.transpose(1, 2))
+
+    tile_override = int(os.environ.get("PAGEDPQ_BUILD_TILE_BATCH", "0"))
+    if tile_override < 0:
+        raise ValueError("PAGEDPQ_BUILD_TILE_BATCH must be >= 0")
+    temp_budget_mb = float(os.environ.get("PAGEDPQ_BUILD_TEMP_BUDGET_MB", "512"))
+    if temp_budget_mb <= 0.0:
+        raise ValueError("PAGEDPQ_BUILD_TEMP_BUDGET_MB must be > 0")
+    # CUDA scatter_add_ uses floating-point atomics. Use a conflict-free
+    # one-hot write followed by fp32 GEMM there; retain the historical CPU
+    # reduction so CPU/golden artifacts remain byte-identical. The legacy
+    # override is used only by the standalone determinism diagnostic.
+    legacy_cuda_scatter = str(
+        os.environ.get("PAGEDPQ_BUILD_DIAGNOSTIC_LEGACY_ATOMICS", "0")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    deterministic_centroid_reduction = device.type == "cuda" and not legacy_cuda_scatter
+    # The distance expression can concurrently hold its broadcast lhs, GEMM
+    # result, and final result. Include those plus the fp32 data/accumulator
+    # slices so the requested budget bounds the whole tiled calculation, not
+    # merely one GEMM output.
+    fp32_bytes = torch.empty((), dtype=torch.float32).element_size()
+    long_bytes = torch.empty((), dtype=torch.long).element_size()
+    dist_bytes = int(page_size) * max(int(active_centroids), int(centroids)) * fp32_bytes
+    onehot_bytes = (
+        int(page_size) * int(active_centroids) * fp32_bytes
+        if deterministic_centroid_reduction
+        else 0
     )
-    assign = torch.argmin(dist, dim=2)
+    data_bytes = int(page_size) * int(subdim) * fp32_bytes
+    center_bytes = int(centroids) * int(subdim) * fp32_bytes
+    per_batch_temp_bytes = (
+        3 * dist_bytes
+        + onehot_bytes
+        + 2 * data_bytes
+        + 3 * center_bytes
+        + int(page_size) * (long_bytes + fp32_bytes)
+        + int(centroids) * fp32_bytes
+    )
+    if tile_override > 0:
+        tile_batch = min(batch_count, tile_override)
+    else:
+        budget_bytes = int(temp_budget_mb * MB)
+        tile_batch = min(batch_count, max(1, budget_bytes // max(1, per_batch_temp_bytes)))
+    if str(os.environ.get("PAGEDPQ_BUILD_LOG_TILE", "0")).strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        print(
+            f"[pagedpq-build] device={device} batch={batch_count} tile={tile_batch} "
+            f"temp_bytes_per_batch={per_batch_temp_bytes} "
+            f"centroid_reduction="
+            f"{'onehot_row_mm' if deterministic_centroid_reduction else 'scatter_add'} "
+            f"distance_gemm={'row_mm' if device.type == 'cuda' else 'bmm'}",
+            flush=True,
+        )
+
+    centers = torch.empty((batch_count, centroids, subdim), dtype=torch.float32, device=device)
+    assign = torch.empty((batch_count, page_size), dtype=torch.long, device=device)
+    for batch_start in range(0, batch_count, tile_batch):
+        batch_end = min(batch_count, batch_start + tile_batch)
+        data = torch.empty(
+            (batch_end - batch_start, page_size, subdim),
+            dtype=torch.float32,
+            device=device,
+        )
+        for tile_row, batch_id in enumerate(range(batch_start, batch_end)):
+            page_id = int(batch_id // subvecs)
+            sub = int(batch_id % subvecs)
+            page_start = int(dynamic_start + page_id * page_size)
+            data[tile_row].copy_(
+                keys[
+                    page_start : page_start + page_size,
+                    sub * subdim : (sub + 1) * subdim,
+                ]
+            )
+
+        init_idx_tile = init_idx[batch_start:batch_end]
+        centers_active = torch.gather(
+            data,
+            1,
+            init_idx_tile.unsqueeze(-1).expand(-1, -1, subdim),
+        ).clone()
+        if active_centroids < int(page_size):
+            assign_tile = torch.zeros(
+                (data.shape[0], page_size),
+                dtype=torch.long,
+                device=device,
+            )
+            if not deterministic_centroid_reduction:
+                ones = torch.ones(
+                    (data.shape[0], page_size),
+                    dtype=torch.float32,
+                    device=device,
+                )
+            for _ in range(max(1, int(kmeans_iters))):
+                if device.type == "cuda":
+                    cross = _rowwise_mm(data, centers_active.transpose(1, 2))
+                    dist = (
+                        (data * data).sum(dim=2, keepdim=True)
+                        + (centers_active * centers_active).sum(dim=2).unsqueeze(1)
+                        - 2.0 * cross
+                    )
+                    del cross
+                else:
+                    dist = (
+                        (data * data).sum(dim=2, keepdim=True)
+                        + (centers_active * centers_active).sum(dim=2).unsqueeze(1)
+                        - 2.0 * torch.bmm(data, centers_active.transpose(1, 2))
+                    )
+                assign_tile = torch.argmin(dist, dim=2)
+                del dist
+                if deterministic_centroid_reduction:
+                    onehot = torch.zeros(
+                        (data.shape[0], page_size, active_centroids),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    onehot.scatter_(2, assign_tile.unsqueeze(-1), 1.0)
+                    sums = _rowwise_mm(onehot.transpose(1, 2), data)
+                    counts = onehot.sum(dim=1)
+                    del onehot
+                else:
+                    sums = torch.zeros_like(centers_active)
+                    sums.scatter_add_(
+                        1,
+                        assign_tile.unsqueeze(-1).expand(-1, -1, subdim),
+                        data,
+                    )
+                    counts = torch.zeros(
+                        (data.shape[0], active_centroids),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    counts.scatter_add_(1, assign_tile, ones)
+                centers_active = torch.where(
+                    counts.unsqueeze(-1) > 0,
+                    sums / counts.clamp_min(1.0).unsqueeze(-1),
+                    centers_active,
+                )
+
+        if pad_idx is not None:
+            pad_idx_tile = pad_idx[batch_start:batch_end]
+            pad = torch.gather(
+                data,
+                1,
+                pad_idx_tile.unsqueeze(-1).expand(-1, -1, subdim),
+            )
+            centers_tile = torch.cat([centers_active, pad], dim=1)
+        else:
+            centers_tile = centers_active
+        if device.type == "cuda":
+            cross = _rowwise_mm(data, centers_tile.transpose(1, 2))
+            dist = (
+                (data * data).sum(dim=2, keepdim=True)
+                + (centers_tile * centers_tile).sum(dim=2).unsqueeze(1)
+                - 2.0 * cross
+            )
+            del cross
+        else:
+            dist = (
+                (data * data).sum(dim=2, keepdim=True)
+                + (centers_tile * centers_tile).sum(dim=2).unsqueeze(1)
+                - 2.0 * torch.bmm(data, centers_tile.transpose(1, 2))
+            )
+        assign_tile = torch.argmin(dist, dim=2)
+        del dist
+        centers[batch_start:batch_end].copy_(centers_tile)
+        assign[batch_start:batch_end].copy_(assign_tile)
+        del data, centers_active, centers_tile, assign_tile
+        if active_centroids < int(page_size):
+            del sums, counts
+            if not deterministic_centroid_reduction:
+                del ones
+        if pad_idx is not None:
+            del pad
 
     codebooks = centers.view(num_pages, subvecs, centroids, subdim).contiguous()
     codes_long = assign.view(num_pages, subvecs, page_size).permute(0, 2, 1).contiguous().to(torch.long)
@@ -412,7 +564,7 @@ def build_page_pq_torch(
         )
         for page_id in range(num_pages)
     ]
-    read_bytes = float(block.numel() * int(key_bytes))
+    read_bytes = float(token_count * dim * int(key_bytes))
     code_bytes = 1 if int(subbits) <= 8 else 2
     write_bytes = float(codebooks.numel() * int(key_bytes) + native_codes.numel() * code_bytes)
     _sync_if_cuda(device)

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import numpy as np
@@ -176,6 +177,7 @@ def value_vpq_pack_torch(
     key_bytes: int,
     device: torch.device,
     value_group_pages: int = 1,
+    kmeans_iters: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int] | None:
     if not index.pages:
         return None
@@ -186,7 +188,14 @@ def value_vpq_pack_torch(
     page_size = int(selection_page_size * group_pages)
     actual_value_subvecs = int(value_subvecs) if int(value_subvecs) > 0 else int(index.pages[0].codes.shape[1])
     actual_value_subbits = int(value_subbits) if int(value_subbits) > 0 else 8
-    cache_key = (str(device), int(actual_value_subvecs), int(actual_value_subbits), int(group_pages), "torch")
+    cache_key = (
+        str(device),
+        int(actual_value_subvecs),
+        int(actual_value_subbits),
+        int(group_pages),
+        int(kmeans_iters),
+        "torch",
+    )
     cached = getattr(index, "_value_vpq_gpu_pack_by_params", None)
     if isinstance(cached, dict) and cache_key in cached:
         setattr(index, "_last_value_vpq_build_stats", None)
@@ -202,7 +211,7 @@ def value_vpq_pack_torch(
         page_size=page_size,
         subvecs=int(actual_value_subvecs),
         subbits=int(actual_value_subbits),
-        kmeans_iters=3,
+        kmeans_iters=int(kmeans_iters),
         seed=90210 + int(dynamic_start) + 1000003 * int(group_pages),
         key_bytes=int(key_bytes),
         router_enabled=False,
@@ -244,6 +253,7 @@ def vpq_values_for_tokens_gpu(
     value_subbits: int,
     prefer_torch: bool = False,
     value_bytes: int = 2,
+    kmeans_iters: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     if bool(prefer_torch):
         pack = value_vpq_pack_torch(
@@ -253,6 +263,7 @@ def vpq_values_for_tokens_gpu(
             value_subbits=int(value_subbits) if int(value_subbits) > 0 else int(subbits),
             key_bytes=int(value_bytes),
             device=values.device,
+            kmeans_iters=int(kmeans_iters),
         )
     else:
         if values_np is None:
@@ -368,6 +379,52 @@ def reconstruct_all_vpq_values_gpu(
     return packed
 
 
+def _bucket_sums_counts(
+    bucket_ids: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    bucket_count: int,
+    bins_per_group: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    legacy_cuda_atomics = str(
+        os.environ.get("PAGEDPQ_BUILD_DIAGNOSTIC_LEGACY_ATOMICS", "0")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if bucket_ids.device.type != "cuda" or legacy_cuda_atomics:
+        sums = torch.bincount(bucket_ids, weights=weights, minlength=int(bucket_count))
+        counts = torch.bincount(bucket_ids, minlength=int(bucket_count)).to(dtype=weights.dtype)
+        return sums, counts
+
+    # Weighted CUDA bincount uses floating-point atomics. PQ risk buckets are
+    # page-local, so reduce one page-sized group at a time with a conflict-free
+    # constant scatter followed by fp64 GEMM. This bounds the one-hot workspace
+    # to roughly page_size * num_codes instead of tokens * all_page_codes.
+    sums = torch.zeros((int(bucket_count),), dtype=weights.dtype, device=weights.device)
+    counts = torch.zeros_like(sums)
+    bins_per_group = max(1, int(bins_per_group))
+    for group_start in range(0, int(bucket_count), bins_per_group):
+        group_end = min(int(bucket_count), group_start + bins_per_group)
+        group_rows = torch.nonzero(
+            (bucket_ids >= group_start) & (bucket_ids < group_end),
+            as_tuple=False,
+        ).reshape(-1)
+        if group_rows.numel() == 0:
+            continue
+        local_ids = bucket_ids.index_select(0, group_rows) - int(group_start)
+        onehot = torch.zeros(
+            (int(group_rows.numel()), group_end - group_start),
+            dtype=weights.dtype,
+            device=weights.device,
+        )
+        onehot.scatter_(1, local_ids.unsqueeze(1), 1.0)
+        group_weights = weights.index_select(0, group_rows)
+        sums[group_start:group_end] = torch.mm(
+            onehot.transpose(0, 1),
+            group_weights.unsqueeze(1),
+        ).squeeze(1)
+        counts[group_start:group_end] = onehot.sum(dim=0)
+    return sums, counts
+
+
 def value_vpq_code_stat_risk_torch(
     *,
     index: GPUIndex,
@@ -380,6 +437,7 @@ def value_vpq_code_stat_risk_torch(
     value_subvecs: int,
     value_subbits: int,
     value_bytes: int,
+    kmeans_iters: int = 3,
 ) -> tuple[torch.Tensor, int]:
     """Per-token deployable V-PQ residual-risk sidecar using torch-built V-PQ.
 
@@ -397,6 +455,7 @@ def value_vpq_code_stat_risk_torch(
         value_subbits=int(value_subbits) if int(value_subbits) > 0 else int(subbits),
         key_bytes=int(value_bytes),
         device=values.device,
+        kmeans_iters=int(kmeans_iters),
     )
     if pack is None or values.numel() == 0 or not bool(torch.any(valid)):
         actual_value_subbits = int(value_subbits) if int(value_subbits) > 0 else int(subbits)
@@ -431,8 +490,12 @@ def value_vpq_code_stat_risk_torch(
         per_token = torch.sum(residual_valid[:, lo:hi] * residual_valid[:, lo:hi], dim=1)
         bucket_ids = valid_pages * int(num_codes) + selected_codes[:, int(sub)]
         bucket_ids = torch.clamp(bucket_ids, min=0, max=bucket_count - 1)
-        sums = torch.bincount(bucket_ids, weights=per_token, minlength=bucket_count)
-        counts = torch.bincount(bucket_ids, minlength=bucket_count).to(dtype=torch.float64)
+        sums, counts = _bucket_sums_counts(
+            bucket_ids,
+            per_token,
+            bucket_count=bucket_count,
+            bins_per_group=num_codes,
+        )
         means = sums / torch.clamp_min(counts, 1.0)
         risk_valid += means.index_select(0, bucket_ids)
     out.index_copy_(0, valid_idx, risk_valid)
@@ -486,8 +549,12 @@ def value_vpq_code_stat_risk_from_pack_streaming_torch(
             approx = codebooks[page_i, int(sub)].index_select(0, code_ids).float()
             residual = values_page[:, lo:hi] - approx
             per_token = torch.sum(residual.double() * residual.double(), dim=1)
-            sums = torch.bincount(code_ids, weights=per_token, minlength=num_codes)
-            counts = torch.bincount(code_ids, minlength=num_codes).to(dtype=torch.float64)
+            sums, counts = _bucket_sums_counts(
+                code_ids,
+                per_token,
+                bucket_count=num_codes,
+                bins_per_group=num_codes,
+            )
             means = sums / torch.clamp_min(counts, 1.0)
             risk_page += means.index_select(0, code_ids)
         out[start_i:end_i] = risk_page
@@ -554,8 +621,12 @@ def value_vpq_code_stat_risk_subset_torch(
         per_token = torch.sum(residual_valid[:, lo:hi] * residual_valid[:, lo:hi], dim=1)
         bucket_ids = valid_pages * int(num_codes) + selected_codes[:, int(sub)]
         bucket_ids = torch.clamp(bucket_ids, min=0, max=bucket_count - 1)
-        sums = torch.bincount(bucket_ids, weights=per_token, minlength=bucket_count)
-        counts = torch.bincount(bucket_ids, minlength=bucket_count).to(dtype=torch.float64)
+        sums, counts = _bucket_sums_counts(
+            bucket_ids,
+            per_token,
+            bucket_count=bucket_count,
+            bins_per_group=num_codes,
+        )
         means = sums / torch.clamp_min(counts, 1.0)
         risk_valid += means.index_select(0, bucket_ids)
     out.index_copy_(0, valid_idx, risk_valid)
