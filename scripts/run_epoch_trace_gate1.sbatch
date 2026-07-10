@@ -71,7 +71,7 @@ echo "[gate1] ON run (epoch trace enabled)"
 
 echo "[gate1] byte-diff non-trace outputs (args.json excluded: records the flag)"
 FAIL=0
-for f in per_head_joint_policy.csv layer_joint_policy.csv gqa_union_stats.csv summary.json; do
+for f in per_head_joint_policy.csv layer_joint_policy.csv gqa_union_stats.csv; do
   if ! cmp -s "$OUT_OFF/$f" "$OUT_ON/$f"; then
     echo "  MISMATCH: $f"
     FAIL=1
@@ -79,11 +79,27 @@ for f in per_head_joint_policy.csv layer_joint_policy.csv gqa_union_stats.csv su
     echo "  identical: $f"
   fi
 done
+# summary.json embeds wall-clock elapsed_seconds; compare field-aware with
+# timing excluded (every numeric field must still match bit-exactly).
+if .venv/bin/python - "$OUT_OFF/summary.json" "$OUT_ON/summary.json" <<'EOF'
+import json, sys
+a = json.load(open(sys.argv[1]))
+b = json.load(open(sys.argv[2]))
+a.pop("elapsed_seconds", None)
+b.pop("elapsed_seconds", None)
+sys.exit(0 if json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True) else 1)
+EOF
+then
+  echo "  identical (excl. elapsed_seconds): summary.json"
+else
+  echo "  MISMATCH: summary.json (beyond elapsed_seconds)"
+  FAIL=1
+fi
 if [ "$FAIL" -ne 0 ]; then
   echo "[gate1] GATE 1 FAIL: observer changed a numeric output"
   exit 1
 fi
-echo "[gate1] GATE 1 PASS: all numeric outputs byte-identical"
+echo "[gate1] GATE 1 PASS: all numeric outputs byte-identical (summary.json modulo wall clock)"
 
 echo "[gate1] gate 2 + gate 3 validators on the small ON run"
 .venv/bin/python scripts/validate_epoch_trace.py --trace_dir "$TRACE" --run_dir "$OUT_ON"
