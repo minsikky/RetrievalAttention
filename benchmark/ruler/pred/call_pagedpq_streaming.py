@@ -605,6 +605,7 @@ def generate_batched(
     dense_kv_staging_buffers: int = 2,
     dense_kv_query_block_tokens: int = 2048,
     greedy_logit_trace: list[torch.Tensor] | None = None,
+    forced_token_ids: list[int] | None = None,
 ) -> tuple[list[int], dict[str, float | int]]:
     if input_ids.ndim != 2 or int(input_ids.shape[0]) != 1:
         raise ValueError("batched runner currently expects batch size 1")
@@ -626,6 +627,14 @@ def generate_batched(
             query_block_tokens=int(dense_kv_query_block_tokens),
             device=device,
         )
+    forced_tokens = None
+    if forced_token_ids is not None:
+        if len(forced_token_ids) != int(max_new_tokens):
+            raise ValueError(
+                "forced token count must equal max_new_tokens: "
+                f"{len(forced_token_ids)} != {int(max_new_tokens)}"
+            )
+        forced_tokens = torch.tensor(forced_token_ids, dtype=torch.long, device=device).view(1, -1)
     sync_cuda_if_needed(device)
     prompt_start = time.perf_counter()
     out = prefill_batched(
@@ -650,11 +659,12 @@ def generate_batched(
     sync_cuda_if_needed(device)
     decode_start = time.perf_counter()
     for step in range(int(max_new_tokens)):
-        token_id = int(next_token.item())
+        input_token = next_token if forced_tokens is None else forced_tokens[:, step : step + 1]
+        token_id = int(input_token.item())
         generated.append(token_id)
         if dense_kv_offload:
             log_cuda_memory(f"offload.decode.step.{step}.start", device)
-        out = model_forward_last_logits(model, next_token.to(device), past_key_values=past_key_values, use_cache=True)
+        out = model_forward_last_logits(model, input_token, past_key_values=past_key_values, use_cache=True)
         past_key_values = out.past_key_values
         next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
         if greedy_logit_trace is not None and step + 1 < int(max_new_tokens):
@@ -891,6 +901,11 @@ def run() -> None:
         help="optional torch-save path for per-step logits used by greedy A/B validation",
     )
     parser.add_argument(
+        "--forced_token_trace_file",
+        default="",
+        help="optional prior logit-trace file whose token_ids are teacher-forced during decode",
+    )
+    parser.add_argument(
         "--prefill_selector_backend",
         choices=["native", "native_fused", "torch_lut", "torch_lut_fp16", "torch_lut_streaming", "torch_lut_batched", "torch_matmul"],
         default="native",
@@ -967,6 +982,29 @@ def run() -> None:
     rows = load_data(args.data_file)
     if int(args.num_samples) > 0:
         rows = rows[: int(args.num_samples)]
+    forced_token_records = None
+    if str(args.forced_token_trace_file):
+        loaded_forced_records = torch.load(
+            args.forced_token_trace_file,
+            map_location="cpu",
+            weights_only=False,
+        )
+        if not isinstance(loaded_forced_records, list) or len(loaded_forced_records) != len(rows):
+            raise ValueError(
+                "forced token trace must contain exactly one record per selected input row"
+            )
+        forced_token_records = []
+        for record in loaded_forced_records:
+            if not isinstance(record, dict) or "index" not in record or "token_ids" not in record:
+                raise ValueError("forced token trace records require index and token_ids")
+            forced_token_records.append(
+                {
+                    "index": record["index"],
+                    "token_ids": [int(token_id) for token_id in record["token_ids"]],
+                }
+            )
+        del loaded_forced_records
+        log(f"loaded forced tokens from {args.forced_token_trace_file}")
 
     load_start = time.perf_counter()
     log("loading tokenizer")
@@ -1027,7 +1065,7 @@ def run() -> None:
         if attn_noise_config is not None:
             attn_noise_counters = context_value
         with out_path.open("w", encoding="utf-8", buffering=1) as fout:
-            for sample in tqdm(rows, desc=f"{args.mode}:{args.task}"):
+            for sample_idx, sample in enumerate(tqdm(rows, desc=f"{args.mode}:{args.task}")):
                 if str(args.mode) in {"pagedpq_stream", "pagedpq_batched"}:
                     reset_paged_pq_attention_state(model)
                 input_ids = tokenizer(str(sample["input"]), return_tensors="pt").input_ids
@@ -1053,6 +1091,16 @@ def run() -> None:
                         raise ValueError("greedy logit tracing is supported only by batched generation")
                     sample_logit_trace = []
                     generate_kwargs["greedy_logit_trace"] = sample_logit_trace
+                if forced_token_records is not None:
+                    if generate_fn is not generate_batched:
+                        raise ValueError("forced tokens are supported only by batched generation")
+                    forced_record = forced_token_records[sample_idx]
+                    if forced_record.get("index") != sample["index"]:
+                        raise ValueError(
+                            "forced token trace/input index mismatch at row "
+                            f"{sample_idx}: {forced_record.get('index')} != {sample['index']}"
+                        )
+                    generate_kwargs["forced_token_ids"] = forced_record["token_ids"]
                 generated, timing = generate_fn(**generate_kwargs)
                 if logit_trace_records is not None:
                     logit_trace_records.append(
@@ -1182,9 +1230,15 @@ def run() -> None:
             "kv_block_tokens": int(args.dense_kv_block_tokens),
             "query_block_tokens": int(args.dense_kv_query_block_tokens),
             "staging_buffers": int(args.dense_kv_staging_buffers),
+            "qk_compute": (
+                "tf32_bf16_exact_fp32_output" if device.type == "cuda" else "fp32"
+            ),
+            "av_compute": "fp32",
             "h2d_bytes": total_h2d_bytes,
             "h2d_tib": float(total_h2d_bytes / (1024.0 ** 4)),
         }
+    if forced_token_records is not None:
+        summary["teacher_forced"] = True
     if logit_trace_records is not None:
         trace_path = Path(args.greedy_logit_trace_file)
         trace_path.parent.mkdir(parents=True, exist_ok=True)

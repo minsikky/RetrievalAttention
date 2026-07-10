@@ -157,6 +157,10 @@ GREEDY_LOGIT_TRACE_ARG=()
 if [ -n "${GREEDY_LOGIT_TRACE_FILE:-}" ]; then
   GREEDY_LOGIT_TRACE_ARG=(--greedy_logit_trace_file "${GREEDY_LOGIT_TRACE_FILE}")
 fi
+FORCED_TOKEN_TRACE_ARG=()
+if [ -n "${FORCED_TOKEN_TRACE_FILE:-}" ]; then
+  FORCED_TOKEN_TRACE_ARG=(--forced_token_trace_file "${FORCED_TOKEN_TRACE_FILE}")
+fi
 PREFILL_TAIL_BLEND_ARG=()
 if [ -n "${PREFILL_TAIL_BLEND:-}" ]; then
   PREFILL_TAIL_BLEND_ARG=(--prefill_tail_blend "${PREFILL_TAIL_BLEND}")
@@ -175,6 +179,7 @@ echo "[pagedpq_stream_smoke] out=${OUT_DIR}"
 echo "[pagedpq_stream_smoke] budget=${BUDGET:-4096} confidence=${ONLINE_CONFIDENCE_RULE:-joint_kv_stability} target=${TAIL_PROXY_MASS_MIN:-0.0} geom_min=${GEOMETRIC_MIN_BUDGET:-8192} geom_max=${GEOMETRIC_MAX_BUDGET:-65536} page=${PAGE_SIZE:-5632} chunk=${PREFILL_CHUNK_SIZE:-0}"
 echo "[pagedpq_stream_smoke] exact_logit_backend=${FRONTIER_EXACT_LOGIT_BACKEND:-auto}"
 echo "[pagedpq_stream_smoke] dense_kv_offload=${DENSE_KV_OFFLOAD:-0} kv_block=${DENSE_KV_BLOCK_TOKENS:-8192} staging=${DENSE_KV_STAGING_BUFFERS:-2} query_block=${DENSE_KV_QUERY_BLOCK_TOKENS:-2048}"
+echo "[pagedpq_stream_smoke] forced_token_trace=${FORCED_TOKEN_TRACE_FILE:-none}"
 
 DATA_FILE="${DATA_FILE_OVERRIDE:-${DATA_DIR}/${TASK_NAME}/validation.jsonl}"
 if [ -n "${DATA_FILE_OVERRIDE:-}" ]; then
@@ -286,7 +291,8 @@ fi
   "${ALLOW_TF32_SELECTOR_ARG[@]}" \
   "${NATIVE_DECODE_TAIL_ARG[@]}" \
   "${DENSE_KV_OFFLOAD_ARG[@]}" \
-  "${GREEDY_LOGIT_TRACE_ARG[@]}"
+  "${GREEDY_LOGIT_TRACE_ARG[@]}" \
+  "${FORCED_TOKEN_TRACE_ARG[@]}"
 
 if [ "${SKIP_RULER_EVAL:-0}" != "1" ]; then
   pushd benchmark/ruler >/dev/null

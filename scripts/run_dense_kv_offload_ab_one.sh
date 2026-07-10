@@ -35,67 +35,36 @@ export OUTPUT_ROOT="benchmark_suite_result/qwen1m_dense_kv_offload_ab/runs"
 LOG_ROOT="${WORKTREE}/benchmark_suite_result/qwen1m_dense_kv_offload_ab/logs/ctx${CONTEXT_LEN}"
 mkdir -p "${LOG_ROOT}"
 
-unset DENSE_KV_OFFLOAD DATA_FILE_OVERRIDE REUSE_DATA
+unset DENSE_KV_OFFLOAD DATA_FILE_OVERRIDE REUSE_DATA FORCED_TOKEN_TRACE_FILE
 export RUN_NAME="stock_${TASK_NAME}_${CONTEXT_LEN}_n${NUM_SAMPLES}"
 export GREEDY_LOGIT_TRACE_FILE="${LOG_ROOT}/stock_logits.pt"
 bash scripts/run_ruler_pagedpq_stream_smoke_one.sh 2>&1 | tee "${LOG_ROOT}/stock.console.log"
 
 STOCK_DATA="${WORKTREE}/${OUTPUT_ROOT}/${RUN_NAME}/data/${TASK_NAME}/validation.jsonl"
-STOCK_PRED="${WORKTREE}/${OUTPUT_ROOT}/${RUN_NAME}/pred/${TASK_NAME}.jsonl"
+STOCK_SUMMARY="${WORKTREE}/${OUTPUT_ROOT}/${RUN_NAME}/summary/${TASK_NAME}.json"
 export DENSE_KV_OFFLOAD=1
 export DATA_FILE_OVERRIDE="${STOCK_DATA}"
 export RUN_NAME="offload_${TASK_NAME}_${CONTEXT_LEN}_n${NUM_SAMPLES}"
 export GREEDY_LOGIT_TRACE_FILE="${LOG_ROOT}/offload_logits.pt"
 bash scripts/run_ruler_pagedpq_stream_smoke_one.sh 2>&1 | tee "${LOG_ROOT}/offload.console.log"
-OFFLOAD_PRED="${WORKTREE}/${OUTPUT_ROOT}/${RUN_NAME}/pred/${TASK_NAME}.jsonl"
+OFFLOAD_SUMMARY="${WORKTREE}/${OUTPUT_ROOT}/${RUN_NAME}/summary/${TASK_NAME}.json"
+
+export RUN_NAME="offload_teacher_${TASK_NAME}_${CONTEXT_LEN}_n${NUM_SAMPLES}"
+export GREEDY_LOGIT_TRACE_FILE="${LOG_ROOT}/teacher_logits.pt"
+export FORCED_TOKEN_TRACE_FILE="${LOG_ROOT}/stock_logits.pt"
+bash scripts/run_ruler_pagedpq_stream_smoke_one.sh 2>&1 | tee "${LOG_ROOT}/teacher.console.log"
+TEACHER_SUMMARY="${WORKTREE}/${OUTPUT_ROOT}/${RUN_NAME}/summary/${TASK_NAME}.json"
 
 module load python/3.10.4
 export LD_LIBRARY_PATH="/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
-"${VENV_PY}" - "${LOG_ROOT}" "${STOCK_PRED}" "${OFFLOAD_PRED}" <<'PY'
-import json
-from pathlib import Path
-import re
-import sys
-
-import torch
-
-log_root = Path(sys.argv[1])
-stock_pred_path = Path(sys.argv[2])
-offload_pred_path = Path(sys.argv[3])
-stock = torch.load(log_root / "stock_logits.pt", map_location="cpu", weights_only=False)
-offload = torch.load(log_root / "offload_logits.pt", map_location="cpu", weights_only=False)
-if len(stock) != len(offload):
-    raise SystemExit(f"sample-count mismatch: stock={len(stock)} offload={len(offload)}")
-
-global_max = 0.0
-for stock_sample, offload_sample in zip(stock, offload):
-    if stock_sample["index"] != offload_sample["index"]:
-        raise SystemExit("sample index mismatch")
-    if stock_sample["token_ids"] != offload_sample["token_ids"]:
-        raise SystemExit(
-            f"greedy token mismatch for sample {stock_sample['index']}:\n"
-            f"stock={stock_sample['token_ids']}\noffload={offload_sample['token_ids']}"
-        )
-    if stock_sample["logits"].shape != offload_sample["logits"].shape:
-        raise SystemExit(f"logit shape mismatch for sample {stock_sample['index']}")
-    for step, (stock_logits, offload_logits) in enumerate(
-        zip(stock_sample["logits"], offload_sample["logits"])
-    ):
-        delta = float((stock_logits.float() - offload_logits.float()).abs().max().item())
-        global_max = max(global_max, delta)
-        print(f"sample={stock_sample['index']} decode_step={step} max_abs_logit_diff={delta:.8f}")
-
-stock_pred = [json.loads(line) for line in stock_pred_path.read_text().splitlines()]
-offload_pred = [json.loads(line) for line in offload_pred_path.read_text().splitlines()]
-if [row["pred"] for row in stock_pred] != [row["pred"] for row in offload_pred]:
-    raise SystemExit("decoded prediction mismatch")
-print(f"PASS: all greedy token IDs and decoded predictions match; global_max_abs_logit_diff={global_max:.8f}")
-
-peak_pattern = re.compile(r"peak=([0-9.]+)MiB")
-for name in ("stock", "offload"):
-    text = (log_root / f"{name}.console.log").read_text()
-    peaks = [float(value) for value in peak_pattern.findall(text)]
-    if not peaks:
-        raise SystemExit(f"no memory trace records found for {name}")
-    print(f"{name}_peak_memory_mib={max(peaks):.1f}")
-PY
+"${VENV_PY}" benchmark/ruler/pred/compare_dense_kv_offload_ab.py \
+  --stock-trace "${LOG_ROOT}/stock_logits.pt" \
+  --offload-trace "${LOG_ROOT}/offload_logits.pt" \
+  --teacher-trace "${LOG_ROOT}/teacher_logits.pt" \
+  --stock-summary "${STOCK_SUMMARY}" \
+  --offload-summary "${OFFLOAD_SUMMARY}" \
+  --teacher-summary "${TEACHER_SUMMARY}" \
+  --stock-console "${LOG_ROOT}/stock.console.log" \
+  --offload-console "${LOG_ROOT}/offload.console.log" \
+  --teacher-console "${LOG_ROOT}/teacher.console.log" \
+  --max-logit-diff "${DENSE_KV_AB_MAX_LOGIT_DIFF:-0.1}"
