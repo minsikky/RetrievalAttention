@@ -524,6 +524,182 @@ __global__ void joint_vprefix_precision_outputs_kernel(
   }
 }
 
+constexpr int64_t kJointVPrefixTokenChunk = 256;
+
+template <typename order_t>
+__global__ void joint_vprefix_precision_token_partials_kernel(
+    const float* __restrict__ probs,
+    const float* __restrict__ residual_hi,
+    const float* __restrict__ residual_lo,
+    const bool* __restrict__ commit_mask,
+    const order_t* __restrict__ exact_order,
+    float* __restrict__ hi_partials,
+    float* __restrict__ lo_partials,
+    int32_t* __restrict__ commit_partials,
+    int64_t rows,
+    int64_t context_len,
+    int64_t max_exact,
+    int64_t dim,
+    int64_t chunks) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t row_width = rows * dim;
+  int64_t total = chunks * row_width;
+  if (linear >= total) {
+    return;
+  }
+
+  int64_t d = linear % dim;
+  int64_t kh = (linear / dim) % rows;
+  int64_t chunk = linear / row_width;
+  int64_t begin = chunk * kJointVPrefixTokenChunk;
+  int64_t end = min(begin + kJointVPrefixTokenChunk, max_exact);
+  float hi_acc = 0.0f;
+  float lo_acc = 0.0f;
+  int32_t commit_acc = 0;
+  for (int64_t j = begin; j < end; ++j) {
+    int64_t token = static_cast<int64_t>(exact_order[kh * max_exact + j]);
+    if (token >= 0 && token < context_len) {
+      float p = probs[kh * context_len + token];
+      hi_acc = __fadd_rn(hi_acc, __fmul_rn(p, residual_hi[token * dim + d]));
+      lo_acc = __fadd_rn(lo_acc, __fmul_rn(p, residual_lo[token * dim + d]));
+      if (d == 0 && commit_mask[token]) {
+        ++commit_acc;
+      }
+    }
+  }
+  hi_partials[linear] = hi_acc;
+  lo_partials[linear] = lo_acc;
+  if (d == 0) {
+    commit_partials[chunk * rows + kh] = commit_acc;
+  }
+}
+
+template <typename order_t>
+__global__ void joint_vprefix_precision_outputs_tokpar_kernel(
+    const float* __restrict__ base_outputs,
+    const float* __restrict__ probs,
+    const float* __restrict__ residual_hi,
+    const float* __restrict__ residual_lo,
+    const bool* __restrict__ commit_mask,
+    const order_t* __restrict__ exact_order,
+    const int64_t* __restrict__ v_budgets,
+    const int64_t* __restrict__ v_hi_counts,
+    const float* __restrict__ hi_partials,
+    const float* __restrict__ lo_partials,
+    const int32_t* __restrict__ commit_partials,
+    float* __restrict__ outputs,
+    int32_t* __restrict__ lo_reads,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len,
+    int64_t max_exact,
+    int64_t v_steps,
+    int64_t dim) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t rows = k_count * heads;
+  int64_t total = rows * dim;
+  if (linear >= total) {
+    return;
+  }
+
+  int64_t d = linear % dim;
+  int64_t kh = linear / dim;
+  int64_t head = kh % heads;
+  int64_t ki = kh / heads;
+  int64_t row_width = rows * dim;
+  float hi_acc = 0.0f;
+  float lo_exact_acc = 0.0f;
+  float lo_hi_acc = 0.0f;
+  int32_t commit_exact_acc = 0;
+  int32_t commit_hi_acc = 0;
+  int64_t prev_exact = 0;
+  int64_t prev_hi = 0;
+
+  for (int64_t vi = 0; vi < v_steps; ++vi) {
+    int64_t exact_count = v_budgets[vi];
+    exact_count = max(static_cast<int64_t>(0), min(exact_count, context_len));
+    exact_count = min(exact_count, max_exact);
+    int64_t hi_count = max(static_cast<int64_t>(0), min(v_hi_counts[vi], exact_count));
+    if (exact_count < prev_exact || hi_count < prev_hi) {
+      hi_acc = 0.0f;
+      lo_exact_acc = 0.0f;
+      lo_hi_acc = 0.0f;
+      commit_exact_acc = 0;
+      commit_hi_acc = 0;
+      prev_exact = 0;
+      prev_hi = 0;
+    }
+
+    // Fixed deterministic reduction order: advance ranks monotonically;
+    // consume complete 256-token chunks in ascending chunk index, and consume
+    // leading/trailing partial chunks token-by-token in ascending rank order.
+    int64_t j = prev_hi;
+    while (j < hi_count) {
+      if (j % kJointVPrefixTokenChunk == 0 &&
+          j + kJointVPrefixTokenChunk <= hi_count) {
+        int64_t chunk = j / kJointVPrefixTokenChunk;
+        int64_t partial_idx = chunk * row_width + linear;
+        hi_acc = __fadd_rn(hi_acc, hi_partials[partial_idx]);
+        lo_hi_acc = __fadd_rn(lo_hi_acc, lo_partials[partial_idx]);
+        if (d == 0) {
+          commit_hi_acc += commit_partials[chunk * rows + kh];
+        }
+        j += kJointVPrefixTokenChunk;
+      } else {
+        int64_t token = static_cast<int64_t>(exact_order[kh * max_exact + j]);
+        if (token >= 0 && token < context_len) {
+          float p = probs[kh * context_len + token];
+          hi_acc = __fadd_rn(hi_acc, __fmul_rn(p, residual_hi[token * dim + d]));
+          lo_hi_acc = __fadd_rn(lo_hi_acc, __fmul_rn(p, residual_lo[token * dim + d]));
+          if (d == 0 && commit_mask[token]) {
+            ++commit_hi_acc;
+          }
+        }
+        ++j;
+      }
+    }
+
+    j = prev_exact;
+    while (j < exact_count) {
+      if (j % kJointVPrefixTokenChunk == 0 &&
+          j + kJointVPrefixTokenChunk <= exact_count) {
+        int64_t chunk = j / kJointVPrefixTokenChunk;
+        int64_t partial_idx = chunk * row_width + linear;
+        lo_exact_acc = __fadd_rn(lo_exact_acc, lo_partials[partial_idx]);
+        if (d == 0) {
+          commit_exact_acc += commit_partials[chunk * rows + kh];
+        }
+        j += kJointVPrefixTokenChunk;
+      } else {
+        int64_t token = static_cast<int64_t>(exact_order[kh * max_exact + j]);
+        if (token >= 0 && token < context_len) {
+          float p = probs[kh * context_len + token];
+          lo_exact_acc = __fadd_rn(
+              lo_exact_acc,
+              __fmul_rn(p, residual_lo[token * dim + d]));
+          if (d == 0 && commit_mask[token]) {
+            ++commit_exact_acc;
+          }
+        }
+        ++j;
+      }
+    }
+
+    float delta = hi_acc;
+    if (exact_count > hi_count) {
+      delta = __fsub_rn(__fadd_rn(hi_acc, lo_exact_acc), lo_hi_acc);
+    }
+    outputs[((ki * v_steps + vi) * heads + head) * dim + d] =
+        __fadd_rn(base_outputs[kh * dim + d], delta);
+    if (d == 0) {
+      lo_reads[(ki * v_steps + vi) * heads + head] =
+          exact_count > hi_count ? commit_exact_acc - commit_hi_acc : 0;
+    }
+    prev_exact = exact_count;
+    prev_hi = hi_count;
+  }
+}
+
 __global__ void joint_risk_sort_inputs_kernel(
     const float* __restrict__ probs,
     const float* __restrict__ code_error,

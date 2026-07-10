@@ -103,6 +103,8 @@ def _test_native_exact_value_counts() -> None:
         joint_vprefix_outputs,
         joint_vprefix_outputs_precision,
         joint_vprefix_outputs_precision_from_risk,
+        joint_vprefix_outputs_precision_from_risk_tokpar,
+        joint_vprefix_outputs_precision_tokpar,
         joint_vprefix_outputs_from_grouped_risk,
         joint_vprefix_outputs_from_grouped_merge_risk_batched,
         joint_vprefix_outputs_from_grouped_risk_batched,
@@ -262,6 +264,20 @@ def _test_native_exact_value_counts() -> None:
         raise AssertionError("native progressive-precision V-prefix grid mismatches Torch reference")
     if not torch.equal(got_lo_reads, reads_ref_t):
         raise AssertionError("native progressive-precision V-prefix read counts mismatch")
+    got_precision_tokpar, got_lo_reads_tokpar = joint_vprefix_outputs_precision_tokpar(
+        base_outputs,
+        probs,
+        residual,
+        residual_lo,
+        commit_mask,
+        exact_order,
+        v_budgets,
+        v_hi_counts,
+    )
+    if not torch.allclose(got_precision_tokpar, precision_ref_t, atol=5e-5, rtol=5e-5):
+        raise AssertionError("token-parallel progressive-precision V-prefix grid mismatches reference")
+    if not torch.equal(got_lo_reads_tokpar, reads_ref_t):
+        raise AssertionError("token-parallel progressive-precision V-prefix read counts mismatch")
     got_prefix_from_risk = joint_vprefix_outputs_from_risk(
         base_outputs,
         probs,
@@ -271,6 +287,18 @@ def _test_native_exact_value_counts() -> None:
     )
     got_precision_from_risk, got_precision_reads_from_risk = (
         joint_vprefix_outputs_precision_from_risk(
+            base_outputs,
+            probs,
+            residual,
+            residual_lo,
+            commit_mask,
+            code_error,
+            v_budgets,
+            v_hi_counts,
+        )
+    )
+    got_precision_from_risk_tokpar, got_precision_reads_from_risk_tokpar = (
+        joint_vprefix_outputs_precision_from_risk_tokpar(
             base_outputs,
             probs,
             residual,
@@ -329,6 +357,69 @@ def _test_native_exact_value_counts() -> None:
         raise AssertionError("native progressive-precision risk sort output mismatch")
     if not torch.equal(got_precision_reads_from_risk, precision_risk_reads_ref):
         raise AssertionError("native progressive-precision risk sort read-count mismatch")
+    if not torch.allclose(
+        got_precision_from_risk_tokpar,
+        precision_risk_ref,
+        atol=5e-5,
+        rtol=5e-5,
+    ):
+        raise AssertionError("token-parallel progressive-precision risk sort output mismatch")
+    if not torch.equal(got_precision_reads_from_risk_tokpar, precision_risk_reads_ref):
+        raise AssertionError("token-parallel progressive-precision risk sort read-count mismatch")
+
+    # Cross a fixed 256-token boundary and include a decreasing rung to cover
+    # both deterministic chunk reduction and the reset-to-zero path.
+    tok_context = 600
+    tok_k = 2
+    tok_probs = torch.softmax(
+        torch.randn((tok_k, heads, tok_context), device=device, dtype=torch.float32),
+        dim=2,
+    )
+    tok_base = torch.randn((tok_k, heads, dim), device=device, dtype=torch.float32)
+    tok_hi = torch.randn((tok_context, dim), device=device, dtype=torch.float32)
+    tok_lo = torch.randn_like(tok_hi)
+    tok_commit = torch.rand((tok_context,), device=device) > 0.4
+    tok_order = torch.stack(
+        [torch.randperm(tok_context, device=device) for _ in range(tok_k * heads)]
+    ).reshape(tok_k, heads, tok_context)
+    tok_budgets = torch.tensor([0, 257, 100, 600], device=device, dtype=torch.long)
+    tok_hi_counts = torch.tensor([0, 26, 10, 60], device=device, dtype=torch.long)
+    tok_serial, tok_serial_reads = joint_vprefix_outputs_precision(
+        tok_base,
+        tok_probs,
+        tok_hi,
+        tok_lo,
+        tok_commit,
+        tok_order,
+        tok_budgets,
+        tok_hi_counts,
+    )
+    tok_parallel, tok_parallel_reads = joint_vprefix_outputs_precision_tokpar(
+        tok_base,
+        tok_probs,
+        tok_hi,
+        tok_lo,
+        tok_commit,
+        tok_order,
+        tok_budgets,
+        tok_hi_counts,
+    )
+    tok_repeat, tok_repeat_reads = joint_vprefix_outputs_precision_tokpar(
+        tok_base,
+        tok_probs,
+        tok_hi,
+        tok_lo,
+        tok_commit,
+        tok_order,
+        tok_budgets,
+        tok_hi_counts,
+    )
+    if not torch.allclose(tok_parallel, tok_serial, atol=5e-5, rtol=5e-5):
+        raise AssertionError("token-parallel chunked V-prefix output mismatches serial math")
+    if not torch.equal(tok_parallel_reads, tok_serial_reads):
+        raise AssertionError("token-parallel chunked V-prefix read counts mismatch")
+    if not torch.equal(tok_parallel, tok_repeat) or not torch.equal(tok_parallel_reads, tok_repeat_reads):
+        raise AssertionError("token-parallel V-prefix is not deterministic on fixed geometry")
 
     base_context = 10
     base_pages = 2

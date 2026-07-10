@@ -23,6 +23,15 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision_cuda(
     torch::Tensor exact_order,
     torch::Tensor v_budgets,
     torch::Tensor v_hi_counts);
+std::vector<torch::Tensor> joint_vprefix_outputs_precision_tokpar_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_hi,
+    torch::Tensor residual_lo,
+    torch::Tensor commit_mask,
+    torch::Tensor exact_order,
+    torch::Tensor v_budgets,
+    torch::Tensor v_hi_counts);
 
 torch::Tensor joint_vprefix_outputs_from_risk_cuda(
     torch::Tensor base_outputs,
@@ -31,6 +40,15 @@ torch::Tensor joint_vprefix_outputs_from_risk_cuda(
     torch::Tensor code_error,
     torch::Tensor v_budgets);
 std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_hi,
+    torch::Tensor residual_lo,
+    torch::Tensor commit_mask,
+    torch::Tensor code_error,
+    torch::Tensor v_budgets,
+    torch::Tensor v_hi_counts);
+std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_cuda(
     torch::Tensor base_outputs,
     torch::Tensor probs,
     torch::Tensor residual_hi,

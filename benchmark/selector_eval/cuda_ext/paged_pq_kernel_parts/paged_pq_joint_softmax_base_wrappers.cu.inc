@@ -1,3 +1,79 @@
+template <typename order_t>
+void launch_joint_vprefix_precision_tokpar(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_hi,
+    torch::Tensor residual_lo,
+    torch::Tensor commit_mask,
+    torch::Tensor exact_order,
+    torch::Tensor v_budgets,
+    torch::Tensor v_hi_counts,
+    torch::Tensor outputs,
+    torch::Tensor lo_reads) {
+  const auto k_count = base_outputs.size(0);
+  const auto heads = base_outputs.size(1);
+  const auto dim = base_outputs.size(2);
+  const auto context_len = probs.size(2);
+  const auto max_exact = exact_order.numel() / (k_count * heads);
+  const auto v_steps = v_budgets.size(0);
+  const int64_t rows = k_count * heads;
+  const int64_t chunks =
+      (max_exact + kJointVPrefixTokenChunk - 1) / kJointVPrefixTokenChunk;
+  auto partial_opts = base_outputs.options().dtype(torch::kFloat32);
+  auto int_opts = base_outputs.options().dtype(torch::kInt);
+  auto hi_partials = torch::empty({chunks, rows, dim}, partial_opts);
+  auto lo_partials = torch::empty({chunks, rows, dim}, partial_opts);
+  auto commit_partials = torch::empty({chunks, rows}, int_opts);
+
+  const int threads = 256;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int64_t partial_total = chunks * rows * dim;
+  if (partial_total > 0) {
+    const int64_t partial_blocks = (partial_total + threads - 1) / threads;
+    joint_vprefix_precision_token_partials_kernel<order_t><<<
+        static_cast<unsigned int>(partial_blocks), threads, 0, stream>>>(
+        probs.data_ptr<float>(),
+        residual_hi.data_ptr<float>(),
+        residual_lo.data_ptr<float>(),
+        commit_mask.data_ptr<bool>(),
+        exact_order.data_ptr<order_t>(),
+        hi_partials.data_ptr<float>(),
+        lo_partials.data_ptr<float>(),
+        commit_partials.data_ptr<int32_t>(),
+        rows,
+        context_len,
+        max_exact,
+        dim,
+        chunks);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+
+  const int64_t output_total = rows * dim;
+  const int64_t output_blocks = (output_total + threads - 1) / threads;
+  joint_vprefix_precision_outputs_tokpar_kernel<order_t><<<
+      static_cast<unsigned int>(output_blocks), threads, 0, stream>>>(
+      base_outputs.data_ptr<float>(),
+      probs.data_ptr<float>(),
+      residual_hi.data_ptr<float>(),
+      residual_lo.data_ptr<float>(),
+      commit_mask.data_ptr<bool>(),
+      exact_order.data_ptr<order_t>(),
+      v_budgets.data_ptr<int64_t>(),
+      v_hi_counts.data_ptr<int64_t>(),
+      hi_partials.data_ptr<float>(),
+      lo_partials.data_ptr<float>(),
+      commit_partials.data_ptr<int32_t>(),
+      outputs.data_ptr<float>(),
+      lo_reads.data_ptr<int32_t>(),
+      k_count,
+      heads,
+      context_len,
+      max_exact,
+      v_steps,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 torch::Tensor joint_vprefix_outputs_cuda(
     torch::Tensor base_outputs,
     torch::Tensor probs,
@@ -82,6 +158,42 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision_cuda(
       v_steps,
       dim);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {outputs, lo_reads};
+}
+
+std::vector<torch::Tensor> joint_vprefix_outputs_precision_tokpar_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_hi,
+    torch::Tensor residual_lo,
+    torch::Tensor commit_mask,
+    torch::Tensor exact_order,
+    torch::Tensor v_budgets,
+    torch::Tensor v_hi_counts) {
+  const auto k_count = base_outputs.size(0);
+  const auto heads = base_outputs.size(1);
+  const auto dim = base_outputs.size(2);
+  const auto v_steps = v_budgets.size(0);
+  auto outputs = torch::empty(
+      {k_count, v_steps, heads, dim},
+      base_outputs.options().dtype(torch::kFloat32));
+  auto lo_reads = torch::empty(
+      {k_count, v_steps, heads},
+      base_outputs.options().dtype(torch::kInt));
+  if (k_count == 0 || heads == 0 || dim == 0 || v_steps == 0) {
+    return {outputs, lo_reads};
+  }
+  launch_joint_vprefix_precision_tokpar<int64_t>(
+      base_outputs,
+      probs,
+      residual_hi,
+      residual_lo,
+      commit_mask,
+      exact_order,
+      v_budgets,
+      v_hi_counts,
+      outputs,
+      lo_reads);
   return {outputs, lo_reads};
 }
 

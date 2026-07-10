@@ -124,6 +124,57 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision(
       v_hi_counts.contiguous());
 }
 
+std::vector<torch::Tensor> joint_vprefix_outputs_precision_tokpar(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_hi,
+    torch::Tensor residual_lo,
+    torch::Tensor commit_mask,
+    torch::Tensor exact_order,
+    torch::Tensor v_budgets,
+    torch::Tensor v_hi_counts) {
+  TORCH_CHECK(base_outputs.is_cuda(), "base_outputs must be CUDA");
+  TORCH_CHECK(probs.is_cuda(), "probs must be CUDA");
+  TORCH_CHECK(residual_hi.is_cuda(), "residual_hi must be CUDA");
+  TORCH_CHECK(residual_lo.is_cuda(), "residual_lo must be CUDA");
+  TORCH_CHECK(commit_mask.is_cuda(), "commit_mask must be CUDA");
+  TORCH_CHECK(exact_order.is_cuda(), "exact_order must be CUDA");
+  TORCH_CHECK(v_budgets.is_cuda(), "v_budgets must be CUDA");
+  TORCH_CHECK(v_hi_counts.is_cuda(), "v_hi_counts must be CUDA");
+  TORCH_CHECK(base_outputs.scalar_type() == torch::kFloat32, "base_outputs must be float32");
+  TORCH_CHECK(probs.scalar_type() == torch::kFloat32, "probs must be float32");
+  TORCH_CHECK(residual_hi.scalar_type() == torch::kFloat32, "residual_hi must be float32");
+  TORCH_CHECK(residual_lo.scalar_type() == torch::kFloat32, "residual_lo must be float32");
+  TORCH_CHECK(commit_mask.scalar_type() == torch::kBool, "commit_mask must be bool");
+  TORCH_CHECK(exact_order.scalar_type() == torch::kLong, "exact_order must be int64");
+  TORCH_CHECK(v_budgets.scalar_type() == torch::kLong, "v_budgets must be int64");
+  TORCH_CHECK(v_hi_counts.scalar_type() == torch::kLong, "v_hi_counts must be int64");
+  TORCH_CHECK(base_outputs.dim() == 3, "base_outputs shape must be [k, heads, dim]");
+  TORCH_CHECK(probs.dim() == 3, "probs shape must be [k, heads, context]");
+  TORCH_CHECK(residual_hi.dim() == 2, "residual_hi shape must be [context, dim]");
+  TORCH_CHECK(residual_lo.sizes() == residual_hi.sizes(), "residual lo/hi shape mismatch");
+  TORCH_CHECK(commit_mask.dim() == 1, "commit_mask shape must be [context]");
+  TORCH_CHECK(exact_order.dim() == 3, "exact_order shape must be [k, heads, max_exact]");
+  TORCH_CHECK(v_budgets.dim() == 1, "v_budgets shape must be [steps]");
+  TORCH_CHECK(v_hi_counts.sizes() == v_budgets.sizes(), "V hi-count/budget shape mismatch");
+  TORCH_CHECK(probs.size(0) == base_outputs.size(0), "probs/base k count mismatch");
+  TORCH_CHECK(probs.size(1) == base_outputs.size(1), "probs/base head count mismatch");
+  TORCH_CHECK(exact_order.size(0) == base_outputs.size(0), "order/base k count mismatch");
+  TORCH_CHECK(exact_order.size(1) == base_outputs.size(1), "order/base head count mismatch");
+  TORCH_CHECK(residual_hi.size(0) == probs.size(2), "residual/probs context mismatch");
+  TORCH_CHECK(commit_mask.size(0) == probs.size(2), "commit/probs context mismatch");
+  TORCH_CHECK(residual_hi.size(1) == base_outputs.size(2), "residual/base dim mismatch");
+  return joint_vprefix_outputs_precision_tokpar_cuda(
+      base_outputs.contiguous(),
+      probs.contiguous(),
+      residual_hi.contiguous(),
+      residual_lo.contiguous(),
+      commit_mask.contiguous(),
+      exact_order.contiguous(),
+      v_budgets.contiguous(),
+      v_hi_counts.contiguous());
+}
+
 torch::Tensor joint_vprefix_outputs_from_risk(
     torch::Tensor base_outputs,
     torch::Tensor probs,
@@ -200,6 +251,56 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk(
   TORCH_CHECK(commit_mask.size(0) == probs.size(2), "commit/probs context mismatch");
   TORCH_CHECK(residual_hi.size(1) == base_outputs.size(2), "residual/base dim mismatch");
   return joint_vprefix_outputs_precision_from_risk_cuda(
+      base_outputs.contiguous(),
+      probs.contiguous(),
+      residual_hi.contiguous(),
+      residual_lo.contiguous(),
+      commit_mask.contiguous(),
+      code_error.contiguous(),
+      v_budgets.contiguous(),
+      v_hi_counts.contiguous());
+}
+
+std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_hi,
+    torch::Tensor residual_lo,
+    torch::Tensor commit_mask,
+    torch::Tensor code_error,
+    torch::Tensor v_budgets,
+    torch::Tensor v_hi_counts) {
+  TORCH_CHECK(base_outputs.is_cuda(), "base_outputs must be CUDA");
+  TORCH_CHECK(probs.is_cuda(), "probs must be CUDA");
+  TORCH_CHECK(residual_hi.is_cuda(), "residual_hi must be CUDA");
+  TORCH_CHECK(residual_lo.is_cuda(), "residual_lo must be CUDA");
+  TORCH_CHECK(commit_mask.is_cuda(), "commit_mask must be CUDA");
+  TORCH_CHECK(code_error.is_cuda(), "code_error must be CUDA");
+  TORCH_CHECK(v_budgets.is_cuda(), "v_budgets must be CUDA");
+  TORCH_CHECK(v_hi_counts.is_cuda(), "v_hi_counts must be CUDA");
+  TORCH_CHECK(base_outputs.scalar_type() == torch::kFloat32, "base_outputs must be float32");
+  TORCH_CHECK(probs.scalar_type() == torch::kFloat32, "probs must be float32");
+  TORCH_CHECK(residual_hi.scalar_type() == torch::kFloat32, "residual_hi must be float32");
+  TORCH_CHECK(residual_lo.scalar_type() == torch::kFloat32, "residual_lo must be float32");
+  TORCH_CHECK(commit_mask.scalar_type() == torch::kBool, "commit_mask must be bool");
+  TORCH_CHECK(code_error.scalar_type() == torch::kFloat32, "code_error must be float32");
+  TORCH_CHECK(v_budgets.scalar_type() == torch::kLong, "v_budgets must be int64");
+  TORCH_CHECK(v_hi_counts.scalar_type() == torch::kLong, "v_hi_counts must be int64");
+  TORCH_CHECK(base_outputs.dim() == 3, "base_outputs shape must be [k, heads, dim]");
+  TORCH_CHECK(probs.dim() == 3, "probs shape must be [k, heads, context]");
+  TORCH_CHECK(residual_hi.dim() == 2, "residual_hi shape must be [context, dim]");
+  TORCH_CHECK(residual_lo.sizes() == residual_hi.sizes(), "residual lo/hi shape mismatch");
+  TORCH_CHECK(commit_mask.dim() == 1, "commit_mask shape must be [context]");
+  TORCH_CHECK(code_error.dim() == 1, "code_error shape must be [context]");
+  TORCH_CHECK(v_budgets.dim() == 1, "v_budgets shape must be [steps]");
+  TORCH_CHECK(v_hi_counts.sizes() == v_budgets.sizes(), "V hi-count/budget shape mismatch");
+  TORCH_CHECK(probs.size(0) == base_outputs.size(0), "probs/base k count mismatch");
+  TORCH_CHECK(probs.size(1) == base_outputs.size(1), "probs/base head count mismatch");
+  TORCH_CHECK(residual_hi.size(0) == probs.size(2), "residual/probs context mismatch");
+  TORCH_CHECK(commit_mask.size(0) == probs.size(2), "commit/probs context mismatch");
+  TORCH_CHECK(code_error.size(0) == probs.size(2), "code_error/probs context mismatch");
+  TORCH_CHECK(residual_hi.size(1) == base_outputs.size(2), "residual/base dim mismatch");
+  return joint_vprefix_outputs_precision_from_risk_tokpar_cuda(
       base_outputs.contiguous(),
       probs.contiguous(),
       residual_hi.contiguous(),

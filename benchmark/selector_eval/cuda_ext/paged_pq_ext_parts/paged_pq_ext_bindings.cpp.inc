@@ -169,6 +169,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	      &joint_vprefix_outputs_precision,
 	      "Build fused progressive-precision V-prefix output grids (CUDA)");
 	  m.def(
+	      "joint_vprefix_outputs_precision_tokpar",
+	      &joint_vprefix_outputs_precision_tokpar,
+	      "Build token-parallel progressive-precision V-prefix output grids (CUDA)");
+	  m.def(
 	      "joint_vprefix_outputs_from_risk",
 	      &joint_vprefix_outputs_from_risk,
 	      "Build residual-risk exact-V output grid by sorting risk scores natively (CUDA)");
@@ -176,6 +180,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	      "joint_vprefix_outputs_precision_from_risk",
 	      &joint_vprefix_outputs_precision_from_risk,
 	      "Build fused progressive-precision V-prefix grids with native risk sorting (CUDA)");
+	  m.def(
+	      "joint_vprefix_outputs_precision_from_risk_tokpar",
+	      &joint_vprefix_outputs_precision_from_risk_tokpar,
+	      "Build token-parallel progressive-precision V-prefix grids with native risk sorting (CUDA)");
 	  m.def(
 	      "joint_vprefix_outputs_from_grouped_risk",
 	      &joint_vprefix_outputs_from_grouped_risk,

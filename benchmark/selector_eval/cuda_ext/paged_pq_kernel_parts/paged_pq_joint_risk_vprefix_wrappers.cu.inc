@@ -214,6 +214,112 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_cuda(
   return {outputs, lo_reads};
 }
 
+std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_hi,
+    torch::Tensor residual_lo,
+    torch::Tensor commit_mask,
+    torch::Tensor code_error,
+    torch::Tensor v_budgets,
+    torch::Tensor v_hi_counts) {
+  const auto k_count = base_outputs.size(0);
+  const auto heads = base_outputs.size(1);
+  const auto dim = base_outputs.size(2);
+  const auto context_len = probs.size(2);
+  const auto v_steps = v_budgets.size(0);
+  auto outputs = torch::empty(
+      {k_count, v_steps, heads, dim},
+      base_outputs.options().dtype(torch::kFloat32));
+  auto lo_reads = torch::empty(
+      {k_count, v_steps, heads},
+      base_outputs.options().dtype(torch::kInt));
+  if (k_count == 0 || heads == 0 || dim == 0 || v_steps == 0) {
+    return {outputs, lo_reads};
+  }
+  if (context_len == 0) {
+    outputs.copy_(base_outputs.reshape({k_count, 1, heads, dim}).expand(
+        {k_count, v_steps, heads, dim}));
+    lo_reads.zero_();
+    return {outputs, lo_reads};
+  }
+
+  const int64_t rows = k_count * heads;
+  auto flat_opts = base_outputs.options().dtype(torch::kFloat32);
+  auto long_opts = base_outputs.options().dtype(torch::kLong);
+  auto int_opts = base_outputs.options().dtype(torch::kInt);
+  auto byte_opts = base_outputs.options().dtype(torch::kUInt8);
+  auto risk_in = torch::empty({rows, context_len}, flat_opts);
+  auto risk_out = torch::empty({rows, context_len}, flat_opts);
+  auto ids_in = torch::empty({rows, context_len}, int_opts);
+  auto ids_out = torch::empty({rows, context_len}, int_opts);
+  auto offsets = torch::empty({rows + 1}, long_opts);
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int threads = 256;
+  const int64_t total = rows * context_len;
+  const int64_t fill_blocks = (total + threads - 1) / threads;
+  joint_risk_sort_inputs_kernel<<<static_cast<unsigned int>(fill_blocks), threads, 0, stream>>>(
+      probs.data_ptr<float>(),
+      code_error.data_ptr<float>(),
+      risk_in.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      rows,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const int64_t offset_blocks = ((rows + 1) + threads - 1) / threads;
+  joint_segment_offsets_kernel<<<static_cast<unsigned int>(offset_blocks), threads, 0, stream>>>(
+      offsets.data_ptr<int64_t>(),
+      rows,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  size_t temp_bytes = 0;
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      nullptr,
+      temp_bytes,
+      risk_in.data_ptr<float>(),
+      risk_out.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      ids_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  auto temp = torch::empty({static_cast<int64_t>(temp_bytes)}, byte_opts);
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      temp.data_ptr(),
+      temp_bytes,
+      risk_in.data_ptr<float>(),
+      risk_out.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      ids_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  launch_joint_vprefix_precision_tokpar<int32_t>(
+      base_outputs,
+      probs,
+      residual_hi,
+      residual_lo,
+      commit_mask,
+      ids_out,
+      v_budgets,
+      v_hi_counts,
+      outputs,
+      lo_reads);
+  return {outputs, lo_reads};
+}
+
 torch::Tensor joint_vprefix_outputs_from_grouped_risk_cuda(
     torch::Tensor base_outputs,
     torch::Tensor probs,
