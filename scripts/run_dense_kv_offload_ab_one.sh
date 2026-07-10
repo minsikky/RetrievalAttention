@@ -25,6 +25,11 @@ export TASK_NAME="niah_single_1"
 export CONTEXT_LEN="${CONTEXT_LEN:-32768}"
 export NUM_SAMPLES="2"
 export PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-4096}"
+STOCK_CALIBRATION_CHUNK="${STOCK_CALIBRATION_CHUNK:-$((2 * PREFILL_CHUNK_SIZE))}"
+if [ "${STOCK_CALIBRATION_CHUNK}" -le 0 ]; then
+  echo "[ERROR] STOCK_CALIBRATION_CHUNK must be positive" >&2
+  exit 2
+fi
 export DENSE_KV_BLOCK_TOKENS="${DENSE_KV_BLOCK_TOKENS:-8192}"
 export DENSE_KV_STAGING_BUFFERS="${DENSE_KV_STAGING_BUFFERS:-2}"
 export DENSE_KV_QUERY_BLOCK_TOKENS="${DENSE_KV_QUERY_BLOCK_TOKENS:-2048}"
@@ -55,16 +60,27 @@ export FORCED_TOKEN_TRACE_FILE="${LOG_ROOT}/stock_logits.pt"
 bash scripts/run_ruler_pagedpq_stream_smoke_one.sh 2>&1 | tee "${LOG_ROOT}/teacher.console.log"
 TEACHER_SUMMARY="${WORKTREE}/${OUTPUT_ROOT}/${RUN_NAME}/summary/${TASK_NAME}.json"
 
+unset DENSE_KV_OFFLOAD
+export PREFILL_CHUNK_SIZE="${STOCK_CALIBRATION_CHUNK}"
+export RUN_NAME="stock_calibration_chunk${STOCK_CALIBRATION_CHUNK}_${TASK_NAME}_${CONTEXT_LEN}_n${NUM_SAMPLES}"
+export GREEDY_LOGIT_TRACE_FILE="${LOG_ROOT}/calibration_logits.pt"
+bash scripts/run_ruler_pagedpq_stream_smoke_one.sh 2>&1 | tee "${LOG_ROOT}/calibration.console.log"
+CALIBRATION_SUMMARY="${WORKTREE}/${OUTPUT_ROOT}/${RUN_NAME}/summary/${TASK_NAME}.json"
+
 module load python/3.10.4
 export LD_LIBRARY_PATH="/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
 "${VENV_PY}" benchmark/ruler/pred/compare_dense_kv_offload_ab.py \
   --stock-trace "${LOG_ROOT}/stock_logits.pt" \
   --offload-trace "${LOG_ROOT}/offload_logits.pt" \
   --teacher-trace "${LOG_ROOT}/teacher_logits.pt" \
+  --calibration-trace "${LOG_ROOT}/calibration_logits.pt" \
   --stock-summary "${STOCK_SUMMARY}" \
   --offload-summary "${OFFLOAD_SUMMARY}" \
   --teacher-summary "${TEACHER_SUMMARY}" \
+  --calibration-summary "${CALIBRATION_SUMMARY}" \
   --stock-console "${LOG_ROOT}/stock.console.log" \
   --offload-console "${LOG_ROOT}/offload.console.log" \
   --teacher-console "${LOG_ROOT}/teacher.console.log" \
-  --max-logit-diff "${DENSE_KV_AB_MAX_LOGIT_DIFF:-0.1}"
+  --calibration-console "${LOG_ROOT}/calibration.console.log" \
+  --max-logit-diff "${DENSE_KV_AB_MAX_LOGIT_DIFF:-0.1}" \
+  --floor-mult "${DENSE_KV_AB_FLOOR_MULT:-2.0}"

@@ -1106,6 +1106,7 @@ def run() -> None:
                     logit_trace_records.append(
                         {
                             "index": sample["index"],
+                            "prompt_tokens": int(input_ids.shape[1]),
                             "token_ids": generated,
                             "logits": torch.stack(sample_logit_trace, dim=0),
                         }

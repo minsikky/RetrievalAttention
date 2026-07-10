@@ -2,11 +2,27 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
 
 import torch
+
+
+@dataclass(frozen=True)
+class ComparisonMetrics:
+    max_absolute: float
+    mean_absolute: float
+    mean_step_max: float
+    unsafe_disagreements: tuple[str, ...]
+    disagreement_count: int
+    step_count: int
+    element_count: int
+    max_sample: int | str | None
+    max_step: int
+    max_token_position: int | None
+    max_vocab_id: int
 
 
 def _load_trace(path: Path) -> list[dict]:
@@ -77,34 +93,61 @@ def _report_greedy_forks(stock: list[dict], offload: list[dict]) -> None:
         )
 
 
-def _teacher_metrics(stock: list[dict], teacher: list[dict]) -> tuple[float, float, float, list[str]]:
-    global_max = 0.0
+def _comparison_metrics(
+    stock: list[dict],
+    candidate: list[dict],
+    *,
+    label: str,
+) -> ComparisonMetrics:
+    global_max = -1.0
     absolute_sum = 0.0
     element_count = 0
     step_max_sum = 0.0
     step_count = 0
     unsafe_disagreements: list[str] = []
     disagreement_count = 0
+    max_sample = None
+    max_step = -1
+    max_token_position = None
+    max_vocab_id = -1
 
-    for stock_sample, teacher_sample in zip(stock, teacher):
+    for stock_sample, candidate_sample in zip(stock, candidate):
         stock_tokens = [int(x) for x in stock_sample["token_ids"]]
-        teacher_tokens = [int(x) for x in teacher_sample["token_ids"]]
-        if teacher_tokens != stock_tokens:
-            raise ValueError(f"teacher-forced tokens differ from stock for sample {stock_sample['index']}")
-        stock_logits = stock_sample["logits"]
-        teacher_logits = teacher_sample["logits"]
-        if stock_logits.shape != teacher_logits.shape:
+        candidate_tokens = [int(x) for x in candidate_sample["token_ids"]]
+        if candidate_tokens != stock_tokens:
+            raise ValueError(f"{label} forced tokens differ from stock for sample {stock_sample['index']}")
+        stock_prompt_tokens = stock_sample.get("prompt_tokens")
+        candidate_prompt_tokens = candidate_sample.get("prompt_tokens")
+        if (
+            stock_prompt_tokens is not None
+            and candidate_prompt_tokens is not None
+            and int(stock_prompt_tokens) != int(candidate_prompt_tokens)
+        ):
             raise ValueError(
-                f"teacher logit shape mismatch for sample {stock_sample['index']}: "
-                f"{tuple(stock_logits.shape)} != {tuple(teacher_logits.shape)}"
+                f"{label} prompt length differs for sample {stock_sample['index']}: "
+                f"{stock_prompt_tokens} != {candidate_prompt_tokens}"
+            )
+        stock_logits = stock_sample["logits"]
+        candidate_logits = candidate_sample["logits"]
+        if stock_logits.shape != candidate_logits.shape:
+            raise ValueError(
+                f"{label} logit shape mismatch for sample {stock_sample['index']}: "
+                f"{tuple(stock_logits.shape)} != {tuple(candidate_logits.shape)}"
             )
 
-        for step, (stock_step_raw, teacher_step_raw) in enumerate(zip(stock_logits, teacher_logits)):
+        for step, (stock_step_raw, candidate_step_raw) in enumerate(zip(stock_logits, candidate_logits)):
             stock_step = stock_step_raw.float().reshape(-1)
-            teacher_step = teacher_step_raw.float().reshape(-1)
-            absolute = (stock_step - teacher_step).abs()
+            candidate_step = candidate_step_raw.float().reshape(-1)
+            absolute = (stock_step - candidate_step).abs()
             step_max = float(absolute.max().item())
-            global_max = max(global_max, step_max)
+            if step_max > global_max:
+                global_max = step_max
+                max_sample = stock_sample["index"]
+                max_step = step
+                max_token_position = (
+                    int(stock_prompt_tokens) + step if stock_prompt_tokens is not None else None
+                )
+                max_vocab_id = int(torch.argmax(absolute).item())
             step_max_sum += step_max
             step_count += 1
             absolute_sum += float(absolute.double().sum().item())
@@ -114,15 +157,15 @@ def _teacher_metrics(stock: list[dict], teacher: list[dict]) -> tuple[float, flo
             # Use the same reduction for both arms: torch.topk and argmax can
             # choose different indices for an exact tie.
             stock_argmax = int(torch.argmax(stock_step).item())
-            teacher_argmax = int(torch.argmax(teacher_step).item())
-            if stock_argmax == teacher_argmax:
+            candidate_argmax = int(torch.argmax(candidate_step).item())
+            if stock_argmax == candidate_argmax:
                 continue
             disagreement_count += 1
             stock_margin = float((stock_top2.values[0] - stock_top2.values[1]).item())
             allowed = stock_margin < 2.0 * step_max
             print(
-                f"teacher_argmax_disagreement sample={stock_sample['index']} step={step} "
-                f"stock_argmax={stock_argmax} offload_argmax={teacher_argmax} "
+                f"{label}_argmax_disagreement sample={stock_sample['index']} step={step} "
+                f"stock_argmax={stock_argmax} candidate_argmax={candidate_argmax} "
                 f"stock_margin={stock_margin:.8f} max_abs_logit_diff={step_max:.8f} "
                 f"allowed_near_tie={str(allowed).lower()}"
             )
@@ -132,12 +175,36 @@ def _teacher_metrics(stock: list[dict], teacher: list[dict]) -> tuple[float, flo
                     f">= 2*delta {2.0 * step_max:.8f}"
                 )
 
-    mean_absolute = absolute_sum / max(1, element_count)
+    if step_count == 0:
+        raise ValueError(f"{label} trace has no decode steps")
+    mean_absolute = absolute_sum / element_count
     print(
-        f"teacher_forced_steps={sum(int(sample['logits'].shape[0]) for sample in teacher)} "
-        f"teacher_forced_elements={element_count} argmax_disagreements={disagreement_count}"
+        f"{label}_steps={step_count} {label}_elements={element_count} "
+        f"{label}_argmax_disagreements={disagreement_count}"
     )
-    return global_max, mean_absolute, step_max_sum / max(1, step_count), unsafe_disagreements
+    print(
+        f"{label}_max_abs_logit_diff={global_max:.8f} "
+        f"{label}_mean_abs_logit_diff={mean_absolute:.8f} "
+        f"{label}_mean_step_max_abs_logit_diff={step_max_sum / step_count:.8f}"
+    )
+    token_position = "unknown" if max_token_position is None else str(max_token_position)
+    print(
+        f"{label}_global_max_delta sample={max_sample} step={max_step} "
+        f"token_position={token_position} vocab_id={max_vocab_id} delta={global_max:.8f}"
+    )
+    return ComparisonMetrics(
+        max_absolute=global_max,
+        mean_absolute=mean_absolute,
+        mean_step_max=step_max_sum / step_count,
+        unsafe_disagreements=tuple(unsafe_disagreements),
+        disagreement_count=disagreement_count,
+        step_count=step_count,
+        element_count=element_count,
+        max_sample=max_sample,
+        max_step=max_step,
+        max_token_position=max_token_position,
+        max_vocab_id=max_vocab_id,
+    )
 
 
 def run(args: argparse.Namespace) -> int:
@@ -145,48 +212,78 @@ def run(args: argparse.Namespace) -> int:
         stock = _load_trace(args.stock_trace)
         offload = _load_trace(args.offload_trace)
         teacher = _load_trace(args.teacher_trace)
+        calibration = _load_trace(args.calibration_trace)
         _validate_aligned(stock, offload, "greedy offload")
         _validate_aligned(stock, teacher, "teacher offload")
+        _validate_aligned(stock, calibration, "stock calibration")
         _report_greedy_forks(stock, offload)
 
         stock_score = _load_score(args.stock_summary)
         offload_score = _load_score(args.offload_summary)
         teacher_score = _load_score(args.teacher_summary)
-        scores_equal = stock_score == offload_score == teacher_score
+        calibration_score = _load_score(args.calibration_summary)
+        scores_equal = stock_score == offload_score == teacher_score == calibration_score
         print(
             f"task_scores stock={stock_score:.8f} offload={offload_score:.8f} "
-            f"teacher={teacher_score:.8f} equal={str(scores_equal).lower()}"
+            f"teacher={teacher_score:.8f} calibration={calibration_score:.8f} "
+            f"equal={str(scores_equal).lower()}"
         )
 
-        teacher_max, teacher_mean, mean_step_max, unsafe = _teacher_metrics(stock, teacher)
-        print(
-            f"teacher_forced_max_abs_logit_diff={teacher_max:.8f} "
-            f"teacher_forced_mean_abs_logit_diff={teacher_mean:.8f} "
-            f"teacher_forced_mean_step_max_abs_logit_diff={mean_step_max:.8f} "
-            f"threshold={args.max_logit_diff:.8f}"
+        offload_metrics = _comparison_metrics(
+            stock,
+            teacher,
+            label="offload_teacher_forced",
+        )
+        calibration_metrics = _comparison_metrics(
+            stock,
+            calibration,
+            label="calibration",
         )
         for name, path in (
             ("stock", args.stock_console),
             ("offload", args.offload_console),
             ("teacher", args.teacher_console),
+            ("calibration", args.calibration_console),
         ):
             print(f"{name}_peak_memory_mib={_peak_mib(path):.1f}")
+
+        scaled_floor = args.floor_mult * calibration_metrics.max_absolute
+        effective_threshold = max(args.max_logit_diff, scaled_floor)
+        gate_summary = (
+            f"absolute_threshold={args.max_logit_diff:.8f} "
+            f"calibration_floor_max_abs={calibration_metrics.max_absolute:.8f} "
+            f"floor_mult={args.floor_mult:.8f} scaled_floor={scaled_floor:.8f} "
+            f"effective_threshold={effective_threshold:.8f} "
+            f"offload_max_abs={offload_metrics.max_absolute:.8f}"
+        )
+        print(f"noise_floor_gate {gate_summary}")
 
         reasons = []
         if not scores_equal:
             reasons.append("task scores differ")
-        if not teacher_max < args.max_logit_diff:
+        if offload_metrics.max_absolute > effective_threshold:
             reasons.append(
-                f"teacher max logit diff {teacher_max:.8f} is not below {args.max_logit_diff:.8f}"
+                f"offload max logit diff {offload_metrics.max_absolute:.8f} "
+                f"exceeds effective threshold {effective_threshold:.8f}"
             )
-        if unsafe:
-            reasons.append("unsafe argmax disagreements: " + "; ".join(unsafe))
+        if offload_metrics.unsafe_disagreements:
+            reasons.append(
+                "unsafe offload argmax disagreements: "
+                + "; ".join(offload_metrics.unsafe_disagreements)
+            )
+        if calibration_metrics.unsafe_disagreements:
+            reasons.append(
+                "unsafe calibration argmax disagreements: "
+                + "; ".join(calibration_metrics.unsafe_disagreements)
+            )
         if reasons:
-            print("KVOFF-AB: FAIL (" + " | ".join(reasons) + ")")
+            print("KVOFF-AB: FAIL (" + gate_summary + " | " + " | ".join(reasons) + ")")
             return 1
         print(
-            "KVOFF-AB: PASS (task scores identical; teacher-forced max logit diff below threshold; "
-            "all argmax disagreements, if any, are margin-qualified near-ties)"
+            "KVOFF-AB: PASS ("
+            + gate_summary
+            + " | task scores identical; offload max is within the calibrated threshold; "
+            "all offload/calibration argmax disagreements, if any, are margin-qualified near-ties)"
         )
         return 0
     except Exception as exc:
@@ -199,16 +296,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stock-trace", type=Path, required=True)
     parser.add_argument("--offload-trace", type=Path, required=True)
     parser.add_argument("--teacher-trace", type=Path, required=True)
+    parser.add_argument("--calibration-trace", type=Path, required=True)
     parser.add_argument("--stock-summary", type=Path, required=True)
     parser.add_argument("--offload-summary", type=Path, required=True)
     parser.add_argument("--teacher-summary", type=Path, required=True)
+    parser.add_argument("--calibration-summary", type=Path, required=True)
     parser.add_argument("--stock-console", type=Path, required=True)
     parser.add_argument("--offload-console", type=Path, required=True)
     parser.add_argument("--teacher-console", type=Path, required=True)
+    parser.add_argument("--calibration-console", type=Path, required=True)
     parser.add_argument("--max-logit-diff", type=float, default=0.1)
+    parser.add_argument("--floor-mult", type=float, default=2.0)
     args = parser.parse_args()
     if args.max_logit_diff <= 0:
         parser.error("--max-logit-diff must be positive")
+    if args.floor_mult < 0:
+        parser.error("--floor-mult must be non-negative")
     return args
 
 
