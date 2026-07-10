@@ -32,11 +32,24 @@ def _load_trace(path: Path) -> list[dict]:
     return trace
 
 
-def _load_score(path: Path) -> float:
+def _load_summary(path: Path) -> dict:
     payload = json.loads(path.read_text())
     if "score" not in payload:
         raise KeyError(f"summary has no score: {path}")
-    return float(payload["score"])
+    return payload
+
+
+def _report_arm_timing(name: str, summary: dict) -> float:
+    samples = int(summary["samples"])
+    elapsed = float(summary["elapsed_seconds"])
+    seconds_per_sample = elapsed / max(1, samples)
+    print(
+        f"arm_wall_clock name={name} elapsed_seconds={elapsed:.6f} samples={samples} "
+        f"seconds_per_sample={seconds_per_sample:.6f} "
+        f"mean_prefill_seconds={float(summary['mean_stream_prefill_seconds']):.6f} "
+        f"mean_decode_seconds={float(summary['mean_stream_decode_seconds']):.6f}"
+    )
+    return seconds_per_sample
 
 
 def _peak_mib(path: Path) -> float:
@@ -218,15 +231,27 @@ def run(args: argparse.Namespace) -> int:
         _validate_aligned(stock, calibration, "stock calibration")
         _report_greedy_forks(stock, offload)
 
-        stock_score = _load_score(args.stock_summary)
-        offload_score = _load_score(args.offload_summary)
-        teacher_score = _load_score(args.teacher_summary)
-        calibration_score = _load_score(args.calibration_summary)
+        stock_summary = _load_summary(args.stock_summary)
+        offload_summary = _load_summary(args.offload_summary)
+        teacher_summary = _load_summary(args.teacher_summary)
+        calibration_summary = _load_summary(args.calibration_summary)
+        stock_score = float(stock_summary["score"])
+        offload_score = float(offload_summary["score"])
+        teacher_score = float(teacher_summary["score"])
+        calibration_score = float(calibration_summary["score"])
         scores_equal = stock_score == offload_score == teacher_score == calibration_score
         print(
             f"task_scores stock={stock_score:.8f} offload={offload_score:.8f} "
             f"teacher={teacher_score:.8f} calibration={calibration_score:.8f} "
             f"equal={str(scores_equal).lower()}"
+        )
+        stock_seconds = _report_arm_timing("stock", stock_summary)
+        offload_seconds = _report_arm_timing("offload", offload_summary)
+        _report_arm_timing("teacher", teacher_summary)
+        _report_arm_timing("calibration", calibration_summary)
+        print(
+            "arm_wall_clock_ratio "
+            f"offload_over_stock={offload_seconds / max(stock_seconds, 1e-9):.6f}"
         )
 
         offload_metrics = _comparison_metrics(

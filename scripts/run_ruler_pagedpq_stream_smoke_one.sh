@@ -149,8 +149,10 @@ if [ "${DENSE_KV_OFFLOAD:-0}" = "1" ]; then
   DENSE_KV_OFFLOAD_ARG=(
     --dense_kv_offload
     --dense_kv_block_tokens "${DENSE_KV_BLOCK_TOKENS:-8192}"
+    --dense_kv_decode_block_tokens "${DENSE_KV_DECODE_BLOCK_TOKENS:-262144}"
     --dense_kv_staging_buffers "${DENSE_KV_STAGING_BUFFERS:-2}"
-    --dense_kv_query_block_tokens "${DENSE_KV_QUERY_BLOCK_TOKENS:-2048}"
+    --dense_kv_query_block_tokens "${DENSE_KV_QUERY_BLOCK_TOKENS:-4096}"
+    --dense_kv_av_tf32 "${DENSE_KV_AV_TF32:-1}"
   )
 fi
 GREEDY_LOGIT_TRACE_ARG=()
@@ -178,7 +180,7 @@ echo "[pagedpq_stream_smoke] mode=${MODE} approx_prefill=${APPROX_PREFILL} task=
 echo "[pagedpq_stream_smoke] out=${OUT_DIR}"
 echo "[pagedpq_stream_smoke] budget=${BUDGET:-4096} confidence=${ONLINE_CONFIDENCE_RULE:-joint_kv_stability} target=${TAIL_PROXY_MASS_MIN:-0.0} geom_min=${GEOMETRIC_MIN_BUDGET:-8192} geom_max=${GEOMETRIC_MAX_BUDGET:-65536} page=${PAGE_SIZE:-5632} chunk=${PREFILL_CHUNK_SIZE:-0}"
 echo "[pagedpq_stream_smoke] exact_logit_backend=${FRONTIER_EXACT_LOGIT_BACKEND:-auto}"
-echo "[pagedpq_stream_smoke] dense_kv_offload=${DENSE_KV_OFFLOAD:-0} kv_block=${DENSE_KV_BLOCK_TOKENS:-8192} staging=${DENSE_KV_STAGING_BUFFERS:-2} query_block=${DENSE_KV_QUERY_BLOCK_TOKENS:-2048}"
+echo "[pagedpq_stream_smoke] dense_kv_offload=${DENSE_KV_OFFLOAD:-0} kv_block=${DENSE_KV_BLOCK_TOKENS:-8192} decode_block=${DENSE_KV_DECODE_BLOCK_TOKENS:-262144} staging=${DENSE_KV_STAGING_BUFFERS:-2} query_block=${DENSE_KV_QUERY_BLOCK_TOKENS:-4096} av_tf32=${DENSE_KV_AV_TF32:-1}"
 echo "[pagedpq_stream_smoke] forced_token_trace=${FORCED_TOKEN_TRACE_FILE:-none}"
 
 DATA_FILE="${DATA_FILE_OVERRIDE:-${DATA_DIR}/${TASK_NAME}/validation.jsonl}"
