@@ -17,6 +17,13 @@ Keep this file to current commands only. Old command recipes are preserved in `n
 
 ## CUDA / Frontier Unit Validation
 
+CPU bit-parity smoke for the memory-bounded precision-tier V-PQ sidecars:
+
+```bash
+module load python/3.10.4
+.venv/bin/python benchmark/selector_eval/runners/verify_memory_bounded_vpq.py
+```
+
 ```bash
 sbatch scripts/run_frontier_cuda_unit_tests.sh
 ```

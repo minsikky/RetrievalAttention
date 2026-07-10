@@ -1,5 +1,18 @@
 # Current Status
 
+## 2026-07-09 Frozen-sim 128k MIG40 memory fix
+
+The precision-tier frozen simulator no longer retains full-context float32
+V-PQ `vhat` and residual planes for every layer/KV head. The exact audit found
+these were 32.06 GiB total at 128k (not the prior fp16 estimate); this explains
+the +8 GiB 32k warm growth and projects the old 128k steady state near 65 GiB.
+The new default `SELECTOR_PQ_JOINT_MEMORY_BOUNDED_VPQ=1` keeps V codes,
+codebooks, float64 `code_error`, and the fp16 commit-error cache, then rebuilds
+the exact float32 `vhat`/residual only for the current KV head. Projected 128k
+decode peak is <= about 34.15 GiB and warm is about 32.6 GiB. CPU bit-parity
+smoke passes; same-GPU 32k identity and 128k MIG fit runs remain the empirical
+gates. Full audit: `notes/vpq_sidecar_memory_audit_20260709.md`.
+
 ## 2026-07-09 Issue #10 — feed-forward budget predictor FEASIBLE (positive)
 
 Can a scan-domain statistic predict the escalation loop's final stopping
