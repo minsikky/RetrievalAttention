@@ -1,0 +1,736 @@
+{
+  "resource_rates": {
+    "scan_items": 1000000000,
+    "qk_flops": 6553600000000
+  },
+  "epochs": [
+    {
+      "name": "h0_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h0_e0_start_eval",
+      "depends_on": [
+        "h0_pq_scan"
+      ],
+      "bytes": 18163808,
+      "work": {
+        "qk_flops": 25520384
+      },
+      "requests": 567619
+    },
+    {
+      "name": "h1_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h1_e0_start_eval",
+      "depends_on": [
+        "h1_pq_scan"
+      ],
+      "bytes": 14486176,
+      "work": {
+        "qk_flops": 22068480
+      },
+      "requests": 452693
+    },
+    {
+      "name": "h2_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h2_e0_start_eval",
+      "depends_on": [
+        "h2_pq_scan"
+      ],
+      "bytes": 14464896,
+      "work": {
+        "qk_flops": 22068480
+      },
+      "requests": 452028
+    },
+    {
+      "name": "h3_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h3_e0_start_eval",
+      "depends_on": [
+        "h3_pq_scan"
+      ],
+      "bytes": 10544928,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 329529
+    },
+    {
+      "name": "h4_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h4_e0_start_eval",
+      "depends_on": [
+        "h4_pq_scan"
+      ],
+      "bytes": 10578080,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 330565
+    },
+    {
+      "name": "h5_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h5_e0_start_eval",
+      "depends_on": [
+        "h5_pq_scan"
+      ],
+      "bytes": 10556192,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 329881
+    },
+    {
+      "name": "h5_e1_commit",
+      "depends_on": [
+        "h5_e0_start_eval"
+      ],
+      "bytes": 7278784,
+      "work": {
+        "qk_flops": 10355712
+      },
+      "requests": 227462
+    },
+    {
+      "name": "h6_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h6_e0_start_eval",
+      "depends_on": [
+        "h6_pq_scan"
+      ],
+      "bytes": 10577664,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 330552
+    },
+    {
+      "name": "h7_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h7_e0_start_eval",
+      "depends_on": [
+        "h7_pq_scan"
+      ],
+      "bytes": 10589536,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 330923
+    },
+    {
+      "name": "h8_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h8_e0_start_eval",
+      "depends_on": [
+        "h8_pq_scan"
+      ],
+      "bytes": 14461376,
+      "work": {
+        "qk_flops": 22068480
+      },
+      "requests": 451918
+    },
+    {
+      "name": "h8_e1_commit",
+      "depends_on": [
+        "h8_e0_start_eval"
+      ],
+      "bytes": 7334528,
+      "work": {
+        "qk_flops": 10355456
+      },
+      "requests": 229204
+    },
+    {
+      "name": "h9_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h9_e0_start_eval",
+      "depends_on": [
+        "h9_pq_scan"
+      ],
+      "bytes": 14493856,
+      "work": {
+        "qk_flops": 22068480
+      },
+      "requests": 452933
+    },
+    {
+      "name": "h10_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h10_e0_start_eval",
+      "depends_on": [
+        "h10_pq_scan"
+      ],
+      "bytes": 10510048,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 328439
+    },
+    {
+      "name": "h10_e1_commit",
+      "depends_on": [
+        "h10_e0_start_eval"
+      ],
+      "bytes": 5474048,
+      "work": {
+        "qk_flops": 8629504
+      },
+      "requests": 171064
+    },
+    {
+      "name": "h11_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h11_e0_start_eval",
+      "depends_on": [
+        "h11_pq_scan"
+      ],
+      "bytes": 10522368,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 328824
+    },
+    {
+      "name": "h11_e1_commit",
+      "depends_on": [
+        "h11_e0_start_eval"
+      ],
+      "bytes": 5503968,
+      "work": {
+        "qk_flops": 8629504
+      },
+      "requests": 171999
+    },
+    {
+      "name": "h12_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h12_e0_start_eval",
+      "depends_on": [
+        "h12_pq_scan"
+      ],
+      "bytes": 10530240,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 329070
+    },
+    {
+      "name": "h13_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h13_e0_start_eval",
+      "depends_on": [
+        "h13_pq_scan"
+      ],
+      "bytes": 10574336,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 330448
+    },
+    {
+      "name": "h14_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h14_e0_start_eval",
+      "depends_on": [
+        "h14_pq_scan"
+      ],
+      "bytes": 10548224,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 329632
+    },
+    {
+      "name": "h15_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h15_e0_start_eval",
+      "depends_on": [
+        "h15_pq_scan"
+      ],
+      "bytes": 10517600,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 328675
+    },
+    {
+      "name": "h16_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h16_e0_start_eval",
+      "depends_on": [
+        "h16_pq_scan"
+      ],
+      "bytes": 10455456,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 326733
+    },
+    {
+      "name": "h16_e1_commit",
+      "depends_on": [
+        "h16_e0_start_eval"
+      ],
+      "bytes": 7176544,
+      "work": {
+        "qk_flops": 10355712
+      },
+      "requests": 224267
+    },
+    {
+      "name": "h17_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h17_e0_start_eval",
+      "depends_on": [
+        "h17_pq_scan"
+      ],
+      "bytes": 10478944,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 327467
+    },
+    {
+      "name": "h18_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h18_e0_start_eval",
+      "depends_on": [
+        "h18_pq_scan"
+      ],
+      "bytes": 10540704,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 329397
+    },
+    {
+      "name": "h18_e1_commit",
+      "depends_on": [
+        "h18_e0_start_eval"
+      ],
+      "bytes": 7248704,
+      "work": {
+        "qk_flops": 10355712
+      },
+      "requests": 226522
+    },
+    {
+      "name": "h19_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h19_e0_start_eval",
+      "depends_on": [
+        "h19_pq_scan"
+      ],
+      "bytes": 10469088,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 327159
+    },
+    {
+      "name": "h19_e1_commit",
+      "depends_on": [
+        "h19_e0_start_eval"
+      ],
+      "bytes": 7195392,
+      "work": {
+        "qk_flops": 10355712
+      },
+      "requests": 224856
+    },
+    {
+      "name": "h20_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h20_e0_start_eval",
+      "depends_on": [
+        "h20_pq_scan"
+      ],
+      "bytes": 10927200,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 341475
+    },
+    {
+      "name": "h20_e1_commit",
+      "depends_on": [
+        "h20_e0_start_eval"
+      ],
+      "bytes": 5660832,
+      "work": {
+        "qk_flops": 8629504
+      },
+      "requests": 176901
+    },
+    {
+      "name": "h21_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h21_e0_start_eval",
+      "depends_on": [
+        "h21_pq_scan"
+      ],
+      "bytes": 10594880,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 331090
+    },
+    {
+      "name": "h22_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h22_e0_start_eval",
+      "depends_on": [
+        "h22_pq_scan"
+      ],
+      "bytes": 10522208,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 328819
+    },
+    {
+      "name": "h23_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h23_e0_start_eval",
+      "depends_on": [
+        "h23_pq_scan"
+      ],
+      "bytes": 14725600,
+      "work": {
+        "qk_flops": 22068480
+      },
+      "requests": 460175
+    },
+    {
+      "name": "h24_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h24_e0_start_eval",
+      "depends_on": [
+        "h24_pq_scan"
+      ],
+      "bytes": 18058112,
+      "work": {
+        "qk_flops": 25520384
+      },
+      "requests": 564316
+    },
+    {
+      "name": "h25_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h25_e0_start_eval",
+      "depends_on": [
+        "h25_pq_scan"
+      ],
+      "bytes": 14490784,
+      "work": {
+        "qk_flops": 22068480
+      },
+      "requests": 452837
+    },
+    {
+      "name": "h26_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h26_e0_start_eval",
+      "depends_on": [
+        "h26_pq_scan"
+      ],
+      "bytes": 14490112,
+      "work": {
+        "qk_flops": 22068480
+      },
+      "requests": 452816
+    },
+    {
+      "name": "h27_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h27_e0_start_eval",
+      "depends_on": [
+        "h27_pq_scan"
+      ],
+      "bytes": 18084928,
+      "work": {
+        "qk_flops": 25520384
+      },
+      "requests": 565154
+    },
+    {
+      "name": "h28_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h28_e0_start_eval",
+      "depends_on": [
+        "h28_pq_scan"
+      ],
+      "bytes": 10534880,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 329215
+    },
+    {
+      "name": "h29_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h29_e0_start_eval",
+      "depends_on": [
+        "h29_pq_scan"
+      ],
+      "bytes": 10519488,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 328734
+    },
+    {
+      "name": "h30_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h30_e0_start_eval",
+      "depends_on": [
+        "h30_pq_scan"
+      ],
+      "bytes": 10500672,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 328146
+    },
+    {
+      "name": "h31_pq_scan",
+      "depends_on": [],
+      "bytes": 2204704,
+      "work": {
+        "scan_items": 134838
+      },
+      "requests": 68897
+    },
+    {
+      "name": "h31_e0_start_eval",
+      "depends_on": [
+        "h31_pq_scan"
+      ],
+      "bytes": 10501184,
+      "work": {
+        "qk_flops": 15164928
+      },
+      "requests": 328162
+    }
+  ]
+}

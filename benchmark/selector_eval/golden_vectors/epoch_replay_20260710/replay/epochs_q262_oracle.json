@@ -1,0 +1,703 @@
+{
+  "resource_rates": {
+    "scan_items": 1000000000,
+    "qk_flops": 6553600000000
+  },
+  "epochs": [
+    {
+      "name": "h0_pq_scan",
+      "depends_on": [],
+      "bytes": 1342720,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 41960
+    },
+    {
+      "name": "h0_e0_start_eval",
+      "depends_on": [
+        "h0_pq_scan"
+      ],
+      "bytes": 20567392,
+      "work": {
+        "qk_flops": 28817920
+      },
+      "requests": 642731
+    },
+    {
+      "name": "h1_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h1_e0_start_eval",
+      "depends_on": [
+        "h1_pq_scan"
+      ],
+      "bytes": 3487840,
+      "work": {
+        "qk_flops": 28817920
+      },
+      "requests": 108995
+    },
+    {
+      "name": "h2_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h2_e0_start_eval",
+      "depends_on": [
+        "h2_pq_scan"
+      ],
+      "bytes": 1048480,
+      "work": {
+        "qk_flops": 20295680
+      },
+      "requests": 32765
+    },
+    {
+      "name": "h3_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h3_e0_start_eval",
+      "depends_on": [
+        "h3_pq_scan"
+      ],
+      "bytes": 219200,
+      "work": {
+        "qk_flops": 9643008
+      },
+      "requests": 6850
+    },
+    {
+      "name": "h4_pq_scan",
+      "depends_on": [],
+      "bytes": 1342720,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 41960
+    },
+    {
+      "name": "h4_e0_start_eval",
+      "depends_on": [
+        "h4_pq_scan"
+      ],
+      "bytes": 9328832,
+      "work": {
+        "qk_flops": 13904128
+      },
+      "requests": 291526
+    },
+    {
+      "name": "h5_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h5_e0_start_eval",
+      "depends_on": [
+        "h5_pq_scan"
+      ],
+      "bytes": 9305344,
+      "work": {
+        "qk_flops": 24556800
+      },
+      "requests": 290792
+    },
+    {
+      "name": "h6_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h6_e0_start_eval",
+      "depends_on": [
+        "h6_pq_scan"
+      ],
+      "bytes": 217568,
+      "work": {
+        "qk_flops": 13904128
+      },
+      "requests": 6799
+    },
+    {
+      "name": "h7_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h7_e0_start_eval",
+      "depends_on": [
+        "h7_pq_scan"
+      ],
+      "bytes": 55456,
+      "work": {
+        "qk_flops": 13904128
+      },
+      "requests": 1733
+    },
+    {
+      "name": "h8_pq_scan",
+      "depends_on": [],
+      "bytes": 1342720,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 41960
+    },
+    {
+      "name": "h8_e0_start_eval",
+      "depends_on": [
+        "h8_pq_scan"
+      ],
+      "bytes": 11504640,
+      "work": {
+        "qk_flops": 16034560
+      },
+      "requests": 359520
+    },
+    {
+      "name": "h8_e1_commit",
+      "depends_on": [
+        "h8_e0_start_eval"
+      ],
+      "bytes": 2320544,
+      "work": {
+        "qk_flops": 6391552
+      },
+      "requests": 72517
+    },
+    {
+      "name": "h9_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h9_e0_start_eval",
+      "depends_on": [
+        "h9_pq_scan"
+      ],
+      "bytes": 1219136,
+      "work": {
+        "qk_flops": 16034560
+      },
+      "requests": 38098
+    },
+    {
+      "name": "h10_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h10_e0_start_eval",
+      "depends_on": [
+        "h10_pq_scan"
+      ],
+      "bytes": 1350208,
+      "work": {
+        "qk_flops": 16034560
+      },
+      "requests": 42194
+    },
+    {
+      "name": "h11_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h11_e0_start_eval",
+      "depends_on": [
+        "h11_pq_scan"
+      ],
+      "bytes": 1948736,
+      "work": {
+        "qk_flops": 20295680
+      },
+      "requests": 60898
+    },
+    {
+      "name": "h12_pq_scan",
+      "depends_on": [],
+      "bytes": 1342720,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 41960
+    },
+    {
+      "name": "h12_e0_start_eval",
+      "depends_on": [
+        "h12_pq_scan"
+      ],
+      "bytes": 9315072,
+      "work": {
+        "qk_flops": 13904128
+      },
+      "requests": 291096
+    },
+    {
+      "name": "h13_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h13_e0_start_eval",
+      "depends_on": [
+        "h13_pq_scan"
+      ],
+      "bytes": 660544,
+      "work": {
+        "qk_flops": 9643008
+      },
+      "requests": 20642
+    },
+    {
+      "name": "h14_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h14_e0_start_eval",
+      "depends_on": [
+        "h14_pq_scan"
+      ],
+      "bytes": 660896,
+      "work": {
+        "qk_flops": 13904128
+      },
+      "requests": 20653
+    },
+    {
+      "name": "h15_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h15_e0_start_eval",
+      "depends_on": [
+        "h15_pq_scan"
+      ],
+      "bytes": 493856,
+      "work": {
+        "qk_flops": 13904128
+      },
+      "requests": 15433
+    },
+    {
+      "name": "h16_pq_scan",
+      "depends_on": [],
+      "bytes": 1342720,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 41960
+    },
+    {
+      "name": "h16_e0_start_eval",
+      "depends_on": [
+        "h16_pq_scan"
+      ],
+      "bytes": 9287808,
+      "work": {
+        "qk_flops": 13904128
+      },
+      "requests": 290244
+    },
+    {
+      "name": "h16_e1_commit",
+      "depends_on": [
+        "h16_e0_start_eval"
+      ],
+      "bytes": 2184128,
+      "work": {
+        "qk_flops": 6391552
+      },
+      "requests": 68254
+    },
+    {
+      "name": "h17_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h17_e0_start_eval",
+      "depends_on": [
+        "h17_pq_scan"
+      ],
+      "bytes": 340256,
+      "work": {
+        "qk_flops": 9643008
+      },
+      "requests": 10633
+    },
+    {
+      "name": "h18_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h18_e0_start_eval",
+      "depends_on": [
+        "h18_pq_scan"
+      ],
+      "bytes": 3305024,
+      "work": {
+        "qk_flops": 16034560
+      },
+      "requests": 103282
+    },
+    {
+      "name": "h19_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h19_e0_start_eval",
+      "depends_on": [
+        "h19_pq_scan"
+      ],
+      "bytes": 2273184,
+      "work": {
+        "qk_flops": 20295680
+      },
+      "requests": 71037
+    },
+    {
+      "name": "h20_pq_scan",
+      "depends_on": [],
+      "bytes": 1342720,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 41960
+    },
+    {
+      "name": "h20_e0_start_eval",
+      "depends_on": [
+        "h20_pq_scan"
+      ],
+      "bytes": 9375776,
+      "work": {
+        "qk_flops": 13904128
+      },
+      "requests": 292993
+    },
+    {
+      "name": "h21_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h21_e0_start_eval",
+      "depends_on": [
+        "h21_pq_scan"
+      ],
+      "bytes": 4196192,
+      "work": {
+        "qk_flops": 13904128
+      },
+      "requests": 131131
+    },
+    {
+      "name": "h22_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h22_e0_start_eval",
+      "depends_on": [
+        "h22_pq_scan"
+      ],
+      "bytes": 2508224,
+      "work": {
+        "qk_flops": 13904128
+      },
+      "requests": 78382
+    },
+    {
+      "name": "h23_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h23_e0_start_eval",
+      "depends_on": [
+        "h23_pq_scan"
+      ],
+      "bytes": 603232,
+      "work": {
+        "qk_flops": 13904128
+      },
+      "requests": 18851
+    },
+    {
+      "name": "h24_pq_scan",
+      "depends_on": [],
+      "bytes": 1342720,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 41960
+    },
+    {
+      "name": "h24_e0_start_eval",
+      "depends_on": [
+        "h24_pq_scan"
+      ],
+      "bytes": 11438592,
+      "work": {
+        "qk_flops": 16034560
+      },
+      "requests": 357456
+    },
+    {
+      "name": "h24_e1_commit",
+      "depends_on": [
+        "h24_e0_start_eval"
+      ],
+      "bytes": 2351872,
+      "work": {
+        "qk_flops": 6391552
+      },
+      "requests": 73496
+    },
+    {
+      "name": "h25_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h25_e0_start_eval",
+      "depends_on": [
+        "h25_pq_scan"
+      ],
+      "bytes": 2474176,
+      "work": {
+        "qk_flops": 20295680
+      },
+      "requests": 77318
+    },
+    {
+      "name": "h26_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h26_e0_start_eval",
+      "depends_on": [
+        "h26_pq_scan"
+      ],
+      "bytes": 395648,
+      "work": {
+        "qk_flops": 16034560
+      },
+      "requests": 12364
+    },
+    {
+      "name": "h27_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h27_e0_start_eval",
+      "depends_on": [
+        "h27_pq_scan"
+      ],
+      "bytes": 521888,
+      "work": {
+        "qk_flops": 16034560
+      },
+      "requests": 16309
+    },
+    {
+      "name": "h27_e1_commit",
+      "depends_on": [
+        "h27_e0_start_eval"
+      ],
+      "bytes": 332640,
+      "work": {
+        "qk_flops": 6391552
+      },
+      "requests": 10395
+    },
+    {
+      "name": "h28_pq_scan",
+      "depends_on": [],
+      "bytes": 1342720,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 41960
+    },
+    {
+      "name": "h28_e0_start_eval",
+      "depends_on": [
+        "h28_pq_scan"
+      ],
+      "bytes": 6900736,
+      "work": {
+        "qk_flops": 9643008
+      },
+      "requests": 215648
+    },
+    {
+      "name": "h29_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h29_e0_start_eval",
+      "depends_on": [
+        "h29_pq_scan"
+      ],
+      "bytes": 1848160,
+      "work": {
+        "qk_flops": 9643008
+      },
+      "requests": 57755
+    },
+    {
+      "name": "h30_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h30_e0_start_eval",
+      "depends_on": [
+        "h30_pq_scan"
+      ],
+      "bytes": 1188960,
+      "work": {
+        "qk_flops": 9643008
+      },
+      "requests": 37155
+    },
+    {
+      "name": "h30_e1_commit",
+      "depends_on": [
+        "h30_e0_start_eval"
+      ],
+      "bytes": 1432128,
+      "work": {
+        "qk_flops": 5326336
+      },
+      "requests": 44754
+    },
+    {
+      "name": "h31_pq_scan",
+      "depends_on": [],
+      "bytes": 0,
+      "work": {
+        "scan_items": 83225
+      },
+      "requests": 0
+    },
+    {
+      "name": "h31_e0_start_eval",
+      "depends_on": [
+        "h31_pq_scan"
+      ],
+      "bytes": 331584,
+      "work": {
+        "qk_flops": 9643008
+      },
+      "requests": 10362
+    }
+  ]
+}
