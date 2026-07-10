@@ -1243,6 +1243,137 @@ def output_from_base_and_split_masks(
     return out.astype(np.float32, copy=False)
 
 
+def gqa_union_commit_head_output(
+    *,
+    rec: dict,
+    union_k: np.ndarray,
+    group_hi_k: np.ndarray,
+    union_v: np.ndarray,
+    context_len: int,
+    query_dim: int,
+    precision_k_hi_frac: float,
+    precision_v_hi_frac: float,
+    v_risk_key_exp_bits: int,
+    v_risk_key_mantissa_bits: int,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Recompute one head's committed output under issue #20 union-commit.
+
+    Mirrors the frozen per-head execution machinery bit-for-bit (the same
+    ``mixed_scores_for_variant`` -> softmax -> base_output path and the same
+    V hi/lo precision split as ``run()``'s (ki, vi) loop), but substitutes the
+    group's UNION exact-K set for the head's own committed K set (item 2), the
+    group-MAX per-token K tier for the head's own hi/lo split (item 3), and the
+    group's UNION exact-V set for the head's own committed V set (item 4). No
+    re-selection: the walk is frozen; only the loaded/executed sets grow, so the
+    softmax + Vcorr denominators reweight over the larger set.
+
+    Self-consistency: for a group of one head with union_k == committed_k,
+    group_hi_k == committed_hi_k, union_v == committed_v this reproduces the
+    baseline output exactly (verified by the OFF/ON gate at group size 1).
+    """
+    union_k = np.asarray(union_k, dtype=np.int64)
+    # Item 2: exact logits (variant exact scores) for EVERY union-K token,
+    # PQ elsewhere -- identical construction to run()'s base_output loop with
+    # selected_cpu = union_k.
+    score_vec, _missing, _scale, _bias, _extra_mb, _probes = mixed_scores_for_variant(
+        variant=str(rec["variant"]),
+        context_len=int(context_len),
+        selected_cpu=union_k,
+        ranked_cpu=rec["ranked_cpu"],
+        ranked_scores_cpu=rec["ranked_scores_cpu"],
+        exact_scores_np=rec["scores_np"],
+        query_dim=int(query_dim),
+        calibrate=bool(rec["calibrate"]),
+        key_bytes=int(rec["key_bytes"]),
+    )
+    scores_lo_np = rec["scores_lo_np"]
+    # Item 3: per-token K tier = max across the group. A union token that is hi
+    # in ANY group head is read at planes A+B (full-precision exact score); the
+    # rest fall to this head's own lo-plane exact score. group_hi_k already is
+    # the union of every head's committed hi-K set, so lo_union = union_k minus
+    # group_hi_k.
+    if precision_k_hi_frac < 1.0 and scores_lo_np is not None:
+        hi_flag = np.zeros((int(context_len),), dtype=bool)
+        hi_flag[np.asarray(group_hi_k, dtype=np.int64)] = True
+        lo_union = union_k[~hi_flag[union_k]]
+        if lo_union.size:
+            score_vec = score_vec.astype(np.float32, copy=True)
+            score_vec[lo_union] = scores_lo_np[lo_union]
+    page_unscanned_mask = rec["page_unscanned_mask"]
+    page_centroid_logit = rec["page_centroid_logit"]
+    if page_unscanned_mask is not None and page_centroid_logit is not None:
+        score_vec = score_vec.astype(np.float32, copy=True)
+        score_vec[page_unscanned_mask] = page_centroid_logit[page_unscanned_mask]
+    probs = np.exp(score_vec - float(np.max(score_vec)))
+    probs /= max(float(probs.sum()), 1e-20)
+    probs = probs.astype(np.float64, copy=False)
+    vhat_for_base = rec["vhat_for_base"]
+    base_output = (
+        probs @ vhat_for_base.astype(np.float64, copy=False)
+    ).astype(np.float32, copy=False)
+
+    # Item 4: exact-V over the UNION set, per-head Vcorr split as usual (same
+    # risk key + fp16-commit machinery as run()'s (ki, vi) V block), reweighted
+    # by the new probs. No re-selection: exact_mask is fixed to union_v.
+    code_error = rec["code_error"]
+    risk_scores = (probs * probs) * code_error
+    if int(v_risk_key_exp_bits) > 0:
+        risk_scores = _quantize_risk_key(
+            risk_scores, int(v_risk_key_exp_bits), int(v_risk_key_mantissa_bits)
+        )
+    exact_mask = np.zeros((int(context_len),), dtype=bool)
+    exact_mask[np.asarray(union_v, dtype=np.int64)] = True
+    residual = rec["residual"]
+    residual_lo = rec["residual_lo"]
+    precision_v_lo_err = rec["precision_v_lo_err"]
+    v_hi_reads = 0
+    v_lo_reads = 0
+    if precision_v_hi_frac < 1.0 and residual_lo is not None and bool(np.any(exact_mask)):
+        exact_idx = np.flatnonzero(exact_mask)
+        hi_target = int(math.ceil(float(exact_idx.size) * precision_v_hi_frac))
+        risk_order = exact_idx[
+            np.argsort(-risk_scores[exact_idx].astype(np.float64, copy=False), kind="stable")
+        ]
+        lo_candidates = risk_order[hi_target:]
+        commit = lo_candidates[
+            _fp16_commit_mask(
+                precision_v_lo_err[lo_candidates],
+                code_error[lo_candidates],
+            )
+        ]
+        v_hi_mask = np.zeros((int(context_len),), dtype=bool)
+        v_lo_mask = np.zeros((int(context_len),), dtype=bool)
+        v_hi_mask[risk_order[:hi_target]] = True
+        v_lo_mask[commit] = True
+        v_hi_reads = int(hi_target)
+        v_lo_reads = int(commit.size)
+        out = output_from_base_and_split_masks(
+            base_output=base_output,
+            probs=probs,
+            residual=residual,
+            residual_lo=residual_lo,
+            hi_mask=v_hi_mask,
+            lo_mask=v_lo_mask,
+        )
+    else:
+        v_hi_reads = int(np.count_nonzero(exact_mask))
+        out = output_from_base_and_exact_mask(
+            base_output=base_output,
+            probs=probs,
+            residual=residual,
+            exact_mask=exact_mask,
+        )
+    meta = {
+        "union_k_tokens": int(union_k.size),
+        "union_v_tokens": int(np.asarray(union_v, dtype=np.int64).size),
+        "union_k_hi_tokens": int(np.asarray(group_hi_k, dtype=np.int64).size),
+        "union_k_lo_tokens": int(union_k.size - int(np.count_nonzero(np.isin(union_k, np.asarray(group_hi_k, dtype=np.int64))))),
+        "v_hi_reads": int(v_hi_reads),
+        "v_lo_reads": int(v_lo_reads),
+    }
+    return out, meta
+
+
 def v_selection_state_mb(
     *,
     rule: str,
@@ -3112,6 +3243,24 @@ def run() -> None:
         ),
     )
     parser.add_argument(
+        "--gqa_union_commit",
+        action="store_true",
+        help=(
+            "Issue #20 union-commit execution mode (default OFF = byte-identical "
+            "to the frozen per-head contract; only adds the gqa_union_commit.csv "
+            "table when ON, never mutates an existing output). Per-head selection "
+            "walks/budgets/escalation stay frozen. THEN, per 4-head GQA group "
+            "(heads sharing a kv_head), every head's exact-K set becomes the "
+            "UNION of the group's 4 committed K sets (exact logits replace PQ for "
+            "every union token, softmax/Vcorr denominators update), the per-token "
+            "K tier is the MAX across the group (any head hi -> planes A+B), and "
+            "every head's exact-V set becomes the UNION of the group's committed "
+            "V sets (per-head Vcorr split recomputed as usual over the larger "
+            "set). Records baseline vs union-commit per-head relL2. Requires all "
+            "q heads of each kv group present (e.g. --heads 0..31)."
+        ),
+    )
+    parser.add_argument(
         "--budget_deescalate",
         action="store_true",
         help=(
@@ -3578,6 +3727,8 @@ def run() -> None:
     temporal_budget_cache: dict[tuple[str, str, str, float, str, int], tuple[int, int]] = {}
     gqa_union_stats = bool(args.gqa_union_stats)
     gqa_union_rows: list[dict[str, object]] = []
+    gqa_union_commit = bool(args.gqa_union_commit)
+    gqa_union_commit_rows: list[dict[str, object]] = []
     page_index_build_cache: dict[int, dict[str, object]] = {}
     t0 = time.perf_counter()
 
@@ -3594,6 +3745,10 @@ def run() -> None:
         )
         needed_kv_heads = sorted({int(trace.kv_head_for(h)) for h in heads})
         gqa_union_acc: dict[tuple, dict[str, object]] = {}
+        # Issue #20: per-qidx stash of the per-head operands needed to recompute
+        # each head's committed output under the group union. Keyed by
+        # (kv_head, variant, v_rule, policy, threshold, start_strategy) -> {head: rec}.
+        uc_stash: dict[tuple, dict[int, dict[str, object]]] = {}
         temporal_reuse_now = False
         temporal_stale_tokens = 0
         if temporal_reuse_max_stale > 0 and all(kv in temporal_index_cache for kv in needed_kv_heads):
@@ -4417,7 +4572,7 @@ def run() -> None:
                                     residual=residual,
                                     exact_mask=exact_mask,
                                 )
-                            if temporal_cache_stats or gqa_union_stats or epoch_trace_stats or v_threshold_lab_stats:
+                            if temporal_cache_stats or gqa_union_stats or gqa_union_commit or epoch_trace_stats or v_threshold_lab_stats:
                                 exact_mask_by_pair[(ki, vi)] = np.asarray(exact_mask, dtype=bool)
                             if la_active:
                                 la_masks.append(np.asarray(exact_mask, dtype=bool))
@@ -4842,6 +4997,67 @@ def run() -> None:
                                     acc["v_sum"] += int(g_v.size)
                                     acc["k_sets"].append(g_k)
                                     acc["v_sets"].append(g_v)
+                                if gqa_union_commit:
+                                    # Issue #20: stash everything needed to
+                                    # re-execute this head's committed output
+                                    # under the group union (processed after the
+                                    # head loop, once all 4 group members exist).
+                                    uc_key = (
+                                        int(kv_head),
+                                        str(score_proxy_variant),
+                                        str(canonical_v_rule),
+                                        str(policy),
+                                        float(threshold),
+                                        str(start_strategy),
+                                    )
+                                    committed_k = np.asarray(selected_by_k[ki], dtype=np.int64)
+                                    committed_v = np.flatnonzero(
+                                        exact_mask_by_pair[(ki, vi)]
+                                    ).astype(np.int64)
+                                    # Committed hi-K set at the settled rung: the
+                                    # ranked-prefix tokens the frozen split kept
+                                    # at full precision (planes A+B). Empty when
+                                    # the split is disabled.
+                                    if precision_k_hi_frac < 1.0 and scores_lo_np is not None:
+                                        committed_lo_k = _precision_lo_tokens(
+                                            base=base,
+                                            ranked_cpu=variant_ranked_cpu,
+                                            budget=int(k_budgets[ki]),
+                                            context_len=int(context_len),
+                                            hi_frac=float(precision_k_hi_frac),
+                                            frozen_hi_count=precision_frozen_hi_count,
+                                        )
+                                        committed_hi_k = np.setdiff1d(
+                                            committed_k, committed_lo_k, assume_unique=False
+                                        )
+                                    else:
+                                        committed_hi_k = committed_k
+                                    uc_stash.setdefault(uc_key, {})[int(head)] = {
+                                        "head": int(head),
+                                        "kv_head": int(kv_head),
+                                        "variant": str(score_proxy_variant),
+                                        "committed_ki": int(ki),
+                                        "committed_vi": int(vi),
+                                        "committed_k": committed_k,
+                                        "committed_v": committed_v,
+                                        "committed_hi_k": np.asarray(committed_hi_k, dtype=np.int64),
+                                        "baseline_relL2": float(metric["output_relative_l2"]),
+                                        "baseline_cosine": float(metric["output_cosine"]),
+                                        "dense_head": dense_head,
+                                        "ranked_cpu": variant_ranked_cpu,
+                                        "ranked_scores_cpu": variant_ranked_scores_cpu,
+                                        "scores_np": scores_np,
+                                        "scores_lo_np": scores_lo_np,
+                                        "vhat_for_base": vhat_for_base,
+                                        "residual": residual,
+                                        "residual_lo": residual_lo,
+                                        "code_error": code_error,
+                                        "precision_v_lo_err": precision_v_lo_err,
+                                        "page_unscanned_mask": page_unscanned_mask,
+                                        "page_centroid_logit": page_centroid_logit,
+                                        "calibrate": str(args.tail_score_calibration) == "affine_selected",
+                                        "key_bytes": int(args.key_bytes),
+                                    }
                                 row = {
                                     "qidx": int(qidx),
                                     "position": int(position),
@@ -5321,6 +5537,76 @@ def run() -> None:
                         "v_union_over_sum": float(v_union) / max(float(acc["v_sum"]), 1.0),
                     }
                 )
+        if gqa_union_commit:
+            # Issue #20 union-commit pass: after every head's frozen walk has
+            # settled, form the per-group K/V unions and MAX-tier K map, then
+            # re-execute each head's committed output over the union sets.
+            for uc_key, members in uc_stash.items():
+                recs = [members[h] for h in sorted(members)]
+                union_k = np.unique(
+                    np.concatenate([r["committed_k"] for r in recs])
+                ).astype(np.int64)
+                union_v = np.unique(
+                    np.concatenate([r["committed_v"] for r in recs])
+                ).astype(np.int64)
+                group_hi_k = np.unique(
+                    np.concatenate([r["committed_hi_k"] for r in recs])
+                ).astype(np.int64)
+                k_sum = int(sum(int(r["committed_k"].size) for r in recs))
+                v_sum = int(sum(int(r["committed_v"].size) for r in recs))
+                for rec in recs:
+                    out_union, umeta = gqa_union_commit_head_output(
+                        rec=rec,
+                        union_k=union_k,
+                        group_hi_k=group_hi_k,
+                        union_v=union_v,
+                        context_len=int(context_len),
+                        query_dim=int(trace.head_dim),
+                        precision_k_hi_frac=float(precision_k_hi_frac),
+                        precision_v_hi_frac=float(precision_v_hi_frac),
+                        v_risk_key_exp_bits=int(args.v_risk_key_exp_bits),
+                        v_risk_key_mantissa_bits=int(args.v_risk_key_mantissa_bits),
+                    )
+                    u_metric = _output_error_metrics(rec["dense_head"], out_union)
+                    base_rl2 = float(rec["baseline_relL2"])
+                    union_rl2 = float(u_metric["output_relative_l2"])
+                    gqa_union_commit_rows.append(
+                        {
+                            "qidx": int(qidx),
+                            "position": int(position),
+                            "decode_length": int(decode_tokens),
+                            "kv_head": int(uc_key[0]),
+                            "head": int(rec["head"]),
+                            "score_proxy_variant": str(uc_key[1]),
+                            "v_selection_rule": str(uc_key[2]),
+                            "policy": str(uc_key[3]),
+                            "threshold": float(uc_key[4]),
+                            "start_strategy": str(uc_key[5]),
+                            "group_heads": int(len(recs)),
+                            "committed_ki": int(rec["committed_ki"]),
+                            "committed_vi": int(rec["committed_vi"]),
+                            "committed_k_tokens": int(rec["committed_k"].size),
+                            "committed_v_tokens": int(rec["committed_v"].size),
+                            "committed_hi_k_tokens": int(rec["committed_hi_k"].size),
+                            "group_k_sum_tokens": int(k_sum),
+                            "group_v_sum_tokens": int(v_sum),
+                            "union_k_tokens": int(union_k.size),
+                            "union_v_tokens": int(union_v.size),
+                            "union_k_hi_tokens": int(group_hi_k.size),
+                            "union_k_lo_tokens": int(umeta["union_k_lo_tokens"]),
+                            "union_k_over_committed": float(union_k.size) / max(float(rec["committed_k"].size), 1.0),
+                            "union_v_over_committed": float(union_v.size) / max(float(rec["committed_v"].size), 1.0),
+                            "union_v_hi_reads": int(umeta["v_hi_reads"]),
+                            "union_v_lo_reads": int(umeta["v_lo_reads"]),
+                            "baseline_relL2": base_rl2,
+                            "union_relL2": union_rl2,
+                            "relL2_delta_union_minus_baseline": float(union_rl2 - base_rl2),
+                            "union_worse_than_baseline": bool(union_rl2 > base_rl2),
+                            "baseline_cosine": float(rec["baseline_cosine"]),
+                            "union_cosine": float(u_metric["output_cosine"]),
+                        }
+                    )
+            uc_stash.clear()
         dense_concat = np.concatenate([dense_heads[int(head)] for head in heads], axis=0).astype(np.float32, copy=False)
         dense_proj = project_head_subset(
             concat_subset=dense_concat,
@@ -5411,6 +5697,8 @@ def run() -> None:
         output_tables.append(("oracle_budget_diagnostic.csv", oracle_rows))
     if gqa_union_rows:
         output_tables.append(("gqa_union_stats.csv", gqa_union_rows))
+    if gqa_union_commit_rows:
+        output_tables.append(("gqa_union_commit.csv", gqa_union_commit_rows))
     for filename, rows in output_tables:
         with (out_dir / filename).open("w", newline="", encoding="utf-8") as f:
             fieldnames = list(rows[0].keys())
