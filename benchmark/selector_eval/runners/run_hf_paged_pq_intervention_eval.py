@@ -346,6 +346,8 @@ def patched_paged_pq_attention(model, layer_ids: list[int], args, stats: dict[in
                 delattr(module, "_pagedpq_joint_vpq_sidecar_cache")
             if hasattr(module, "_pagedpq_joint_grouped_vpq_sidecar_cache"):
                 delattr(module, "_pagedpq_joint_grouped_vpq_sidecar_cache")
+            if hasattr(module, "_pagedpq_joint_memory_bounded_vpq_cache"):
+                delattr(module, "_pagedpq_joint_memory_bounded_vpq_cache")
         if hasattr(model, "_pagedpq_joint_score_grid_workspace_cache"):
             delattr(model, "_pagedpq_joint_score_grid_workspace_cache")
         if hasattr(model, "_pagedpq_joint_softmax_base_workspace_cache"):

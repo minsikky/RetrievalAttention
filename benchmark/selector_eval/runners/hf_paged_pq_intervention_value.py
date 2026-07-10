@@ -316,6 +316,54 @@ def vpq_values_for_tokens_gpu(
     return out.reshape(*tokens.shape, int(values.shape[-1])), valid, page_ids, int(actual_value_subbits)
 
 
+def reconstruct_vpq_values_from_pack_torch(
+    *,
+    values: torch.Tensor,
+    pack: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int],
+    dynamic_start: int,
+    context_len: int,
+) -> torch.Tensor:
+    """Rebuild full V-PQ values without retaining a plane or synchronizing."""
+
+    codebooks, codes, _page_starts, page_size, _actual_value_subbits = pack
+    context_len_i = max(0, min(int(context_len), int(values.shape[0])))
+    out = torch.empty(
+        (context_len_i, int(values.shape[-1])),
+        dtype=torch.float32,
+        device=values.device,
+    )
+    pages = int(codebooks.shape[0])
+    subvecs = int(codebooks.shape[1])
+    subdim = int(codebooks.shape[-1])
+    dynamic_start_i = max(0, min(int(dynamic_start), context_len_i))
+    sealed_rows = min(
+        int(pages * int(page_size)),
+        max(0, context_len_i - dynamic_start_i),
+    )
+    if sealed_rows <= 0:
+        out.copy_(values[:context_len_i])
+        return out
+    rows = torch.arange(sealed_rows, dtype=torch.long, device=values.device)
+    page_ids = torch.div(rows, int(page_size), rounding_mode="floor")
+    flat_codes = codes.reshape(pages * int(page_size), subvecs)[:sealed_rows].to(torch.long)
+    num_codes = int(codebooks.shape[2])
+    for sub in range(subvecs):
+        lo = int(sub) * subdim
+        hi = lo + subdim
+        lookup_rows = page_ids * num_codes + flat_codes[:, int(sub)]
+        approx = codebooks[:, int(sub)].reshape(pages * num_codes, subdim).index_select(
+            0,
+            lookup_rows,
+        )
+        out[dynamic_start_i : dynamic_start_i + sealed_rows, lo:hi].copy_(approx)
+    if dynamic_start_i > 0:
+        out[:dynamic_start_i].copy_(values[:dynamic_start_i])
+    sealed_end_i = dynamic_start_i + sealed_rows
+    if sealed_end_i < context_len_i:
+        out[sealed_end_i:context_len_i].copy_(values[sealed_end_i:context_len_i])
+    return out
+
+
 def reconstruct_all_vpq_values_gpu(
     *,
     index: GPUIndex,
@@ -507,6 +555,7 @@ def value_vpq_code_stat_risk_from_pack_streaming_torch(
     values: torch.Tensor,
     pack: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int],
     context_len: int,
+    dynamic_start: int | None = None,
 ) -> tuple[torch.Tensor, int]:
     """Build deployable V-PQ residual-risk stats without full vhat/residual tensors.
 
@@ -532,7 +581,11 @@ def value_vpq_code_stat_risk_from_pack_streaming_torch(
     num_codes = 1 << int(actual_value_subbits)
     pages = int(page_starts.numel())
     for page_i in range(pages):
-        start_i = int(page_starts[page_i].item())
+        start_i = (
+            int(dynamic_start) + int(page_i) * int(page_size)
+            if dynamic_start is not None
+            else int(page_starts[page_i].item())
+        )
         if start_i >= context_len_i:
             continue
         end_i = min(context_len_i, start_i + int(page_size), int(values.shape[0]))

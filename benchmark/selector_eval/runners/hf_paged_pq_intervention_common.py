@@ -296,6 +296,7 @@ def reset_paged_pq_attention_state(model) -> None:
             "_pagedpq_joint_vpq_sidecar_cache",
             "_pagedpq_joint_grouped_vpq_sidecar_cache",
             "_pagedpq_joint_compact_vpq_sidecar_cache",
+            "_pagedpq_joint_memory_bounded_vpq_cache",
             "_pagedpq_precision_tier_row_cache",
         ):
             if hasattr(module, attr):

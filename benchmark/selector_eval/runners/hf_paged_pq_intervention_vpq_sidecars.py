@@ -10,10 +10,110 @@ from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import GPUIndex, load_sel
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_common import _env_int, _env_truthy
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_value import (
     value_vpq_code_stat_risk_subset_torch,
+    value_vpq_code_stat_risk_from_pack_streaming_torch,
     value_vpq_code_stat_risk_torch,
     value_vpq_pack_torch,
     vpq_values_for_tokens_gpu,
 )
+
+
+def memory_bounded_vpq_enabled(args: Any) -> bool:
+    return bool(getattr(args, "joint_kv_precision_tiers", False)) and _env_truthy(
+        "SELECTOR_PQ_JOINT_MEMORY_BOUNDED_VPQ",
+        "1",
+    )
+
+
+def memory_bounded_vpq_code_error_for(
+    *,
+    module: Any,
+    cache_key: tuple[object, ...],
+    values_t: torch.Tensor,
+    pack: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int],
+    context_len_i: int,
+) -> tuple[torch.Tensor, int]:
+    """Cache only the exact scalar V-PQ risk statistic, never full V planes."""
+
+    context_len_i = int(context_len_i)
+    bounded_key = ("per_head", cache_key)
+    cache = getattr(module, "_pagedpq_joint_memory_bounded_vpq_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(module, "_pagedpq_joint_memory_bounded_vpq_cache", cache)
+    cached = cache.get(bounded_key)
+    if cached is not None:
+        cached_len, cached_capacity, code_error_cached, cached_subbits = cached
+        cached_len_i = int(cached_len)
+        cached_capacity_i = int(cached_capacity)
+        if cached_len_i >= context_len_i:
+            return code_error_cached[:context_len_i], int(cached_subbits)
+        if cached_capacity_i < context_len_i:
+            grow_pad_i = max(
+                0,
+                _env_int("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE_GROW_PAD", 256),
+            )
+            new_capacity_i = max(
+                context_len_i,
+                cached_capacity_i + max(grow_pad_i, context_len_i - cached_capacity_i),
+            )
+            code_error_buf_t = torch.empty(
+                (new_capacity_i,),
+                dtype=code_error_cached.dtype,
+                device=code_error_cached.device,
+            )
+            if cached_len_i > 0:
+                code_error_buf_t[:cached_len_i].copy_(code_error_cached[:cached_len_i])
+            code_error_cached = code_error_buf_t
+            cached_capacity_i = int(new_capacity_i)
+        # An unchanged page geometry means appended rows are still the exact
+        # suffix. Their V-PQ fallback is exact V, hence code_error is zero.
+        code_error_cached[cached_len_i:context_len_i].zero_()
+        cache[bounded_key] = (
+            context_len_i,
+            cached_capacity_i,
+            code_error_cached,
+            int(cached_subbits),
+        )
+        return code_error_cached[:context_len_i], int(cached_subbits)
+
+    code_error_t, actual_subbits = value_vpq_code_stat_risk_from_pack_streaming_torch(
+        values=values_t,
+        pack=pack,
+        context_len=context_len_i,
+        dynamic_start=int(cache_key[7]) if len(cache_key) > 7 else None,
+    )
+    grow_pad_i = max(
+        0,
+        _env_int("SELECTOR_PQ_JOINT_PERSISTENT_VPQ_CACHE_GROW_PAD", 256),
+    )
+    cache_capacity_i = int(context_len_i + grow_pad_i)
+    if cache_capacity_i > context_len_i:
+        code_error_buf_t = torch.empty(
+            (cache_capacity_i,),
+            dtype=code_error_t.dtype,
+            device=code_error_t.device,
+        )
+        code_error_buf_t[:context_len_i].copy_(code_error_t)
+        code_error_t = code_error_buf_t
+
+    kv_head_i = int(cache_key[0]) if cache_key else -1
+    for old_key in list(cache):
+        if (
+            isinstance(old_key, tuple)
+            and len(old_key) == 2
+            and old_key[0] == "per_head"
+            and isinstance(old_key[1], tuple)
+            and old_key[1]
+            and int(old_key[1][0]) == kv_head_i
+        ):
+            cache.pop(old_key, None)
+    cache[bounded_key] = (
+        context_len_i,
+        cache_capacity_i,
+        code_error_t,
+        int(actual_subbits),
+    )
+    return code_error_t[:context_len_i], int(actual_subbits)
 
 
 def joint_vpq_sidecars_for(
@@ -40,6 +140,37 @@ state: Any,
         "0",
     )
     cache_key = joint_vpq_cache_key_for(int(kv_head), values_t, index)
+    if memory_bounded_vpq_enabled(args) and values_t.device.type == "cuda":
+        pack = value_vpq_pack_torch(
+            index=index,
+            values=values_t,
+            value_subvecs=int(args.value_subvecs),
+            value_subbits=int(args.value_subbits) if int(args.value_subbits) > 0 else int(args.subbits),
+            key_bytes=int(value_bytes),
+            device=values_t.device,
+        )
+        if pack is not None:
+            code_error_t, actual_value_subbits_for_cost = memory_bounded_vpq_code_error_for(
+                module=module,
+                cache_key=cache_key,
+                values_t=values_t,
+                pack=pack,
+                context_len_i=context_len_i,
+            )
+            empty_plane_t = torch.empty(
+                (0, int(values_t.shape[-1])),
+                dtype=torch.float32,
+                device=values_t.device,
+            )
+            out = (
+                empty_plane_t,
+                empty_plane_t,
+                code_error_t,
+                int(actual_value_subbits_for_cost),
+            )
+            if use_joint_vpq_cache:
+                joint_vpq_runtime_cache[(*cache_key, int(context_len_i))] = out
+            return out
     # This geometry key is sequence-local. reset_paged_pq_attention_state()
     # clears the persistent V-PQ cache before each independent sample, so the
     # sidecar built during prefill warm is both content-safe and directly

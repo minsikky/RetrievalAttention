@@ -145,6 +145,11 @@ def grouped_vpq_compact_sidecars_for(
             values=values_all[int(kv_head)][:context_len_i],
             pack=single_pack,
             context_len=int(context_len_i),
+            dynamic_start=(
+                int(gqa_indexes[int(kv_head)].pages[0].start)
+                if gqa_indexes[int(kv_head)].pages
+                else None
+            ),
         )
         code_error_parts.append(code_error_t.to(dtype=torch.float32))
     code_error_groups_t = torch.stack(code_error_parts, dim=0).contiguous()

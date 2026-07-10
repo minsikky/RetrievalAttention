@@ -207,6 +207,10 @@ def joint_cuda_flags_config() -> dict[str, bool | int]:
             "SELECTOR_PQ_JOINT_COMPACT_VPQ_RISK_PREFIX",
             "0",
         ),
+        "selector_pq_joint_memory_bounded_vpq": env_truthy(
+            "SELECTOR_PQ_JOINT_MEMORY_BOUNDED_VPQ",
+            "1",
+        ),
         "selector_pq_joint_native_vpq_base": env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_BASE", "0"),
         "selector_pq_joint_native_vpq_append": env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_APPEND", "0"),
         "selector_pq_joint_native_vpq_sidecar": env_truthy("SELECTOR_PQ_JOINT_NATIVE_VPQ_SIDECAR", "0"),

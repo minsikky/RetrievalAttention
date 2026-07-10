@@ -24,6 +24,10 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_value import (
     value_vpq_pack_torch,
     vpq_values_for_tokens_gpu,
 )
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_vpq_sidecars import (
+    memory_bounded_vpq_code_error_for,
+    memory_bounded_vpq_enabled,
+)
 
 
 @dataclass
@@ -360,12 +364,46 @@ class PagedPQPatchState:
                     "0",
                 ) and not _env_truthy("SELECTOR_PQ_JOINT_COMPACT_VPQ_RISK_PREFIX", "0"):
                     persistent_cache = getattr(module, "_pagedpq_joint_vpq_sidecar_cache", None)
-                    if not isinstance(persistent_cache, dict):
-                        persistent_cache = {}
-                        setattr(module, "_pagedpq_joint_vpq_sidecar_cache", persistent_cache)
                     values_t = values_all[int(kv_head)].detach()
                     context_len_i = int(values_t.shape[0])
                     cache_key = self.joint_vpq_cache_key_for(int(kv_head), values_t, cached_index)
+                    if (
+                        memory_bounded_vpq_enabled(args)
+                        and values_t.device.type == "cuda"
+                    ):
+                        bounded_value_pack = value_vpq_pack_torch(
+                            index=cached_index,
+                            values=values_t,
+                            value_subvecs=int(args.value_subvecs),
+                            value_subbits=(
+                                int(args.value_subbits)
+                                if int(args.value_subbits) > 0
+                                else int(args.subbits)
+                            ),
+                            key_bytes=int(self.value_bytes),
+                            device=self.device,
+                        )
+                        if bounded_value_pack is not None:
+                            sidecar_t0 = time.perf_counter()
+                            memory_bounded_vpq_code_error_for(
+                                module=module,
+                                cache_key=cache_key,
+                                values_t=values_t,
+                                pack=bounded_value_pack,
+                                context_len_i=context_len_i,
+                            )
+                            if (
+                                bool(getattr(args, "profile_native_ops", False))
+                                and self.device.type == "cuda"
+                            ):
+                                torch.cuda.synchronize(self.device)
+                            self.stats[int(layer_id)].add_index_sidecar_timing(
+                                time.perf_counter() - sidecar_t0
+                            )
+                            continue
+                    if not isinstance(persistent_cache, dict):
+                        persistent_cache = {}
+                        setattr(module, "_pagedpq_joint_vpq_sidecar_cache", persistent_cache)
                     if cache_key not in persistent_cache:
                         sidecar_t0 = time.perf_counter()
                         all_tokens_t = torch.arange(context_len_i, dtype=torch.long, device=values_t.device)

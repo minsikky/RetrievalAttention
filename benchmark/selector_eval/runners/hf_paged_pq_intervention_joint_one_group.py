@@ -35,6 +35,13 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_vprefix impo
     JointVPrefixGridRuntime,
     build_joint_vprefix_grid,
 )
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_value import (
+    reconstruct_vpq_values_from_pack_torch,
+    value_vpq_pack_torch,
+)
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_vpq_sidecars import (
+    memory_bounded_vpq_enabled,
+)
 
 # Frozen progressive-precision tiers (--joint_kv_precision_tiers, spec
 # OPEN-2/M6): the top 10% of the K ranked prefix / V risk-ranked exact set
@@ -455,6 +462,34 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             values_t=values_t,
             context_len_i=context_len_i,
         )
+    memory_bounded_vpq_active = bool(
+        memory_bounded_vpq_enabled(args)
+        and not compact_grouped_vpq_enabled
+        and int(vhat_all_t.shape[0]) == 0
+        and int(residual_t.shape[0]) == 0
+    )
+    if memory_bounded_vpq_active:
+        value_pack = value_vpq_pack_torch(
+            index=index,
+            values=values_t,
+            value_subvecs=int(args.value_subvecs),
+            value_subbits=(
+                int(args.value_subbits)
+                if int(args.value_subbits) > 0
+                else int(args.subbits)
+            ),
+            key_bytes=int(value_bytes),
+            device=values_t.device,
+        )
+        if value_pack is None or not index.pages:
+            raise RuntimeError("missing V-PQ pack for memory-bounded reconstruction")
+        vhat_all_t = reconstruct_vpq_values_from_pack_torch(
+            values=values_t,
+            pack=value_pack,
+            dynamic_start=int(index.pages[0].start),
+            context_len=context_len_i,
+        )
+        residual_t = values_t.float() - vhat_all_t.float()
     if bool(getattr(args, "profile_native_ops", False)):
         _sync_if_cuda(device)
         stats[layer_id].add_native_detail_timing(
