@@ -460,6 +460,7 @@ def approximate_joint_kv_all_heads(
     softmax_base_workspace_for = joint_workspace.softmax_base_workspace_for
     grouped_output_workspace_for = joint_workspace.grouped_output_workspace_for
     native_rank_prefix_tokens = joint_workspace.native_rank_prefix_tokens
+    vpq_reconstruction_workspace_for = joint_workspace.vpq_reconstruction_workspace_for
     grouped_risk_prefix_workspace_for = joint_workspace.grouped_risk_prefix_workspace_for
     grouped_score_direct_workspace_for = joint_workspace.grouped_score_direct_workspace_for
     nocalib_score_grid_workspace_for = joint_workspace.nocalib_score_grid_workspace_for
@@ -638,6 +639,7 @@ def approximate_joint_kv_all_heads(
             grouped_output_workspace_for=grouped_output_workspace_for,
             softmax_base_workspace_for=softmax_base_workspace_for,
             native_rank_prefix_tokens=native_rank_prefix_tokens,
+            vpq_reconstruction_workspace_for=vpq_reconstruction_workspace_for,
             wall_profile_enabled=bool(wall_profile_enabled),
             kv_head_indices=kv_head_indices,
         )

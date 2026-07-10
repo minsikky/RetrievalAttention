@@ -149,6 +149,10 @@ class JointKVWorkspace:
             self.model,
             "_pagedpq_joint_position_ids_cache",
         )
+        self.vpq_reconstruction_workspace_cache = _dict_attr(
+            self.model,
+            "_pagedpq_joint_vpq_reconstruction_workspace_cache",
+        )
 
     def torch_score_grid_workspace_for(
         self,
@@ -187,6 +191,37 @@ class JointKVWorkspace:
             cached = (int(capacity), positions)
             self.position_ids_cache[key] = cached
         return cached[1][: int(count)]
+
+    def vpq_reconstruction_workspace_for(
+        self,
+        *,
+        context_len: int,
+        dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Shared stream-ordered scratch for one transient V-PQ head.
+
+        Frozen-sim processes KV groups serially on one CUDA stream.  Reusing
+        one pair of model-level buffers therefore preserves the memory-bounded
+        one-head residency contract without retaining a pair per layer/head.
+        """
+
+        key = (str(self.device), int(dim))
+        cached = self.vpq_reconstruction_workspace_cache.get(key)
+        capacity = int(cached[0]) if cached is not None else 0
+        if cached is None or capacity < int(context_len):
+            capacity = int(context_len) + 256
+            vhat = torch.empty(
+                (int(capacity), int(dim)),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            residual = torch.empty_like(vhat)
+            cached = (int(capacity), vhat, residual)
+            self.vpq_reconstruction_workspace_cache[key] = cached
+        return (
+            cached[1][: int(context_len)],
+            cached[2][: int(context_len)],
+        )
 
     def nocalib_score_grid_workspace_for(
         self,

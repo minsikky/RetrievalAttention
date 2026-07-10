@@ -18,6 +18,32 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_common import (
 )
 
 
+_compiled_adjacent_rel_l2 = None
+
+
+def _adjacent_rel_l2_eager(cur_t: torch.Tensor, next_t: torch.Tensor) -> torch.Tensor:
+    return torch.linalg.vector_norm(cur_t - next_t, dim=-1) / torch.clamp_min(
+        torch.linalg.vector_norm(next_t, dim=-1),
+        1e-20,
+    )
+
+
+def _adjacent_rel_l2(cur_t: torch.Tensor, next_t: torch.Tensor) -> torch.Tensor:
+    if (
+        cur_t.device.type == "cuda"
+        and _env_truthy("SELECTOR_PQ_JOINT_FROZENSIM_COMPILE", "0")
+    ):
+        global _compiled_adjacent_rel_l2
+        if _compiled_adjacent_rel_l2 is None:
+            _compiled_adjacent_rel_l2 = torch.compile(
+                _adjacent_rel_l2_eager,
+                dynamic=True,
+                fullgraph=True,
+            )
+        return _compiled_adjacent_rel_l2(cur_t, next_t)
+    return _adjacent_rel_l2_eager(cur_t, next_t)
+
+
 @dataclass
 class JointPolicyResult:
     final_ki_by_head: list[int]
@@ -399,10 +425,7 @@ def _prepare_torch_policy(
     if len(runtime.active_k_budgets) > 1:
         k_cur = output_grid64[:-1]
         k_next = output_grid64[1:]
-        k_delta_t = (
-            torch.linalg.vector_norm(k_cur - k_next, dim=-1)
-            / torch.clamp_min(torch.linalg.vector_norm(k_next, dim=-1), 1e-20)
-        )
+        k_delta_t = _adjacent_rel_l2(k_cur, k_next)
     else:
         k_delta_t = torch.empty(
             (0, len(runtime.v_budgets), runtime.group_heads),
@@ -412,10 +435,7 @@ def _prepare_torch_policy(
     if len(runtime.v_budgets) > 1:
         v_cur = output_grid64[:, :-1]
         v_next = output_grid64[:, 1:]
-        v_delta_t = (
-            torch.linalg.vector_norm(v_cur - v_next, dim=-1)
-            / torch.clamp_min(torch.linalg.vector_norm(v_next, dim=-1), 1e-20)
-        )
+        v_delta_t = _adjacent_rel_l2(v_cur, v_next)
     else:
         v_delta_t = torch.empty(
             (len(runtime.active_k_budgets), 0, runtime.group_heads),

@@ -101,6 +101,8 @@ def _test_native_exact_value_counts() -> None:
         joint_mixed_select_policy_intervals_rankpos_no_calib_no_mb,
         joint_mixed_select_policy_merge_rankpos_no_calib_no_mb,
         joint_vprefix_outputs,
+        joint_vprefix_outputs_precision,
+        joint_vprefix_outputs_precision_from_risk,
         joint_vprefix_outputs_from_grouped_risk,
         joint_vprefix_outputs_from_grouped_merge_risk_batched,
         joint_vprefix_outputs_from_grouped_risk_batched,
@@ -204,12 +206,80 @@ def _test_native_exact_value_counts() -> None:
     ref_prefix = torch.stack(ref_by_v, dim=1)
     if not torch.allclose(got_prefix, ref_prefix, atol=2e-5, rtol=2e-5):
         raise AssertionError("native joint V-prefix output grid mismatches Torch reference")
+    residual_lo = torch.randn_like(residual)
+    commit_mask = torch.rand((query_context_len,), device=device) > 0.35
+    v_hi_counts = torch.tensor([0, 1, 1, 2], device=device, dtype=torch.long)
+    got_precision, got_lo_reads = joint_vprefix_outputs_precision(
+        base_outputs,
+        probs,
+        residual,
+        residual_lo,
+        commit_mask,
+        exact_order,
+        v_budgets,
+        v_hi_counts,
+    )
+    gathered_lo = residual_lo.index_select(0, exact_order.reshape(-1)).reshape(
+        k_count, heads, max_exact, dim
+    )
+    hi_prefix = torch.cumsum(
+        gathered_probs.reshape(k_count, heads, max_exact, 1) * gathered_residual,
+        dim=2,
+    )
+    lo_prefix = torch.cumsum(
+        gathered_probs.reshape(k_count, heads, max_exact, 1) * gathered_lo,
+        dim=2,
+    )
+    commit_prefix = torch.cumsum(
+        commit_mask.to(torch.int32).index_select(0, exact_order.reshape(-1)).reshape(
+            k_count, heads, max_exact
+        ),
+        dim=2,
+    )
+    precision_ref = []
+    reads_ref = []
+    for budget, hi in zip(
+        v_budgets.detach().cpu().tolist(),
+        v_hi_counts.detach().cpu().tolist(),
+        strict=True,
+    ):
+        exact = max(0, min(int(budget), max_exact, query_context_len))
+        hi = max(0, min(int(hi), exact))
+        if exact <= 0:
+            precision_ref.append(base_outputs)
+            reads_ref.append(torch.zeros((k_count, heads), device=device, dtype=torch.int32))
+            continue
+        delta = hi_prefix[:, :, hi - 1, :]
+        reads = torch.zeros((k_count, heads), device=device, dtype=torch.int32)
+        if exact > hi:
+            delta = (delta + lo_prefix[:, :, exact - 1, :]) - lo_prefix[:, :, hi - 1, :]
+            reads = commit_prefix[:, :, exact - 1] - commit_prefix[:, :, hi - 1]
+        precision_ref.append(base_outputs + delta)
+        reads_ref.append(reads)
+    precision_ref_t = torch.stack(precision_ref, dim=1)
+    reads_ref_t = torch.stack(reads_ref, dim=1)
+    if not torch.allclose(got_precision, precision_ref_t, atol=5e-5, rtol=5e-5):
+        raise AssertionError("native progressive-precision V-prefix grid mismatches Torch reference")
+    if not torch.equal(got_lo_reads, reads_ref_t):
+        raise AssertionError("native progressive-precision V-prefix read counts mismatch")
     got_prefix_from_risk = joint_vprefix_outputs_from_risk(
         base_outputs,
         probs,
         residual,
         code_error,
         v_budgets,
+    )
+    got_precision_from_risk, got_precision_reads_from_risk = (
+        joint_vprefix_outputs_precision_from_risk(
+            base_outputs,
+            probs,
+            residual,
+            residual_lo,
+            commit_mask,
+            code_error,
+            v_budgets,
+            v_hi_counts,
+        )
     )
     risk_for_sort = (probs * probs) * code_error.reshape(1, 1, -1)
     exact_order_for_sort = torch.topk(
@@ -240,6 +310,25 @@ def _test_native_exact_value_counts() -> None:
     ref_prefix_from_risk = torch.stack(ref_by_v_from_risk, dim=1)
     if not torch.allclose(got_prefix_from_risk, ref_prefix_from_risk, atol=2e-5, rtol=2e-5):
         raise AssertionError("native joint V-prefix-from-risk output grid mismatches Torch reference")
+    precision_risk_ref, precision_risk_reads_ref = joint_vprefix_outputs_precision(
+        base_outputs,
+        probs,
+        residual,
+        residual_lo,
+        commit_mask,
+        exact_order_for_sort,
+        v_budgets,
+        v_hi_counts,
+    )
+    if not torch.allclose(
+        got_precision_from_risk,
+        precision_risk_ref,
+        atol=5e-5,
+        rtol=5e-5,
+    ):
+        raise AssertionError("native progressive-precision risk sort output mismatch")
+    if not torch.equal(got_precision_reads_from_risk, precision_risk_reads_ref):
+        raise AssertionError("native progressive-precision risk sort read-count mismatch")
 
     base_context = 10
     base_pages = 2

@@ -34,6 +34,7 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_policy impor
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_vprefix import (
     JointVPrefixGridRuntime,
     build_joint_vprefix_grid,
+    precision_grid_layout_tensors,
 )
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_value import (
     reconstruct_vpq_values_from_pack_torch,
@@ -54,14 +55,101 @@ _FROZEN_PRECISION_K_HI_FRAC = 0.1
 _FROZEN_PRECISION_V_HI_FRAC = 0.1
 _FROZEN_PRECISION_LO_BYTES = 1
 
+_compiled_rowwise_int8_qdq = None
 
-def _rowwise_int8_qdq(x32_t: torch.Tensor) -> torch.Tensor:
+
+def _rowwise_int8_qdq_eager(x32_t: torch.Tensor) -> torch.Tensor:
     """Per-row symmetric absmax int8 quantize-dequantize (the MSB-plane
     read). Torch mirror of _quantize_rows_symmetric(x, 8) in
     run_joint_kv_budget_policy_eval.py: scale = absmax/127 clamped to
     1e-12, round-half-even codes."""
     scale_t = (x32_t.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min_(1e-12)
     return torch.round(x32_t / scale_t) * scale_t
+
+
+def _rowwise_int8_qdq(x32_t: torch.Tensor) -> torch.Tensor:
+    if (
+        x32_t.device.type == "cuda"
+        and _env_truthy("SELECTOR_PQ_JOINT_FROZENSIM_COMPILE", "0")
+    ):
+        global _compiled_rowwise_int8_qdq
+        if _compiled_rowwise_int8_qdq is None:
+            _compiled_rowwise_int8_qdq = torch.compile(
+                _rowwise_int8_qdq_eager,
+                dynamic=True,
+                fullgraph=True,
+            )
+        return _compiled_rowwise_int8_qdq(x32_t)
+    return _rowwise_int8_qdq_eager(x32_t)
+
+
+def _qk_matmul(lhs_t: torch.Tensor, rhs_t: torch.Tensor) -> torch.Tensor:
+    """Optional TF32 QK/lo-QK diagnostic without changing global defaults."""
+
+    if not (
+        lhs_t.device.type == "cuda"
+        and _env_truthy("SELECTOR_PQ_JOINT_FROZENSIM_TF32_QK", "0")
+    ):
+        return lhs_t @ rhs_t
+    old_allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        return lhs_t @ rhs_t
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
+
+
+def _batched_precision_score_grid(
+    *,
+    out_t: torch.Tensor,
+    exact_scores_t: torch.Tensor,
+    pq_logits_t: torch.Tensor,
+    indexed_tokens_t: torch.Tensor,
+    base_tokens_t: torch.Tensor,
+    ranked_prefix_tokens_t: torch.Tensor,
+    scores_lo_t: torch.Tensor,
+    take_counts_t: torch.Tensor,
+    hi_counts_t: torch.Tensor,
+    rank_positions_t: torch.Tensor,
+) -> torch.Tensor:
+    """Compose every frozen K rung without a Python launch loop.
+
+    This is assignment-only batching: each output element receives the same
+    exact/PQ/lo value as the eager per-rung sequence, and no reduction order
+    changes.
+    """
+
+    k_count = int(out_t.shape[0])
+    heads = int(out_t.shape[1])
+    out_t.copy_(exact_scores_t.unsqueeze(0))
+    out_t[:, :, indexed_tokens_t] = pq_logits_t.unsqueeze(0)
+
+    if int(base_tokens_t.numel()) > 0:
+        base_index_t = base_tokens_t.reshape(1, 1, -1).expand(k_count, heads, -1)
+        base_values_t = exact_scores_t.index_select(1, base_tokens_t).unsqueeze(0).expand(
+            k_count,
+            -1,
+            -1,
+        )
+        out_t.scatter_(2, base_index_t, base_values_t)
+
+    rank_count = int(ranked_prefix_tokens_t.shape[1])
+    if rank_count <= 0:
+        return out_t
+    rank_index_t = ranked_prefix_tokens_t.unsqueeze(0).expand(k_count, -1, -1)
+    exact_rank_t = exact_scores_t.gather(1, ranked_prefix_tokens_t).unsqueeze(0)
+    lo_rank_t = scores_lo_t.gather(1, ranked_prefix_tokens_t).unsqueeze(0)
+    pq_rank_t = out_t.gather(2, rank_index_t)
+    positions_t = rank_positions_t[:rank_count].reshape(1, 1, -1)
+    exact_mask_t = positions_t < hi_counts_t.reshape(-1, 1, 1)
+    lo_mask_t = positions_t < take_counts_t.reshape(-1, 1, 1)
+    rank_values_t = torch.where(
+        exact_mask_t,
+        exact_rank_t,
+        torch.where(lo_mask_t, lo_rank_t, pq_rank_t),
+    )
+    out_t.scatter_(2, rank_index_t, rank_values_t)
+    return out_t
 
 
 def _cached_precision_tier_value_error(
@@ -267,6 +355,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     grouped_output_workspace_for = runtime.grouped_output_workspace_for
     softmax_base_workspace_for = runtime.softmax_base_workspace_for
     native_rank_prefix_tokens = runtime.native_rank_prefix_tokens
+    vpq_reconstruction_workspace_for = runtime.vpq_reconstruction_workspace_for
     wall_profile_enabled = runtime.wall_profile_enabled
     time_trace = getattr(self, "_pagedpq_joint_time_trace", None)
     grouped_probs_workspace_t: torch.Tensor | None = None
@@ -406,7 +495,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         else:
             keys_t = torch_k_cache[int(kv_head_i)][:context_len_i].to(device=device, dtype=torch.float32)
             exact_keys32_t = keys_t
-            exact_scores_h = (queries_h @ keys_t.transpose(0, 1)) / sqrt_dim
+            exact_scores_h = _qk_matmul(queries_h, keys_t.transpose(0, 1)) / sqrt_dim
         if bool(getattr(args, "profile_native_ops", False)):
             _sync_if_cuda(device)
             stats[layer_id].add_native_detail_timing(
@@ -483,13 +572,19 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         )
         if value_pack is None or not index.pages:
             raise RuntimeError("missing V-PQ pack for memory-bounded reconstruction")
+        vhat_all_t, residual_t = vpq_reconstruction_workspace_for(
+            context_len=int(context_len_i),
+            dim=int(values_t.shape[1]),
+        )
         vhat_all_t = reconstruct_vpq_values_from_pack_torch(
             values=values_t,
             pack=value_pack,
             dynamic_start=int(index.pages[0].start),
             context_len=context_len_i,
+            out=vhat_all_t,
+            layout_cache_owner=index,
         )
-        residual_t = values_t.float() - vhat_all_t.float()
+        torch.sub(values_t[:context_len_i], vhat_all_t, out=residual_t)
     if bool(getattr(args, "profile_native_ops", False)):
         _sync_if_cuda(device)
         stats[layer_id].add_native_detail_timing(
@@ -717,7 +812,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 )
             else:
                 keys_t = torch_k_cache[int(kv_head_i)][:context_len_i].to(device=device, dtype=torch.float32)
-                exact_scores_h = (queries_h @ keys_t.transpose(0, 1)) / sqrt_dim
+                exact_scores_h = _qk_matmul(queries_h, keys_t.transpose(0, 1)) / sqrt_dim
         else:
             if not _env_truthy("SELECTOR_PQ_JOINT_NATIVE_SCORE_GRID", "0"):
                 raise RuntimeError(
@@ -1143,7 +1238,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 values_lo_t=values_lo_t,
             )
             v_commit_mask_t = int8_err16_t < code_error_t.to(dtype=torch.float16)
-            scores_lo_h_t = (queries_h @ keys_lo_t.transpose(0, 1)) / sqrt_dim
+            scores_lo_h_t = _qk_matmul(queries_h, keys_lo_t.transpose(0, 1)) / sqrt_dim
             del keys32_t, keys_lo_t, values32_t
         else:
             # Keep the blessed CPU operation sequence unchanged byte-for-byte.
@@ -1474,6 +1569,12 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
             "SELECTOR_PQ_JOINT_FUSED_TOKENFIT_SOFTMAX_BASE",
             "0",
         )
+        batched_precision_score_grid = bool(
+            precision_tiers_enabled
+            and device.type == "cuda"
+            and not native_score_grid_enabled
+            and str(args.tail_score_calibration) == "none"
+        )
         for ki_i, k_budget in enumerate(active_joint_k_budgets):
             take_i = max(0, min(int(k_budget), int(ranked_nonbase_t.numel())))
             grid_take_counts.append(int(take_i))
@@ -1482,7 +1583,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 # materializing the full selected-token tensor on the hot path.
                 selected_t_i = None
                 selected_len_i = int(base_t.numel()) + int(ranked_nonbase_count)
-            elif native_score_grid_enabled:
+            elif native_score_grid_enabled or batched_precision_score_grid:
                 # The native score-grid path only needs the take count, base
                 # tokens, and ranked prefix. Avoid allocating base+prefix
                 # selected-token tensors for every K budget.
@@ -1512,7 +1613,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                     )
                     / MB
                 )
-            if not native_score_grid_enabled:
+            if not native_score_grid_enabled and not batched_precision_score_grid:
                 if selected_t_i is None:
                     selected_t_i = selected_for_budget_batch(int(k_budget))
                     grid_selected_by_ki[-1] = selected_t_i
@@ -1523,6 +1624,33 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                         selected_t_i,
                         out_t=torch_score_grid_t[int(ki_i)],
                     )
+        if batched_precision_score_grid:
+            if (
+                torch_score_grid_t is None
+                or exact_scores_h is None
+                or scores_lo_h_t is None
+                or ranked_prefix_tokens_t is None
+            ):
+                raise RuntimeError("missing frozen score-grid batching inputs")
+            take_counts_t, hi_counts_t, rank_positions_t = precision_grid_layout_tensors(
+                owner=args,
+                device=device,
+                kind="k",
+                counts=grid_take_counts,
+                hi_frac=float(_FROZEN_PRECISION_K_HI_FRAC),
+            )
+            _batched_precision_score_grid(
+                out_t=torch_score_grid_t,
+                exact_scores_t=exact_scores_h.to(dtype=prob_dtype),
+                pq_logits_t=pq_logits_t,
+                indexed_tokens_t=indexed_tokens_t,
+                base_tokens_t=base_t,
+                ranked_prefix_tokens_t=ranked_prefix_tokens_t,
+                scores_lo_t=scores_lo_h_t,
+                take_counts_t=take_counts_t,
+                hi_counts_t=hi_counts_t,
+                rank_positions_t=rank_positions_t,
+            )
         probs_grid_t: torch.Tensor | None = None
         base_output_grid_t: torch.Tensor | None = None
         score_grid_t: torch.Tensor | None = None

@@ -322,16 +322,25 @@ def reconstruct_vpq_values_from_pack_torch(
     pack: tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int],
     dynamic_start: int,
     context_len: int,
+    out: torch.Tensor | None = None,
+    layout_cache_owner: object | None = None,
 ) -> torch.Tensor:
     """Rebuild full V-PQ values without retaining a plane or synchronizing."""
 
     codebooks, codes, _page_starts, page_size, _actual_value_subbits = pack
     context_len_i = max(0, min(int(context_len), int(values.shape[0])))
-    out = torch.empty(
-        (context_len_i, int(values.shape[-1])),
-        dtype=torch.float32,
-        device=values.device,
-    )
+    if out is None:
+        out = torch.empty(
+            (context_len_i, int(values.shape[-1])),
+            dtype=torch.float32,
+            device=values.device,
+        )
+    elif (
+        out.dtype != torch.float32
+        or out.device != values.device
+        or tuple(out.shape) != (context_len_i, int(values.shape[-1]))
+    ):
+        raise ValueError("V-PQ reconstruction output has incompatible shape, dtype, or device")
     pages = int(codebooks.shape[0])
     subvecs = int(codebooks.shape[1])
     subdim = int(codebooks.shape[-1])
@@ -343,17 +352,42 @@ def reconstruct_vpq_values_from_pack_torch(
     if sealed_rows <= 0:
         out.copy_(values[:context_len_i])
         return out
-    rows = torch.arange(sealed_rows, dtype=torch.long, device=values.device)
-    page_ids = torch.div(rows, int(page_size), rounding_mode="floor")
-    flat_codes = codes.reshape(pages * int(page_size), subvecs)[:sealed_rows].to(torch.long)
     num_codes = int(codebooks.shape[2])
+    lookup_rows_by_sub = None
+    if layout_cache_owner is not None:
+        layout_cache = getattr(layout_cache_owner, "_value_vpq_reconstruction_layout_cache", None)
+        if not isinstance(layout_cache, dict):
+            layout_cache = {}
+            setattr(layout_cache_owner, "_value_vpq_reconstruction_layout_cache", layout_cache)
+        layout_key = (
+            str(values.device),
+            int(codes.data_ptr()),
+            int(sealed_rows),
+            int(page_size),
+            int(subvecs),
+            int(num_codes),
+        )
+        lookup_rows_by_sub = layout_cache.get(layout_key)
+    if lookup_rows_by_sub is None:
+        rows = torch.arange(sealed_rows, dtype=torch.long, device=values.device)
+        page_ids = torch.div(rows, int(page_size), rounding_mode="floor")
+        flat_codes = codes.reshape(pages * int(page_size), subvecs)[:sealed_rows].to(torch.long)
+        lookup_rows_by_sub = tuple(
+            (page_ids * num_codes + flat_codes[:, int(sub)]).contiguous()
+            for sub in range(subvecs)
+        )
+        if layout_cache_owner is not None:
+            # Packs are append/rebuild artifacts.  Retaining layouts keyed by
+            # every old codes allocation would turn this launch cache into a
+            # decode-length memory leak.
+            layout_cache.clear()
+            layout_cache[layout_key] = lookup_rows_by_sub
     for sub in range(subvecs):
         lo = int(sub) * subdim
         hi = lo + subdim
-        lookup_rows = page_ids * num_codes + flat_codes[:, int(sub)]
         approx = codebooks[:, int(sub)].reshape(pages * num_codes, subdim).index_select(
             0,
-            lookup_rows,
+            lookup_rows_by_sub[int(sub)],
         )
         out[dynamic_start_i : dynamic_start_i + sealed_rows, lo:hi].copy_(approx)
     if dynamic_start_i > 0:

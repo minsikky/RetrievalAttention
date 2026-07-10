@@ -35,6 +35,56 @@ torch::Tensor joint_vprefix_outputs_cuda(
   return outputs;
 }
 
+std::vector<torch::Tensor> joint_vprefix_outputs_precision_cuda(
+    torch::Tensor base_outputs,
+    torch::Tensor probs,
+    torch::Tensor residual_hi,
+    torch::Tensor residual_lo,
+    torch::Tensor commit_mask,
+    torch::Tensor exact_order,
+    torch::Tensor v_budgets,
+    torch::Tensor v_hi_counts) {
+  const auto k_count = base_outputs.size(0);
+  const auto heads = base_outputs.size(1);
+  const auto dim = base_outputs.size(2);
+  const auto context_len = probs.size(2);
+  const auto max_exact = exact_order.size(2);
+  const auto v_steps = v_budgets.size(0);
+  auto outputs = torch::empty(
+      {k_count, v_steps, heads, dim},
+      base_outputs.options().dtype(torch::kFloat32));
+  auto lo_reads = torch::empty(
+      {k_count, v_steps, heads},
+      base_outputs.options().dtype(torch::kInt));
+  if (k_count == 0 || heads == 0 || dim == 0 || v_steps == 0) {
+    return {outputs, lo_reads};
+  }
+  const int threads = 256;
+  const int64_t total = k_count * heads * dim;
+  const int64_t blocks = (total + threads - 1) / threads;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  joint_vprefix_precision_outputs_kernel<int64_t><<<
+      static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      base_outputs.data_ptr<float>(),
+      probs.data_ptr<float>(),
+      residual_hi.data_ptr<float>(),
+      residual_lo.data_ptr<float>(),
+      commit_mask.data_ptr<bool>(),
+      exact_order.data_ptr<int64_t>(),
+      v_budgets.data_ptr<int64_t>(),
+      v_hi_counts.data_ptr<int64_t>(),
+      outputs.data_ptr<float>(),
+      lo_reads.data_ptr<int32_t>(),
+      k_count,
+      heads,
+      context_len,
+      max_exact,
+      v_steps,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {outputs, lo_reads};
+}
+
 torch::Tensor joint_vpq_base_outputs_from_probs_cuda(
     torch::Tensor probs,
     torch::Tensor values,

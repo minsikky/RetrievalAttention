@@ -13,11 +13,14 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import build_page_pq_torch
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_one_group import (
+    _batched_precision_score_grid,
     _rowwise_int8_qdq,
 )
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_vprefix import (
     JointVPrefixGridRuntime,
     build_joint_vprefix_grid,
+    compose_precision_vprefix_outputs_batched,
+    precision_grid_layout_tensors,
 )
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_value import (
     reconstruct_vpq_values_from_pack_torch,
@@ -138,6 +141,19 @@ def main() -> None:
     residual_rebuilt = values.float() - vhat_rebuilt.float()
     if not torch.equal(residual_rebuilt, residual):
         raise AssertionError("transient residual reconstruction changed bits")
+    vhat_workspace = torch.empty_like(vhat_rebuilt)
+    vhat_workspace_out = reconstruct_vpq_values_from_pack_torch(
+        values=values,
+        pack=pack,
+        dynamic_start=dynamic_start,
+        context_len=context_len,
+        out=vhat_workspace,
+        layout_cache_owner=index,
+    )
+    if vhat_workspace_out.data_ptr() != vhat_workspace.data_ptr():
+        raise AssertionError("transient reconstruction did not reuse its workspace")
+    if not torch.equal(vhat_workspace_out, vhat_rebuilt):
+        raise AssertionError("cached reconstruction layout changed bits")
 
     k_count = 2
     heads = 2
@@ -198,6 +214,93 @@ def main() -> None:
         raise AssertionError("memory-bounded V-prefix outputs changed bits")
     if not torch.equal(bounded.v_lo_reads_grid, old.v_lo_reads_grid):
         raise AssertionError("memory-bounded V-prefix commit counts changed")
+
+    # The CUDA path batches only assignment/projection dimensions.  Verify
+    # those helpers directly on CPU against the original eager sequences.
+    exact_counts_t, hi_counts_t, _positions_t = precision_grid_layout_tensors(
+        owner=SimpleNamespace(),
+        device=torch.device("cpu"),
+        kind="v",
+        counts=[0, 3, 7],
+        hi_frac=0.1,
+    )
+    prefix_len = 7
+    cum_hi = torch.cumsum(torch.randn((k_count, heads, prefix_len, dim)), dim=2)
+    cum_lo = torch.cumsum(torch.randn((k_count, heads, prefix_len, dim)), dim=2)
+    commit_cum = torch.cumsum(
+        torch.randint(0, 2, (k_count, heads, prefix_len), dtype=torch.int32),
+        dim=2,
+    )
+    batched_outputs, batched_reads = compose_precision_vprefix_outputs_batched(
+        base_output_grid=base,
+        cum_hi=cum_hi,
+        cum_lo=cum_lo,
+        commit_cum=commit_cum,
+        exact_counts_t=exact_counts_t,
+        hi_counts_t=hi_counts_t,
+    )
+    eager_outputs = []
+    eager_reads = []
+    zero_reads = torch.zeros((k_count, heads), dtype=torch.int32)
+    for exact_count, hi_count in zip(exact_counts_t.tolist(), hi_counts_t.tolist(), strict=True):
+        if exact_count <= 0:
+            eager_outputs.append(base)
+            eager_reads.append(zero_reads)
+            continue
+        delta = cum_hi[:, :, hi_count - 1, :]
+        reads = zero_reads
+        if exact_count > hi_count:
+            delta = (delta + cum_lo[:, :, exact_count - 1, :]) - cum_lo[:, :, hi_count - 1, :]
+            reads = commit_cum[:, :, exact_count - 1] - commit_cum[:, :, hi_count - 1]
+        eager_outputs.append(base + delta)
+        eager_reads.append(reads)
+    if not torch.equal(batched_outputs, torch.stack(eager_outputs, dim=1)):
+        raise AssertionError("batched V-budget projection changed bits")
+    if not torch.equal(batched_reads, torch.stack(eager_reads, dim=1)):
+        raise AssertionError("batched V-budget counts changed")
+
+    score_context = 13
+    score_heads = 2
+    indexed_tokens = torch.randperm(score_context)
+    base_tokens = indexed_tokens[:2].sort().values
+    nonbase = indexed_tokens[2:]
+    ranked = torch.stack([nonbase, nonbase.flip(0)], dim=0)
+    take_counts = [0, 4, int(nonbase.numel())]
+    take_counts_t, hi_counts_t, rank_positions_t = precision_grid_layout_tensors(
+        owner=SimpleNamespace(),
+        device=torch.device("cpu"),
+        kind="k",
+        counts=take_counts,
+        hi_frac=0.1,
+    )
+    exact_scores = torch.randn((score_heads, score_context))
+    pq_logits = torch.randn((score_heads, score_context))
+    lo_scores = torch.randn((score_heads, score_context))
+    batched_score = _batched_precision_score_grid(
+        out_t=torch.empty((len(take_counts), score_heads, score_context)),
+        exact_scores_t=exact_scores,
+        pq_logits_t=pq_logits,
+        indexed_tokens_t=indexed_tokens,
+        base_tokens_t=base_tokens,
+        ranked_prefix_tokens_t=ranked,
+        scores_lo_t=lo_scores,
+        take_counts_t=take_counts_t,
+        hi_counts_t=hi_counts_t,
+        rank_positions_t=rank_positions_t,
+    )
+    eager_score = []
+    base_rows = base_tokens.reshape(1, -1).expand(score_heads, -1)
+    for take, hi in zip(take_counts, hi_counts_t.tolist(), strict=True):
+        row = exact_scores.clone()
+        row[:, indexed_tokens] = pq_logits
+        selected = torch.cat((base_rows, ranked[:, :take]), dim=1)
+        row.scatter_(1, selected, exact_scores.gather(1, selected))
+        if take > hi:
+            lo_pos = ranked[:, hi:take]
+            row.scatter_(1, lo_pos, lo_scores.gather(1, lo_pos))
+        eager_score.append(row)
+    if not torch.equal(batched_score, torch.stack(eager_score, dim=0)):
+        raise AssertionError("batched K-rung score composition changed bits")
     print("memory-bounded V-PQ CPU parity: PASS")
 
 

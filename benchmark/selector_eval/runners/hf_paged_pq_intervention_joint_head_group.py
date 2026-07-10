@@ -75,6 +75,7 @@ class JointKVHeadGroupRuntime:
     grouped_output_workspace_for: Callable
     softmax_base_workspace_for: Callable
     native_rank_prefix_tokens: Callable
+    vpq_reconstruction_workspace_for: Callable
     wall_profile_enabled: bool
     kv_head_indices: list[int] | None = None
     grouped_geo_t0: float = 0.0
