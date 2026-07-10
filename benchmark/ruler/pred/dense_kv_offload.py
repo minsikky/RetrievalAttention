@@ -17,6 +17,20 @@ class _LayerKV:
     length: int = 0
 
 
+@contextlib.contextmanager
+def _scoped_cuda_tf32(device: torch.device, *, enabled: bool):
+    """Set CUDA matmul TF32 only for the enclosed operation."""
+    if device.type != "cuda":
+        yield
+        return
+    previous = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+
+
 class DenseKVOffloadCache(Cache):
     """Pre-sized CPU KV cache with a shared bounded GPU staging pool."""
 
@@ -224,6 +238,9 @@ def streamed_exact_attention(
         raise ValueError(f"{query_heads} query heads are not divisible by {kv_heads} KV heads")
     groups = query_heads // kv_heads
     grouped_query = query_states.reshape(batch, kv_heads, groups, query_len, head_dim)
+    # Casting once avoids rounding each QK GEMM output back to bf16. TF32 can
+    # represent every bf16 operand exactly and retains fp32 accumulation.
+    grouped_query_f32 = grouped_query.float()
 
     row_max = torch.full(
         (batch, kv_heads, groups, query_len),
@@ -241,14 +258,15 @@ def streamed_exact_attention(
     for key_start, key_block, value_block in cache.iter_layer_blocks(layer_idx):
         key_len = int(key_block.shape[-2])
         key_stop = key_start + key_len
-        key_t = key_block.unsqueeze(2).transpose(-1, -2)
+        key_t_f32 = key_block.unsqueeze(2).transpose(-1, -2).float()
         value_f32 = value_block.unsqueeze(2).float()
         for query_offset in range(0, query_len, cache.query_block_tokens):
             query_stop = min(query_len, query_offset + cache.query_block_tokens)
-            query_block = grouped_query[:, :, :, query_offset:query_stop, :]
-            # The dot product follows the model dtype. Softmax statistics and
-            # the weighted-V numerator are explicitly accumulated in fp32.
-            scores = torch.matmul(query_block, key_t).float()
+            query_block_f32 = grouped_query_f32[:, :, :, query_offset:query_stop, :]
+            # QK uses TF32 tensor cores on CUDA. This is lossless for the bf16
+            # source values while producing fp32 scores and accumulation.
+            with _scoped_cuda_tf32(query_states.device, enabled=True):
+                scores = torch.matmul(query_block_f32, key_t_f32)
             scores.mul_(float(scaling))
 
             first_query_position = query_start + query_offset
@@ -272,7 +290,11 @@ def streamed_exact_attention(
             block_exp = torch.exp(scores - merged_max.unsqueeze(-1))
 
             old_numerator.mul_(old_scale.unsqueeze(-1))
-            old_numerator.add_(torch.matmul(block_exp, value_f32))
+            # block_exp contains general fp32 values, so keep AV at full fp32
+            # instead of allowing TF32 to truncate the softmax probabilities.
+            with _scoped_cuda_tf32(query_states.device, enabled=False):
+                block_numerator = torch.matmul(block_exp, value_f32)
+            old_numerator.add_(block_numerator)
             old_sum.mul_(old_scale)
             old_sum.add_(block_exp.sum(dim=-1))
             old_max.copy_(merged_max)
