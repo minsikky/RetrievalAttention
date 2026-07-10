@@ -4,6 +4,15 @@ set -euo pipefail
 cd /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention
 export LD_LIBRARY_PATH="/sw/pkgs/arc/python/3.10.4/lib:${LD_LIBRARY_PATH:-}"
 
+# Zero numeric-impact memory hygiene (allocator config + per-chunk cache
+# release only; no effect on outputs). Defaults-respecting so a caller that
+# sets its own values wins. Placed in this inner launcher deliberately: sbatch
+# copies only the top-level script at submit time, but this launcher is read
+# from disk at runtime, so already-queued jobs pick these up. The python reads
+# FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK from env (call_pagedpq_streaming.py).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK="${FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK:-1}"
+
 TASK_NAME="${TASK_NAME:-niah_single_1}"
 CONTEXT_LEN="${CONTEXT_LEN:-2048}"
 NUM_SAMPLES="${NUM_SAMPLES:-2}"
