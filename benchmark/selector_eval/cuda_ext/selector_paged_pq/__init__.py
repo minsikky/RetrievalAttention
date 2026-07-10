@@ -53,6 +53,8 @@ _EXPORTED_NAMES = [
     "gqa_fullscan_pq_topk",
     "gqa_fullscan_pq_topk_scores",
     "joint_vprefix_outputs",
+    "joint_vprefix_outputs_precision",
+    "joint_vprefix_outputs_precision_from_risk",
     "joint_vprefix_outputs_from_risk",
     "joint_vprefix_outputs_from_grouped_risk",
     "joint_vprefix_outputs_from_grouped_risk_batched",
