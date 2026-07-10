@@ -542,54 +542,51 @@ def _sorted_vprefix_outputs_precision_tiers(
         if bf16_vprefix:
             raise RuntimeError("fused frozensim risk sort does not support bf16 V-prefix inputs")
         native = load_selector_paged_pq_ext()
-        binding_name = (
-            "joint_vprefix_outputs_precision_from_risk_tokpar"
-            if tokpar_vprefix
-            else "joint_vprefix_outputs_precision_from_risk"
-        )
-        if not hasattr(native, binding_name):
+        if tokpar_vprefix:
+            if not hasattr(native, "joint_vprefix_outputs_precision_from_risk_tokpar"):
+                raise RuntimeError("token-parallel frozensim risk sort requires an updated CUDA extension")
+            binding = native.joint_vprefix_outputs_precision_from_risk_tokpar
+            k_chunk = precision_vprefix_tokpar_k_chunk_size(
+                k_count=int(runtime.k_count),
+                heads=int(runtime.group_heads),
+                order_count=int(runtime.max_exact_v_count),
+                head_dim=int(runtime.head_dim),
+            )
+            output_chunks: list[torch.Tensor] = []
+            read_chunks: list[torch.Tensor] = []
+            for k_start in range(0, int(runtime.k_count), int(k_chunk)):
+                k_end = min(int(runtime.k_count), int(k_start) + int(k_chunk))
+                output_chunk_t, read_chunk_t = binding(
+                    runtime.base_output_grid[int(k_start): int(k_end)].to(
+                        dtype=torch.float32
+                    ).contiguous(),
+                    runtime.probs_grid[int(k_start): int(k_end)].to(
+                        dtype=torch.float32
+                    ).contiguous(),
+                    runtime.residual.to(dtype=torch.float32).contiguous(),
+                    runtime.residual_lo_commit.to(dtype=torch.float32).contiguous(),
+                    runtime.v_commit_mask.to(dtype=torch.bool).contiguous(),
+                    runtime.code_error.to(dtype=torch.float32).contiguous(),
+                    runtime.joint_v_budgets_t,
+                    hi_counts_t,
+                )
+                output_chunks.append(output_chunk_t)
+                read_chunks.append(read_chunk_t)
+            if len(output_chunks) == 1:
+                return output_chunks[0], read_chunks[0]
+            return torch.cat(output_chunks, dim=0), torch.cat(read_chunks, dim=0)
+        if not hasattr(native, "joint_vprefix_outputs_precision_from_risk"):
             raise RuntimeError("fused frozensim risk sort requires an updated CUDA extension")
-        binding = getattr(native, binding_name)
-        if not tokpar_vprefix:
-            return binding(
-                runtime.base_output_grid.to(dtype=torch.float32).contiguous(),
-                runtime.probs_grid.to(dtype=torch.float32).contiguous(),
-                runtime.residual.to(dtype=torch.float32).contiguous(),
-                runtime.residual_lo_commit.to(dtype=torch.float32).contiguous(),
-                runtime.v_commit_mask.to(dtype=torch.bool).contiguous(),
-                runtime.code_error.to(dtype=torch.float32).contiguous(),
-                runtime.joint_v_budgets_t,
-                hi_counts_t,
-            )
-        k_chunk = precision_vprefix_tokpar_k_chunk_size(
-            k_count=int(runtime.k_count),
-            heads=int(runtime.group_heads),
-            order_count=int(runtime.max_exact_v_count),
-            head_dim=int(runtime.head_dim),
+        return native.joint_vprefix_outputs_precision_from_risk(
+            runtime.base_output_grid.to(dtype=torch.float32).contiguous(),
+            runtime.probs_grid.to(dtype=torch.float32).contiguous(),
+            runtime.residual.to(dtype=torch.float32).contiguous(),
+            runtime.residual_lo_commit.to(dtype=torch.float32).contiguous(),
+            runtime.v_commit_mask.to(dtype=torch.bool).contiguous(),
+            runtime.code_error.to(dtype=torch.float32).contiguous(),
+            runtime.joint_v_budgets_t,
+            hi_counts_t,
         )
-        output_chunks: list[torch.Tensor] = []
-        read_chunks: list[torch.Tensor] = []
-        for k_start in range(0, int(runtime.k_count), int(k_chunk)):
-            k_end = min(int(runtime.k_count), int(k_start) + int(k_chunk))
-            output_chunk_t, read_chunk_t = binding(
-                runtime.base_output_grid[int(k_start): int(k_end)].to(
-                    dtype=torch.float32
-                ).contiguous(),
-                runtime.probs_grid[int(k_start): int(k_end)].to(
-                    dtype=torch.float32
-                ).contiguous(),
-                runtime.residual.to(dtype=torch.float32).contiguous(),
-                runtime.residual_lo_commit.to(dtype=torch.float32).contiguous(),
-                runtime.v_commit_mask.to(dtype=torch.bool).contiguous(),
-                runtime.code_error.to(dtype=torch.float32).contiguous(),
-                runtime.joint_v_budgets_t,
-                hi_counts_t,
-            )
-            output_chunks.append(output_chunk_t)
-            read_chunks.append(read_chunk_t)
-        if len(output_chunks) == 1:
-            return output_chunks[0], read_chunks[0]
-        return torch.cat(output_chunks, dim=0), torch.cat(read_chunks, dim=0)
     if risk_grid_t is None:
         raise RuntimeError("missing risk grid for sorted precision V-prefix")
     if int(runtime.max_exact_v_count) >= runtime.context_len:
@@ -606,56 +603,53 @@ def _sorted_vprefix_outputs_precision_tiers(
         if bf16_vprefix:
             raise RuntimeError("fused frozensim V-prefix does not support bf16 inputs")
         native = load_selector_paged_pq_ext()
-        binding_name = (
-            "joint_vprefix_outputs_precision_tokpar"
-            if tokpar_vprefix
-            else "joint_vprefix_outputs_precision"
-        )
-        if not hasattr(native, binding_name):
+        if tokpar_vprefix:
+            if not hasattr(native, "joint_vprefix_outputs_precision_tokpar"):
+                raise RuntimeError("token-parallel frozensim V-prefix requires an updated CUDA extension")
+            binding = native.joint_vprefix_outputs_precision_tokpar
+            k_chunk = precision_vprefix_tokpar_k_chunk_size(
+                k_count=int(runtime.k_count),
+                heads=int(runtime.group_heads),
+                order_count=int(exact_order_grid_t.shape[2]),
+                head_dim=int(runtime.head_dim),
+            )
+            output_chunks = []
+            read_chunks = []
+            for k_start in range(0, int(runtime.k_count), int(k_chunk)):
+                k_end = min(int(runtime.k_count), int(k_start) + int(k_chunk))
+                output_chunk_t, read_chunk_t = binding(
+                    runtime.base_output_grid[int(k_start): int(k_end)].to(
+                        dtype=torch.float32
+                    ).contiguous(),
+                    runtime.probs_grid[int(k_start): int(k_end)].to(
+                        dtype=torch.float32
+                    ).contiguous(),
+                    runtime.residual.to(dtype=torch.float32).contiguous(),
+                    runtime.residual_lo_commit.to(dtype=torch.float32).contiguous(),
+                    runtime.v_commit_mask.to(dtype=torch.bool).contiguous(),
+                    exact_order_grid_t[int(k_start): int(k_end)].to(
+                        dtype=torch.long
+                    ).contiguous(),
+                    runtime.joint_v_budgets_t,
+                    hi_counts_t,
+                )
+                output_chunks.append(output_chunk_t)
+                read_chunks.append(read_chunk_t)
+            if len(output_chunks) == 1:
+                return output_chunks[0], read_chunks[0]
+            return torch.cat(output_chunks, dim=0), torch.cat(read_chunks, dim=0)
+        if not hasattr(native, "joint_vprefix_outputs_precision"):
             raise RuntimeError("fused frozensim V-prefix requires an updated CUDA extension")
-        binding = getattr(native, binding_name)
-        if not tokpar_vprefix:
-            return binding(
-                runtime.base_output_grid.to(dtype=torch.float32).contiguous(),
-                runtime.probs_grid.to(dtype=torch.float32).contiguous(),
-                runtime.residual.to(dtype=torch.float32).contiguous(),
-                runtime.residual_lo_commit.to(dtype=torch.float32).contiguous(),
-                runtime.v_commit_mask.to(dtype=torch.bool).contiguous(),
-                exact_order_grid_t.to(dtype=torch.long).contiguous(),
-                runtime.joint_v_budgets_t,
-                hi_counts_t,
-            )
-        k_chunk = precision_vprefix_tokpar_k_chunk_size(
-            k_count=int(runtime.k_count),
-            heads=int(runtime.group_heads),
-            order_count=int(exact_order_grid_t.shape[2]),
-            head_dim=int(runtime.head_dim),
+        return native.joint_vprefix_outputs_precision(
+            runtime.base_output_grid.to(dtype=torch.float32).contiguous(),
+            runtime.probs_grid.to(dtype=torch.float32).contiguous(),
+            runtime.residual.to(dtype=torch.float32).contiguous(),
+            runtime.residual_lo_commit.to(dtype=torch.float32).contiguous(),
+            runtime.v_commit_mask.to(dtype=torch.bool).contiguous(),
+            exact_order_grid_t.to(dtype=torch.long).contiguous(),
+            runtime.joint_v_budgets_t,
+            hi_counts_t,
         )
-        output_chunks = []
-        read_chunks = []
-        for k_start in range(0, int(runtime.k_count), int(k_chunk)):
-            k_end = min(int(runtime.k_count), int(k_start) + int(k_chunk))
-            output_chunk_t, read_chunk_t = binding(
-                runtime.base_output_grid[int(k_start): int(k_end)].to(
-                    dtype=torch.float32
-                ).contiguous(),
-                runtime.probs_grid[int(k_start): int(k_end)].to(
-                    dtype=torch.float32
-                ).contiguous(),
-                runtime.residual.to(dtype=torch.float32).contiguous(),
-                runtime.residual_lo_commit.to(dtype=torch.float32).contiguous(),
-                runtime.v_commit_mask.to(dtype=torch.bool).contiguous(),
-                exact_order_grid_t[int(k_start): int(k_end)].to(
-                    dtype=torch.long
-                ).contiguous(),
-                runtime.joint_v_budgets_t,
-                hi_counts_t,
-            )
-            output_chunks.append(output_chunk_t)
-            read_chunks.append(read_chunk_t)
-        if len(output_chunks) == 1:
-            return output_chunks[0], read_chunks[0]
-        return torch.cat(output_chunks, dim=0), torch.cat(read_chunks, dim=0)
     order_count_i = int(exact_order_grid_t.shape[2])
     prefix_dtype = torch.bfloat16 if bf16_vprefix else torch.float32
     commit_mask_i32_t = runtime.v_commit_mask.to(dtype=torch.int32)
