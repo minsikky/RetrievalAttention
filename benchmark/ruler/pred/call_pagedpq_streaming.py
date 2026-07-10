@@ -572,7 +572,13 @@ def prefill_batched(
                 use_cache=True,
             )
             past_key_values = out.past_key_values
-            sync_cuda_if_needed(device)
+            # Keep offload work queued across chunks; the final sync below
+            # still bounds prefill timing and the completed-memory snapshot.
+            if not dense_kv_offload or env_truthy(
+                "FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK",
+                "0",
+            ):
+                sync_cuda_if_needed(device)
             memory_label = (
                 f"offload.prefill.chunk.{start}_{stop}.done"
                 if dense_kv_offload
@@ -587,6 +593,8 @@ def prefill_batched(
         set_pagedpq_prefill_sidecar_warm_deferred(model, False)
     if out is None:
         raise RuntimeError("empty prompt")
+    if dense_kv_offload:
+        sync_cuda_if_needed(device)
     log_cuda_memory("prefill.chunked.forward_done", device)
     return out
 
@@ -602,8 +610,10 @@ def generate_batched(
     prefill_chunk_size: int | None = None,
     dense_kv_offload: bool = False,
     dense_kv_block_tokens: int = 8192,
+    dense_kv_decode_block_tokens: int = 262144,
     dense_kv_staging_buffers: int = 2,
-    dense_kv_query_block_tokens: int = 2048,
+    dense_kv_query_block_tokens: int = 4096,
+    dense_kv_av_tf32: bool = True,
     greedy_logit_trace: list[torch.Tensor] | None = None,
     forced_token_ids: list[int] | None = None,
 ) -> tuple[list[int], dict[str, float | int]]:
@@ -623,8 +633,10 @@ def generate_batched(
             num_layers=len(model.model.layers),
             max_cache_len=prompt_len + int(max_new_tokens),
             kv_block_tokens=int(dense_kv_block_tokens),
+            decode_kv_block_tokens=int(dense_kv_decode_block_tokens),
             staging_buffers=int(dense_kv_staging_buffers),
             query_block_tokens=int(dense_kv_query_block_tokens),
+            av_tf32=bool(dense_kv_av_tf32),
             device=device,
         )
     forced_tokens = None
@@ -655,24 +667,31 @@ def generate_batched(
     prompt_seconds = time.perf_counter() - prompt_start
 
     generated: list[int] = []
+    # The offload path does not need token IDs on the host until decoding is
+    # complete. Deferring this copy removes one synchronization per token.
+    deferred_generated: list[torch.Tensor] | None = [] if dense_kv_offload else None
     log_cuda_memory("decode.start", device, reset_peak=True)
+    if dense_kv_offload:
+        log_cuda_memory("offload.decode.start", device)
     sync_cuda_if_needed(device)
     decode_start = time.perf_counter()
     for step in range(int(max_new_tokens)):
         input_token = next_token if forced_tokens is None else forced_tokens[:, step : step + 1]
-        token_id = int(input_token.item())
-        generated.append(token_id)
-        if dense_kv_offload:
-            log_cuda_memory(f"offload.decode.step.{step}.start", device)
+        if deferred_generated is None:
+            generated.append(int(input_token.item()))
+        else:
+            deferred_generated.append(input_token.detach())
         out = model_forward_last_logits(model, input_token, past_key_values=past_key_values, use_cache=True)
         past_key_values = out.past_key_values
         next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
         if greedy_logit_trace is not None and step + 1 < int(max_new_tokens):
             greedy_logit_trace.append(out.logits[:, -1, :].detach().cpu())
-        if dense_kv_offload:
-            log_cuda_memory(f"offload.decode.step.{step}.done", device)
     sync_cuda_if_needed(device)
+    if deferred_generated:
+        generated = torch.cat(deferred_generated, dim=1).reshape(-1).cpu().tolist()
     decode_seconds = time.perf_counter() - decode_start
+    if dense_kv_offload:
+        log_cuda_memory("offload.decode.done", device)
     log_cuda_memory("decode.done", device)
     timing = {
         "prompt_tokens": int(prompt_len),
@@ -893,8 +912,10 @@ def run() -> None:
         help="opt in to exact Qwen2 attention with a pinned-CPU bf16 KV cache",
     )
     parser.add_argument("--dense_kv_block_tokens", type=int, default=8192)
+    parser.add_argument("--dense_kv_decode_block_tokens", type=int, default=262144)
     parser.add_argument("--dense_kv_staging_buffers", type=int, default=2)
-    parser.add_argument("--dense_kv_query_block_tokens", type=int, default=2048)
+    parser.add_argument("--dense_kv_query_block_tokens", type=int, default=4096)
+    parser.add_argument("--dense_kv_av_tf32", type=int, choices=[0, 1], default=1)
     parser.add_argument(
         "--greedy_logit_trace_file",
         default="",
@@ -958,7 +979,11 @@ def run() -> None:
             parser.error("--dense_kv_offload requires --mode dense_batched")
         if int(args.prefill_chunk_size) <= 0:
             parser.error("--dense_kv_offload requires --prefill_chunk_size > 0")
-        if int(args.dense_kv_block_tokens) <= 0 or int(args.dense_kv_query_block_tokens) <= 0:
+        if (
+            int(args.dense_kv_block_tokens) <= 0
+            or int(args.dense_kv_decode_block_tokens) <= 0
+            or int(args.dense_kv_query_block_tokens) <= 0
+        ):
             parser.error("dense KV block sizes must be positive")
         if int(args.dense_kv_staging_buffers) < 2:
             parser.error("--dense_kv_staging_buffers must be at least 2")
@@ -1083,8 +1108,10 @@ def run() -> None:
                     generate_kwargs.update(
                         dense_kv_offload=True,
                         dense_kv_block_tokens=int(args.dense_kv_block_tokens),
+                        dense_kv_decode_block_tokens=int(args.dense_kv_decode_block_tokens),
                         dense_kv_staging_buffers=int(args.dense_kv_staging_buffers),
                         dense_kv_query_block_tokens=int(args.dense_kv_query_block_tokens),
+                        dense_kv_av_tf32=bool(args.dense_kv_av_tf32),
                     )
                 if logit_trace_records is not None:
                     if generate_fn is not generate_batched:
@@ -1229,12 +1256,13 @@ def run() -> None:
         summary["dense_kv_offload"] = {
             "enabled": True,
             "kv_block_tokens": int(args.dense_kv_block_tokens),
+            "decode_kv_block_tokens": int(args.dense_kv_decode_block_tokens),
             "query_block_tokens": int(args.dense_kv_query_block_tokens),
             "staging_buffers": int(args.dense_kv_staging_buffers),
             "qk_compute": (
                 "tf32_bf16_exact_fp32_output" if device.type == "cuda" else "fp32"
             ),
-            "av_compute": "fp32",
+            "av_compute": "tf32" if bool(args.dense_kv_av_tf32) and device.type == "cuda" else "fp32",
             "h2d_bytes": total_h2d_bytes,
             "h2d_tib": float(total_h2d_bytes / (1024.0 ** 4)),
         }

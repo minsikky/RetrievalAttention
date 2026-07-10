@@ -15,6 +15,8 @@ class _LayerKV:
     key: torch.Tensor
     value: torch.Tensor
     length: int = 0
+    append_start: int = 0
+    append_ready_event: torch.cuda.Event | None = None
 
 
 @contextlib.contextmanager
@@ -40,21 +42,30 @@ class DenseKVOffloadCache(Cache):
         num_layers: int,
         max_cache_len: int,
         kv_block_tokens: int,
+        decode_kv_block_tokens: int | None = None,
         staging_buffers: int,
-        query_block_tokens: int = 2048,
+        query_block_tokens: int = 4096,
+        av_tf32: bool = True,
         device: torch.device | str = "cpu",
     ) -> None:
         super().__init__()
         if num_layers <= 0 or max_cache_len <= 0:
             raise ValueError("num_layers and max_cache_len must be positive")
-        if kv_block_tokens <= 0 or query_block_tokens <= 0:
+        decode_block_tokens = (
+            int(kv_block_tokens)
+            if decode_kv_block_tokens is None
+            else int(decode_kv_block_tokens)
+        )
+        if kv_block_tokens <= 0 or decode_block_tokens <= 0 or query_block_tokens <= 0:
             raise ValueError("KV and query block sizes must be positive")
         if staging_buffers < 2:
             raise ValueError("staging_buffers must be at least 2 for H2D/compute overlap")
         self.num_layers = int(num_layers)
         self.max_cache_len = int(max_cache_len)
         self.kv_block_tokens = int(kv_block_tokens)
+        self.decode_kv_block_tokens = decode_block_tokens
         self.query_block_tokens = int(query_block_tokens)
+        self.av_tf32 = bool(av_tf32)
         self.staging_buffers = int(staging_buffers)
         self.device = torch.device(device)
         self._layers: list[_LayerKV | None] = [None] * self.num_layers
@@ -62,11 +73,13 @@ class DenseKVOffloadCache(Cache):
         self.h2d_bytes = 0
 
         self._copy_stream: torch.cuda.Stream | None = None
+        self._d2h_stream: torch.cuda.Stream | None = None
         self._stage_keys: list[torch.Tensor] = []
         self._stage_values: list[torch.Tensor] = []
         self._ready_events: list[torch.cuda.Event] = []
         self._consumed_events: list[torch.cuda.Event] = []
         self._slot_used: list[bool] = []
+        self._causal_masks: dict[int, torch.Tensor] = {}
 
     def __len__(self) -> int:
         return self.num_layers
@@ -123,11 +136,24 @@ class DenseKVOffloadCache(Cache):
             raise RuntimeError(
                 f"KV cache capacity exceeded at layer {idx}: {stop} > {self.max_cache_len}"
             )
-        # A blocking D2H append makes the pinned source ready before the
-        # independent H2D stream starts reading it. Each token is appended
-        # once; the much larger repeated prefill traffic is H2D.
-        layer.key[:, :, start:stop, :].copy_(key_states.detach(), non_blocking=False)
-        layer.value[:, :, start:stop, :].copy_(value_states.detach(), non_blocking=False)
+        non_blocking = self.device.type == "cuda"
+        if non_blocking:
+            if self._d2h_stream is None:
+                self._d2h_stream = torch.cuda.Stream(device=self.device)
+            if layer.append_ready_event is None:
+                layer.append_ready_event = torch.cuda.Event()
+            current_stream = torch.cuda.current_stream(key_states.device)
+            with torch.cuda.stream(self._d2h_stream):
+                self._d2h_stream.wait_stream(current_stream)
+                layer.key[:, :, start:stop, :].copy_(key_states.detach(), non_blocking=True)
+                layer.value[:, :, start:stop, :].copy_(value_states.detach(), non_blocking=True)
+                layer.append_ready_event.record(self._d2h_stream)
+            key_states.record_stream(self._d2h_stream)
+            value_states.record_stream(self._d2h_stream)
+        else:
+            layer.key[:, :, start:stop, :].copy_(key_states.detach())
+            layer.value[:, :, start:stop, :].copy_(value_states.detach())
+        layer.append_start = start
         layer.length = stop
         if idx == 0:
             self._seen_tokens = stop
@@ -143,7 +169,7 @@ class DenseKVOffloadCache(Cache):
         shape = (
             int(layer.key.shape[0]),
             int(layer.key.shape[1]),
-            self.kv_block_tokens,
+            max(self.kv_block_tokens, self.decode_kv_block_tokens),
             int(layer.key.shape[3]),
         )
         self._copy_stream = torch.cuda.Stream(device=self.device)
@@ -159,6 +185,8 @@ class DenseKVOffloadCache(Cache):
             raise RuntimeError("CUDA staging was not initialized")
         count = int(stop - start)
         with torch.cuda.stream(self._copy_stream):
+            if layer.append_ready_event is not None and stop > layer.append_start:
+                self._copy_stream.wait_event(layer.append_ready_event)
             if self._slot_used[slot]:
                 self._copy_stream.wait_event(self._consumed_events[slot])
             self._stage_keys[slot][:, :, :count, :].copy_(
@@ -176,17 +204,27 @@ class DenseKVOffloadCache(Cache):
             * (layer.key.element_size() + layer.value.element_size())
         )
 
-    def _cpu_blocks(self, layer: _LayerKV) -> Iterator[tuple[int, torch.Tensor, torch.Tensor]]:
-        for start in range(0, int(layer.length), self.kv_block_tokens):
-            stop = min(int(layer.length), start + self.kv_block_tokens)
+    def _cpu_blocks(
+        self,
+        layer: _LayerKV,
+        block_tokens: int,
+    ) -> Iterator[tuple[int, torch.Tensor, torch.Tensor]]:
+        for start in range(0, int(layer.length), block_tokens):
+            stop = min(int(layer.length), start + block_tokens)
             yield start, layer.key[:, :, start:stop, :], layer.value[:, :, start:stop, :]
 
-    def _cuda_blocks(self, layer: _LayerKV) -> Iterator[tuple[int, torch.Tensor, torch.Tensor]]:
+    def _cuda_blocks(
+        self,
+        layer: _LayerKV,
+        block_tokens: int,
+    ) -> Iterator[tuple[int, torch.Tensor, torch.Tensor]]:
         self._ensure_staging(layer)
+        if self._copy_stream is None:
+            raise RuntimeError("CUDA staging was not initialized")
         current_stream = torch.cuda.current_stream(self.device)
         blocks = [
-            (start, min(int(layer.length), start + self.kv_block_tokens))
-            for start in range(0, int(layer.length), self.kv_block_tokens)
+            (start, min(int(layer.length), start + block_tokens))
+            for start in range(0, int(layer.length), block_tokens)
         ]
         initial = min(self.staging_buffers, len(blocks))
         for block_idx in range(initial):
@@ -208,14 +246,33 @@ class DenseKVOffloadCache(Cache):
                 next_start, next_stop = blocks[next_idx]
                 self._enqueue_h2d(layer, next_start, next_stop, slot)
 
-    def iter_layer_blocks(self, layer_idx: int) -> Iterator[tuple[int, torch.Tensor, torch.Tensor]]:
+    def iter_layer_blocks(
+        self,
+        layer_idx: int,
+        *,
+        block_tokens: int,
+    ) -> Iterator[tuple[int, torch.Tensor, torch.Tensor]]:
         layer = self._layers[int(layer_idx)]
         if layer is None or layer.length == 0:
             raise RuntimeError(f"layer {layer_idx} has no cached KV")
         if self.device.type == "cuda":
-            yield from self._cuda_blocks(layer)
+            yield from self._cuda_blocks(layer, block_tokens)
         else:
-            yield from self._cpu_blocks(layer)
+            yield from self._cpu_blocks(layer, block_tokens)
+
+    def causal_mask(self, query_len: int) -> torch.Tensor:
+        mask = self._causal_masks.get(int(query_len))
+        if mask is None:
+            mask = torch.triu(
+                torch.ones(
+                    (query_len, query_len),
+                    dtype=torch.bool,
+                    device=self.device,
+                ),
+                diagonal=1,
+            )
+            self._causal_masks[int(query_len)] = mask
+        return mask
 
 
 def streamed_exact_attention(
@@ -254,53 +311,80 @@ def streamed_exact_attention(
         dtype=torch.float32,
         device=query_states.device,
     )
+    block_tokens = (
+        cache.decode_kv_block_tokens if query_len == 1 else cache.kv_block_tokens
+    )
+    causal_mask = cache.causal_mask(query_len) if query_len > 1 else None
 
-    for key_start, key_block, value_block in cache.iter_layer_blocks(layer_idx):
-        key_len = int(key_block.shape[-2])
-        key_stop = key_start + key_len
-        key_t_f32 = key_block.unsqueeze(2).transpose(-1, -2).float()
-        value_f32 = value_block.unsqueeze(2).float()
-        for query_offset in range(0, query_len, cache.query_block_tokens):
-            query_stop = min(query_len, query_offset + cache.query_block_tokens)
-            query_block_f32 = grouped_query_f32[:, :, :, query_offset:query_stop, :]
-            # QK uses TF32 tensor cores on CUDA. This is lossless for the bf16
-            # source values while producing fp32 scores and accumulation.
-            with _scoped_cuda_tf32(query_states.device, enabled=True):
+    # QK always uses TF32 on CUDA. AV does too by default; the explicit
+    # full-fp32 AV fallback remains available for calibrated A/B attribution.
+    with _scoped_cuda_tf32(query_states.device, enabled=True):
+        for key_start, key_block, value_block in cache.iter_layer_blocks(
+            layer_idx,
+            block_tokens=block_tokens,
+        ):
+            key_len = int(key_block.shape[-2])
+            key_stop = key_start + key_len
+            key_t_f32 = key_block.unsqueeze(2).transpose(-1, -2).float()
+            value_f32 = value_block.unsqueeze(2).float()
+            for query_offset in range(0, query_len, cache.query_block_tokens):
+                query_stop = min(query_len, query_offset + cache.query_block_tokens)
+                query_block_f32 = grouped_query_f32[:, :, :, query_offset:query_stop, :]
                 scores = torch.matmul(query_block_f32, key_t_f32)
-            scores.mul_(float(scaling))
+                scores.mul_(float(scaling))
 
-            first_query_position = query_start + query_offset
-            last_query_position = query_start + query_stop - 1
-            if key_stop - 1 > first_query_position:
-                query_positions = torch.arange(
-                    first_query_position,
-                    last_query_position + 1,
-                    device=query_states.device,
-                )
-                key_positions = torch.arange(key_start, key_stop, device=query_states.device)
-                causal = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
-                scores.masked_fill_(causal.view(1, 1, 1, query_stop - query_offset, key_len), -torch.inf)
+                current_key_start = max(key_start, query_start)
+                current_key_stop = min(key_stop, query_start + query_len)
+                first_query_position = query_start + query_offset
+                if (
+                    causal_mask is not None
+                    and current_key_stop - 1 > first_query_position
+                ):
+                    score_column_start = current_key_start - key_start
+                    score_column_stop = current_key_stop - key_start
+                    local_key_start = current_key_start - query_start
+                    local_key_stop = current_key_stop - query_start
+                    tile_mask = causal_mask[
+                        query_offset:query_stop,
+                        local_key_start:local_key_stop,
+                    ]
+                    scores[
+                        ..., score_column_start:score_column_stop
+                    ].masked_fill_(
+                        tile_mask.view(
+                            1,
+                            1,
+                            1,
+                            query_stop - query_offset,
+                            local_key_stop - local_key_start,
+                        ),
+                        -torch.inf,
+                    )
 
-            old_max = row_max[:, :, :, query_offset:query_stop]
-            old_sum = row_sum[:, :, :, query_offset:query_stop]
-            old_numerator = numerator[:, :, :, query_offset:query_stop, :]
-            block_max = scores.amax(dim=-1)
-            merged_max = torch.maximum(old_max, block_max)
-            old_scale = torch.exp(old_max - merged_max)
-            block_exp = torch.exp(scores - merged_max.unsqueeze(-1))
+                old_max = row_max[:, :, :, query_offset:query_stop]
+                old_sum = row_sum[:, :, :, query_offset:query_stop]
+                old_numerator = numerator[:, :, :, query_offset:query_stop, :]
+                block_max = scores.amax(dim=-1)
+                merged_max = torch.maximum(old_max, block_max)
+                old_scale = old_max - merged_max
+                old_scale.exp_()
+                scores.sub_(merged_max.unsqueeze(-1))
+                scores.exp_()
+                block_exp = scores
 
-            old_numerator.mul_(old_scale.unsqueeze(-1))
-            # block_exp contains general fp32 values, so keep AV at full fp32
-            # instead of allowing TF32 to truncate the softmax probabilities.
-            with _scoped_cuda_tf32(query_states.device, enabled=False):
-                block_numerator = torch.matmul(block_exp, value_f32)
-            old_numerator.add_(block_numerator)
-            old_sum.mul_(old_scale)
-            old_sum.add_(block_exp.sum(dim=-1))
-            old_max.copy_(merged_max)
+                old_numerator.mul_(old_scale.unsqueeze(-1))
+                if cache.av_tf32:
+                    block_numerator = torch.matmul(block_exp, value_f32)
+                else:
+                    with _scoped_cuda_tf32(query_states.device, enabled=False):
+                        block_numerator = torch.matmul(block_exp, value_f32)
+                old_numerator.add_(block_numerator)
+                old_sum.mul_(old_scale)
+                old_sum.add_(block_exp.sum(dim=-1))
+                old_max.copy_(merged_max)
 
-    output = numerator / row_sum.unsqueeze(-1)
-    return output.to(query_states.dtype).permute(0, 3, 1, 2, 4).reshape(
+    numerator.div_(row_sum.unsqueeze(-1))
+    return numerator.to(query_states.dtype).permute(0, 3, 1, 2, 4).reshape(
         batch, query_len, query_heads, head_dim
     )
 

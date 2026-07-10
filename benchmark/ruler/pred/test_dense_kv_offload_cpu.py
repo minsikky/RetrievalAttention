@@ -33,6 +33,7 @@ def _chunked_greedy(
             num_layers=model.config.num_hidden_layers,
             max_cache_len=int(input_ids.shape[1]) + decode_steps,
             kv_block_tokens=5,
+            decode_kv_block_tokens=17,
             staging_buffers=2,
             query_block_tokens=3,
             device="cpu",
