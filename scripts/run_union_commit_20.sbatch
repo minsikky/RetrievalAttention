@@ -14,7 +14,12 @@
 # union-commit per-head relL2; --gqa_union_stats gives the group union/sum
 # cross-check. CPU only. Pinned worktree (union-commit-20); absolute paths.
 #
-# Positions passed via $DECODES (comma list of decode-token lengths):
+# Positions passed via $DECODES (comma list of decode-token lengths).
+# SUBMIT WITH THE VARS IN THE SUBMISSION ENVIRONMENT, NOT --export=ALL,VAR=...:
+#   DECODES=119742,76387,5162 TAG=small sbatch --export=ALL scripts/run_union_commit_20.sbatch
+# (sbatch --export splits on commas, so --export=ALL,DECODES=a,b silently
+# truncates the list to "a" -- this bit the first submission.)
+#
 #   q137 ctx 12,000  -> decode 5162
 #   q262 ctx 83,225  -> decode 76387
 #   q283 ctx 126,580 -> decode 119742
