@@ -526,7 +526,14 @@ def _sorted_vprefix_outputs_precision_tiers(
     )
     fused_vprefix = _env_truthy("SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX", "0")
     fused_risk_sort = _env_truthy("SELECTOR_PQ_JOINT_FROZENSIM_FUSED_RISK_SORT", "0")
-    tokpar_vprefix = _env_truthy("SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR", "0")
+    # Token-parallel V-prefix defaults ON whenever the fused path is active
+    # (validated 2026-07-11: identity/32k/rate gates, 17.45->7.87 s/token at
+    # 128k). Set SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR=0 for
+    # identity A/Bs against pre-tokpar baselines.
+    tokpar_vprefix = _env_truthy(
+        "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR",
+        "1" if fused_vprefix else "0",
+    )
     bf16_vprefix = _env_truthy("SELECTOR_PQ_JOINT_FROZENSIM_BF16_VPREFIX", "0")
     if tokpar_vprefix and not fused_vprefix:
         raise RuntimeError(
