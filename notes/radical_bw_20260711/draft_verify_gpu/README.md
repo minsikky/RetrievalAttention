@@ -25,11 +25,18 @@ policy controller (`benchmark/selector_eval/runners/hf_paged_pq_intervention_joi
 Prior CPU evidence (layer-16 only, K-recall vs the walk): start+1 ≈ 0.916,
 start+2 ≈ 0.996 at ~1.9x bytes. This experiment tests those modes end-to-end.
 
-## Runs (all `--partition=gpu_mig40 --account=zhengya0`)
+## Runs (all `--partition=gpu-rtx6000 --account=zhengya0`)
 
-Pinned to mig40 (gl1251-class) because token comparisons are contaminated by
-cross-card FP differences. Each arm greedy-decodes; we run our own frozen arm
-(`DRAFT_MODE=off`) with the **identical** env so only the selection differs.
+Token comparisons are contaminated by cross-card FP differences, so ALL arms are
+pinned to one single card class (never a multi-partition list). Originally
+submitted on gpu_mig40 (53333931-936) to match the cached-baseline card class,
+but mig40 was ~24h saturated. Since we run our own frozen arm (`DRAFT_MODE=off`)
+with the **identical** env, the comparison is internally consistent on any
+single card class and never touches a cached mig40 run; resubmitted with a
+command-line `--partition=gpu-rtx6000` override (RTX Pro 6000 Blackwell 96GB —
+overrides the mig40 default in the sbatch header). Each arm greedy-decodes;
+only the selection differs between arms. First-run-on-Blackwell caveat: if the
+first job dies with a kernel/arch error, fall back to the mig40 set.
 
 Driver: `scripts/run_draft_verify_one.sbatch` — the tokpar identity-gate env
 (`run_fspq_tokpar_identity_gate.sbatch`) minus the comparison epilogue, plus
@@ -37,16 +44,17 @@ Driver: `scripts/run_draft_verify_one.sbatch` — the tokpar identity-gate env
 flows through `select_joint_kv_budgets` (the draft chokepoint) rather than the
 tokpar-batched deferral branch.
 
-| run name            | ctx  | task            | n | max_new | mode   | job |
-|---------------------|------|-----------------|---|---------|--------|-----|
-| qa1_32k_n4_off      | 32k  | qa_1            | 4 | default | off    | 53333931 |
-| qa1_32k_n4_start1   | 32k  | qa_1            | 4 | default | start1 | 53333932 |
-| qa1_32k_n4_start2   | 32k  | qa_1            | 4 | default | start2 | 53333933 |
-| mk3_128k_n2_off     | 128k | niah_multikey_3 | 2 | 64      | off    | 53333934 |
-| mk3_128k_n2_start1  | 128k | niah_multikey_3 | 2 | 64      | start1 | 53333936 |
-| mk3_128k_n2_start2  | 128k | niah_multikey_3 | 2 | 64      | start2 | 53333935 |
+| run name            | ctx  | task            | n | max_new | mode   | job (rtx6000) |
+|---------------------|------|-----------------|---|---------|--------|---------------|
+| qa1_32k_n4_off      | 32k  | qa_1            | 4 | default | off    | 53335393 |
+| qa1_32k_n4_start1   | 32k  | qa_1            | 4 | default | start1 | 53335394 |
+| qa1_32k_n4_start2   | 32k  | qa_1            | 4 | default | start2 | 53335395 |
+| mk3_128k_n2_off     | 128k | niah_multikey_3 | 2 | 64      | off    | 53335396 |
+| mk3_128k_n2_start1  | 128k | niah_multikey_3 | 2 | 64      | start1 | 53335398 |
+| mk3_128k_n2_start2  | 128k | niah_multikey_3 | 2 | 64      | start2 | 53335397 |
 
-Chained to keep ≤2 concurrent: A = 931→933→935, B = 932→934→936.
+Chained to keep ≤2 concurrent: A = 5393→5395→5397, B = 5394→5396→5398.
+(The cancelled mig40 set was 53333931-936.)
 Data: `benchmark_suite_result/ktcache_ab_20260709/.../qa_1/validation.jsonl`
 (32k identity-gate data) and
 `benchmark_suite_result/frozen_sim_20260707/runs/frozensim_mk3_128k_n16/.../niah_multikey_3/validation.jsonl`.
