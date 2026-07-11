@@ -1189,8 +1189,21 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     batched_glue_enabled = bool(
         batched_vprefix_records is not None
         and _env_truthy(
-            "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR_BATCHED_GLUE",
+            "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR_BATCHED_GLUE", "0"
+        )
+    )
+    batched_glue_qdq_enabled = bool(
+        batched_vprefix_records is not None
+        and _env_truthy(
+            "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR_BATCHED_GLUE_QDQ",
             "0",
+        )
+    )
+    batched_glue_score_grid_enabled = bool(
+        batched_vprefix_records is not None
+        and _env_truthy(
+            "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR_BATCHED_GLUE_SCORE_GRID",
+            "1" if batched_glue_enabled else "0",
         )
     )
     if precision_tiers_enabled:
@@ -1231,7 +1244,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         # and compute only the newly appended token without retaining another
         # context-by-head_dim plane.
         if device.type == "cuda":
-            if batched_glue_enabled:
+            if batched_glue_qdq_enabled:
                 native = load_selector_paged_pq_ext()
                 if not hasattr(native, "joint_rowwise_int8_qdq_pair"):
                     raise RuntimeError("batched glue requires native paired rowwise QDQ")
@@ -1665,7 +1678,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 counts=grid_take_counts,
                 hi_frac=float(_FROZEN_PRECISION_K_HI_FRAC),
             )
-            if batched_glue_enabled:
+            if batched_glue_score_grid_enabled:
                 native = load_selector_paged_pq_ext()
                 if not hasattr(native, "joint_precision_score_grid"):
                     raise RuntimeError("batched glue requires native precision score grid")
@@ -2731,7 +2744,11 @@ def finish_batched_tokpar_vprefix(runtime) -> bool:
     batched_glue = _env_truthy(
         "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR_BATCHED_GLUE", "0"
     )
-    if batched_glue:
+    batched_glue_policy = _env_truthy(
+        "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR_BATCHED_GLUE_POLICY",
+        "1" if batched_glue else "0",
+    )
+    if batched_glue_policy:
         if deferred_records is None:
             raise RuntimeError("batched glue requires deferred Torch policy records")
         policy_runtimes = [record["policy_runtime"] for record in records]
