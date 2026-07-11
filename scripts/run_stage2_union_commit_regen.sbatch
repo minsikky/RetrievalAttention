@@ -14,9 +14,14 @@
 # operands, adopted Q7.6 two-pass grid) PLUS --gqa_union_commit and the
 # deferred union golden dump.
 #
-# Inventory: standard rows q159/q223/q287 x h{0,8,16,24} (their full GQA
-# groups run so the unions exist; only the contract heads dump) PLUS the two
+# Inventory: standard rows q159/q223/q287 x h{0,8,16,24} PLUS the two
 # honest-case rows from the #20 envelope: q137 h0 (kv0) and q137 h5 (kv1).
+# ALL 32 q heads run at every position: unions are within-group and walks are
+# head-independent (dumped goldens identical either way), but the ratified
+# envelope statistics (gate c) are defined on the full 32-head population per
+# position -- an earlier 8-head q137 run (job 53296998) failed the p95 clause
+# purely because that subset was violation-enriched by construction (both
+# honest-case heads inside an n=8 sample). Only the contract heads dump.
 #
 # Gates run at the end:
 #   (a) verify_stage2_key_regen.py vs the pre-union blessed set (moves are
@@ -36,6 +41,7 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-16}"
 
 ROOT=/scratch/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/stage2_union_commit_regen_20260710
 DUMP="${ROOT}/gold_dump"
+rm -rf "$DUMP" "${ROOT}/run_std" "${ROOT}/run_q137"
 mkdir -p "$DUMP" "${ROOT}/run_std" "${ROOT}/run_q137"
 
 COMMON=(
@@ -72,19 +78,21 @@ COMMON=(
   --golden_dump_stage2_dir "$DUMP"
 )
 
-echo "[s2-union] run A: standard rows (full groups of h0/8/16/24)"
+ALLHEADS=$(python3 -c "print(','.join(str(i) for i in range(32)))")
+
+echo "[s2-union] run A: standard rows (all 32 heads; dump h0/8/16/24)"
 "$WT/.venv/bin/python" "$WT/benchmark/selector_eval/runners/run_joint_kv_budget_policy_eval.py" \
   "${COMMON[@]}" \
   --decode_lengths 8000,32000,128000 \
-  --heads 0,1,2,3,8,9,10,11,16,17,18,19,24,25,26,27 \
+  --heads "$ALLHEADS" \
   --golden_dump_stage2_heads 0,8,16,24 \
   --output_dir "${ROOT}/run_std"
 
-echo "[s2-union] run B: honest-case rows q137 h0 (kv0) + h5 (kv1)"
+echo "[s2-union] run B: honest-case rows (all 32 heads; dump q137 h0 + h5)"
 "$WT/.venv/bin/python" "$WT/benchmark/selector_eval/runners/run_joint_kv_budget_policy_eval.py" \
   "${COMMON[@]}" \
   --decode_lengths 5162 \
-  --heads 0,1,2,3,4,5,6,7 \
+  --heads "$ALLHEADS" \
   --golden_dump_stage2_heads 0,5 \
   --output_dir "${ROOT}/run_q137"
 
