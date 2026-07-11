@@ -94,8 +94,18 @@ def process_joint_kv_head_groups(runtime: JointKVHeadGroupRuntime) -> bool:
         and not runtime.wall_profile_enabled
     )
     runtime.deferred_policy_records = [] if runtime.defer_torch_policy else None
+    # Batched launch folding defaults ON whenever tokpar is effectively on
+    # (bit-identical to the unbatched tokpar path by gate 53323928; rate
+    # 53323979: 7.84->3.20 s/token at 128k). Explicit =0 opts out. Mirrors
+    # the tokpar-default cascade in hf_paged_pq_intervention_joint_vprefix.py.
+    _fused_default = _env_truthy("SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX", "0")
+    _tokpar_default = _env_truthy(
+        "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR",
+        "1" if _fused_default else "0",
+    )
     batched_vprefix = _env_truthy(
-        "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR_BATCHED", "0"
+        "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR_BATCHED",
+        "1" if _tokpar_default else "0",
     )
     runtime.batched_vprefix_records = [] if batched_vprefix else None
     kv_head_indices = (
