@@ -57,6 +57,16 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_cuda
     torch::Tensor code_error,
     torch::Tensor v_budgets,
     torch::Tensor v_hi_counts);
+std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_batched_cuda(
+    std::vector<torch::Tensor> base_outputs_groups,
+    std::vector<torch::Tensor> probs_groups,
+    std::vector<torch::Tensor> residual_hi_groups,
+    std::vector<torch::Tensor> residual_lo_groups,
+    std::vector<torch::Tensor> commit_mask_groups,
+    std::vector<torch::Tensor> code_error_groups,
+    torch::Tensor v_budgets,
+    torch::Tensor v_hi_counts,
+    int64_t transient_budget_bytes);
 
 torch::Tensor joint_vprefix_outputs_from_grouped_risk_cuda(
     torch::Tensor base_outputs,

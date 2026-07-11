@@ -13,6 +13,7 @@ from benchmark.selector_eval.gpu.run_gpu_paged_pq_eval import (
 )
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_common import (
     MB,
+    _env_int,
     _env_truthy,
 )
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_budget import (
@@ -342,6 +343,7 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     )
     grouped_vpq_actual_subbits = runtime.grouped_vpq_actual_subbits
     grouped_risk_records = runtime.grouped_risk_records
+    batched_vprefix_records = runtime.batched_vprefix_records
     outputs_all = runtime.outputs_all
     prefix_index_for = runtime.prefix_index_for
     joint_vpq_sidecars_for = runtime.joint_vpq_sidecars_for
@@ -2358,6 +2360,128 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 record_i["grouped_base_workspace"] = grouped_base_workspace_t
             grouped_risk_records.append(record_i)
             return True
+        if batched_vprefix_records is not None:
+            if not precision_tiers_enabled:
+                raise RuntimeError("batched TOKPAR V-prefix requires precision tiers")
+            if not runtime.defer_torch_policy:
+                raise RuntimeError(
+                    "batched TOKPAR V-prefix requires the deferred vector-policy path"
+                )
+            if not (
+                _env_truthy("SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX", "0")
+                and _env_truthy("SELECTOR_PQ_JOINT_FROZENSIM_FUSED_RISK_SORT", "0")
+                and _env_truthy("SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR", "1")
+            ):
+                raise RuntimeError(
+                    "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR_BATCHED "
+                    "requires fused V-prefix, fused risk sort, and TOKPAR"
+                )
+            _exact_counts_t, hi_counts_t, _positions_t = precision_grid_layout_tensors(
+                owner=args,
+                device=device,
+                kind="v",
+                counts=[
+                    max(0, min(int(v_budget), context_len_i, int(max_exact_v_count)))
+                    for v_budget in joint_v_budgets
+                ],
+                hi_frac=float(_FROZEN_PRECISION_V_HI_FRAC),
+            )
+            policy_runtime = JointPolicyRuntime(
+                args=args,
+                layer_id=int(layer_id),
+                stats=stats,
+                device=device,
+                wall_profile_enabled=bool(wall_profile_enabled),
+                group_heads=int(group_heads_i),
+                active_k_budgets=active_joint_k_budgets,
+                v_budgets=joint_v_budgets,
+                policy_name=policy_name,
+                policy_id=int(policy_id),
+                policy_uses_mb=bool(policy_uses_mb),
+                threshold=float(threshold_value),
+                context_len=int(context_len_i),
+                threshold_mode=str(getattr(args, "joint_kv_threshold_mode", "fixed")),
+                threshold_reference_frac=float(
+                    getattr(args, "joint_kv_threshold_reference_frac", 0.2)
+                ),
+                threshold_scale_shape=str(
+                    getattr(args, "joint_kv_threshold_scale_shape", "linear")
+                ),
+                threshold_min_scale=float(getattr(args, "joint_kv_threshold_min_scale", 0.0)),
+                threshold_max_scale=float(getattr(args, "joint_kv_threshold_max_scale", 1.0)),
+                start_ki_by_head=start_ki_by_head,
+                start_vi_by_head=start_vi_by_head,
+                use_incremental_v_grid=False,
+                grid_outputs=None,
+                grid_outputs_for_v_idx=None,
+                output_for_budget=None,
+                k_artifacts=None,
+                grid_k_mb_by_idx=grid_k_mb_by_idx,
+                v_mb_by_idx=v_mb_by_idx,
+                sim_start_seconds=float(sim_t0),
+                v_lo_reads_grid=None,
+                time_trace=time_trace,
+                defer_torch_policy=True,
+                d2h_owner=self,
+                d2h_slot=int(kv_head_i),
+            )
+            finalize_runtime = JointFinalizeRuntime(
+                args=args,
+                module=self,
+                layer_id=int(layer_id),
+                stats=stats,
+                device=device,
+                outputs_all=outputs_all,
+                head_start=int(head_start_i),
+                head_end=int(head_end_i),
+                group_heads=int(group_heads_i),
+                context_len=int(context_len_i),
+                key_bytes=int(key_bytes),
+                value_bytes=int(value_bytes),
+                selector_mb=float(selector_mb),
+                actual_value_subvecs=int(actual_value_subvecs),
+                code_bytes=int(code_bytes),
+                v_pq_codebook_mb=float(v_pq_codebook_mb),
+                metadata_mb=float(metadata_mb),
+                joint_v_budgets=joint_v_budgets,
+                final_ki_by_head=[],
+                final_vi_by_head=[],
+                final_idx_for_output=None,
+                final_output_grid=None,
+                grid_outputs=None,
+                grid_outputs_for_v_idx=None,
+                grid_selected_counts_by_ki=grid_selected_counts_by_ki,
+                grid_selected_by_ki=None,
+                k_artifacts=None,
+                output_for_budget=None,
+                precision_tiers_enabled=True,
+                precision_v_hi_frac=float(_FROZEN_PRECISION_V_HI_FRAC),
+                precision_lo_bytes=int(_FROZEN_PRECISION_LO_BYTES),
+                k_lo_counts_by_ki=grid_k_lo_counts_by_ki,
+                v_lo_reads_grid=None,
+                v_lo_reads_rows=None,
+            )
+            batched_vprefix_records.append(
+                {
+                    "base_outputs": base_output_grid_t.to(dtype=torch.float32).contiguous(),
+                    "probs": probs_grid_t.to(dtype=torch.float32).contiguous(),
+                    # The memory-bounded reconstruction buffers are reused by
+                    # the next KV head. Retain only the residual plane needed
+                    # by the later layer-level batched launch.
+                    "residual_hi": residual_t.to(dtype=torch.float32).contiguous().clone(),
+                    "residual_lo": residual_lo_commit_t.to(
+                        dtype=torch.float32
+                    ).contiguous(),
+                    "commit_mask": v_commit_mask_t.to(dtype=torch.bool).contiguous(),
+                    "code_error": code_error_t.to(dtype=torch.float32).contiguous(),
+                    "v_budgets": joint_v_budgets_t,
+                    "v_hi_counts": hi_counts_t,
+                    "policy_runtime": policy_runtime,
+                    "finalize_runtime": finalize_runtime,
+                    "select_trace_start": select_trace_start,
+                }
+            )
+            return True
         vprefix_result = build_joint_vprefix_grid(
             JointVPrefixGridRuntime(
                 args=args,
@@ -2513,5 +2637,78 @@ def finish_deferred_joint_kv_heads(runtime) -> bool:
         finalize_runtime.v_lo_reads_rows = v_lo_reads_rows
         if not finalize_joint_head_outputs(finalize_runtime):
             return False
+    records.clear()
+    return True
+
+
+def finish_batched_tokpar_vprefix(runtime) -> bool:
+    records = runtime.batched_vprefix_records
+    if not records:
+        return True
+    native = load_selector_paged_pq_ext()
+    binding_name = "joint_vprefix_outputs_precision_from_risk_tokpar_batched"
+    if not hasattr(native, binding_name):
+        raise RuntimeError("batched TOKPAR V-prefix requires an updated CUDA extension")
+    first = records[0]
+    expected_shapes = (
+        tuple(first["base_outputs"].shape),
+        tuple(first["probs"].shape),
+        tuple(first["residual_hi"].shape),
+    )
+    for record in records[1:]:
+        shapes = (
+            tuple(record["base_outputs"].shape),
+            tuple(record["probs"].shape),
+            tuple(record["residual_hi"].shape),
+        )
+        if shapes != expected_shapes:
+            raise RuntimeError(
+                "batched TOKPAR V-prefix requires uniform KV-head group shapes"
+            )
+    budget_mb = _env_int("SELECTOR_PQ_JOINT_VPREFIX_TRANSIENT_BUDGET_MB", 1600)
+    if budget_mb <= 0:
+        raise ValueError("SELECTOR_PQ_JOINT_VPREFIX_TRANSIENT_BUDGET_MB must be positive")
+    output_groups_t, lo_read_groups_t = getattr(native, binding_name)(
+        [record["base_outputs"] for record in records],
+        [record["probs"] for record in records],
+        [record["residual_hi"] for record in records],
+        [record["residual_lo"] for record in records],
+        [record["commit_mask"] for record in records],
+        [record["code_error"] for record in records],
+        first["v_budgets"],
+        first["v_hi_counts"],
+        int(budget_mb) * 1024 * 1024,
+    )
+    deferred_records = runtime.deferred_policy_records
+    for group, record in enumerate(records):
+        grid_outputs_t = output_groups_t[int(group)]
+        grid_v_lo_reads_t = lo_read_groups_t[int(group)]
+        policy_runtime = record["policy_runtime"]
+        policy_runtime.grid_outputs = grid_outputs_t
+        policy_runtime.v_lo_reads_grid = grid_v_lo_reads_t
+        policy_result = select_joint_kv_budgets(policy_runtime)
+        finalize_runtime = record["finalize_runtime"]
+        finalize_runtime.final_ki_by_head = policy_result.final_ki_by_head
+        finalize_runtime.final_vi_by_head = policy_result.final_vi_by_head
+        finalize_runtime.final_idx_for_output = policy_result.final_idx_for_output
+        finalize_runtime.final_output_grid = policy_result.final_output_grid
+        finalize_runtime.grid_outputs = grid_outputs_t
+        finalize_runtime.v_lo_reads_grid = grid_v_lo_reads_t
+        finalize_runtime.v_lo_reads_rows = policy_result.v_lo_reads_rows
+        if policy_result.deferred_torch_policy is not None:
+            if deferred_records is None:
+                raise RuntimeError("missing deferred policy record list")
+            policy_result.deferred_torch_policy.runtime.output_for_budget = None
+            policy_result.deferred_torch_policy.runtime.k_artifacts = None
+            policy_result.deferred_torch_policy.runtime.grid_outputs = None
+            policy_result.deferred_torch_policy.runtime.v_lo_reads_grid = None
+            deferred_records.append(
+                (policy_result.deferred_torch_policy, finalize_runtime)
+            )
+        elif not finalize_joint_head_outputs(finalize_runtime):
+            return False
+        time_trace = getattr(runtime.self, "_pagedpq_joint_time_trace", None)
+        if time_trace is not None:
+            time_trace.cuda_end("select", record["select_trace_start"])
     records.clear()
     return True

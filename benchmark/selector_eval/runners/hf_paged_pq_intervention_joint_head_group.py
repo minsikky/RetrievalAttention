@@ -6,7 +6,9 @@ from typing import Any, Callable
 
 import torch
 
+from benchmark.selector_eval.runners.hf_paged_pq_intervention_common import _env_truthy
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_one_group import (
+    finish_batched_tokpar_vprefix,
     finish_deferred_joint_kv_heads,
     process_one_joint_kv_head,
 )
@@ -81,6 +83,7 @@ class JointKVHeadGroupRuntime:
     grouped_geo_t0: float = 0.0
     defer_torch_policy: bool = False
     deferred_policy_records: list | None = None
+    batched_vprefix_records: list | None = None
 
 
 def process_joint_kv_head_groups(runtime: JointKVHeadGroupRuntime) -> bool:
@@ -91,6 +94,10 @@ def process_joint_kv_head_groups(runtime: JointKVHeadGroupRuntime) -> bool:
         and not runtime.wall_profile_enabled
     )
     runtime.deferred_policy_records = [] if runtime.defer_torch_policy else None
+    batched_vprefix = _env_truthy(
+        "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR_BATCHED", "0"
+    )
+    runtime.batched_vprefix_records = [] if batched_vprefix else None
     kv_head_indices = (
         list(runtime.kv_head_indices)
         if runtime.kv_head_indices is not None
@@ -98,6 +105,9 @@ def process_joint_kv_head_groups(runtime: JointKVHeadGroupRuntime) -> bool:
     )
     for kv_head_i in kv_head_indices:
         if not process_one_joint_kv_head(runtime, int(kv_head_i)):
+            return False
+    if runtime.batched_vprefix_records:
+        if not finish_batched_tokpar_vprefix(runtime):
             return False
     if runtime.deferred_policy_records:
         return finish_deferred_joint_kv_heads(runtime)

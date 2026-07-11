@@ -57,6 +57,7 @@ _EXPORTED_NAMES = [
     "joint_vprefix_outputs_precision_tokpar",
     "joint_vprefix_outputs_precision_from_risk",
     "joint_vprefix_outputs_precision_from_risk_tokpar",
+    "joint_vprefix_outputs_precision_from_risk_tokpar_batched",
     "joint_vprefix_outputs_from_risk",
     "joint_vprefix_outputs_from_grouped_risk",
     "joint_vprefix_outputs_from_grouped_risk_batched",

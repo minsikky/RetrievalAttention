@@ -104,6 +104,7 @@ def _test_native_exact_value_counts() -> None:
         joint_vprefix_outputs_precision,
         joint_vprefix_outputs_precision_from_risk,
         joint_vprefix_outputs_precision_from_risk_tokpar,
+        joint_vprefix_outputs_precision_from_risk_tokpar_batched,
         joint_vprefix_outputs_precision_tokpar,
         joint_vprefix_outputs_from_grouped_risk,
         joint_vprefix_outputs_from_grouped_merge_risk_batched,
@@ -420,6 +421,53 @@ def _test_native_exact_value_counts() -> None:
         raise AssertionError("token-parallel chunked V-prefix read counts mismatch")
     if not torch.equal(tok_parallel, tok_repeat) or not torch.equal(tok_parallel_reads, tok_repeat_reads):
         raise AssertionError("token-parallel V-prefix is not deterministic on fixed geometry")
+
+    batched_groups = 3
+    batched_base = [torch.randn_like(tok_base) for _ in range(batched_groups)]
+    batched_probs = [
+        torch.softmax(torch.randn_like(tok_probs), dim=2) for _ in range(batched_groups)
+    ]
+    batched_hi = [torch.randn_like(tok_hi) for _ in range(batched_groups)]
+    batched_lo = [torch.randn_like(tok_lo) for _ in range(batched_groups)]
+    batched_commit = [
+        torch.rand((tok_context,), device=device) > 0.4 for _ in range(batched_groups)
+    ]
+    batched_error = [
+        torch.rand((tok_context,), device=device, dtype=torch.float32)
+        for _ in range(batched_groups)
+    ]
+    single_outputs = []
+    single_reads = []
+    for group in range(batched_groups):
+        output, reads = joint_vprefix_outputs_precision_from_risk_tokpar(
+            batched_base[group],
+            batched_probs[group],
+            batched_hi[group],
+            batched_lo[group],
+            batched_commit[group],
+            batched_error[group],
+            tok_budgets,
+            tok_hi_counts,
+        )
+        single_outputs.append(output)
+        single_reads.append(reads)
+    grouped_outputs, grouped_reads = (
+        joint_vprefix_outputs_precision_from_risk_tokpar_batched(
+            batched_base,
+            batched_probs,
+            batched_hi,
+            batched_lo,
+            batched_commit,
+            batched_error,
+            tok_budgets,
+            tok_hi_counts,
+            1024 * 1024 * 1024,
+        )
+    )
+    if not torch.equal(grouped_outputs, torch.stack(single_outputs)):
+        raise AssertionError("batched TOKPAR V-prefix output is not bit-identical")
+    if not torch.equal(grouped_reads, torch.stack(single_reads)):
+        raise AssertionError("batched TOKPAR V-prefix read counts mismatch")
 
     base_context = 10
     base_pages = 2

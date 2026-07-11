@@ -311,6 +311,85 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar(
       v_hi_counts.contiguous());
 }
 
+std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_batched(
+    std::vector<torch::Tensor> base_outputs_groups,
+    std::vector<torch::Tensor> probs_groups,
+    std::vector<torch::Tensor> residual_hi_groups,
+    std::vector<torch::Tensor> residual_lo_groups,
+    std::vector<torch::Tensor> commit_mask_groups,
+    std::vector<torch::Tensor> code_error_groups,
+    torch::Tensor v_budgets,
+    torch::Tensor v_hi_counts,
+    int64_t transient_budget_bytes) {
+  const size_t groups = base_outputs_groups.size();
+  TORCH_CHECK(groups > 0, "batched V-prefix requires at least one group");
+  TORCH_CHECK(probs_groups.size() == groups, "probs group count mismatch");
+  TORCH_CHECK(residual_hi_groups.size() == groups, "residual-hi group count mismatch");
+  TORCH_CHECK(residual_lo_groups.size() == groups, "residual-lo group count mismatch");
+  TORCH_CHECK(commit_mask_groups.size() == groups, "commit-mask group count mismatch");
+  TORCH_CHECK(code_error_groups.size() == groups, "code-error group count mismatch");
+  TORCH_CHECK(v_budgets.is_cuda(), "v_budgets must be CUDA");
+  TORCH_CHECK(v_hi_counts.is_cuda(), "v_hi_counts must be CUDA");
+  TORCH_CHECK(v_budgets.scalar_type() == torch::kLong, "v_budgets must be int64");
+  TORCH_CHECK(v_hi_counts.scalar_type() == torch::kLong, "v_hi_counts must be int64");
+  TORCH_CHECK(v_budgets.dim() == 1, "v_budgets shape must be [steps]");
+  TORCH_CHECK(v_hi_counts.sizes() == v_budgets.sizes(), "V hi-count/budget shape mismatch");
+
+  const auto expected_base = base_outputs_groups[0].sizes();
+  const auto expected_probs = probs_groups[0].sizes();
+  TORCH_CHECK(expected_base.size() == 3, "base_outputs groups must have shape [k, heads, dim]");
+  TORCH_CHECK(expected_probs.size() == 3, "probs groups must have shape [k, heads, context]");
+  TORCH_CHECK(expected_probs[0] == expected_base[0], "probs/base k count mismatch");
+  TORCH_CHECK(expected_probs[1] == expected_base[1], "probs/base head count mismatch");
+  for (size_t group = 0; group < groups; ++group) {
+    auto& base = base_outputs_groups[group];
+    auto& probs = probs_groups[group];
+    auto& residual_hi = residual_hi_groups[group];
+    auto& residual_lo = residual_lo_groups[group];
+    auto& commit_mask = commit_mask_groups[group];
+    auto& code_error = code_error_groups[group];
+    TORCH_CHECK(base.is_cuda() && probs.is_cuda(), "base/probs groups must be CUDA");
+    TORCH_CHECK(
+        residual_hi.is_cuda() && residual_lo.is_cuda(),
+        "residual groups must be CUDA");
+    TORCH_CHECK(
+        commit_mask.is_cuda() && code_error.is_cuda(),
+        "commit/code-error groups must be CUDA");
+    TORCH_CHECK(base.scalar_type() == torch::kFloat32, "base groups must be float32");
+    TORCH_CHECK(probs.scalar_type() == torch::kFloat32, "probs groups must be float32");
+    TORCH_CHECK(residual_hi.scalar_type() == torch::kFloat32, "residual-hi groups must be float32");
+    TORCH_CHECK(residual_lo.scalar_type() == torch::kFloat32, "residual-lo groups must be float32");
+    TORCH_CHECK(commit_mask.scalar_type() == torch::kBool, "commit groups must be bool");
+    TORCH_CHECK(code_error.scalar_type() == torch::kFloat32, "code-error groups must be float32");
+    TORCH_CHECK(base.sizes() == expected_base, "base group shape mismatch");
+    TORCH_CHECK(probs.sizes() == expected_probs, "probs group shape mismatch");
+    TORCH_CHECK(residual_hi.dim() == 2, "residual-hi groups must have shape [context, dim]");
+    TORCH_CHECK(residual_lo.sizes() == residual_hi.sizes(), "residual lo/hi shape mismatch");
+    TORCH_CHECK(commit_mask.dim() == 1, "commit groups must have shape [context]");
+    TORCH_CHECK(code_error.dim() == 1, "code-error groups must have shape [context]");
+    TORCH_CHECK(residual_hi.size(0) == expected_probs[2], "residual/probs context mismatch");
+    TORCH_CHECK(commit_mask.size(0) == expected_probs[2], "commit/probs context mismatch");
+    TORCH_CHECK(code_error.size(0) == expected_probs[2], "code-error/probs context mismatch");
+    TORCH_CHECK(residual_hi.size(1) == expected_base[2], "residual/base dim mismatch");
+    TORCH_CHECK(base.is_contiguous(), "base groups must be contiguous");
+    TORCH_CHECK(probs.is_contiguous(), "probs groups must be contiguous");
+    TORCH_CHECK(residual_hi.is_contiguous(), "residual-hi groups must be contiguous");
+    TORCH_CHECK(residual_lo.is_contiguous(), "residual-lo groups must be contiguous");
+    TORCH_CHECK(commit_mask.is_contiguous(), "commit groups must be contiguous");
+    TORCH_CHECK(code_error.is_contiguous(), "code-error groups must be contiguous");
+  }
+  return joint_vprefix_outputs_precision_from_risk_tokpar_batched_cuda(
+      std::move(base_outputs_groups),
+      std::move(probs_groups),
+      std::move(residual_hi_groups),
+      std::move(residual_lo_groups),
+      std::move(commit_mask_groups),
+      std::move(code_error_groups),
+      v_budgets.contiguous(),
+      v_hi_counts.contiguous(),
+      transient_budget_bytes);
+}
+
 torch::Tensor joint_vprefix_outputs_from_grouped_risk(
     torch::Tensor base_outputs,
     torch::Tensor probs,

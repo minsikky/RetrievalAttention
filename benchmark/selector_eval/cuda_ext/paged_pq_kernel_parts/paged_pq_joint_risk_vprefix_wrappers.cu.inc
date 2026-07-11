@@ -320,6 +320,197 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_cuda
   return {outputs, lo_reads};
 }
 
+std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_batched_cuda(
+    std::vector<torch::Tensor> base_outputs_groups,
+    std::vector<torch::Tensor> probs_groups,
+    std::vector<torch::Tensor> residual_hi_groups,
+    std::vector<torch::Tensor> residual_lo_groups,
+    std::vector<torch::Tensor> commit_mask_groups,
+    std::vector<torch::Tensor> code_error_groups,
+    torch::Tensor v_budgets,
+    torch::Tensor v_hi_counts,
+    int64_t transient_budget_bytes) {
+  const int64_t groups = static_cast<int64_t>(base_outputs_groups.size());
+  TORCH_CHECK(groups > 0, "batched V-prefix requires at least one group");
+  const auto k_count = base_outputs_groups[0].size(0);
+  const auto heads = base_outputs_groups[0].size(1);
+  const auto dim = base_outputs_groups[0].size(2);
+  const auto context_len = probs_groups[0].size(2);
+  const auto v_steps = v_budgets.size(0);
+  const int64_t rows_per_group = k_count * heads;
+  const int64_t rows = groups * rows_per_group;
+  const int64_t chunks =
+      (context_len + kJointVPrefixTokenChunk - 1) / kJointVPrefixTokenChunk;
+  auto output_opts = base_outputs_groups[0].options().dtype(torch::kFloat32);
+  auto outputs = torch::empty(
+      {groups, k_count, v_steps, heads, dim}, output_opts);
+  auto lo_reads = torch::empty(
+      {groups, k_count, v_steps, heads},
+      base_outputs_groups[0].options().dtype(torch::kInt));
+  if (rows == 0 || dim == 0 || v_steps == 0) {
+    return {outputs, lo_reads};
+  }
+  if (context_len == 0) {
+    for (int64_t group = 0; group < groups; ++group) {
+      outputs[group].copy_(base_outputs_groups[group].reshape(
+          {k_count, 1, heads, dim}).expand({k_count, v_steps, heads, dim}));
+    }
+    lo_reads.zero_();
+    return {outputs, lo_reads};
+  }
+
+  auto flat_opts = output_opts;
+  auto long_opts = base_outputs_groups[0].options().dtype(torch::kLong);
+  auto int_opts = base_outputs_groups[0].options().dtype(torch::kInt);
+  auto byte_opts = base_outputs_groups[0].options().dtype(torch::kUInt8);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  size_t temp_bytes = 0;
+  const int64_t total = rows * context_len;
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      nullptr,
+      temp_bytes,
+      static_cast<float*>(nullptr),
+      static_cast<float*>(nullptr),
+      static_cast<int32_t*>(nullptr),
+      static_cast<int32_t*>(nullptr),
+      total,
+      rows,
+      static_cast<int64_t*>(nullptr),
+      static_cast<int64_t*>(nullptr),
+      0,
+      sizeof(float) * 8,
+      stream);
+  const int64_t pointer_bytes =
+      groups * kJointBatchedVPrefixPointerStride * static_cast<int64_t>(sizeof(int64_t));
+  const int64_t sort_bytes =
+      total * static_cast<int64_t>(2 * sizeof(float) + 2 * sizeof(int32_t)) +
+      (rows + 1) * static_cast<int64_t>(sizeof(int64_t)) +
+      static_cast<int64_t>(temp_bytes);
+  const int64_t partial_bytes =
+      chunks * rows *
+      (dim * static_cast<int64_t>(2 * sizeof(float)) +
+       static_cast<int64_t>(sizeof(int32_t)));
+  const int64_t required_bytes = pointer_bytes + sort_bytes + partial_bytes;
+  TORCH_CHECK(
+      transient_budget_bytes > 0,
+      "batched V-prefix transient budget must be positive");
+  TORCH_CHECK(
+      required_bytes <= transient_budget_bytes,
+      "batched V-prefix requires ", required_bytes,
+      " transient bytes (sort=", sort_bytes,
+      ", partials=", partial_bytes,
+      ", pointers=", pointer_bytes,
+      ") but budget is ", transient_budget_bytes);
+
+  auto risk_in = torch::empty({rows, context_len}, flat_opts);
+  auto risk_out = torch::empty({rows, context_len}, flat_opts);
+  auto ids_in = torch::empty({rows, context_len}, int_opts);
+  auto ids_out = torch::empty({rows, context_len}, int_opts);
+  auto offsets = torch::empty({rows + 1}, long_opts);
+  auto pointer_table = torch::empty(
+      {groups, kJointBatchedVPrefixPointerStride}, long_opts);
+  std::vector<int64_t> host_pointers(
+      static_cast<size_t>(groups * kJointBatchedVPrefixPointerStride));
+  for (int64_t group = 0; group < groups; ++group) {
+    const int64_t base = group * kJointBatchedVPrefixPointerStride;
+    host_pointers[base + kJointBatchedVPrefixBasePointer] =
+        reinterpret_cast<int64_t>(base_outputs_groups[group].data_ptr<float>());
+    host_pointers[base + kJointBatchedVPrefixProbsPointer] =
+        reinterpret_cast<int64_t>(probs_groups[group].data_ptr<float>());
+    host_pointers[base + kJointBatchedVPrefixResidualHiPointer] =
+        reinterpret_cast<int64_t>(residual_hi_groups[group].data_ptr<float>());
+    host_pointers[base + kJointBatchedVPrefixResidualLoPointer] =
+        reinterpret_cast<int64_t>(residual_lo_groups[group].data_ptr<float>());
+    host_pointers[base + kJointBatchedVPrefixCommitPointer] =
+        reinterpret_cast<int64_t>(commit_mask_groups[group].data_ptr<bool>());
+    host_pointers[base + kJointBatchedVPrefixCodeErrorPointer] =
+        reinterpret_cast<int64_t>(code_error_groups[group].data_ptr<float>());
+  }
+  C10_CUDA_CHECK(cudaMemcpyAsync(
+      pointer_table.data_ptr<int64_t>(),
+      host_pointers.data(),
+      static_cast<size_t>(pointer_bytes),
+      cudaMemcpyHostToDevice,
+      stream));
+
+  const int threads = 256;
+  const int64_t fill_blocks = (total + threads - 1) / threads;
+  joint_batched_risk_sort_inputs_kernel<<<
+      static_cast<unsigned int>(fill_blocks), threads, 0, stream>>>(
+      pointer_table.data_ptr<int64_t>(),
+      risk_in.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      groups,
+      rows_per_group,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const int64_t offset_blocks = ((rows + 1) + threads - 1) / threads;
+  joint_segment_offsets_kernel<<<
+      static_cast<unsigned int>(offset_blocks), threads, 0, stream>>>(
+      offsets.data_ptr<int64_t>(), rows, context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto temp = torch::empty({static_cast<int64_t>(temp_bytes)}, byte_opts);
+  cub::DeviceSegmentedRadixSort::SortPairsDescending(
+      temp.data_ptr(),
+      temp_bytes,
+      risk_in.data_ptr<float>(),
+      risk_out.data_ptr<float>(),
+      ids_in.data_ptr<int32_t>(),
+      ids_out.data_ptr<int32_t>(),
+      total,
+      rows,
+      offsets.data_ptr<int64_t>(),
+      offsets.data_ptr<int64_t>() + 1,
+      0,
+      sizeof(float) * 8,
+      stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto hi_partials = torch::empty({chunks, rows, dim}, flat_opts);
+  auto lo_partials = torch::empty({chunks, rows, dim}, flat_opts);
+  auto commit_partials = torch::empty({chunks, rows}, int_opts);
+  const int64_t partial_total = chunks * rows * dim;
+  const int64_t partial_blocks = (partial_total + threads - 1) / threads;
+  joint_batched_vprefix_precision_token_partials_kernel<int32_t><<<
+      static_cast<unsigned int>(partial_blocks), threads, 0, stream>>>(
+      pointer_table.data_ptr<int64_t>(),
+      ids_out.data_ptr<int32_t>(),
+      hi_partials.data_ptr<float>(),
+      lo_partials.data_ptr<float>(),
+      commit_partials.data_ptr<int32_t>(),
+      groups,
+      rows_per_group,
+      context_len,
+      context_len,
+      dim,
+      chunks);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  const int64_t output_total = rows * dim;
+  const int64_t output_blocks = (output_total + threads - 1) / threads;
+  joint_batched_vprefix_precision_outputs_tokpar_kernel<int32_t><<<
+      static_cast<unsigned int>(output_blocks), threads, 0, stream>>>(
+      pointer_table.data_ptr<int64_t>(),
+      ids_out.data_ptr<int32_t>(),
+      v_budgets.data_ptr<int64_t>(),
+      v_hi_counts.data_ptr<int64_t>(),
+      hi_partials.data_ptr<float>(),
+      lo_partials.data_ptr<float>(),
+      commit_partials.data_ptr<int32_t>(),
+      outputs.data_ptr<float>(),
+      lo_reads.data_ptr<int32_t>(),
+      groups,
+      k_count,
+      heads,
+      context_len,
+      context_len,
+      v_steps,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {outputs, lo_reads};
+}
+
 torch::Tensor joint_vprefix_outputs_from_grouped_risk_cuda(
     torch::Tensor base_outputs,
     torch::Tensor probs,
