@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Callable
@@ -19,6 +20,33 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_common import (
 
 
 _compiled_adjacent_rel_l2 = None
+
+
+def _joint_draft_mode() -> str | None:
+    """Draft-then-verify one-shot selection mode.
+
+    SELECTOR_PQ_JOINT_DRAFT_MODE={off,start1,start2}. Default off leaves the
+    escalation walk untouched (byte-identical to the frozen algorithm). When
+    ``start1``/``start2`` is set, the controller skips the stability walk
+    entirely and pins the K-budget rung to (proxy-mass start rung + 1 / + 2),
+    clamped to the ladder, then applies the frozen v_target rule to that rung.
+    """
+    mode = str(os.environ.get("SELECTOR_PQ_JOINT_DRAFT_MODE", "off")).strip().lower()
+    if mode in {"", "off", "0", "false", "none"}:
+        return None
+    if mode in {"start1", "start2"}:
+        return mode
+    raise ValueError(
+        f"unknown SELECTOR_PQ_JOINT_DRAFT_MODE={mode!r}; expected off, start1, or start2"
+    )
+
+
+def _draft_budget_index_at_least(budgets, target: float) -> int:
+    """First ladder index whose budget is >= target (mirrors the frozen rule)."""
+    for idx, budget in enumerate(budgets):
+        if int(budget) >= float(target):
+            return int(idx)
+    return max(0, len(budgets) - 1)
 
 
 def _adjacent_rel_l2_eager(cur_t: torch.Tensor, next_t: torch.Tensor) -> torch.Tensor:
@@ -116,6 +144,36 @@ def select_joint_kv_budgets(runtime: JointPolicyRuntime) -> JointPolicyResult:
     final_output_grid: torch.Tensor | None = None
     v_lo_reads_rows: list[list[list[int]]] | None = None
     deferred_torch_policy: PreparedTorchPolicy | None = None
+
+    draft_mode = _joint_draft_mode()
+    if draft_mode is not None:
+        # Draft-then-verify: skip the escalation walk entirely. Pin each head's
+        # K rung to (proxy-mass start rung + bump), clamped to the ladder, then
+        # apply the frozen v_target rule (v = max(v0, 0.25*k_target)) to that
+        # rung. finalize_joint_head_outputs reconstructs the fused output for
+        # these one-shot budgets via the same grid the walk would have used.
+        bump = 1 if draft_mode == "start1" else 2
+        k_budgets = runtime.active_k_budgets
+        v_budgets = runtime.v_budgets
+        n_k = len(k_budgets)
+        n_v = len(v_budgets)
+        for local_head_i in range(runtime.group_heads):
+            start_ki, _start_vi = _head_start_indices(runtime, local_head_i)
+            ki = min(int(start_ki) + int(bump), max(0, n_k - 1))
+            k_target = float(k_budgets[int(ki)])
+            v_target = max(float(v_budgets[0]), k_target * 0.25)
+            vi = _draft_budget_index_at_least(v_budgets, v_target)
+            vi = min(max(0, int(vi)), max(0, n_v - 1))
+            final_ki_by_head.append(int(ki))
+            final_vi_by_head.append(int(vi))
+        return JointPolicyResult(
+            final_ki_by_head=final_ki_by_head,
+            final_vi_by_head=final_vi_by_head,
+            final_idx_for_output=None,
+            final_output_grid=None,
+            v_lo_reads_rows=None,
+            deferred_torch_policy=None,
+        )
 
     if runtime.use_incremental_v_grid and runtime.grid_outputs_for_v_idx is not None:
         k_mb_by_idx = _k_mb_by_index(runtime)
