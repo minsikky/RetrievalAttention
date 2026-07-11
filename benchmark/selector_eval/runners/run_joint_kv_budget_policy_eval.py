@@ -1255,7 +1255,7 @@ def gqa_union_commit_head_output(
     precision_v_hi_frac: float,
     v_risk_key_exp_bits: int,
     v_risk_key_mantissa_bits: int,
-) -> tuple[np.ndarray, dict[str, object]]:
+) -> tuple[np.ndarray, dict[str, object], dict[str, object]]:
     """Recompute one head's committed output under issue #20 union-commit.
 
     Mirrors the frozen per-head execution machinery bit-for-bit (the same
@@ -1371,7 +1371,15 @@ def gqa_union_commit_head_output(
         "v_hi_reads": int(v_hi_reads),
         "v_lo_reads": int(v_lo_reads),
     }
-    return out, meta
+    # Internals for the stage-2 union golden writer (issue #20 item 3): the
+    # union-domain score row, softmax weights, and base output the committed
+    # execution actually used. Pure observers of arrays computed above.
+    internals = {
+        "score_vec": score_vec,
+        "probs": probs,
+        "base_output": base_output,
+    }
+    return out, meta, internals
 
 
 def v_selection_state_mb(
@@ -1610,11 +1618,42 @@ def _write_stage2_golden(
     two_pass_calibrate: bool = False,
     two_pass_frac_bits: int = 0,
     two_pass_int_bits: int = 16,
+    union_group_heads: np.ndarray | None = None,
+    union_k_tokens: np.ndarray | None = None,
+    union_k_hi_tokens: np.ndarray | None = None,
+    union_v_tokens: np.ndarray | None = None,
+    union_score_vec: np.ndarray | None = None,
+    union_probs: np.ndarray | None = None,
+    union_base_output: np.ndarray | None = None,
+    group_committed_k: list[np.ndarray] | None = None,
+    group_committed_v: list[np.ndarray] | None = None,
+    group_committed_hi_k: list[np.ndarray] | None = None,
+    union_baseline_rel_l2: float = float("nan"),
+    union_rel_l2: float = float("nan"),
 ) -> None:
     """Stage-2 goldens (issue #7): controller trace, per-band flash partials
     at the settled state, quantized-domain tail sum, proxy-mass scalars, and
     the V-path risk/selection state. The V-selection recompute below mirrors
-    the selection block inside run() — keep the two in sync."""
+    the selection block inside run() — keep the two in sync.
+
+    UNION-COMMIT MODE (issue #20 item 3, ratified 2026-07-10): when the
+    union_* kwargs are provided, the WALK-domain items are dumped unchanged
+    (item 1 controller trace, item 4 proxy-mass scalars, item-7 3a per-probe
+    band partials, item-8 two_pass_* — per-head selection is frozen), while
+    the COMMITTED-EXECUTION items are recomputed in the union domain: items
+    2/3 band partials gain one extra "union" band and use the union score row
+    (exact logits for every union-K token, group-max tier for the lo plane);
+    items 5/6 take the exact-V set AS GIVEN (= the group's committed-V union;
+    no top-count re-selection) and split it hi/lo in the risk / E6M12-key
+    domain of the union softmax weights; item-7 3b/3c/3e settled fields use
+    the union masks/weights/base output. New union_* npz fields carry the
+    group context (per-head committed sets, union ids, group hi-K union,
+    softmax denominator scalars, envelope relL2 bookkeeping)."""
+    union_mode = union_k_tokens is not None
+    if union_mode:
+        union_k_tokens = np.asarray(union_k_tokens, dtype=np.int64)
+        union_k_hi_tokens = np.asarray(union_k_hi_tokens, dtype=np.int64)
+        union_v_tokens = np.asarray(union_v_tokens, dtype=np.int64)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     n = int(context_len)
@@ -1674,7 +1713,13 @@ def _write_stage2_golden(
     # Items 2+3: per-band flash partials (max, sumexp, acc[d]) at the settled
     # K state. Bands: resident base tokens, rung bands 0..settled_ki over the
     # ranked selection, then the never-read tail (quantized PQ logits).
-    score_vec = scores_by_k[settled_ki].astype(np.float64, copy=False)
+    # UNION MODE: the score row is the union execution's mixed row (exact for
+    # every union-K token, group-max tier lo plane) and one extra "union" band
+    # (group-mates' committed K tokens beyond this head's own rungs) sits
+    # between band<settled_ki> and the tail.
+    score_vec = (
+        union_score_vec if union_mode else scores_by_k[settled_ki]
+    ).astype(np.float64, copy=False)
     vhat64 = vhat.astype(np.float64, copy=False)
     base_mask = np.ones(n, dtype=bool)
     base_mask[int(dynamic_start):int(sealed_end)] = False
@@ -1687,6 +1732,12 @@ def _write_stage2_golden(
         part_labels.append(f"band{i}")
         part_masks.append(m_i & ~prev & ~base_mask)
         prev |= m_i
+    if union_mode:
+        m_u = np.zeros(n, dtype=bool)
+        m_u[union_k_tokens] = True
+        part_labels.append("union")
+        part_masks.append(m_u & ~prev & ~base_mask)
+        prev |= m_u
     part_labels.append("tail")
     part_masks.append(~base_mask & ~prev)
 
@@ -1719,7 +1770,9 @@ def _write_stage2_golden(
         if se > 0.0:
             num += acc * math.exp(bm - big_m)
     combined = (num / max(denom, 1e-300)).astype(np.float32)
-    ref = base_output_by_k[settled_ki].astype(np.float32, copy=False)
+    ref = (
+        union_base_output if union_mode else base_output_by_k[settled_ki]
+    ).astype(np.float32, copy=False)
     combine_rel = float(
         np.linalg.norm(combined - ref) / max(float(np.linalg.norm(ref)), 1e-20)
     )
@@ -1730,12 +1783,21 @@ def _write_stage2_golden(
 
     # Item 5: V path at the settled pair — MIRRORS the selection block in
     # run() (global_residual_risk + precision hi/lo split + commit test).
-    probs = probs_by_k[settled_ki]
+    # UNION MODE: probs are the union softmax weights and the exact-V set is
+    # GIVEN (= the group's committed-V union; frozen from the walks, no
+    # top-count re-selection). risk still orders the hi/lo split inside the
+    # set; v_risk_cutoff degrades to min-risk-in-set (informative only).
+    probs = union_probs if union_mode else probs_by_k[settled_ki]
     risk = (probs * probs) * code_error
     if v_risk_key_bits is not None:
         risk = _quantize_risk_key(risk, int(v_risk_key_bits[0]), int(v_risk_key_bits[1]))
-    exact_count = max(0, min(int(v_budgets[settled_vi]), n))
-    exact_mask = top_mask(risk, exact_count)
+    if union_mode:
+        exact_count = int(union_v_tokens.size)
+        exact_mask = np.zeros(n, dtype=bool)
+        exact_mask[union_v_tokens] = True
+    else:
+        exact_count = max(0, min(int(v_budgets[settled_vi]), n))
+        exact_mask = top_mask(risk, exact_count)
     risk_cutoff = float(np.min(risk[exact_mask])) if bool(np.any(exact_mask)) else 0.0
     hi_mask = np.zeros(n, dtype=bool)
     lo_mask = np.zeros(n, dtype=bool)
@@ -1778,7 +1840,9 @@ def _write_stage2_golden(
     key_q = _quantize_risk_key(
         risk_hw, _FROZEN_V_RISK_KEY_EXP_BITS, _FROZEN_V_RISK_KEY_MANTISSA_BITS
     )
-    exact_mask_key = top_mask(key_q, exact_count)
+    # UNION MODE: the key domain splits the GIVEN union set (the ranker's
+    # select role is frozen out; its split role remains the hardware contract).
+    exact_mask_key = exact_mask.copy() if union_mode else top_mask(key_q, exact_count)
     key_cutoff = float(np.min(key_q[exact_mask_key])) if bool(np.any(exact_mask_key)) else 0.0
     hi_mask_key = np.zeros(n, dtype=bool)
     lo_mask_key = np.zeros(n, dtype=bool)
@@ -1845,7 +1909,11 @@ def _write_stage2_golden(
             _key_cache[ki_] = kq_
             return kq_
 
-        _key_cache[int(settled_ki)] = key_q
+        if not union_mode:
+            # (union mode: key_q above is the UNION-domain key; the 3a probe
+            # records replay the frozen walk, so settled_ki's frozen key must
+            # be rebuilt from probs_by_k like any other rung.)
+            _key_cache[int(settled_ki)] = key_q
 
         def _key_masks(ki_: int, vi_: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             kq_ = _key_for_ki(ki_)
@@ -1866,12 +1934,19 @@ def _write_stage2_golden(
             return kq_, hm_, lm_
 
         def _compose_sum(
-            ki_: int, hm_: np.ndarray, lm_: np.ndarray, *, hw: bool
+            ki_: int,
+            hm_: np.ndarray,
+            lm_: np.ndarray,
+            *,
+            hw: bool,
+            probs_override: np.ndarray | None = None,
+            base_override: np.ndarray | None = None,
         ) -> np.ndarray:
             hi_op = diff16_hi if hw else residual_hi
             lo_op = diff16_lo if hw else residual_int8
-            s_ = base_output_by_k[ki_].astype(np.float64, copy=True)
-            p_ = probs_by_k[ki_]
+            base_ = base_output_by_k[ki_] if base_override is None else base_override
+            s_ = base_.astype(np.float64, copy=True)
+            p_ = probs_by_k[ki_] if probs_override is None else probs_override
             if bool(np.any(hm_)):
                 s_ += p_[hm_].astype(np.float64, copy=False) @ hi_op[hm_]
             if bool(np.any(lm_)):
@@ -2017,13 +2092,29 @@ def _write_stage2_golden(
         # 3b: settled-state Vcorr total = out(settled) - base(settled), both
         # domains. REF is cross-checked against the item-5 composition path
         # (output_from_base_and_split_masks) to fp32-exact equality.
-        _, hm_s, lm_s = _key_masks(int(settled_ki), int(settled_vi))
-        base_s = base_output_by_k[int(settled_ki)].astype(np.float64, copy=False)
-        settled_acc_ref = _compose_sum(int(settled_ki), hm_s, lm_s, hw=False) - base_s
-        settled_acc_hw = _compose_sum(int(settled_ki), hm_s, lm_s, hw=True) - base_s
+        # UNION MODE: the settled commit state is the union execution — masks
+        # are the item-6 union key-domain split, weights/base are the union
+        # softmax row.
+        if union_mode:
+            hm_s, lm_s = hi_mask_key, lo_mask_key
+            settled_base_fp32 = union_base_output.astype(np.float32, copy=False)
+            settled_probs = union_probs
+        else:
+            _, hm_s, lm_s = _key_masks(int(settled_ki), int(settled_vi))
+            settled_base_fp32 = base_output_by_k[int(settled_ki)]
+            settled_probs = probs_by_k[int(settled_ki)]
+        base_s = settled_base_fp32.astype(np.float64, copy=False)
+        settled_acc_ref = _compose_sum(
+            int(settled_ki), hm_s, lm_s, hw=False,
+            probs_override=settled_probs, base_override=settled_base_fp32,
+        ) - base_s
+        settled_acc_hw = _compose_sum(
+            int(settled_ki), hm_s, lm_s, hw=True,
+            probs_override=settled_probs, base_override=settled_base_fp32,
+        ) - base_s
         check_s = output_from_base_and_split_masks(
-            base_output=base_output_by_k[int(settled_ki)],
-            probs=probs_by_k[int(settled_ki)],
+            base_output=settled_base_fp32,
+            probs=settled_probs,
             residual=residual_hi,
             residual_lo=residual_int8,
             hi_mask=hm_s,
@@ -2037,8 +2128,15 @@ def _write_stage2_golden(
         # 3c: settled exact-V operands in key-rank order. Plane A is the
         # literal _quantize_rows_symmetric(values_np, 8) (per-row absmax int8,
         # float32 scale); plane B mirrors _int8_dualplane_rows' residual plane.
-        order_s = np.argsort(-key_q, kind="stable")
-        vtok = order_s[: int(exact_count)].astype(np.int64)
+        # UNION MODE: the set is the GIVEN union; key-rank order within it
+        # (stable = stream order on ties, same as the frozen contract).
+        if union_mode:
+            vtok = union_v_tokens[
+                np.argsort(-key_q[union_v_tokens], kind="stable")
+            ].astype(np.int64)
+        else:
+            order_s = np.argsort(-key_q, kind="stable")
+            vtok = order_s[: int(exact_count)].astype(np.int64)
         vrows = np.asarray(values_fp16, dtype=np.float32)[vtok]
         levels = float((1 << (8 - 1)) - 1)  # 127, mirrors _quantize_rows_symmetric
         scaleA = np.maximum(np.max(np.abs(vrows), axis=1, keepdims=True) / levels, 1e-12)
@@ -2119,7 +2217,9 @@ def _write_stage2_golden(
             else np.zeros((union_tokens.size, hd), dtype=np.float32)
         )
         band_commit = commit_full[union_tokens].astype(np.uint8)
-        band_p_settled = probs_by_k[int(settled_ki)][union_tokens].astype(np.float64)
+        band_p_settled = (
+            union_probs if union_mode else probs_by_k[int(settled_ki)]
+        )[union_tokens].astype(np.float64)
         item7["vexact_band_tokens"] = union_tokens
         item7["vexact_band_v_fp32"] = band_v
         item7["vexact_band_values_lo_fp32"] = band_vlo
@@ -2145,7 +2245,7 @@ def _write_stage2_golden(
             hiboundary_offsets=item7["vcorr_hiboundary_offsets"],
             settled_hi_tokens=np.flatnonzero(hm_s),
             settled_lo_tokens=np.flatnonzero(lm_s),
-            base_output_fp32=base_output_by_k[int(settled_ki)],
+            base_output_fp32=settled_base_fp32,
         )
         for _key, _stored in (
             ("marginal_ref", item7["vcorr_acc_marginal_ref"]),
@@ -2164,8 +2264,14 @@ def _write_stage2_golden(
                 )
 
         # 3d: first-kd K-move fixup (fields present only when the trace
-        # de-escalates on the K axis). kd is a one-rung down move.
+        # de-escalates on the K axis). kd is a one-rung down move. Never on
+        # the escalate-only frozen walk; explicitly not supported in union
+        # mode (the union pass is defined on escalate-only traces).
         kd_j = next((j for j, k in enumerate(kinds) if k == "kd"), None)
+        if kd_j is not None and union_mode:
+            raise AssertionError(
+                f"union-commit golden dump on a de-escalating trace q{qidx} h{head}: unsupported"
+            )
         if kd_j is not None:
             ki_from = int(p_ki[kd_j])
             ki_to = ki_from - 1
@@ -2340,6 +2446,48 @@ def _write_stage2_golden(
         item8["two_pass_occupancy_hist_lo_fp64"] = float(q_min)
         item8["two_pass_occupancy_hist_hi_fp64"] = float(q_max)
 
+    # Issue #20 union-commit group context: everything a consumer needs to
+    # replay/verify the union execution for this head — the per-head committed
+    # sets (ragged, ordered by union_group_heads), the union ids, the group
+    # hi-K union (RTL tier-merge verification target), the union softmax
+    # normalization scalars, and the envelope relL2 bookkeeping.
+    union_fields: dict[str, object] = {}
+    if union_mode:
+        def _ragged(sets_: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+            offs = np.zeros(len(sets_) + 1, dtype=np.int64)
+            for i_, s_ in enumerate(sets_):
+                offs[i_ + 1] = offs[i_] + int(np.asarray(s_).size)
+            flat = (
+                np.concatenate([np.asarray(s_, dtype=np.int64) for s_ in sets_])
+                if sets_
+                else np.zeros(0, dtype=np.int64)
+            )
+            return flat, offs
+
+        gk_flat, gk_off = _ragged(group_committed_k or [])
+        gv_flat, gv_off = _ragged(group_committed_v or [])
+        gh_flat, gh_off = _ragged(group_committed_hi_k or [])
+        usv = np.asarray(union_score_vec)
+        u_max = float(np.max(usv)) if usv.size else 0.0
+        u_sumexp = float(np.sum(np.exp(usv - u_max))) if usv.size else 0.0
+        union_fields = {
+            "gqa_union_commit": True,
+            "union_group_heads": np.asarray(union_group_heads, dtype=np.int64),
+            "union_k_tokens": union_k_tokens,
+            "union_k_hi_tokens": union_k_hi_tokens,
+            "union_v_tokens": union_v_tokens,
+            "group_committed_k_flat": gk_flat,
+            "group_committed_k_offsets": gk_off,
+            "group_committed_v_flat": gv_flat,
+            "group_committed_v_offsets": gv_off,
+            "group_committed_hi_k_flat": gh_flat,
+            "group_committed_hi_k_offsets": gh_off,
+            "union_score_max_fp64": float(u_max),
+            "union_softmax_sumexp_fp64": float(u_sumexp),
+            "union_baseline_rel_l2_fp64": float(union_baseline_rel_l2),
+            "union_rel_l2_fp64": float(union_rel_l2),
+        }
+
     np.savez_compressed(
         out / f"golden2_q{int(qidx)}_h{int(head)}.npz",
         qidx=int(qidx),
@@ -2395,6 +2543,7 @@ def _write_stage2_golden(
         v_dropped_reads_key=int(dropped_key),
         **item7,
         **item8,
+        **union_fields,
     )
 
 
@@ -3433,6 +3582,17 @@ def run() -> None:
         ),
     )
     parser.add_argument(
+        "--golden_dump_stage2_heads",
+        default="",
+        help=(
+            "Optional CSV of head ids: dump golden2_*.npz rows only for these "
+            "heads (empty = every head in --heads). Lets union-commit golden "
+            "runs (issue #20) execute the full 4-head GQA groups while dumping "
+            "only the contract rows; group-mate data is embedded in each row's "
+            "union_* fields."
+        ),
+    )
+    parser.add_argument(
         "--epoch_trace_dir",
         default="",
         help=(
@@ -3729,6 +3889,12 @@ def run() -> None:
     gqa_union_rows: list[dict[str, object]] = []
     gqa_union_commit = bool(args.gqa_union_commit)
     gqa_union_commit_rows: list[dict[str, object]] = []
+    golden_dump_heads: set[int] | None = (
+        {int(x) for x in parse_csv_ints(args.golden_dump_stage2_heads)}
+        if str(args.golden_dump_stage2_heads).strip()
+        else None
+    )
+    union_stage2_dump = bool(str(args.golden_dump_stage2_dir)) and gqa_union_commit
     page_index_build_cache: dict[int, dict[str, object]] = {}
     t0 = time.perf_counter()
 
@@ -4761,7 +4927,15 @@ def run() -> None:
                                     float(v_budgets[vi]) / max(float(context_len), 1.0),
                                 )
                                 approx = outputs[(ki, vi)]
-                                if str(args.golden_dump_stage2_dir):
+                                # Union-commit (issue #20 item 3): stage-2 dumps
+                                # are DEFERRED to the post-loop union pass, where
+                                # the group unions exist; the walk-domain inputs
+                                # are stashed below alongside the union stash.
+                                if (
+                                    str(args.golden_dump_stage2_dir)
+                                    and not gqa_union_commit
+                                    and (golden_dump_heads is None or int(head) in golden_dump_heads)
+                                ):
                                     _write_stage2_golden(
                                         str(args.golden_dump_stage2_dir),
                                         qidx=int(qidx),
@@ -5032,7 +5206,7 @@ def run() -> None:
                                         )
                                     else:
                                         committed_hi_k = committed_k
-                                    uc_stash.setdefault(uc_key, {})[int(head)] = {
+                                    uc_rec: dict[str, object] = {
                                         "head": int(head),
                                         "kv_head": int(kv_head),
                                         "variant": str(score_proxy_variant),
@@ -5058,6 +5232,27 @@ def run() -> None:
                                         "calibrate": str(args.tail_score_calibration) == "affine_selected",
                                         "key_bytes": int(args.key_bytes),
                                     }
+                                    if union_stage2_dump:
+                                        # Walk-domain inputs the deferred stage-2
+                                        # union golden writer needs (issue #20
+                                        # item 3). References only; per-qidx
+                                        # lifetime (uc_stash clears each qidx).
+                                        uc_rec.update(
+                                            {
+                                                "start_ki": int(start_ki),
+                                                "start_vi": int(start_vi),
+                                                "policy_trace": list(policy_trace),
+                                                "scores_by_k": scores_by_k,
+                                                "probs_by_k": probs_by_k,
+                                                "base_output_by_k": base_output_by_k,
+                                                "selected_by_k": selected_by_k,
+                                                "values_np": values_np,
+                                                "values_lo": values_lo,
+                                                "resident_base": np.asarray(base, dtype=np.int64),
+                                                "index": index,
+                                            }
+                                        )
+                                    uc_stash.setdefault(uc_key, {})[int(head)] = uc_rec
                                 row = {
                                     "qidx": int(qidx),
                                     "position": int(position),
@@ -5554,8 +5749,23 @@ def run() -> None:
                 ).astype(np.int64)
                 k_sum = int(sum(int(r["committed_k"].size) for r in recs))
                 v_sum = int(sum(int(r["committed_v"].size) for r in recs))
+                if union_stage2_dump:
+                    # One V-PQ page block per (kv_head, ctx) — selection-
+                    # independent, identical for every group member.
+                    _write_stage2_vpage(
+                        str(args.golden_dump_stage2_dir),
+                        index=recs[0]["index"],
+                        values_np=recs[0]["values_np"],
+                        kv_head=int(uc_key[0]),
+                        context_len=int(context_len),
+                        subbits=int(args.subbits),
+                        value_subvecs=int(args.value_subvecs),
+                        value_subbits=int(args.value_subbits),
+                        code_error=recs[0]["code_error"],
+                        precision_v_lo_err=recs[0]["precision_v_lo_err"],
+                    )
                 for rec in recs:
-                    out_union, umeta = gqa_union_commit_head_output(
+                    out_union, umeta, uinternals = gqa_union_commit_head_output(
                         rec=rec,
                         union_k=union_k,
                         group_hi_k=group_hi_k,
@@ -5606,6 +5816,67 @@ def run() -> None:
                             "union_cosine": float(u_metric["output_cosine"]),
                         }
                     )
+                    if union_stage2_dump and (
+                        golden_dump_heads is None or int(rec["head"]) in golden_dump_heads
+                    ):
+                        _write_stage2_golden(
+                            str(args.golden_dump_stage2_dir),
+                            qidx=int(qidx),
+                            head=int(rec["head"]),
+                            kv_head=int(uc_key[0]),
+                            position=int(position),
+                            context_len=int(context_len),
+                            dynamic_start=int(dynamic_start),
+                            sealed_end=int(sealed_end_geom),
+                            page_size=int(args.page_size),
+                            head_dim=int(trace.head_dim),
+                            threshold=float(uc_key[4]),
+                            policy=str(uc_key[3]),
+                            start_strategy=str(uc_key[5]),
+                            start_ki=int(rec["start_ki"]),
+                            start_vi=int(rec["start_vi"]),
+                            settled_ki=int(rec["committed_ki"]),
+                            settled_vi=int(rec["committed_vi"]),
+                            policy_trace=list(rec["policy_trace"]),
+                            ranked_scores_cpu=rec["ranked_scores_cpu"],
+                            k_budgets=k_budgets,
+                            v_budgets=v_budgets,
+                            scores_by_k=rec["scores_by_k"],
+                            probs_by_k=rec["probs_by_k"],
+                            base_output_by_k=rec["base_output_by_k"],
+                            selected_by_k=rec["selected_by_k"],
+                            vhat=rec["vhat_for_base"],
+                            code_error=rec["code_error"],
+                            precision_v_hi_frac=float(precision_v_hi_frac),
+                            precision_v_lo_err=rec["precision_v_lo_err"],
+                            values_fp16=rec["values_np"],
+                            values_lo=rec["values_lo"],
+                            v_risk_key_bits=(
+                                (int(args.v_risk_key_exp_bits), int(args.v_risk_key_mantissa_bits))
+                                if int(args.v_risk_key_exp_bits) > 0
+                                else None
+                            ),
+                            resident_base_cpu=rec["resident_base"],
+                            ranked_cpu=rec["ranked_cpu"],
+                            exact_scores_np=rec["scores_np"],
+                            two_pass_calibrate=bool(rec["calibrate"]),
+                            two_pass_frac_bits=int(args.two_pass_cutoff_frac_bits),
+                            two_pass_int_bits=int(args.two_pass_cutoff_int_bits),
+                            union_group_heads=np.asarray(
+                                [int(r["head"]) for r in recs], dtype=np.int64
+                            ),
+                            union_k_tokens=union_k,
+                            union_k_hi_tokens=group_hi_k,
+                            union_v_tokens=union_v,
+                            union_score_vec=uinternals["score_vec"],
+                            union_probs=uinternals["probs"],
+                            union_base_output=uinternals["base_output"],
+                            group_committed_k=[r["committed_k"] for r in recs],
+                            group_committed_v=[r["committed_v"] for r in recs],
+                            group_committed_hi_k=[r["committed_hi_k"] for r in recs],
+                            union_baseline_rel_l2=float(base_rl2),
+                            union_rel_l2=float(union_rl2),
+                        )
             uc_stash.clear()
         dense_concat = np.concatenate([dense_heads[int(head)] for head in heads], axis=0).astype(np.float32, copy=False)
         dense_proj = project_head_subset(
