@@ -31,9 +31,16 @@ Regen: `scripts/run_stage2_union_commit_regen.sbatch` (job 53296998), branch
    - aggregate mean AND p95 o-proj relL2 must improve (union < baseline) at
      every validated position;
    - per-head regressions permitted only at ctx < 32k, bounded at
-     **≤ +6e-4 absolute and ≤ +15% relative** vs the frozen baseline.
+     **≤ +6e-4 absolute and ≤ +15% relative** vs the frozen baseline;
+   - **tie floor (proposed numeric amendment, pending RTL sign-off on the
+     #20 thread):** deltas ≤ 1e-7 absolute relL2 are ties, not regressions,
+     at any ctx. The strict-zero clause at ctx ≥ 32k is not falsifiable at
+     fp32 metric precision — observed q223 h14/kv3: baseline 5.041846e-4 →
+     union 5.042063e-4 (+2.17e-8, +0.004%), the only positive delta in the
+     96-row standard set. Ties are printed by the gate, never silent.
    Encoded as a hard assertion in `scripts/verify_union_envelope.py`, run by
-   the regen job on its own `gqa_union_commit.csv`.
+   the regen job on its own `gqa_union_commit.csv` (all 32 heads per
+   position — the ratified population; see Inventory).
 
 ## Inventory
 

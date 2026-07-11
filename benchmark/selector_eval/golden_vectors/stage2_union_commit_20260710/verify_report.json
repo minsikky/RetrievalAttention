@@ -1,0 +1,995 @@
+{
+  "dv_domain": {
+    "flagged": [],
+    "max_abs": 4.0264735510706084e-07,
+    "worst_row": "golden2_q287_h16.npz"
+  },
+  "fatal": 12,
+  "g3": {
+    "checked": 14,
+    "max_abs_by_band_domain": {
+      "hiboundary_hw": 0.0,
+      "hiboundary_ref": 0.0,
+      "marginal_hw": 0.0,
+      "marginal_ref": 0.0,
+      "settled_hw": 0.0,
+      "settled_ref": 0.0
+    },
+    "rows": [
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q137_h0.npz"
+      },
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q137_h5.npz"
+      },
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q159_h0.npz"
+      },
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q159_h16.npz"
+      },
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q159_h24.npz"
+      },
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q159_h8.npz"
+      },
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q223_h0.npz"
+      },
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q223_h16.npz"
+      },
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q223_h24.npz"
+      },
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q223_h8.npz"
+      },
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q287_h0.npz"
+      },
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q287_h16.npz"
+      },
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q287_h24.npz"
+      },
+      {
+        "error": null,
+        "max_abs_by_band_domain": {
+          "hiboundary_hw": 0.0,
+          "hiboundary_ref": 0.0,
+          "marginal_hw": 0.0,
+          "marginal_ref": 0.0,
+          "settled_hw": 0.0,
+          "settled_ref": 0.0
+        },
+        "row": "golden2_q287_h8.npz"
+      }
+    ],
+    "worst": {
+      "key": "golden2_q137_h0.npz:marginal_ref",
+      "max_abs": 0.0
+    }
+  },
+  "pages": [
+    {
+      "page": "page_v_ctx134838_kv0.npz",
+      "status": "bit-identical"
+    },
+    {
+      "page": "page_v_ctx134838_kv2.npz",
+      "status": "bit-identical"
+    },
+    {
+      "page": "page_v_ctx134838_kv4.npz",
+      "status": "bit-identical"
+    },
+    {
+      "page": "page_v_ctx134838_kv6.npz",
+      "status": "bit-identical"
+    },
+    {
+      "page": "page_v_ctx14838_kv0.npz",
+      "status": "bit-identical"
+    },
+    {
+      "page": "page_v_ctx14838_kv2.npz",
+      "status": "bit-identical"
+    },
+    {
+      "page": "page_v_ctx14838_kv4.npz",
+      "status": "bit-identical"
+    },
+    {
+      "page": "page_v_ctx14838_kv6.npz",
+      "status": "bit-identical"
+    },
+    {
+      "page": "page_v_ctx38838_kv0.npz",
+      "status": "bit-identical"
+    },
+    {
+      "page": "page_v_ctx38838_kv2.npz",
+      "status": "bit-identical"
+    },
+    {
+      "page": "page_v_ctx38838_kv4.npz",
+      "status": "bit-identical"
+    },
+    {
+      "page": "page_v_ctx38838_kv6.npz",
+      "status": "bit-identical"
+    }
+  ],
+  "rows": [
+    {
+      "dv_hw_minus_ref_max": 1.9503329944103864e-07,
+      "dv_trace_delta_max": 2.3564704524844937e-07,
+      "fp_vs_key_mask_token_diffs": {
+        "exact": 0,
+        "hi": 0,
+        "lo": 0
+      },
+      "frozen_field_mismatches": [
+        "band_labels: bits differ",
+        "band_count: bits differ",
+        "band_max: bits differ",
+        "band_sumexp: bits differ",
+        "band_acc: bits differ",
+        "combined_output_fp32: bits differ",
+        "base_output_fp32: bits differ",
+        "combine_rel_err: bits differ",
+        "risk_scores: bits differ",
+        "v_exact_count: bits differ",
+        "v_risk_cutoff: bits differ",
+        "v_exact_mask_packed: bits differ",
+        "v_hi_mask_packed: bits differ",
+        "v_lo_mask_packed: bits differ",
+        "v_w17_fp64: bits differ",
+        "vcorr_settled_acc_ref: bits differ",
+        "vcorr_settled_acc_hw: bits differ",
+        "vexact_tokens: bits differ",
+        "vexact_v_fp16: bits differ",
+        "vexact_int8_codes: bits differ",
+        "vexact_int8_scale: bits differ",
+        "vexact_int8_scale_fp64: bits differ",
+        "vexact_int8_err_fp16: bits differ",
+        "vexact_commit: bits differ",
+        "vexact_residual_codes: bits differ",
+        "vexact_residual_scale: bits differ",
+        "vexact_residual_scale_fp64: bits differ",
+        "vexact_band_tokens: bits differ",
+        "vexact_band_v_fp32: bits differ",
+        "vexact_band_values_lo_fp32: bits differ",
+        "vexact_band_commit: bits differ",
+        "vexact_band_p_settled_fp64: bits differ"
+      ],
+      "key_mask_token_diffs_frozen_vs_regen": {
+        "exact": 417,
+        "hi": 42,
+        "lo": 459
+      },
+      "missing_fields": [],
+      "row": "golden2_q159_h0.npz"
+    },
+    {
+      "dv_hw_minus_ref_max": 2.5489220250533157e-08,
+      "dv_trace_delta_max": 2.6206731630964986e-07,
+      "fp_vs_key_mask_token_diffs": {
+        "exact": 0,
+        "hi": 0,
+        "lo": 0
+      },
+      "frozen_field_mismatches": [
+        "band_labels: bits differ",
+        "band_count: bits differ",
+        "band_max: bits differ",
+        "band_sumexp: bits differ",
+        "band_acc: bits differ",
+        "combined_output_fp32: bits differ",
+        "base_output_fp32: bits differ",
+        "combine_rel_err: bits differ",
+        "risk_scores: bits differ",
+        "v_exact_count: bits differ",
+        "v_risk_cutoff: bits differ",
+        "v_exact_mask_packed: bits differ",
+        "v_hi_mask_packed: bits differ",
+        "v_lo_mask_packed: bits differ",
+        "v_w17_fp64: bits differ",
+        "vcorr_settled_acc_ref: bits differ",
+        "vcorr_settled_acc_hw: bits differ",
+        "vexact_tokens: bits differ",
+        "vexact_v_fp16: bits differ",
+        "vexact_int8_codes: bits differ",
+        "vexact_int8_scale: bits differ",
+        "vexact_int8_scale_fp64: bits differ",
+        "vexact_int8_err_fp16: bits differ",
+        "vexact_commit: bits differ",
+        "vexact_residual_codes: bits differ",
+        "vexact_residual_scale: bits differ",
+        "vexact_residual_scale_fp64: bits differ",
+        "vexact_band_tokens: bits differ",
+        "vexact_band_v_fp32: bits differ",
+        "vexact_band_values_lo_fp32: bits differ",
+        "vexact_band_commit: bits differ",
+        "vexact_band_p_settled_fp64: bits differ"
+      ],
+      "key_mask_token_diffs_frozen_vs_regen": {
+        "exact": 906,
+        "hi": 90,
+        "lo": 996
+      },
+      "missing_fields": [],
+      "row": "golden2_q159_h16.npz"
+    },
+    {
+      "dv_hw_minus_ref_max": 1.1791373761508434e-08,
+      "dv_trace_delta_max": 7.646512119319215e-08,
+      "fp_vs_key_mask_token_diffs": {
+        "exact": 0,
+        "hi": 0,
+        "lo": 0
+      },
+      "frozen_field_mismatches": [
+        "band_labels: bits differ",
+        "band_count: bits differ",
+        "band_max: bits differ",
+        "band_sumexp: bits differ",
+        "band_acc: bits differ",
+        "combined_output_fp32: bits differ",
+        "base_output_fp32: bits differ",
+        "combine_rel_err: bits differ",
+        "risk_scores: bits differ",
+        "v_exact_count: bits differ",
+        "v_risk_cutoff: bits differ",
+        "v_exact_mask_packed: bits differ",
+        "v_hi_mask_packed: bits differ",
+        "v_lo_mask_packed: bits differ",
+        "v_w17_fp64: bits differ",
+        "vcorr_settled_acc_ref: bits differ",
+        "vcorr_settled_acc_hw: bits differ",
+        "vexact_tokens: bits differ",
+        "vexact_v_fp16: bits differ",
+        "vexact_int8_codes: bits differ",
+        "vexact_int8_scale: bits differ",
+        "vexact_int8_scale_fp64: bits differ",
+        "vexact_int8_err_fp16: bits differ",
+        "vexact_commit: bits differ",
+        "vexact_residual_codes: bits differ",
+        "vexact_residual_scale: bits differ",
+        "vexact_residual_scale_fp64: bits differ",
+        "vexact_band_tokens: bits differ",
+        "vexact_band_v_fp32: bits differ",
+        "vexact_band_values_lo_fp32: bits differ",
+        "vexact_band_commit: bits differ",
+        "vexact_band_p_settled_fp64: bits differ"
+      ],
+      "key_mask_token_diffs_frozen_vs_regen": {
+        "exact": 2986,
+        "hi": 298,
+        "lo": 3284
+      },
+      "missing_fields": [],
+      "row": "golden2_q159_h24.npz"
+    },
+    {
+      "dv_hw_minus_ref_max": 2.102996737771666e-07,
+      "dv_trace_delta_max": 3.7190176002720524e-07,
+      "fp_vs_key_mask_token_diffs": {
+        "exact": 0,
+        "hi": 0,
+        "lo": 0
+      },
+      "frozen_field_mismatches": [
+        "band_labels: bits differ",
+        "band_count: bits differ",
+        "band_max: bits differ",
+        "band_sumexp: bits differ",
+        "band_acc: bits differ",
+        "combined_output_fp32: bits differ",
+        "base_output_fp32: bits differ",
+        "combine_rel_err: bits differ",
+        "risk_scores: bits differ",
+        "v_exact_count: bits differ",
+        "v_risk_cutoff: bits differ",
+        "v_exact_mask_packed: bits differ",
+        "v_hi_mask_packed: bits differ",
+        "v_lo_mask_packed: bits differ",
+        "v_w17_fp64: bits differ",
+        "vcorr_settled_acc_ref: bits differ",
+        "vcorr_settled_acc_hw: bits differ",
+        "vexact_tokens: bits differ",
+        "vexact_v_fp16: bits differ",
+        "vexact_int8_codes: bits differ",
+        "vexact_int8_scale: bits differ",
+        "vexact_int8_scale_fp64: bits differ",
+        "vexact_int8_err_fp16: bits differ",
+        "vexact_commit: bits differ",
+        "vexact_residual_codes: bits differ",
+        "vexact_residual_scale: bits differ",
+        "vexact_residual_scale_fp64: bits differ",
+        "vexact_band_tokens: bits differ",
+        "vexact_band_v_fp32: bits differ",
+        "vexact_band_values_lo_fp32: bits differ",
+        "vexact_band_commit: bits differ",
+        "vexact_band_p_settled_fp64: bits differ"
+      ],
+      "key_mask_token_diffs_frozen_vs_regen": {
+        "exact": 491,
+        "hi": 49,
+        "lo": 540
+      },
+      "missing_fields": [],
+      "row": "golden2_q159_h8.npz"
+    },
+    {
+      "dv_hw_minus_ref_max": 1.815716139941248e-09,
+      "dv_trace_delta_max": 4.092716973309093e-07,
+      "fp_vs_key_mask_token_diffs": {
+        "exact": 0,
+        "hi": 0,
+        "lo": 0
+      },
+      "frozen_field_mismatches": [
+        "band_labels: bits differ",
+        "band_count: bits differ",
+        "band_max: bits differ",
+        "band_sumexp: bits differ",
+        "band_acc: bits differ",
+        "combined_output_fp32: bits differ",
+        "base_output_fp32: bits differ",
+        "combine_rel_err: bits differ",
+        "risk_scores: bits differ",
+        "v_exact_count: bits differ",
+        "v_risk_cutoff: bits differ",
+        "v_exact_mask_packed: bits differ",
+        "v_hi_mask_packed: bits differ",
+        "v_lo_mask_packed: bits differ",
+        "v_w17_fp64: bits differ",
+        "vcorr_settled_acc_ref: bits differ",
+        "vcorr_settled_acc_hw: bits differ",
+        "vexact_tokens: bits differ",
+        "vexact_v_fp16: bits differ",
+        "vexact_int8_codes: bits differ",
+        "vexact_int8_scale: bits differ",
+        "vexact_int8_scale_fp64: bits differ",
+        "vexact_int8_err_fp16: bits differ",
+        "vexact_commit: bits differ",
+        "vexact_residual_codes: bits differ",
+        "vexact_residual_scale: bits differ",
+        "vexact_residual_scale_fp64: bits differ",
+        "vexact_band_tokens: bits differ",
+        "vexact_band_v_fp32: bits differ",
+        "vexact_band_values_lo_fp32: bits differ",
+        "vexact_band_commit: bits differ",
+        "vexact_band_p_settled_fp64: bits differ"
+      ],
+      "key_mask_token_diffs_frozen_vs_regen": {
+        "exact": 1847,
+        "hi": 185,
+        "lo": 2032
+      },
+      "missing_fields": [],
+      "row": "golden2_q223_h0.npz"
+    },
+    {
+      "dv_hw_minus_ref_max": 3.311074166088184e-08,
+      "dv_trace_delta_max": 3.3299526288081346e-08,
+      "fp_vs_key_mask_token_diffs": {
+        "exact": 0,
+        "hi": 0,
+        "lo": 0
+      },
+      "frozen_field_mismatches": [
+        "band_labels: bits differ",
+        "band_count: bits differ",
+        "band_max: bits differ",
+        "band_sumexp: bits differ",
+        "band_acc: bits differ",
+        "combined_output_fp32: bits differ",
+        "base_output_fp32: bits differ",
+        "combine_rel_err: bits differ",
+        "risk_scores: bits differ",
+        "v_exact_count: bits differ",
+        "v_risk_cutoff: bits differ",
+        "v_exact_mask_packed: bits differ",
+        "v_hi_mask_packed: bits differ",
+        "v_lo_mask_packed: bits differ",
+        "v_w17_fp64: bits differ",
+        "vcorr_settled_acc_ref: bits differ",
+        "vcorr_settled_acc_hw: bits differ",
+        "vexact_tokens: bits differ",
+        "vexact_v_fp16: bits differ",
+        "vexact_int8_codes: bits differ",
+        "vexact_int8_scale: bits differ",
+        "vexact_int8_scale_fp64: bits differ",
+        "vexact_int8_err_fp16: bits differ",
+        "vexact_commit: bits differ",
+        "vexact_residual_codes: bits differ",
+        "vexact_residual_scale: bits differ",
+        "vexact_residual_scale_fp64: bits differ",
+        "vexact_band_tokens: bits differ",
+        "vexact_band_v_fp32: bits differ",
+        "vexact_band_values_lo_fp32: bits differ",
+        "vexact_band_commit: bits differ",
+        "vexact_band_p_settled_fp64: bits differ"
+      ],
+      "key_mask_token_diffs_frozen_vs_regen": {
+        "exact": 2100,
+        "hi": 210,
+        "lo": 2306
+      },
+      "missing_fields": [],
+      "row": "golden2_q223_h16.npz"
+    },
+    {
+      "dv_hw_minus_ref_max": 2.104308726021912e-09,
+      "dv_trace_delta_max": 4.19854042824617e-07,
+      "fp_vs_key_mask_token_diffs": {
+        "exact": 0,
+        "hi": 0,
+        "lo": 0
+      },
+      "frozen_field_mismatches": [
+        "band_labels: bits differ",
+        "band_count: bits differ",
+        "band_max: bits differ",
+        "band_sumexp: bits differ",
+        "band_acc: bits differ",
+        "combined_output_fp32: bits differ",
+        "base_output_fp32: bits differ",
+        "combine_rel_err: bits differ",
+        "risk_scores: bits differ",
+        "v_exact_count: bits differ",
+        "v_risk_cutoff: bits differ",
+        "v_exact_mask_packed: bits differ",
+        "v_hi_mask_packed: bits differ",
+        "v_lo_mask_packed: bits differ",
+        "v_w17_fp64: bits differ",
+        "vcorr_settled_acc_ref: bits differ",
+        "vcorr_settled_acc_hw: bits differ",
+        "vexact_tokens: bits differ",
+        "vexact_v_fp16: bits differ",
+        "vexact_int8_codes: bits differ",
+        "vexact_int8_scale: bits differ",
+        "vexact_int8_scale_fp64: bits differ",
+        "vexact_int8_err_fp16: bits differ",
+        "vexact_commit: bits differ",
+        "vexact_residual_codes: bits differ",
+        "vexact_residual_scale: bits differ",
+        "vexact_residual_scale_fp64: bits differ",
+        "vexact_band_tokens: bits differ",
+        "vexact_band_v_fp32: bits differ",
+        "vexact_band_values_lo_fp32: bits differ",
+        "vexact_band_commit: bits differ",
+        "vexact_band_p_settled_fp64: bits differ"
+      ],
+      "key_mask_token_diffs_frozen_vs_regen": {
+        "exact": 2872,
+        "hi": 287,
+        "lo": 3135
+      },
+      "missing_fields": [],
+      "row": "golden2_q223_h24.npz"
+    },
+    {
+      "dv_hw_minus_ref_max": 4.9527199525584154e-08,
+      "dv_trace_delta_max": 3.018185238561934e-08,
+      "fp_vs_key_mask_token_diffs": {
+        "exact": 0,
+        "hi": 0,
+        "lo": 0
+      },
+      "frozen_field_mismatches": [
+        "band_labels: bits differ",
+        "band_count: bits differ",
+        "band_max: bits differ",
+        "band_sumexp: bits differ",
+        "band_acc: bits differ",
+        "combined_output_fp32: bits differ",
+        "base_output_fp32: bits differ",
+        "combine_rel_err: bits differ",
+        "risk_scores: bits differ",
+        "v_exact_count: bits differ",
+        "v_risk_cutoff: bits differ",
+        "v_exact_mask_packed: bits differ",
+        "v_hi_mask_packed: bits differ",
+        "v_lo_mask_packed: bits differ",
+        "v_w17_fp64: bits differ",
+        "vcorr_settled_acc_ref: bits differ",
+        "vcorr_settled_acc_hw: bits differ",
+        "vexact_tokens: bits differ",
+        "vexact_v_fp16: bits differ",
+        "vexact_int8_codes: bits differ",
+        "vexact_int8_scale: bits differ",
+        "vexact_int8_scale_fp64: bits differ",
+        "vexact_int8_err_fp16: bits differ",
+        "vexact_commit: bits differ",
+        "vexact_residual_codes: bits differ",
+        "vexact_residual_scale: bits differ",
+        "vexact_residual_scale_fp64: bits differ",
+        "vexact_band_tokens: bits differ",
+        "vexact_band_v_fp32: bits differ",
+        "vexact_band_values_lo_fp32: bits differ",
+        "vexact_band_commit: bits differ",
+        "vexact_band_p_settled_fp64: bits differ"
+      ],
+      "key_mask_token_diffs_frozen_vs_regen": {
+        "exact": 6268,
+        "hi": 627,
+        "lo": 6875
+      },
+      "missing_fields": [],
+      "row": "golden2_q223_h8.npz"
+    },
+    {
+      "dv_hw_minus_ref_max": 1.88264058222044e-09,
+      "dv_trace_delta_max": 1.6578795913505624e-07,
+      "fp_vs_key_mask_token_diffs": {
+        "exact": 0,
+        "hi": 0,
+        "lo": 0
+      },
+      "frozen_field_mismatches": [
+        "band_labels: bits differ",
+        "band_count: bits differ",
+        "band_max: bits differ",
+        "band_sumexp: bits differ",
+        "band_acc: bits differ",
+        "combined_output_fp32: bits differ",
+        "base_output_fp32: bits differ",
+        "combine_rel_err: bits differ",
+        "risk_scores: bits differ",
+        "v_exact_count: bits differ",
+        "v_risk_cutoff: bits differ",
+        "v_exact_mask_packed: bits differ",
+        "v_hi_mask_packed: bits differ",
+        "v_lo_mask_packed: bits differ",
+        "v_w17_fp64: bits differ",
+        "vcorr_settled_acc_ref: bits differ",
+        "vcorr_settled_acc_hw: bits differ",
+        "vexact_tokens: bits differ",
+        "vexact_v_fp16: bits differ",
+        "vexact_int8_codes: bits differ",
+        "vexact_int8_scale: bits differ",
+        "vexact_int8_scale_fp64: bits differ",
+        "vexact_int8_err_fp16: bits differ",
+        "vexact_commit: bits differ",
+        "vexact_residual_codes: bits differ",
+        "vexact_residual_scale: bits differ",
+        "vexact_residual_scale_fp64: bits differ",
+        "vexact_band_tokens: bits differ",
+        "vexact_band_v_fp32: bits differ",
+        "vexact_band_values_lo_fp32: bits differ",
+        "vexact_band_commit: bits differ",
+        "vexact_band_p_settled_fp64: bits differ"
+      ],
+      "key_mask_token_diffs_frozen_vs_regen": {
+        "exact": 5700,
+        "hi": 570,
+        "lo": 6266
+      },
+      "missing_fields": [],
+      "row": "golden2_q287_h0.npz"
+    },
+    {
+      "dv_hw_minus_ref_max": 4.0264735510706084e-07,
+      "dv_trace_delta_max": 1.9635918137956773e-07,
+      "fp_vs_key_mask_token_diffs": {
+        "exact": 0,
+        "hi": 0,
+        "lo": 0
+      },
+      "frozen_field_mismatches": [
+        "band_labels: bits differ",
+        "band_count: bits differ",
+        "band_max: bits differ",
+        "band_sumexp: bits differ",
+        "band_acc: bits differ",
+        "combined_output_fp32: bits differ",
+        "base_output_fp32: bits differ",
+        "combine_rel_err: bits differ",
+        "risk_scores: bits differ",
+        "v_exact_count: bits differ",
+        "v_risk_cutoff: bits differ",
+        "v_exact_mask_packed: bits differ",
+        "v_hi_mask_packed: bits differ",
+        "v_lo_mask_packed: bits differ",
+        "v_w17_fp64: bits differ",
+        "vcorr_settled_acc_ref: bits differ",
+        "vcorr_settled_acc_hw: bits differ",
+        "vexact_tokens: bits differ",
+        "vexact_v_fp16: bits differ",
+        "vexact_int8_codes: bits differ",
+        "vexact_int8_scale: bits differ",
+        "vexact_int8_scale_fp64: bits differ",
+        "vexact_int8_err_fp16: bits differ",
+        "vexact_commit: bits differ",
+        "vexact_residual_codes: bits differ",
+        "vexact_residual_scale: bits differ",
+        "vexact_residual_scale_fp64: bits differ",
+        "vexact_band_tokens: bits differ",
+        "vexact_band_v_fp32: bits differ",
+        "vexact_band_values_lo_fp32: bits differ",
+        "vexact_band_commit: bits differ",
+        "vexact_band_p_settled_fp64: bits differ"
+      ],
+      "key_mask_token_diffs_frozen_vs_regen": {
+        "exact": 4734,
+        "hi": 473,
+        "lo": 5207
+      },
+      "missing_fields": [],
+      "row": "golden2_q287_h16.npz"
+    },
+    {
+      "dv_hw_minus_ref_max": 1.2081792755374958e-09,
+      "dv_trace_delta_max": 1.412793173028999e-07,
+      "fp_vs_key_mask_token_diffs": {
+        "exact": 0,
+        "hi": 0,
+        "lo": 0
+      },
+      "frozen_field_mismatches": [
+        "band_labels: bits differ",
+        "band_count: bits differ",
+        "band_max: bits differ",
+        "band_sumexp: bits differ",
+        "band_acc: bits differ",
+        "combined_output_fp32: bits differ",
+        "base_output_fp32: bits differ",
+        "combine_rel_err: bits differ",
+        "risk_scores: bits differ",
+        "v_exact_count: bits differ",
+        "v_risk_cutoff: bits differ",
+        "v_exact_mask_packed: bits differ",
+        "v_hi_mask_packed: bits differ",
+        "v_lo_mask_packed: bits differ",
+        "v_w17_fp64: bits differ",
+        "vcorr_settled_acc_ref: bits differ",
+        "vcorr_settled_acc_hw: bits differ",
+        "vexact_tokens: bits differ",
+        "vexact_v_fp16: bits differ",
+        "vexact_int8_codes: bits differ",
+        "vexact_int8_scale: bits differ",
+        "vexact_int8_scale_fp64: bits differ",
+        "vexact_int8_err_fp16: bits differ",
+        "vexact_commit: bits differ",
+        "vexact_residual_codes: bits differ",
+        "vexact_residual_scale: bits differ",
+        "vexact_residual_scale_fp64: bits differ",
+        "vexact_band_tokens: bits differ",
+        "vexact_band_v_fp32: bits differ",
+        "vexact_band_values_lo_fp32: bits differ",
+        "vexact_band_commit: bits differ",
+        "vexact_band_p_settled_fp64: bits differ"
+      ],
+      "key_mask_token_diffs_frozen_vs_regen": {
+        "exact": 6752,
+        "hi": 675,
+        "lo": 7397
+      },
+      "missing_fields": [],
+      "row": "golden2_q287_h24.npz"
+    },
+    {
+      "dv_hw_minus_ref_max": 9.548121242448655e-08,
+      "dv_trace_delta_max": 2.698570009136009e-07,
+      "fp_vs_key_mask_token_diffs": {
+        "exact": 0,
+        "hi": 0,
+        "lo": 0
+      },
+      "frozen_field_mismatches": [
+        "band_labels: bits differ",
+        "band_count: bits differ",
+        "band_max: bits differ",
+        "band_sumexp: bits differ",
+        "band_acc: bits differ",
+        "combined_output_fp32: bits differ",
+        "base_output_fp32: bits differ",
+        "combine_rel_err: bits differ",
+        "risk_scores: bits differ",
+        "v_exact_count: bits differ",
+        "v_risk_cutoff: bits differ",
+        "v_exact_mask_packed: bits differ",
+        "v_hi_mask_packed: bits differ",
+        "v_lo_mask_packed: bits differ",
+        "v_w17_fp64: bits differ",
+        "vcorr_settled_acc_ref: bits differ",
+        "vcorr_settled_acc_hw: bits differ",
+        "vexact_tokens: bits differ",
+        "vexact_v_fp16: bits differ",
+        "vexact_int8_codes: bits differ",
+        "vexact_int8_scale: bits differ",
+        "vexact_int8_scale_fp64: bits differ",
+        "vexact_int8_err_fp16: bits differ",
+        "vexact_commit: bits differ",
+        "vexact_residual_codes: bits differ",
+        "vexact_residual_scale: bits differ",
+        "vexact_residual_scale_fp64: bits differ",
+        "vexact_band_tokens: bits differ",
+        "vexact_band_v_fp32: bits differ",
+        "vexact_band_values_lo_fp32: bits differ",
+        "vexact_band_commit: bits differ",
+        "vexact_band_p_settled_fp64: bits differ"
+      ],
+      "key_mask_token_diffs_frozen_vs_regen": {
+        "exact": 646,
+        "hi": 64,
+        "lo": 710
+      },
+      "missing_fields": [],
+      "row": "golden2_q287_h8.npz"
+    }
+  ],
+  "two_pass": {
+    "checked": 14,
+    "max_abs_cutoff": 0.0,
+    "max_committed_mismatch": 0,
+    "max_occupancy_mismatch": 0,
+    "occupancy_checked": 14,
+    "rows": [
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 4920,
+        "row": "golden2_q137_h0.npz"
+      },
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 2416,
+        "row": "golden2_q137_h5.npz"
+      },
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 5527,
+        "row": "golden2_q159_h0.npz"
+      },
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 1457,
+        "row": "golden2_q159_h16.npz"
+      },
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 1776,
+        "row": "golden2_q159_h24.npz"
+      },
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 3443,
+        "row": "golden2_q159_h8.npz"
+      },
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 7308,
+        "row": "golden2_q223_h0.npz"
+      },
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 7902,
+        "row": "golden2_q223_h16.npz"
+      },
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 3859,
+        "row": "golden2_q223_h24.npz"
+      },
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 4060,
+        "row": "golden2_q223_h8.npz"
+      },
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 12792,
+        "row": "golden2_q287_h0.npz"
+      },
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 13494,
+        "row": "golden2_q287_h16.npz"
+      },
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 13629,
+        "row": "golden2_q287_h24.npz"
+      },
+      {
+        "committed_mismatch": 0,
+        "cutoff_abs": 0.0,
+        "distinct_mismatch": 0,
+        "error": null,
+        "hist_mismatch": 0,
+        "mask_mismatch": 0,
+        "n_committed": 13387,
+        "row": "golden2_q287_h8.npz"
+      }
+    ],
+    "worst": "golden2_q137_h0.npz"
+  }
+}
