@@ -329,7 +329,8 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_batc
     std::vector<torch::Tensor> code_error_groups,
     torch::Tensor v_budgets,
     torch::Tensor v_hi_counts,
-    int64_t transient_budget_bytes) {
+    int64_t transient_budget_bytes,
+    bool vectorized_partials) {
   const int64_t groups = static_cast<int64_t>(base_outputs_groups.size());
   TORCH_CHECK(groups > 0, "batched V-prefix requires at least one group");
   const auto k_count = base_outputs_groups[0].size(0);
@@ -470,21 +471,41 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_batc
   auto hi_partials = torch::empty({chunks, rows, dim}, flat_opts);
   auto lo_partials = torch::empty({chunks, rows, dim}, flat_opts);
   auto commit_partials = torch::empty({chunks, rows}, int_opts);
-  const int64_t partial_total = chunks * rows * dim;
-  const int64_t partial_blocks = (partial_total + threads - 1) / threads;
-  joint_batched_vprefix_precision_token_partials_kernel<int32_t><<<
-      static_cast<unsigned int>(partial_blocks), threads, 0, stream>>>(
-      pointer_table.data_ptr<int64_t>(),
-      ids_out.data_ptr<int32_t>(),
-      hi_partials.data_ptr<float>(),
-      lo_partials.data_ptr<float>(),
-      commit_partials.data_ptr<int32_t>(),
-      groups,
-      rows_per_group,
-      context_len,
-      context_len,
-      dim,
-      chunks);
+  if (vectorized_partials) {
+    TORCH_CHECK(dim % 4 == 0, "vectorized token partials require dim divisible by four");
+    const int64_t dim_tiles = (dim + 127) / 128;
+    const int64_t partial_warps = chunks * rows * dim_tiles;
+    const int64_t partial_blocks = (partial_warps + 7) / 8;
+    joint_batched_vprefix_precision_token_partials_vec4_kernel<int32_t><<<
+        static_cast<unsigned int>(partial_blocks), threads, 0, stream>>>(
+        pointer_table.data_ptr<int64_t>(),
+        ids_out.data_ptr<int32_t>(),
+        hi_partials.data_ptr<float>(),
+        lo_partials.data_ptr<float>(),
+        commit_partials.data_ptr<int32_t>(),
+        groups,
+        rows_per_group,
+        context_len,
+        context_len,
+        dim,
+        chunks);
+  } else {
+    const int64_t partial_total = chunks * rows * dim;
+    const int64_t partial_blocks = (partial_total + threads - 1) / threads;
+    joint_batched_vprefix_precision_token_partials_kernel<int32_t><<<
+        static_cast<unsigned int>(partial_blocks), threads, 0, stream>>>(
+        pointer_table.data_ptr<int64_t>(),
+        ids_out.data_ptr<int32_t>(),
+        hi_partials.data_ptr<float>(),
+        lo_partials.data_ptr<float>(),
+        commit_partials.data_ptr<int32_t>(),
+        groups,
+        rows_per_group,
+        context_len,
+        context_len,
+        dim,
+        chunks);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
   const int64_t output_total = rows * dim;

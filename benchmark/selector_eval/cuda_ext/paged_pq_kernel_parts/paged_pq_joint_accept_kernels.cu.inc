@@ -802,6 +802,116 @@ __global__ void joint_batched_vprefix_precision_token_partials_kernel(
 }
 
 template <typename order_t>
+__global__ void joint_batched_vprefix_precision_token_partials_vec4_kernel(
+    const int64_t* __restrict__ pointers,
+    const order_t* __restrict__ exact_order,
+    float* __restrict__ hi_partials,
+    float* __restrict__ lo_partials,
+    int32_t* __restrict__ commit_partials,
+    int64_t groups,
+    int64_t rows_per_group,
+    int64_t context_len,
+    int64_t max_exact,
+    int64_t dim,
+    int64_t chunks) {
+  constexpr int64_t kDimsPerWarp = 128;
+  int64_t warp =
+      (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+  int64_t lane = threadIdx.x & 31;
+  int64_t rows = groups * rows_per_group;
+  int64_t dim_tiles = (dim + kDimsPerWarp - 1) / kDimsPerWarp;
+  int64_t total_warps = chunks * rows * dim_tiles;
+  if (warp >= total_warps) {
+    return;
+  }
+  int64_t dim_tile = warp % dim_tiles;
+  int64_t row = (warp / dim_tiles) % rows;
+  int64_t chunk = warp / (dim_tiles * rows);
+  int64_t d = dim_tile * kDimsPerWarp + lane * 4;
+  int64_t group = row / rows_per_group;
+  int64_t local_row = row - group * rows_per_group;
+  int64_t begin = chunk * kJointVPrefixTokenChunk;
+  int64_t end = min(begin + kJointVPrefixTokenChunk, max_exact);
+  const float* probs = joint_batched_vprefix_pointer<float>(
+      pointers, group, kJointBatchedVPrefixProbsPointer);
+  const float* residual_hi = joint_batched_vprefix_pointer<float>(
+      pointers, group, kJointBatchedVPrefixResidualHiPointer);
+  const float* residual_lo = joint_batched_vprefix_pointer<float>(
+      pointers, group, kJointBatchedVPrefixResidualLoPointer);
+  const bool* commit_mask = joint_batched_vprefix_pointer<bool>(
+      pointers, group, kJointBatchedVPrefixCommitPointer);
+  float hi0 = 0.0f, hi1 = 0.0f, hi2 = 0.0f, hi3 = 0.0f;
+  float lo0 = 0.0f, lo1 = 0.0f, lo2 = 0.0f, lo3 = 0.0f;
+  int32_t commit_acc = 0;
+  for (int64_t j = begin; j < end; ++j) {
+    int32_t token = lane == 0 ? exact_order[row * max_exact + j] : 0;
+    token = __shfl_sync(0xffffffff, token, 0);
+    if (token >= 0 && token < context_len) {
+      float p = lane == 0 ? probs[local_row * context_len + token] : 0.0f;
+      p = __shfl_sync(0xffffffff, p, 0);
+      if (d + 3 < dim) {
+        float4 hi = *reinterpret_cast<const float4*>(residual_hi + token * dim + d);
+        float4 lo = *reinterpret_cast<const float4*>(residual_lo + token * dim + d);
+        hi0 = __fadd_rn(hi0, __fmul_rn(p, hi.x));
+        hi1 = __fadd_rn(hi1, __fmul_rn(p, hi.y));
+        hi2 = __fadd_rn(hi2, __fmul_rn(p, hi.z));
+        hi3 = __fadd_rn(hi3, __fmul_rn(p, hi.w));
+        lo0 = __fadd_rn(lo0, __fmul_rn(p, lo.x));
+        lo1 = __fadd_rn(lo1, __fmul_rn(p, lo.y));
+        lo2 = __fadd_rn(lo2, __fmul_rn(p, lo.z));
+        lo3 = __fadd_rn(lo3, __fmul_rn(p, lo.w));
+      }
+      if (lane == 0 && dim_tile == 0 && commit_mask[token]) {
+        ++commit_acc;
+      }
+    }
+  }
+  if (d + 3 < dim) {
+    int64_t partial_idx = (chunk * rows + row) * dim + d;
+    *reinterpret_cast<float4*>(hi_partials + partial_idx) =
+        make_float4(hi0, hi1, hi2, hi3);
+    *reinterpret_cast<float4*>(lo_partials + partial_idx) =
+        make_float4(lo0, lo1, lo2, lo3);
+  }
+  if (lane == 0 && dim_tile == 0) {
+    commit_partials[chunk * rows + row] = commit_acc;
+  }
+}
+
+__global__ void joint_rowwise_int8_qdq_pair_kernel(
+    const float* __restrict__ keys,
+    const float* __restrict__ values,
+    float* __restrict__ keys_lo,
+    float* __restrict__ values_lo,
+    int64_t rows,
+    int64_t dim) {
+  extern __shared__ float maxima[];
+  int64_t row = blockIdx.x;
+  int64_t d = threadIdx.x;
+  float key = d < dim ? keys[row * dim + d] : 0.0f;
+  float value = d < dim ? values[row * dim + d] : 0.0f;
+  maxima[d] = d < dim ? fabsf(key) : 0.0f;
+  maxima[blockDim.x + d] = d < dim ? fabsf(value) : 0.0f;
+  __syncthreads();
+  for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (d < stride) {
+      maxima[d] = fmaxf(maxima[d], maxima[d + stride]);
+      maxima[blockDim.x + d] =
+          fmaxf(maxima[blockDim.x + d], maxima[blockDim.x + d + stride]);
+    }
+    __syncthreads();
+  }
+  if (d < dim) {
+    float key_scale = fmaxf(__fdiv_rn(maxima[0], 127.0f), 1.0e-12f);
+    float value_scale =
+        fmaxf(__fdiv_rn(maxima[blockDim.x], 127.0f), 1.0e-12f);
+    keys_lo[row * dim + d] = __fmul_rn(nearbyintf(__fdiv_rn(key, key_scale)), key_scale);
+    values_lo[row * dim + d] =
+        __fmul_rn(nearbyintf(__fdiv_rn(value, value_scale)), value_scale);
+  }
+}
+
+template <typename order_t>
 __global__ void joint_batched_vprefix_precision_outputs_tokpar_kernel(
     const int64_t* __restrict__ pointers,
     const order_t* __restrict__ exact_order,

@@ -105,7 +105,10 @@ def _test_native_exact_value_counts() -> None:
         joint_vprefix_outputs_precision_from_risk,
         joint_vprefix_outputs_precision_from_risk_tokpar,
         joint_vprefix_outputs_precision_from_risk_tokpar_batched,
+        joint_vprefix_outputs_precision_from_risk_tokpar_batched_vec4,
         joint_vprefix_outputs_precision_tokpar,
+        joint_rowwise_int8_qdq_pair,
+        joint_precision_score_grid,
         joint_vprefix_outputs_from_grouped_risk,
         joint_vprefix_outputs_from_grouped_merge_risk_batched,
         joint_vprefix_outputs_from_grouped_risk_batched,
@@ -468,6 +471,77 @@ def _test_native_exact_value_counts() -> None:
         raise AssertionError("batched TOKPAR V-prefix output is not bit-identical")
     if not torch.equal(grouped_reads, torch.stack(single_reads)):
         raise AssertionError("batched TOKPAR V-prefix read counts mismatch")
+    vec4_outputs, vec4_reads = (
+        joint_vprefix_outputs_precision_from_risk_tokpar_batched_vec4(
+            batched_base,
+            batched_probs,
+            batched_hi,
+            batched_lo,
+            batched_commit,
+            batched_error,
+            tok_budgets,
+            tok_hi_counts,
+            1024 * 1024 * 1024,
+        )
+    )
+    if not torch.equal(vec4_outputs, grouped_outputs):
+        raise AssertionError("vec4 token partials are not bit-identical")
+    if not torch.equal(vec4_reads, grouped_reads):
+        raise AssertionError("vec4 token-partial read counts mismatch")
+
+    qdq_rows = 37
+    qdq_dim = 128
+    qdq_keys = torch.randn((qdq_rows, qdq_dim), device=device, dtype=torch.float32)
+    qdq_values = torch.randn_like(qdq_keys)
+    qdq_key_scale = (qdq_keys.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min_(1e-12)
+    qdq_value_scale = (qdq_values.abs().amax(dim=1, keepdim=True) / 127.0).clamp_min_(1e-12)
+    qdq_keys_ref = torch.round(qdq_keys / qdq_key_scale) * qdq_key_scale
+    qdq_values_ref = torch.round(qdq_values / qdq_value_scale) * qdq_value_scale
+    qdq_keys_got, qdq_values_got = joint_rowwise_int8_qdq_pair(qdq_keys, qdq_values)
+    if not torch.equal(qdq_keys_got, qdq_keys_ref):
+        raise AssertionError("native paired key QDQ is not bit-identical")
+    if not torch.equal(qdq_values_got, qdq_values_ref):
+        raise AssertionError("native paired value QDQ is not bit-identical")
+
+    score_k = 3
+    score_heads = 2
+    score_context = 23
+    score_indexed = torch.tensor([1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20], device=device)
+    score_base = torch.tensor([0, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 22], device=device)
+    score_ranked = torch.stack((score_indexed, score_indexed.flip(0)))
+    score_exact = torch.randn((score_heads, score_context), device=device)
+    score_pq = torch.randn((score_heads, int(score_indexed.numel())), device=device)
+    score_lo = torch.randn_like(score_exact)
+    score_take = torch.tensor([2, 7, 11], device=device, dtype=torch.long)
+    score_hi = torch.tensor([1, 1, 2], device=device, dtype=torch.long)
+    score_ref = score_exact.unsqueeze(0).expand(score_k, -1, -1).clone()
+    score_ref[:, :, score_indexed] = score_pq.unsqueeze(0)
+    score_ref[:, :, score_base] = score_exact[:, score_base].unsqueeze(0)
+    rank_index = score_ranked.unsqueeze(0).expand(score_k, -1, -1)
+    score_positions = torch.arange(int(score_ranked.shape[1]), device=device).reshape(1, 1, -1)
+    rank_values = torch.where(
+        score_positions < score_hi.reshape(-1, 1, 1),
+        score_exact.gather(1, score_ranked).unsqueeze(0),
+        torch.where(
+            score_positions < score_take.reshape(-1, 1, 1),
+            score_lo.gather(1, score_ranked).unsqueeze(0),
+            score_ref.gather(2, rank_index),
+        ),
+    )
+    score_ref.scatter_(2, rank_index, rank_values)
+    score_got = joint_precision_score_grid(
+        torch.empty_like(score_ref),
+        score_exact,
+        score_pq,
+        score_indexed,
+        score_base,
+        score_ranked,
+        score_lo,
+        score_take,
+        score_hi,
+    )
+    if not torch.equal(score_got, score_ref):
+        raise AssertionError("native precision score grid is not bit-identical")
 
     base_context = 10
     base_pages = 2

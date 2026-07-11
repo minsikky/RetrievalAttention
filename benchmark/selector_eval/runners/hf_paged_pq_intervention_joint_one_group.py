@@ -30,6 +30,7 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_fused_policy
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_policy import (
     JointPolicyRuntime,
     finish_prepared_torch_policy,
+    prepare_batched_torch_policies,
     select_joint_kv_budgets,
 )
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_vprefix import (
@@ -1185,6 +1186,13 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     scores_lo_h_t: torch.Tensor | None = None
     residual_lo_commit_t: torch.Tensor | None = None
     v_commit_mask_t: torch.Tensor | None = None
+    batched_glue_enabled = bool(
+        batched_vprefix_records is not None
+        and _env_truthy(
+            "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR_BATCHED_GLUE",
+            "0",
+        )
+    )
     if precision_tiers_enabled:
         commit_trace_start = time_trace.cuda_start("commit") if time_trace is not None else None
         # The frozen tiers are implemented on the canonical torch grid
@@ -1223,16 +1231,32 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         # and compute only the newly appended token without retaining another
         # context-by-head_dim plane.
         if device.type == "cuda":
-            keys32_t = (
-                exact_keys32_t
-                if exact_keys32_t is not None
-                else torch_k_cache[int(kv_head_i)][:context_len_i].to(
-                    device=device, dtype=torch.float32
+            if batched_glue_enabled:
+                native = load_selector_paged_pq_ext()
+                if not hasattr(native, "joint_rowwise_int8_qdq_pair"):
+                    raise RuntimeError("batched glue requires native paired rowwise QDQ")
+                keys32_t = (
+                    exact_keys32_t
+                    if exact_keys32_t is not None
+                    else torch_k_cache[int(kv_head_i)][:context_len_i].to(
+                        device=device, dtype=torch.float32
+                    )
                 )
-            )
-            values32_t = values_t.to(device=device, dtype=torch.float32)
-            keys_lo_t = _rowwise_int8_qdq(keys32_t)
-            values_lo_t = _rowwise_int8_qdq(values32_t)
+                values32_t = values_t.to(device=device, dtype=torch.float32)
+                keys_lo_t, values_lo_t = native.joint_rowwise_int8_qdq_pair(
+                    keys32_t.contiguous(), values32_t.contiguous()
+                )
+            else:
+                keys32_t = (
+                    exact_keys32_t
+                    if exact_keys32_t is not None
+                    else torch_k_cache[int(kv_head_i)][:context_len_i].to(
+                        device=device, dtype=torch.float32
+                    )
+                )
+                values32_t = values_t.to(device=device, dtype=torch.float32)
+                keys_lo_t = _rowwise_int8_qdq(keys32_t)
+                values_lo_t = _rowwise_int8_qdq(values32_t)
             int8_err16_t = _cached_precision_tier_value_error(
                 module=self,
                 kv_head=int(kv_head_i),
@@ -1641,18 +1665,34 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
                 counts=grid_take_counts,
                 hi_frac=float(_FROZEN_PRECISION_K_HI_FRAC),
             )
-            _batched_precision_score_grid(
-                out_t=torch_score_grid_t,
-                exact_scores_t=exact_scores_h.to(dtype=prob_dtype),
-                pq_logits_t=pq_logits_t,
-                indexed_tokens_t=indexed_tokens_t,
-                base_tokens_t=base_t,
-                ranked_prefix_tokens_t=ranked_prefix_tokens_t,
-                scores_lo_t=scores_lo_h_t,
-                take_counts_t=take_counts_t,
-                hi_counts_t=hi_counts_t,
-                rank_positions_t=rank_positions_t,
-            )
+            if batched_glue_enabled:
+                native = load_selector_paged_pq_ext()
+                if not hasattr(native, "joint_precision_score_grid"):
+                    raise RuntimeError("batched glue requires native precision score grid")
+                native.joint_precision_score_grid(
+                    torch_score_grid_t,
+                    exact_scores_h.to(dtype=torch.float32).contiguous(),
+                    pq_logits_t.to(dtype=torch.float32).contiguous(),
+                    indexed_tokens_t.to(dtype=torch.long).contiguous(),
+                    base_t.to(dtype=torch.long).contiguous(),
+                    ranked_prefix_tokens_t.to(dtype=torch.long).contiguous(),
+                    scores_lo_h_t.to(dtype=torch.float32).contiguous(),
+                    take_counts_t,
+                    hi_counts_t,
+                )
+            else:
+                _batched_precision_score_grid(
+                    out_t=torch_score_grid_t,
+                    exact_scores_t=exact_scores_h.to(dtype=prob_dtype),
+                    pq_logits_t=pq_logits_t,
+                    indexed_tokens_t=indexed_tokens_t,
+                    base_tokens_t=base_t,
+                    ranked_prefix_tokens_t=ranked_prefix_tokens_t,
+                    scores_lo_t=scores_lo_h_t,
+                    take_counts_t=take_counts_t,
+                    hi_counts_t=hi_counts_t,
+                    rank_positions_t=rank_positions_t,
+                )
         probs_grid_t: torch.Tensor | None = None
         base_output_grid_t: torch.Tensor | None = None
         score_grid_t: torch.Tensor | None = None
@@ -2646,7 +2686,15 @@ def finish_batched_tokpar_vprefix(runtime) -> bool:
     if not records:
         return True
     native = load_selector_paged_pq_ext()
-    binding_name = "joint_vprefix_outputs_precision_from_risk_tokpar_batched"
+    vectorized_partials = _env_truthy(
+        "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR_BATCHED_PARTIALS_VEC4",
+        "0",
+    )
+    binding_name = (
+        "joint_vprefix_outputs_precision_from_risk_tokpar_batched_vec4"
+        if vectorized_partials
+        else "joint_vprefix_outputs_precision_from_risk_tokpar_batched"
+    )
     if not hasattr(native, binding_name):
         raise RuntimeError("batched TOKPAR V-prefix requires an updated CUDA extension")
     first = records[0]
@@ -2680,6 +2728,32 @@ def finish_batched_tokpar_vprefix(runtime) -> bool:
         int(budget_mb) * 1024 * 1024,
     )
     deferred_records = runtime.deferred_policy_records
+    batched_glue = _env_truthy(
+        "SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR_BATCHED_GLUE", "0"
+    )
+    if batched_glue:
+        if deferred_records is None:
+            raise RuntimeError("batched glue requires deferred Torch policy records")
+        policy_runtimes = [record["policy_runtime"] for record in records]
+        prepared_policies = prepare_batched_torch_policies(
+            policy_runtimes,
+            output_groups_t,
+            lo_read_groups_t,
+        )
+        for group, (record, prepared) in enumerate(zip(records, prepared_policies, strict=True)):
+            finalize_runtime = record["finalize_runtime"]
+            finalize_runtime.grid_outputs = output_groups_t[int(group)]
+            finalize_runtime.v_lo_reads_grid = lo_read_groups_t[int(group)]
+            prepared.runtime.output_for_budget = None
+            prepared.runtime.k_artifacts = None
+            prepared.runtime.grid_outputs = None
+            prepared.runtime.v_lo_reads_grid = None
+            deferred_records.append((prepared, finalize_runtime))
+            time_trace = getattr(runtime.self, "_pagedpq_joint_time_trace", None)
+            if time_trace is not None:
+                time_trace.cuda_end("select", record["select_trace_start"])
+        records.clear()
+        return True
     for group, record in enumerate(records):
         grid_outputs_t = output_groups_t[int(group)]
         grid_v_lo_reads_t = lo_read_groups_t[int(group)]

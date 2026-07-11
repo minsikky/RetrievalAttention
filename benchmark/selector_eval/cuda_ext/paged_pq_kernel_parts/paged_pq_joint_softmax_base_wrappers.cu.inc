@@ -1,3 +1,29 @@
+std::vector<torch::Tensor> joint_rowwise_int8_qdq_pair_cuda(
+    torch::Tensor keys,
+    torch::Tensor values) {
+  const auto rows = keys.size(0);
+  const auto dim = keys.size(1);
+  auto keys_lo = torch::empty_like(keys);
+  auto values_lo = torch::empty_like(values);
+  if (rows == 0 || dim == 0) {
+    return {keys_lo, values_lo};
+  }
+  TORCH_CHECK(dim == 128, "native paired rowwise QDQ currently requires dim=128");
+  const int threads = 128;
+  const size_t shared_bytes = static_cast<size_t>(threads) * 2 * sizeof(float);
+  auto stream = at::cuda::getCurrentCUDAStream();
+  joint_rowwise_int8_qdq_pair_kernel<<<
+      static_cast<unsigned int>(rows), threads, shared_bytes, stream>>>(
+      keys.data_ptr<float>(),
+      values.data_ptr<float>(),
+      keys_lo.data_ptr<float>(),
+      values_lo.data_ptr<float>(),
+      rows,
+      dim);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {keys_lo, values_lo};
+}
+
 template <typename order_t>
 void launch_joint_vprefix_precision_tokpar(
     torch::Tensor base_outputs,

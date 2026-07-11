@@ -1,3 +1,78 @@
+torch::Tensor joint_precision_score_grid_cuda(
+    torch::Tensor output,
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor scores_lo,
+    torch::Tensor take_counts,
+    torch::Tensor hi_counts) {
+  const auto k_count = output.size(0);
+  const auto heads = output.size(1);
+  const auto context_len = output.size(2);
+  const auto indexed_count = indexed_tokens.size(0);
+  const auto base_count = base_tokens.size(0);
+  const auto rank_count = ranked_prefix_tokens.size(1);
+  if (k_count == 0 || heads == 0 || context_len == 0) {
+    return output;
+  }
+  auto int_opts = output.options().dtype(torch::kInt);
+  auto byte_opts = output.options().dtype(torch::kUInt8);
+  auto token_to_indexed = torch::empty({context_len}, int_opts);
+  auto base_mask = torch::empty({context_len}, byte_opts);
+  auto rank_pos = torch::empty({heads, context_len}, int_opts);
+  const int threads = 256;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  const int64_t map_total = heads * context_len;
+  const int64_t map_blocks = (map_total + threads - 1) / threads;
+  joint_precision_score_maps_init_kernel<<<
+      static_cast<unsigned int>(map_blocks), threads, 0, stream>>>(
+      token_to_indexed.data_ptr<int32_t>(),
+      base_mask.data_ptr<unsigned char>(),
+      rank_pos.data_ptr<int32_t>(),
+      heads,
+      context_len);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const int64_t scatter_total = indexed_count + base_count + heads * rank_count;
+  if (scatter_total > 0) {
+    const int64_t scatter_blocks = (scatter_total + threads - 1) / threads;
+    joint_precision_score_maps_scatter_kernel<<<
+        static_cast<unsigned int>(scatter_blocks), threads, 0, stream>>>(
+        token_to_indexed.data_ptr<int32_t>(),
+        base_mask.data_ptr<unsigned char>(),
+        rank_pos.data_ptr<int32_t>(),
+        indexed_tokens.data_ptr<int64_t>(),
+        base_tokens.data_ptr<int64_t>(),
+        ranked_prefix_tokens.data_ptr<int64_t>(),
+        indexed_count,
+        base_count,
+        heads,
+        rank_count,
+        context_len);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  const int64_t total = k_count * heads * context_len;
+  const int64_t blocks = (total + threads - 1) / threads;
+  joint_precision_score_grid_fill_kernel<<<
+      static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+      exact_scores.data_ptr<float>(),
+      pq_logits.data_ptr<float>(),
+      scores_lo.data_ptr<float>(),
+      token_to_indexed.data_ptr<int32_t>(),
+      base_mask.data_ptr<unsigned char>(),
+      rank_pos.data_ptr<int32_t>(),
+      take_counts.data_ptr<int64_t>(),
+      hi_counts.data_ptr<int64_t>(),
+      output.data_ptr<float>(),
+      k_count,
+      heads,
+      context_len,
+      indexed_count);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return output;
+}
+
 torch::Tensor joint_mixed_score_grid_cuda(
     torch::Tensor exact_scores,
     torch::Tensor pq_logits,

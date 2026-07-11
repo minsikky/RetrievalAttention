@@ -7,6 +7,19 @@ std::vector<torch::Tensor> selected_mass_thresholds_from_topk_cuda(
     torch::Tensor budgets,
     double exact_mass,
     int64_t min_top);
+std::vector<torch::Tensor> joint_rowwise_int8_qdq_pair_cuda(
+    torch::Tensor keys,
+    torch::Tensor values);
+torch::Tensor joint_precision_score_grid_cuda(
+    torch::Tensor output,
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor scores_lo,
+    torch::Tensor take_counts,
+    torch::Tensor hi_counts);
 
 torch::Tensor joint_vprefix_outputs_cuda(
     torch::Tensor base_outputs,
@@ -66,7 +79,8 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_batc
     std::vector<torch::Tensor> code_error_groups,
     torch::Tensor v_budgets,
     torch::Tensor v_hi_counts,
-    int64_t transient_budget_bytes);
+    int64_t transient_budget_bytes,
+    bool vectorized_partials);
 
 torch::Tensor joint_vprefix_outputs_from_grouped_risk_cuda(
     torch::Tensor base_outputs,

@@ -38,6 +38,17 @@ std::vector<torch::Tensor> selected_mass_thresholds_from_topk(
       min_top);
 }
 
+std::vector<torch::Tensor> joint_rowwise_int8_qdq_pair(
+    torch::Tensor keys,
+    torch::Tensor values) {
+  TORCH_CHECK(keys.is_cuda() && values.is_cuda(), "paired rowwise QDQ inputs must be CUDA");
+  TORCH_CHECK(keys.scalar_type() == torch::kFloat32, "keys must be float32");
+  TORCH_CHECK(values.scalar_type() == torch::kFloat32, "values must be float32");
+  TORCH_CHECK(keys.dim() == 2 && values.dim() == 2, "paired rowwise QDQ inputs must be 2-D");
+  TORCH_CHECK(keys.sizes() == values.sizes(), "paired rowwise QDQ shape mismatch");
+  return joint_rowwise_int8_qdq_pair_cuda(keys.contiguous(), values.contiguous());
+}
+
 torch::Tensor joint_vprefix_outputs(
     torch::Tensor base_outputs,
     torch::Tensor probs,
@@ -311,7 +322,7 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar(
       v_hi_counts.contiguous());
 }
 
-std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_batched(
+static std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_batched_impl(
     std::vector<torch::Tensor> base_outputs_groups,
     std::vector<torch::Tensor> probs_groups,
     std::vector<torch::Tensor> residual_hi_groups,
@@ -320,7 +331,8 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_batc
     std::vector<torch::Tensor> code_error_groups,
     torch::Tensor v_budgets,
     torch::Tensor v_hi_counts,
-    int64_t transient_budget_bytes) {
+    int64_t transient_budget_bytes,
+    bool vectorized_partials) {
   const size_t groups = base_outputs_groups.size();
   TORCH_CHECK(groups > 0, "batched V-prefix requires at least one group");
   TORCH_CHECK(probs_groups.size() == groups, "probs group count mismatch");
@@ -387,7 +399,42 @@ std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_batc
       std::move(code_error_groups),
       v_budgets.contiguous(),
       v_hi_counts.contiguous(),
-      transient_budget_bytes);
+      transient_budget_bytes,
+      vectorized_partials);
+}
+
+std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_batched(
+    std::vector<torch::Tensor> base_outputs_groups,
+    std::vector<torch::Tensor> probs_groups,
+    std::vector<torch::Tensor> residual_hi_groups,
+    std::vector<torch::Tensor> residual_lo_groups,
+    std::vector<torch::Tensor> commit_mask_groups,
+    std::vector<torch::Tensor> code_error_groups,
+    torch::Tensor v_budgets,
+    torch::Tensor v_hi_counts,
+    int64_t transient_budget_bytes) {
+  return joint_vprefix_outputs_precision_from_risk_tokpar_batched_impl(
+      std::move(base_outputs_groups), std::move(probs_groups),
+      std::move(residual_hi_groups), std::move(residual_lo_groups),
+      std::move(commit_mask_groups), std::move(code_error_groups),
+      v_budgets, v_hi_counts, transient_budget_bytes, false);
+}
+
+std::vector<torch::Tensor> joint_vprefix_outputs_precision_from_risk_tokpar_batched_vec4(
+    std::vector<torch::Tensor> base_outputs_groups,
+    std::vector<torch::Tensor> probs_groups,
+    std::vector<torch::Tensor> residual_hi_groups,
+    std::vector<torch::Tensor> residual_lo_groups,
+    std::vector<torch::Tensor> commit_mask_groups,
+    std::vector<torch::Tensor> code_error_groups,
+    torch::Tensor v_budgets,
+    torch::Tensor v_hi_counts,
+    int64_t transient_budget_bytes) {
+  return joint_vprefix_outputs_precision_from_risk_tokpar_batched_impl(
+      std::move(base_outputs_groups), std::move(probs_groups),
+      std::move(residual_hi_groups), std::move(residual_lo_groups),
+      std::move(commit_mask_groups), std::move(code_error_groups),
+      v_budgets, v_hi_counts, transient_budget_bytes, true);
 }
 
 torch::Tensor joint_vprefix_outputs_from_grouped_risk(

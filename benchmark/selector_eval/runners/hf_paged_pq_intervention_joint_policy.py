@@ -491,6 +491,99 @@ def _prepare_torch_policy(
     )
 
 
+def prepare_batched_torch_policies(
+    runtimes: list[JointPolicyRuntime],
+    output_grids: torch.Tensor,
+    v_lo_reads_grids: torch.Tensor,
+) -> list[PreparedTorchPolicy]:
+    """Prepare all KV-head policies with one set of tensor launches and D2H.
+
+    Relative-L2 reductions still operate independently over the final head
+    dimension, so batching only adds a leading group dimension and preserves
+    each row's reduction order.
+    """
+
+    if not runtimes:
+        return []
+    groups = len(runtimes)
+    if int(output_grids.shape[0]) != groups or int(v_lo_reads_grids.shape[0]) != groups:
+        raise RuntimeError("batched policy group count mismatch")
+    first = runtimes[0]
+    k_count = len(first.active_k_budgets)
+    v_count = len(first.v_budgets)
+    heads = int(first.group_heads)
+    for runtime in runtimes:
+        if (
+            len(runtime.active_k_budgets) != k_count
+            or len(runtime.v_budgets) != v_count
+            or int(runtime.group_heads) != heads
+        ):
+            raise RuntimeError("batched policy requires uniform grid shapes")
+
+    output64 = output_grids.to(dtype=torch.float64)
+    if k_count > 1:
+        k_delta = _adjacent_rel_l2(output64[:, :-1], output64[:, 1:])
+    else:
+        k_delta = torch.empty(
+            (groups, 0, v_count, heads), dtype=torch.float64, device=output_grids.device
+        )
+    if v_count > 1:
+        v_delta = _adjacent_rel_l2(output64[:, :, :-1], output64[:, :, 1:])
+    else:
+        v_delta = torch.empty(
+            (groups, k_count, 0, heads), dtype=torch.float64, device=output_grids.device
+        )
+
+    tensor_starts_k = all(isinstance(runtime.start_ki_by_head, torch.Tensor) for runtime in runtimes)
+    tensor_starts_v = all(isinstance(runtime.start_vi_by_head, torch.Tensor) for runtime in runtimes)
+    if tensor_starts_k != any(isinstance(runtime.start_ki_by_head, torch.Tensor) for runtime in runtimes):
+        raise RuntimeError("batched policy requires uniform K-start representation")
+    if tensor_starts_v != any(isinstance(runtime.start_vi_by_head, torch.Tensor) for runtime in runtimes):
+        raise RuntimeError("batched policy requires uniform V-start representation")
+
+    parts = [k_delta.reshape(groups, -1), v_delta.reshape(groups, -1)]
+    if tensor_starts_k:
+        parts.append(
+            torch.stack([runtime.start_ki_by_head for runtime in runtimes]).to(torch.float64)
+        )
+    if tensor_starts_v:
+        parts.append(
+            torch.stack([runtime.start_vi_by_head for runtime in runtimes]).to(torch.float64)
+        )
+    parts.append(v_lo_reads_grids.to(dtype=torch.float64).reshape(groups, -1))
+    packed = torch.cat(parts, dim=1).detach()
+    owner = first.d2h_owner
+    if owner is None:
+        raise RuntimeError("batched deferred Torch policy requires a D2H buffer owner")
+    cache = getattr(owner, "_pagedpq_policy_d2h_buffer_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(owner, "_pagedpq_policy_d2h_buffer_cache", cache)
+    cache_key = ("batched", tuple(packed.shape), str(packed.dtype))
+    packed_host = cache.get(cache_key)
+    if packed_host is None:
+        packed_host = torch.empty_like(packed, device="cpu", pin_memory=True)
+        cache[cache_key] = packed_host
+    packed_host.copy_(packed, non_blocking=True)
+
+    prepared = []
+    for group, runtime in enumerate(runtimes):
+        runtime.grid_outputs = output_grids[group]
+        runtime.v_lo_reads_grid = v_lo_reads_grids[group]
+        prepared.append(
+            PreparedTorchPolicy(
+                runtime=runtime,
+                packed_host=packed_host[group],
+                k_delta_shape=tuple(k_delta.shape[1:]),
+                v_delta_shape=tuple(v_delta.shape[1:]),
+                tensor_starts_k=bool(tensor_starts_k),
+                tensor_starts_v=bool(tensor_starts_v),
+                v_lo_shape=tuple(v_lo_reads_grids.shape[1:]),
+            )
+        )
+    return prepared
+
+
 def finish_prepared_torch_policy(
     prepared: PreparedTorchPolicy,
 ) -> tuple[list[tuple[int, int]], list[list[list[int]]] | None]:

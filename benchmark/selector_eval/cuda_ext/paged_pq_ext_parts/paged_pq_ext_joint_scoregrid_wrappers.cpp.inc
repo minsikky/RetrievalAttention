@@ -413,6 +413,48 @@ torch::Tensor joint_budget_prefix_tokens(
       max_take);
 }
 
+torch::Tensor joint_precision_score_grid(
+    torch::Tensor output,
+    torch::Tensor exact_scores,
+    torch::Tensor pq_logits,
+    torch::Tensor indexed_tokens,
+    torch::Tensor base_tokens,
+    torch::Tensor ranked_prefix_tokens,
+    torch::Tensor scores_lo,
+    torch::Tensor take_counts,
+    torch::Tensor hi_counts) {
+  TORCH_CHECK(output.is_cuda(), "output must be CUDA");
+  TORCH_CHECK(exact_scores.is_cuda() && pq_logits.is_cuda(), "score inputs must be CUDA");
+  TORCH_CHECK(indexed_tokens.is_cuda() && base_tokens.is_cuda(), "token inputs must be CUDA");
+  TORCH_CHECK(ranked_prefix_tokens.is_cuda(), "ranked prefix must be CUDA");
+  TORCH_CHECK(scores_lo.is_cuda() && take_counts.is_cuda() && hi_counts.is_cuda(), "precision inputs must be CUDA");
+  TORCH_CHECK(output.scalar_type() == torch::kFloat32, "output must be float32");
+  TORCH_CHECK(exact_scores.scalar_type() == torch::kFloat32, "exact scores must be float32");
+  TORCH_CHECK(pq_logits.scalar_type() == torch::kFloat32, "PQ logits must be float32");
+  TORCH_CHECK(scores_lo.scalar_type() == torch::kFloat32, "lo scores must be float32");
+  TORCH_CHECK(indexed_tokens.scalar_type() == torch::kLong, "indexed tokens must be int64");
+  TORCH_CHECK(base_tokens.scalar_type() == torch::kLong, "base tokens must be int64");
+  TORCH_CHECK(ranked_prefix_tokens.scalar_type() == torch::kLong, "ranked prefix must be int64");
+  TORCH_CHECK(take_counts.scalar_type() == torch::kLong, "take counts must be int64");
+  TORCH_CHECK(hi_counts.scalar_type() == torch::kLong, "hi counts must be int64");
+  TORCH_CHECK(output.dim() == 3, "output shape must be [k, heads, context]");
+  TORCH_CHECK(exact_scores.dim() == 2 && scores_lo.sizes() == exact_scores.sizes(), "exact/lo shape mismatch");
+  TORCH_CHECK(pq_logits.dim() == 2, "PQ logits must be 2-D");
+  TORCH_CHECK(ranked_prefix_tokens.dim() == 2, "ranked prefix must be 2-D");
+  TORCH_CHECK(output.size(0) == take_counts.size(0), "output/take K count mismatch");
+  TORCH_CHECK(take_counts.sizes() == hi_counts.sizes(), "take/hi count mismatch");
+  TORCH_CHECK(output.size(1) == exact_scores.size(0), "output/exact head mismatch");
+  TORCH_CHECK(output.size(2) == exact_scores.size(1), "output/exact context mismatch");
+  TORCH_CHECK(pq_logits.size(0) == exact_scores.size(0), "PQ/exact head mismatch");
+  TORCH_CHECK(pq_logits.size(1) == indexed_tokens.size(0), "PQ/indexed count mismatch");
+  TORCH_CHECK(ranked_prefix_tokens.size(0) == exact_scores.size(0), "rank/exact head mismatch");
+  return joint_precision_score_grid_cuda(
+      output.contiguous(), exact_scores.contiguous(), pq_logits.contiguous(),
+      indexed_tokens.contiguous(), base_tokens.contiguous(),
+      ranked_prefix_tokens.contiguous(), scores_lo.contiguous(),
+      take_counts.contiguous(), hi_counts.contiguous());
+}
+
 torch::Tensor joint_mixed_score_grid(
     torch::Tensor exact_scores,
     torch::Tensor pq_logits,

@@ -161,6 +161,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	      &selected_mass_thresholds_from_topk,
 	      "Build selected-mass exact-V thresholds from sorted top-k exact logits (CUDA)");
 	  m.def(
+	      "joint_rowwise_int8_qdq_pair",
+	      &joint_rowwise_int8_qdq_pair,
+	      "Quantize-dequantize paired fp32 row tensors with symmetric int8 scales (CUDA)");
+	  m.def(
 	      "joint_vprefix_outputs",
 	      &joint_vprefix_outputs,
 	      "Build residual-risk exact-V prefix output grid from top-risk token order (CUDA)");
@@ -188,6 +192,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	      "joint_vprefix_outputs_precision_from_risk_tokpar_batched",
 	      &joint_vprefix_outputs_precision_from_risk_tokpar_batched,
 	      "Build KV-head-batched token-parallel progressive-precision V-prefix grids with one segmented sort (CUDA)");
+	  m.def(
+	      "joint_vprefix_outputs_precision_from_risk_tokpar_batched_vec4",
+	      &joint_vprefix_outputs_precision_from_risk_tokpar_batched_vec4,
+	      "Build batched token-parallel V-prefix grids with warp-broadcast vectorized partials (CUDA)");
 	  m.def(
 	      "joint_vprefix_outputs_from_grouped_risk",
 	      &joint_vprefix_outputs_from_grouped_risk,
@@ -280,6 +288,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 	      "joint_mixed_softmax_base_outputs_sparse_exact_tokenfit_scaled",
 	      &joint_mixed_softmax_base_outputs_sparse_exact_tokenfit_scaled,
 	      "Build sparse-exact mixed score rows without a dense exact table, softmax them, and compute reconstructed base outputs (CUDA)");
+	  m.def(
+	      "joint_precision_score_grid",
+	      &joint_precision_score_grid,
+	      "Build frozen-tier K score grids with native assignment-only composition (CUDA)");
 	  m.def(
 	      "joint_mixed_score_grid",
 	      &joint_mixed_score_grid,

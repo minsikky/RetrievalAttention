@@ -238,6 +238,108 @@ __global__ void joint_mixed_score_grid_fill_rankpos_nocalib_kernel(
   }
 }
 
+__global__ void joint_precision_score_maps_init_kernel(
+    int32_t* __restrict__ token_to_indexed,
+    unsigned char* __restrict__ base_mask,
+    int32_t* __restrict__ rank_pos,
+    int64_t heads,
+    int64_t context_len) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = heads * context_len;
+  if (linear >= total) {
+    return;
+  }
+  rank_pos[linear] = -1;
+  if (linear < context_len) {
+    token_to_indexed[linear] = -1;
+    base_mask[linear] = 0;
+  }
+}
+
+__global__ void joint_precision_score_maps_scatter_kernel(
+    int32_t* __restrict__ token_to_indexed,
+    unsigned char* __restrict__ base_mask,
+    int32_t* __restrict__ rank_pos,
+    const int64_t* __restrict__ indexed_tokens,
+    const int64_t* __restrict__ base_tokens,
+    const int64_t* __restrict__ ranked_prefix_tokens,
+    int64_t indexed_count,
+    int64_t base_count,
+    int64_t heads,
+    int64_t rank_count,
+    int64_t context_len) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t rank_total = heads * rank_count;
+  int64_t total = indexed_count + base_count + rank_total;
+  if (linear >= total) {
+    return;
+  }
+  if (linear < indexed_count) {
+    int64_t token = indexed_tokens[linear];
+    if (token >= 0 && token < context_len) {
+      token_to_indexed[token] = static_cast<int32_t>(linear);
+    }
+    return;
+  }
+  linear -= indexed_count;
+  if (linear < base_count) {
+    int64_t token = base_tokens[linear];
+    if (token >= 0 && token < context_len) {
+      base_mask[token] = 1;
+    }
+    return;
+  }
+  linear -= base_count;
+  int64_t head = linear / rank_count;
+  int64_t pos = linear - head * rank_count;
+  int64_t token = ranked_prefix_tokens[head * rank_count + pos];
+  if (token >= 0 && token < context_len) {
+    rank_pos[head * context_len + token] = static_cast<int32_t>(pos);
+  }
+}
+
+__global__ void joint_precision_score_grid_fill_kernel(
+    const float* __restrict__ exact_scores,
+    const float* __restrict__ pq_logits,
+    const float* __restrict__ scores_lo,
+    const int32_t* __restrict__ token_to_indexed,
+    const unsigned char* __restrict__ base_mask,
+    const int32_t* __restrict__ rank_pos,
+    const int64_t* __restrict__ take_counts,
+    const int64_t* __restrict__ hi_counts,
+    float* __restrict__ output,
+    int64_t k_count,
+    int64_t heads,
+    int64_t context_len,
+    int64_t indexed_count) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = k_count * heads * context_len;
+  if (linear >= total) {
+    return;
+  }
+  int64_t token = linear % context_len;
+  int64_t kh = linear / context_len;
+  int64_t head = kh % heads;
+  int64_t ki = kh / heads;
+  float exact = exact_scores[head * context_len + token];
+  int32_t indexed_pos = token_to_indexed[token];
+  float value = indexed_pos >= 0 && indexed_pos < indexed_count
+      ? pq_logits[head * indexed_count + indexed_pos]
+      : exact;
+  if (base_mask[token]) {
+    value = exact;
+  }
+  int32_t pos = rank_pos[head * context_len + token];
+  if (pos >= 0) {
+    if (pos < hi_counts[ki]) {
+      value = exact;
+    } else if (pos < take_counts[ki]) {
+      value = scores_lo[head * context_len + token];
+    }
+  }
+  output[linear] = value;
+}
+
 __global__ void joint_mixed_score_grid_fill_pq_or_full_exact_kernel(
     const float* __restrict__ exact_scores,
     const float* __restrict__ pq_logits,
