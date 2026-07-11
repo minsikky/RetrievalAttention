@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=fspq-tokpar-32k
 #SBATCH --account=zhengya0
-#SBATCH --partition=gpu_mig40,spgpu
+#SBATCH --partition=gpu_mig40
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
