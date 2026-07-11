@@ -25,36 +25,36 @@ policy controller (`benchmark/selector_eval/runners/hf_paged_pq_intervention_joi
 Prior CPU evidence (layer-16 only, K-recall vs the walk): start+1 ≈ 0.916,
 start+2 ≈ 0.996 at ~1.9x bytes. This experiment tests those modes end-to-end.
 
-## Runs (all `--partition=gpu-rtx6000 --account=zhengya0`)
+## Runs (two partition-agnostic BUNDLE jobs)
 
-Token comparisons are contaminated by cross-card FP differences, so ALL arms are
-pinned to one single card class (never a multi-partition list). Originally
-submitted on gpu_mig40 (53333931-936) to match the cached-baseline card class,
-but mig40 was ~24h saturated. Since we run our own frozen arm (`DRAFT_MODE=off`)
-with the **identical** env, the comparison is internally consistent on any
-single card class and never touches a cached mig40 run; resubmitted with a
-command-line `--partition=gpu-rtx6000` override (RTX Pro 6000 Blackwell 96GB —
-overrides the mig40 default in the sbatch header). Each arm greedy-decodes;
-only the selection differs between arms. First-run-on-Blackwell caveat: if the
-first job dies with a kernel/arch error, fall back to the mig40 set.
+Token comparisons are contaminated by cross-card FP differences, but the
+card-class-consistency constraint only binds WITHIN a comparison. So each
+context length runs as one BUNDLE job whose arms execute sequentially inside a
+single allocation — every arm shares the exact same GPU by construction
+(pattern: `run_fspq_tokpar_rate_probe.sbatch`'s run_arm loop). `nvidia-smi -L`
+is echoed at bundle start so the card class is recorded in the log. Arms
+compare only within their own bundle; no cached run from any other card class
+is used. Each arm greedy-decodes; only the selection differs between arms.
 
-Driver: `scripts/run_draft_verify_one.sbatch` — the tokpar identity-gate env
-(`run_fspq_tokpar_identity_gate.sbatch`) minus the comparison epilogue, plus
-`SELECTOR_PQ_JOINT_DRAFT_MODE`. `FUSED_VPREFIX_TOKPAR=0` (as the gate) so control
-flows through `select_joint_kv_budgets` (the draft chokepoint) rather than the
-tokpar-batched deferral branch.
+Driver: `scripts/run_draft_verify_bundle.sbatch` (BUNDLE=32k|128k) — the tokpar
+identity-gate env (`run_fspq_tokpar_identity_gate.sbatch`) minus the comparison
+epilogue, plus `SELECTOR_PQ_JOINT_DRAFT_MODE` per arm. `FUSED_VPREFIX_TOKPAR=0`
+(as the gate) so control flows through `select_joint_kv_budgets` (the draft
+chokepoint) rather than the tokpar-batched deferral branch. The single-arm
+driver `scripts/run_draft_verify_one.sbatch` is retained for reruns.
 
-| run name            | ctx  | task            | n | max_new | mode   | job (rtx6000) |
-|---------------------|------|-----------------|---|---------|--------|---------------|
-| qa1_32k_n4_off      | 32k  | qa_1            | 4 | default | off    | 53335393 |
-| qa1_32k_n4_start1   | 32k  | qa_1            | 4 | default | start1 | 53335394 |
-| qa1_32k_n4_start2   | 32k  | qa_1            | 4 | default | start2 | 53335395 |
-| mk3_128k_n2_off     | 128k | niah_multikey_3 | 2 | 64      | off    | 53335396 |
-| mk3_128k_n2_start1  | 128k | niah_multikey_3 | 2 | 64      | start1 | 53335398 |
-| mk3_128k_n2_start2  | 128k | niah_multikey_3 | 2 | 64      | start2 | 53335397 |
+| bundle | task            | n | max_new | arms (sequential)     | partitions | job |
+|--------|-----------------|---|---------|-----------------------|------------|-----|
+| 32k    | qa_1            | 4 | default | off → start1 → start2 | gpu_mig40,spgpu,gpu-rtx6000 | 53335714 |
+| 128k   | niah_multikey_3 | 2 | 64      | off → start2 → start1 | spgpu,gpu-rtx6000 | 53335715 |
 
-Chained to keep ≤2 concurrent: A = 5393→5395→5397, B = 5394→5396→5398.
-(The cancelled mig40 set was 53333931-936.)
+mig40 is excluded from the 128k bundle: mk3@128k dense-prefill SDPA OOMs the
+39.25GB slice (suite jobs 53253685/53253684 died there even with
+expandable_segments + prefill chunk 8192).
+
+Job history: 6 single-arm mig40 jobs (53333931-936, ~24h queue estimate) then
+6 single-arm rtx6000 jobs (53335393-398, never scheduled), both sets cancelled
+in favor of these two bundles.
 Data: `benchmark_suite_result/ktcache_ab_20260709/.../qa_1/validation.jsonl`
 (32k identity-gate data) and
 `benchmark_suite_result/frozen_sim_20260707/runs/frozensim_mk3_128k_n16/.../niah_multikey_3/validation.jsonl`.
