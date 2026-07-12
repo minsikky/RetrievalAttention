@@ -3410,6 +3410,25 @@ def run() -> None:
         ),
     )
     parser.add_argument(
+        "--gqa_group_max_eval",
+        action="store_true",
+        help=(
+            "Issue #20 GROUP-MAX V-selection evaluation (offline, additive; "
+            "requires --gqa_union_commit and all 4 q heads of each kv group). "
+            "Ranks V tokens by group-max risk = max over the 4 group heads of "
+            "the per-head frozen scan-domain risk (p_pq^2 * V_error), takes ONE "
+            "rank cutoff at a single group budget B_grp, and commits the top-"
+            "B_grp set apply-to-all (any committed token applies to all 4 "
+            "heads). For a grid of B_grp candidates (|union|, sum B_h, max B_h, "
+            "multiples of both) plus an OR-theta(global) row, records per-head "
+            "set-coverage recall of the frozen top-B_h V sets, per-head relL2 "
+            "under apply-to-all (frozen-K and union-K execution) vs the frozen "
+            "baseline, and the missed-token attention-weight mass. Never mutates "
+            "the frozen walk; adds gqa_group_max_curve.csv + "
+            "gqa_group_max_ortheta.csv only."
+        ),
+    )
+    parser.add_argument(
         "--budget_deescalate",
         action="store_true",
         help=(
@@ -3889,6 +3908,11 @@ def run() -> None:
     gqa_union_rows: list[dict[str, object]] = []
     gqa_union_commit = bool(args.gqa_union_commit)
     gqa_union_commit_rows: list[dict[str, object]] = []
+    gqa_group_max_eval = bool(args.gqa_group_max_eval)
+    if gqa_group_max_eval and not gqa_union_commit:
+        raise SystemExit("--gqa_group_max_eval requires --gqa_union_commit (needs the per-group committed recs).")
+    gqa_group_max_curve_rows: list[dict[str, object]] = []
+    gqa_group_max_ortheta_rows: list[dict[str, object]] = []
     golden_dump_heads: set[int] | None = (
         {int(x) for x in parse_csv_ints(args.golden_dump_stage2_heads)}
         if str(args.golden_dump_stage2_heads).strip()
@@ -5877,6 +5901,140 @@ def run() -> None:
                             union_baseline_rel_l2=float(base_rl2),
                             union_rel_l2=float(union_rl2),
                         )
+                if gqa_group_max_eval:
+                    # Issue #20 group-max V-selection eval (additive; frozen
+                    # walk untouched). Rank V tokens by group-max risk = max
+                    # over the 4 group heads of the frozen scan-domain risk
+                    # (p_pq^2 * V_error), take ONE rank cutoff at B_grp, commit
+                    # apply-to-all. gqa_union_commit_head_output is reused with
+                    # a group-max V set in place of the union V set.
+                    gm_ctx = int(context_len)
+                    gm_hd = int(trace.head_dim)
+                    gm_pk = float(precision_k_hi_frac)
+                    gm_pv = float(precision_v_hi_frac)
+                    gm_reb = int(args.v_risk_key_exp_bits)
+                    gm_rmb = int(args.v_risk_key_mantissa_bits)
+                    gm_group_heads = "-".join(str(int(r["head"])) for r in recs)
+
+                    def _gm_relL2(rec, union_k_arg, hi_k_arg, v_set):
+                        out_x, _mx, _ix = gqa_union_commit_head_output(
+                            rec=rec, union_k=union_k_arg, group_hi_k=hi_k_arg,
+                            union_v=np.asarray(v_set, dtype=np.int64),
+                            context_len=gm_ctx, query_dim=gm_hd,
+                            precision_k_hi_frac=gm_pk, precision_v_hi_frac=gm_pv,
+                            v_risk_key_exp_bits=gm_reb, v_risk_key_mantissa_bits=gm_rmb,
+                        )
+                        return float(_output_error_metrics(rec["dense_head"], out_x)["output_relative_l2"])
+
+                    gm_risk = None
+                    gm_heads = []
+                    for rec in recs:
+                        out_b, _mb0, int_b = gqa_union_commit_head_output(
+                            rec=rec, union_k=rec["committed_k"],
+                            group_hi_k=rec["committed_hi_k"], union_v=rec["committed_v"],
+                            context_len=gm_ctx, query_dim=gm_hd,
+                            precision_k_hi_frac=gm_pk, precision_v_hi_frac=gm_pv,
+                            v_risk_key_exp_bits=gm_reb, v_risk_key_mantissa_bits=gm_rmb,
+                        )
+                        probs_h = np.asarray(int_b["probs"], dtype=np.float64)
+                        risk_h = (probs_h * probs_h) * np.asarray(rec["code_error"], dtype=np.float64)
+                        cv = np.asarray(rec["committed_v"], dtype=np.int64)
+                        Bh = int(cv.size)
+                        top_bh = np.argsort(-risk_h, kind="stable")[:Bh]
+                        repro_recall = (float(np.intersect1d(cv, top_bh).size) / Bh) if Bh else 1.0
+                        repro_rl2 = float(_output_error_metrics(rec["dense_head"], out_b)["output_relative_l2"])
+                        gm_heads.append({
+                            "rec": rec, "head": int(rec["head"]), "probs": probs_h,
+                            "risk": risk_h, "cv": cv, "Bh": Bh,
+                            "baseline_relL2": float(rec["baseline_relL2"]),
+                            "repro_relL2": repro_rl2, "repro_recall": repro_recall,
+                            "total_prob": float(probs_h.sum()),
+                            "committed_prob_mass": float(probs_h[cv].sum()) if Bh else 0.0,
+                        })
+                        gm_risk = risk_h if gm_risk is None else np.maximum(gm_risk, risk_h)
+                    order = np.argsort(-gm_risk, kind="stable")
+                    B_union = int(union_v.size)
+                    B_sum = int(v_sum)
+                    B_max = int(max(h["Bh"] for h in gm_heads))
+
+                    gm_cands = []
+                    _gm_seen = set()
+                    def _gm_add(label, b):
+                        b = int(min(gm_ctx, max(0, int(b))))
+                        if b in _gm_seen:
+                            return
+                        _gm_seen.add(b)
+                        gm_cands.append((label, b))
+                    _gm_add("union", B_union)
+                    _gm_add("sum", B_sum)
+                    _gm_add("max", B_max)
+                    for _f in (1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0):
+                        _gm_add(f"max_x{_f:g}", round(B_max * _f))
+                    for _f in (0.6, 0.7, 0.8, 0.9, 1.0):
+                        _gm_add(f"sum_x{_f:g}", round(B_sum * _f))
+                    _headline = {"union", "sum", "max"}
+                    for label, Bg in gm_cands:
+                        commit_mask = np.zeros((gm_ctx,), dtype=bool)
+                        commit_mask[order[:Bg]] = True
+                        committed_grp = order[:Bg].astype(np.int64)
+                        do_union_k = label in _headline
+                        for h in gm_heads:
+                            rec = h["rec"]; cv = h["cv"]; probs_h = h["probs"]; Bh = h["Bh"]
+                            inset = commit_mask[cv] if Bh else np.zeros((0,), dtype=bool)
+                            hit = int(np.count_nonzero(inset))
+                            recall = (hit / Bh) if Bh else 1.0
+                            miss_idx = cv[~inset] if Bh else cv[:0]
+                            miss_mass = float(probs_h[miss_idx].sum()) if miss_idx.size else 0.0
+                            rl2_fz = _gm_relL2(rec, rec["committed_k"], rec["committed_hi_k"], committed_grp)
+                            rl2_un = _gm_relL2(rec, union_k, group_hi_k, committed_grp) if do_union_k else float("nan")
+                            gqa_group_max_curve_rows.append({
+                                "qidx": int(qidx), "position": int(position),
+                                "context_len": int(gm_ctx), "kv_head": int(uc_key[0]),
+                                "head": int(h["head"]), "group_heads": gm_group_heads,
+                                "budget_label": str(label), "B_grp": int(Bg),
+                                "bytes_grp": int(256 * Bg), "Bh": int(Bh),
+                                "B_union": int(B_union), "B_sum": int(B_sum), "B_max": int(B_max),
+                                "baseline_relL2": float(h["baseline_relL2"]),
+                                "repro_baseline_relL2": float(h["repro_relL2"]),
+                                "repro_topBh_recall": float(h["repro_recall"]),
+                                "groupmax_relL2_frozenK": float(rl2_fz),
+                                "groupmax_relL2_unionK": float(rl2_un),
+                                "coverage_recall": float(recall),
+                                "missed_tokens": int(Bh - hit),
+                                "missed_weight_mass": float(miss_mass),
+                                "committed_weight_mass": float(h["committed_prob_mass"]),
+                                "total_weight_mass": float(h["total_prob"]),
+                            })
+                    # OR-theta curiosity: single GLOBAL absolute threshold on the
+                    # per-head risk, OR'd across the group == threshold on the
+                    # group-max risk (max_h risk_h >= theta). #12 threshold family.
+                    for gm_theta in (2e-11, 1e-11, 3e-11):
+                        theta_mask = gm_risk >= float(gm_theta)
+                        committed_theta = np.flatnonzero(theta_mask).astype(np.int64)
+                        B_theta = int(committed_theta.size)
+                        for h in gm_heads:
+                            rec = h["rec"]; cv = h["cv"]; probs_h = h["probs"]; Bh = h["Bh"]
+                            inset = theta_mask[cv] if Bh else np.zeros((0,), dtype=bool)
+                            hit = int(np.count_nonzero(inset))
+                            recall = (hit / Bh) if Bh else 1.0
+                            miss_idx = cv[~inset] if Bh else cv[:0]
+                            miss_mass = float(probs_h[miss_idx].sum()) if miss_idx.size else 0.0
+                            rl2_fz = _gm_relL2(rec, rec["committed_k"], rec["committed_hi_k"], committed_theta)
+                            gqa_group_max_ortheta_rows.append({
+                                "qidx": int(qidx), "position": int(position),
+                                "context_len": int(gm_ctx), "kv_head": int(uc_key[0]),
+                                "head": int(h["head"]), "group_heads": gm_group_heads,
+                                "theta": float(gm_theta), "B_theta": int(B_theta),
+                                "bytes_theta": int(256 * B_theta), "Bh": int(Bh),
+                                "B_union": int(B_union),
+                                "baseline_relL2": float(h["baseline_relL2"]),
+                                "ortheta_relL2_frozenK": float(rl2_fz),
+                                "coverage_recall": float(recall),
+                                "missed_tokens": int(Bh - hit),
+                                "missed_weight_mass": float(miss_mass),
+                                "committed_weight_mass": float(h["committed_prob_mass"]),
+                                "total_weight_mass": float(h["total_prob"]),
+                            })
             uc_stash.clear()
         dense_concat = np.concatenate([dense_heads[int(head)] for head in heads], axis=0).astype(np.float32, copy=False)
         dense_proj = project_head_subset(
@@ -5970,6 +6128,10 @@ def run() -> None:
         output_tables.append(("gqa_union_stats.csv", gqa_union_rows))
     if gqa_union_commit_rows:
         output_tables.append(("gqa_union_commit.csv", gqa_union_commit_rows))
+    if gqa_group_max_curve_rows:
+        output_tables.append(("gqa_group_max_curve.csv", gqa_group_max_curve_rows))
+    if gqa_group_max_ortheta_rows:
+        output_tables.append(("gqa_group_max_ortheta.csv", gqa_group_max_ortheta_rows))
     for filename, rows in output_tables:
         with (out_dir / filename).open("w", newline="", encoding="utf-8") as f:
             fieldnames = list(rows[0].keys())

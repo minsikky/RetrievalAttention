@@ -1,0 +1,5 @@
+candidate,bytes_vs_union,quality_mean_relL2,quality_p95_relL2,test_resid_mean_tokens,test_resid_p95_tokens,underprov_frac_test
+sum_Bh,2.113,1.7588e-03,4.0019e-03,,,
+union_oracle,1.0,1.9613e-03,4.6193e-03,,,
+fitted_linear,0.97,1.9662e-03,4.6096e-03,-576.2,7107.3,0.458
+fitted_mult_Bmax,0.971,2.0158e-03,4.6066e-03,-333.5,6206.0,0.583
