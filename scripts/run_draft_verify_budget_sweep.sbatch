@@ -15,16 +15,19 @@ set -euo pipefail
 # tokens), run from the PINNED draft-budget worktree (draft-gpu stays byte-
 # frozen for its in-flight jobs).
 #
-# GRID RE-ANCHORING NOTE (important): the directive assumed
-# JOINT_KV_START_STRATEGY=proxy_mass_mXpY parses arbitrary masses. It does
-# not — _fraction_suffix splits at the FIRST "m" ("proxy_Mass"), the suffix
-# never parses, and every blessed run has de facto used the DEFAULT mass
-# 0.5. That legacy behavior is frozen; this sweep instead sets the mass via
-# the new DRAFT-ONLY env SELECTOR_PQ_JOINT_DRAFT_PROXY_MASS (cannot engage
-# in off/frozen runs) and re-anchors the grid at the true operating point
-# 0.5, sweeping DOWN {0.5, 0.35, 0.2, 0.1} plus one upward probe (0.9, the
-# directive's assumed baseline). Anchor arm = legacy start1 (no mass
-# override) so the matrix start1 numbers reproduce exactly.
+# GRID NOTE (re-scoped after the parser-divergence finding): the GPU
+# lineage's de facto start mass is 0.5 (the GPU-side suffix parse always
+# returns the default), and measured mass-0.5 counts sit at/below the GPU
+# ladder floor k0=4096 at these contexts — so every mass below 0.5 clamps
+# to the same floor start, start-1 == start0 at the floor, and v_target
+# probes at floored arms are no-ops (0.25*4096 = 1024 = v floor). The
+# informative axis collapses to: start0 (floor pin — the cheap point below
+# start1), the legacy start1 anchor, the mass-0.9 upward probe at bump 0
+# (= the CPU-spec operating point, for the divergence reconciliation), and
+# v_ratio {0.125, 0.5} probes at the two off-floor arms (start1 and the
+# 0.9 probe) where k_target > k0 keeps the coupling live. Mass overrides
+# use the DRAFT-ONLY env SELECTOR_PQ_JOINT_DRAFT_PROXY_MASS (cannot engage
+# in off/frozen runs).
 #
 # All draft arms are pin-rung (walk skipped) with the start1 shape: exact-K
 # logits on the committed set + exact/corrected V (full frozen finalize).
@@ -42,19 +45,36 @@ set -euo pipefail
 # teacher-forced-on-dense, all with logit traces.
 
 REPO=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/worktrees/draft-budget
+DGPU=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/worktrees/draft-gpu
 cd "${REPO}"
 
-OUTPUT_ROOT="${OUTPUT_ROOT:-/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/worktrees/draft-gpu/benchmark_suite_result/draft_verify_gpu_20260712_matrix/budget_sweep_32k}"
-TASK_NAME=qa_1
-CONTEXT_LEN=32768
-NUM_SAMPLES=4
+: "${BUNDLE:?set BUNDLE=32k or 128k}"
+case "${BUNDLE}" in
+  32k)
+    TASK_NAME=qa_1
+    CONTEXT_LEN=32768
+    NUM_SAMPLES=4
+    DATA_FILE="${DGPU}/benchmark_suite_result/ktcache_ab_20260709/qa1_32k_n4_ktON/data/qa_1/validation.jsonl"
+    RUN_PREFIX=qa1_32k_n4
+    OUTPUT_ROOT="${OUTPUT_ROOT:-${DGPU}/benchmark_suite_result/draft_verify_gpu_20260712_matrix/budget_sweep_32k}"
+    ;;
+  128k)
+    # mig40 excluded on the submit line (mk3@128k dense prefill OOMs 40GB).
+    TASK_NAME=niah_multikey_3
+    CONTEXT_LEN=131072
+    NUM_SAMPLES=2
+    DATA_FILE="${DGPU}/benchmark_suite_result/frozen_sim_20260707/runs/frozensim_mk3_128k_n16/data/niah_multikey_3/validation.jsonl"
+    RUN_PREFIX=mk3_128k_n2
+    OUTPUT_ROOT="${OUTPUT_ROOT:-${DGPU}/benchmark_suite_result/draft_verify_gpu_20260712_matrix/budget_sweep_128k}"
+    ;;
+  *)
+    echo "unknown BUNDLE=${BUNDLE}" >&2; exit 2 ;;
+esac
 MAX_NEW_TOKENS=64
-DATA_FILE=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/worktrees/draft-gpu/benchmark_suite_result/ktcache_ab_20260709/qa1_32k_n4_ktON/data/qa_1/validation.jsonl
-RUN_PREFIX=qa1_32k_n4
 mkdir -p logs
 
 [ -s "${DATA_FILE}" ] || { echo "missing data ${DATA_FILE}" >&2; exit 1; }
-echo "[dv-budget-swp] head=$(git rev-parse --short HEAD) node=$(hostname)"
+echo "[dv-budget-swp] head=$(git rev-parse --short HEAD) bundle=${BUNDLE} node=$(hostname)"
 nvidia-smi -L
 
 run_arm() {
@@ -104,20 +124,18 @@ run_arm() {
     SKIP_RULER_EVAL=1 \
     bash scripts/run_frontier_ruler_batched_one.sh
   local wall=$(( SECONDS - t0 ))
-  echo "DV-BUDGET-ARM name=${arm_name} run=${run_name} wall=${wall}s"
+  echo "DV-BUDGET-ARM bundle=${BUNDLE} name=${arm_name} run=${run_name} wall=${wall}s"
 }
 
 # name           mode     mass   v_ratio
 GRID="\
+start0:start0::0.25 \
 anchor_b1:start1::0.25 \
-m0p5_b0:start0:0.5:0.25 \
-m0p5_bm1:start-1:0.5:0.25 \
-m0p35_b0:start0:0.35:0.25 \
-m0p2_b0:start0:0.2:0.25 \
-m0p2_bm1:start-1:0.2:0.25 \
-m0p1_bm1:start-1:0.1:0.25 \
 m0p9_b0:start0:0.9:0.25 \
-m0p5_b0_vr0p125:start0:0.5:0.125"
+s1_vr0p125:start1::0.125 \
+s1_vr0p5:start1::0.5 \
+m0p9_vr0p125:start0:0.9:0.125 \
+m0p9_vr0p5:start0:0.9:0.5"
 
 run_arm dense off "" 0.25 ""
 for spec in ${GRID}; do
@@ -129,4 +147,4 @@ for spec in ${GRID}; do
   run_arm "${nm}" "${md}" "${ms}" "${vr}" dense
 done
 
-echo "DV-BUDGET-SWEEP: COMPLETED"
+echo "DV-BUDGET-SWEEP: COMPLETED bundle=${BUNDLE}"
