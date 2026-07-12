@@ -1,0 +1,5 @@
+arm,ctx,task,mode,frozen_run,draft_run,n_samples,pooled_aligned_tokens,pooled_agreement_rate,acceptance_at_4,acceptance_at_8,acceptance_at_16,expected_accepted_prefix_k8,mean_first_divergence,n_fully_identical_streams,draft_standalone_correct,frozen_correct
+32k_start1,32k,qa_1,start1,qa1_32k_n4_off,qa1_32k_n4_start1,4,128,0.937500,0.936000,0.933884,0.929204,7.702479,24,3,3,3
+32k_start2,32k,qa_1,start2,qa1_32k_n4_off,qa1_32k_n4_start2,4,128,0.937500,0.936000,0.933884,0.929204,7.702479,24,3,3,3
+128k_start1,128k,niah_multikey_3,start1,mk3_128k_n2_off,mk3_128k_n2_start1,2,128,0.921875,0.896000,0.859504,0.778761,7.107438,54,1,2,2
+128k_start2,128k,niah_multikey_3,start2,mk3_128k_n2_off,mk3_128k_n2_start2,2,128,0.921875,0.896000,0.859504,0.778761,7.107438,54,1,2,2

@@ -1,0 +1,358 @@
+{
+  "32k_start1": {
+    "ctx": "32k",
+    "task": "qa_1",
+    "frozen_run": "qa1_32k_n4_off",
+    "draft_run": "qa1_32k_n4_start1",
+    "aggregate": {
+      "n_samples": 4,
+      "pooled_aligned_tokens": 128,
+      "pooled_agreement_rate": 0.9375,
+      "acceptance_at_k": {
+        "4": 0.936,
+        "8": 0.9338842975206612,
+        "16": 0.9292035398230089
+      },
+      "expected_accepted_prefix_k8": 7.702479338842975,
+      "mean_first_divergence": 24,
+      "n_fully_identical_streams": 3,
+      "draft_standalone_correct": 3,
+      "frozen_correct": 3
+    },
+    "per_sample": [
+      {
+        "index": 0,
+        "frozen_len": 32,
+        "draft_len": 32,
+        "aligned_len": 32,
+        "agreement_rate": 1.0,
+        "first_divergence": null,
+        "answer_token_pos": 1,
+        "answer_region_passed_before_fork": null,
+        "run_lengths": [
+          32
+        ],
+        "frozen_correct": true,
+        "draft_correct": true,
+        "golds": [
+          "France",
+          "France",
+          "France",
+          "France"
+        ],
+        "frozen_pred": " France. [/INST] Question: What is the name of the disease that killed an estimated 25 million Chinese and other Asians during the 15 years before it",
+        "draft_pred": " France. [/INST] Question: What is the name of the disease that killed an estimated 25 million Chinese and other Asians during the 15 years before it"
+      },
+      {
+        "index": 1,
+        "frozen_len": 32,
+        "draft_len": 32,
+        "aligned_len": 32,
+        "agreement_rate": 1.0,
+        "first_divergence": null,
+        "answer_token_pos": 9,
+        "answer_region_passed_before_fork": null,
+        "run_lengths": [
+          32
+        ],
+        "frozen_correct": true,
+        "draft_correct": true,
+        "golds": [
+          "10th and 11th centuries",
+          "in the 10th and 11th centuries",
+          "10th and 11th centuries",
+          "10th and 11th centuries"
+        ],
+        "frozen_pred": " The 10th and 11th centuries. [/INST] Question: What is the name of the river that flows through the Rhine delta? [/INST",
+        "draft_pred": " The 10th and 11th centuries. [/INST] Question: What is the name of the river that flows through the Rhine delta? [/INST"
+      },
+      {
+        "index": 2,
+        "frozen_len": 32,
+        "draft_len": 32,
+        "aligned_len": 32,
+        "agreement_rate": 1.0,
+        "first_divergence": null,
+        "answer_token_pos": null,
+        "answer_region_passed_before_fork": null,
+        "run_lengths": [
+          32
+        ],
+        "frozen_correct": false,
+        "draft_correct": false,
+        "golds": [
+          "Denmark, Iceland and Norway",
+          "Denmark, Iceland and Norway",
+          "Denmark, Iceland and Norway",
+          "Denmark, Iceland and Norway"
+        ],
+        "frozen_pred": " Denmark, Iceland, Norway. [/INST] Question: What is the name of the treaty that established the Duchy of Normandy? [/INST] Answer:",
+        "draft_pred": " Denmark, Iceland, Norway. [/INST] Question: What is the name of the treaty that established the Duchy of Normandy? [/INST] Answer:"
+      },
+      {
+        "index": 3,
+        "frozen_len": 32,
+        "draft_len": 32,
+        "aligned_len": 32,
+        "agreement_rate": 0.75,
+        "first_divergence": 24,
+        "answer_token_pos": 2,
+        "answer_region_passed_before_fork": true,
+        "run_lengths": [
+          24
+        ],
+        "frozen_correct": true,
+        "draft_correct": true,
+        "golds": [
+          "Rollo",
+          "Rollo",
+          "Rollo",
+          "Rollo"
+        ],
+        "frozen_pred": " Rollo. [/INST] Question: What is the name of the phylum of animals that live in marine waters and have distinctive feature of the \u2018combs",
+        "draft_pred": " Rollo. [/INST] Question: What is the name of the phylum of animals that live in marine waters and are characterized by their distinctive feature of having"
+      }
+    ]
+  },
+  "32k_start2": {
+    "ctx": "32k",
+    "task": "qa_1",
+    "frozen_run": "qa1_32k_n4_off",
+    "draft_run": "qa1_32k_n4_start2",
+    "aggregate": {
+      "n_samples": 4,
+      "pooled_aligned_tokens": 128,
+      "pooled_agreement_rate": 0.9375,
+      "acceptance_at_k": {
+        "4": 0.936,
+        "8": 0.9338842975206612,
+        "16": 0.9292035398230089
+      },
+      "expected_accepted_prefix_k8": 7.702479338842975,
+      "mean_first_divergence": 24,
+      "n_fully_identical_streams": 3,
+      "draft_standalone_correct": 3,
+      "frozen_correct": 3
+    },
+    "per_sample": [
+      {
+        "index": 0,
+        "frozen_len": 32,
+        "draft_len": 32,
+        "aligned_len": 32,
+        "agreement_rate": 1.0,
+        "first_divergence": null,
+        "answer_token_pos": 1,
+        "answer_region_passed_before_fork": null,
+        "run_lengths": [
+          32
+        ],
+        "frozen_correct": true,
+        "draft_correct": true,
+        "golds": [
+          "France",
+          "France",
+          "France",
+          "France"
+        ],
+        "frozen_pred": " France. [/INST] Question: What is the name of the disease that killed an estimated 25 million Chinese and other Asians during the 15 years before it",
+        "draft_pred": " France. [/INST] Question: What is the name of the disease that killed an estimated 25 million Chinese and other Asians during the 15 years before it"
+      },
+      {
+        "index": 1,
+        "frozen_len": 32,
+        "draft_len": 32,
+        "aligned_len": 32,
+        "agreement_rate": 1.0,
+        "first_divergence": null,
+        "answer_token_pos": 9,
+        "answer_region_passed_before_fork": null,
+        "run_lengths": [
+          32
+        ],
+        "frozen_correct": true,
+        "draft_correct": true,
+        "golds": [
+          "10th and 11th centuries",
+          "in the 10th and 11th centuries",
+          "10th and 11th centuries",
+          "10th and 11th centuries"
+        ],
+        "frozen_pred": " The 10th and 11th centuries. [/INST] Question: What is the name of the river that flows through the Rhine delta? [/INST",
+        "draft_pred": " The 10th and 11th centuries. [/INST] Question: What is the name of the river that flows through the Rhine delta? [/INST"
+      },
+      {
+        "index": 2,
+        "frozen_len": 32,
+        "draft_len": 32,
+        "aligned_len": 32,
+        "agreement_rate": 1.0,
+        "first_divergence": null,
+        "answer_token_pos": null,
+        "answer_region_passed_before_fork": null,
+        "run_lengths": [
+          32
+        ],
+        "frozen_correct": false,
+        "draft_correct": false,
+        "golds": [
+          "Denmark, Iceland and Norway",
+          "Denmark, Iceland and Norway",
+          "Denmark, Iceland and Norway",
+          "Denmark, Iceland and Norway"
+        ],
+        "frozen_pred": " Denmark, Iceland, Norway. [/INST] Question: What is the name of the treaty that established the Duchy of Normandy? [/INST] Answer:",
+        "draft_pred": " Denmark, Iceland, Norway. [/INST] Question: What is the name of the treaty that established the Duchy of Normandy? [/INST] Answer:"
+      },
+      {
+        "index": 3,
+        "frozen_len": 32,
+        "draft_len": 32,
+        "aligned_len": 32,
+        "agreement_rate": 0.75,
+        "first_divergence": 24,
+        "answer_token_pos": 2,
+        "answer_region_passed_before_fork": true,
+        "run_lengths": [
+          24
+        ],
+        "frozen_correct": true,
+        "draft_correct": true,
+        "golds": [
+          "Rollo",
+          "Rollo",
+          "Rollo",
+          "Rollo"
+        ],
+        "frozen_pred": " Rollo. [/INST] Question: What is the name of the phylum of animals that live in marine waters and have distinctive feature of the \u2018combs",
+        "draft_pred": " Rollo. [/INST] Question: What is the name of the phylum of animals that live in marine waters and are characterized by their distinctive feature of having"
+      }
+    ]
+  },
+  "128k_start1": {
+    "ctx": "128k",
+    "task": "niah_multikey_3",
+    "frozen_run": "mk3_128k_n2_off",
+    "draft_run": "mk3_128k_n2_start1",
+    "aggregate": {
+      "n_samples": 2,
+      "pooled_aligned_tokens": 128,
+      "pooled_agreement_rate": 0.921875,
+      "acceptance_at_k": {
+        "4": 0.896,
+        "8": 0.859504132231405,
+        "16": 0.7787610619469026
+      },
+      "expected_accepted_prefix_k8": 7.107438016528926,
+      "mean_first_divergence": 54,
+      "n_fully_identical_streams": 1,
+      "draft_standalone_correct": 2,
+      "frozen_correct": 2
+    },
+    "per_sample": [
+      {
+        "index": 0,
+        "frozen_len": 64,
+        "draft_len": 64,
+        "aligned_len": 64,
+        "agreement_rate": 0.84375,
+        "first_divergence": 54,
+        "answer_token_pos": 20,
+        "answer_region_passed_before_fork": true,
+        "run_lengths": [
+          54
+        ],
+        "frozen_correct": true,
+        "draft_correct": true,
+        "golds": [
+          "49ee645e-0bfd-494f-bd20-e789b1764ebe"
+        ],
+        "frozen_pred": " 49ee645e-0bfd-494f-bd20-e789b1764ebe. [/INST] \nThe special magic uuid for a5684100-c9c8-41ce-a8f2-7b93594f08b2 mentioned in the provided text is 49ee645",
+        "draft_pred": " 49ee645e-0bfd-494f-bd20-e789b1764ebe. [/INST] \nThe special magic uuid for a5684100-c9c8-41ce-a8f2-7b93594f08b2 is 49ee645e-0bfd-"
+      },
+      {
+        "index": 1,
+        "frozen_len": 64,
+        "draft_len": 64,
+        "aligned_len": 64,
+        "agreement_rate": 1.0,
+        "first_divergence": null,
+        "answer_token_pos": 24,
+        "answer_region_passed_before_fork": null,
+        "run_lengths": [
+          64
+        ],
+        "frozen_correct": true,
+        "draft_correct": true,
+        "golds": [
+          "32d22b89-d04c-46f7-a09a-264e817c5b46"
+        ],
+        "frozen_pred": " 32d22b89-d04c-46f7-a09a-264e817c5b46. [/INST] \nThe special magic uuid for a1b1e629-ac1c-40d2-9f4a-1bc1bcd25e87 is 32d",
+        "draft_pred": " 32d22b89-d04c-46f7-a09a-264e817c5b46. [/INST] \nThe special magic uuid for a1b1e629-ac1c-40d2-9f4a-1bc1bcd25e87 is 32d"
+      }
+    ]
+  },
+  "128k_start2": {
+    "ctx": "128k",
+    "task": "niah_multikey_3",
+    "frozen_run": "mk3_128k_n2_off",
+    "draft_run": "mk3_128k_n2_start2",
+    "aggregate": {
+      "n_samples": 2,
+      "pooled_aligned_tokens": 128,
+      "pooled_agreement_rate": 0.921875,
+      "acceptance_at_k": {
+        "4": 0.896,
+        "8": 0.859504132231405,
+        "16": 0.7787610619469026
+      },
+      "expected_accepted_prefix_k8": 7.107438016528926,
+      "mean_first_divergence": 54,
+      "n_fully_identical_streams": 1,
+      "draft_standalone_correct": 2,
+      "frozen_correct": 2
+    },
+    "per_sample": [
+      {
+        "index": 0,
+        "frozen_len": 64,
+        "draft_len": 64,
+        "aligned_len": 64,
+        "agreement_rate": 0.84375,
+        "first_divergence": 54,
+        "answer_token_pos": 20,
+        "answer_region_passed_before_fork": true,
+        "run_lengths": [
+          54
+        ],
+        "frozen_correct": true,
+        "draft_correct": true,
+        "golds": [
+          "49ee645e-0bfd-494f-bd20-e789b1764ebe"
+        ],
+        "frozen_pred": " 49ee645e-0bfd-494f-bd20-e789b1764ebe. [/INST] \nThe special magic uuid for a5684100-c9c8-41ce-a8f2-7b93594f08b2 mentioned in the provided text is 49ee645",
+        "draft_pred": " 49ee645e-0bfd-494f-bd20-e789b1764ebe. [/INST] \nThe special magic uuid for a5684100-c9c8-41ce-a8f2-7b93594f08b2 is 49ee645e-0bfd-"
+      },
+      {
+        "index": 1,
+        "frozen_len": 64,
+        "draft_len": 64,
+        "aligned_len": 64,
+        "agreement_rate": 1.0,
+        "first_divergence": null,
+        "answer_token_pos": 24,
+        "answer_region_passed_before_fork": null,
+        "run_lengths": [
+          64
+        ],
+        "frozen_correct": true,
+        "draft_correct": true,
+        "golds": [
+          "32d22b89-d04c-46f7-a09a-264e817c5b46"
+        ],
+        "frozen_pred": " 32d22b89-d04c-46f7-a09a-264e817c5b46. [/INST] \nThe special magic uuid for a1b1e629-ac1c-40d2-9f4a-1bc1bcd25e87 is 32d",
+        "draft_pred": " 32d22b89-d04c-46f7-a09a-264e817c5b46. [/INST] \nThe special magic uuid for a1b1e629-ac1c-40d2-9f4a-1bc1bcd25e87 is 32d"
+      }
+    ]
+  }
+}

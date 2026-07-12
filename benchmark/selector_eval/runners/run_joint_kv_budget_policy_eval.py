@@ -6,6 +6,7 @@ import csv
 import dataclasses
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -1578,6 +1579,28 @@ def rebuild_vcorr_accs_from_operands(
     return out
 
 
+def _stage2_draft_bump() -> int | None:
+    """Draft-then-verify one-shot rung bump for the stage-2 CPU dump (issue #21).
+
+    Reads SELECTOR_PQ_JOINT_DRAFT_MODE={off,start1,start2}. Mirrors
+    ``_joint_draft_mode`` in hf_paged_pq_intervention_joint_policy.py (the GPU
+    decode chokepoint). Default/off returns None so the frozen escalation walk
+    dumps byte-identically; start1/start2 return the K-rung bump (+1/+2) applied
+    at the settled point so the dump emits the DRAFT one-shot committed set from
+    the SAME scan state the frozen walk saw.
+    """
+    mode = str(os.environ.get("SELECTOR_PQ_JOINT_DRAFT_MODE", "off")).strip().lower()
+    if mode in {"", "off", "0", "false", "none"}:
+        return None
+    if mode == "start1":
+        return 1
+    if mode == "start2":
+        return 2
+    raise ValueError(
+        f"unknown SELECTOR_PQ_JOINT_DRAFT_MODE={mode!r}; expected off, start1, or start2"
+    )
+
+
 def _write_stage2_golden(
     out_dir: str,
     *,
@@ -2509,6 +2532,14 @@ def _write_stage2_golden(
         start_vi=int(start_vi),
         settled_ki=int(settled_ki),
         settled_vi=int(settled_vi),
+        # Issue #21 golden-1/2: the head's committed K set (union of walk bands
+        # 0..settled_ki = selected_by_k[settled_ki]) and committed exact-V set as
+        # explicit sorted token-id lists, so the draft-vs-frozen superset/miss
+        # bitmap can be built without re-deriving from band masks. Additive; the
+        # frozen (off-mode) committed_k_tokens must equal the pre-union stage-2
+        # goldens' per-head group_committed_k span for the same q/h.
+        committed_k_tokens=np.sort(np.asarray(selected_by_k[int(settled_ki)], dtype=np.int64)),
+        committed_v_tokens=np.flatnonzero(exact_mask).astype(np.int64),
         probe_kind=np.asarray(kinds),
         probe_ki=np.asarray(p_ki, dtype=np.int64),
         probe_vi=np.asarray(p_vi, dtype=np.int64),
@@ -4920,6 +4951,34 @@ def run() -> None:
                                         test_log=la_test_log,
                                         deescalate=bool(args.budget_deescalate),
                                     )
+                                # Draft-then-verify one-shot override (issue #21).
+                                # When SELECTOR_PQ_JOINT_DRAFT_MODE={start1,start2}
+                                # is set, replace the frozen escalation-walk
+                                # settled point with the pinned one-shot draft rung
+                                # (proxy-mass start rung + bump, clamped to the
+                                # ladder) plus the frozen v_target rule
+                                # (v = max(v_budgets[0], 0.25*k_target)), mirroring
+                                # select_joint_kv_budgets in the GPU decode
+                                # controller. Default off leaves ki/vi untouched
+                                # (byte-identical to the frozen dump). scores_by_k /
+                                # selected_by_k / probs_by_k / base_output_by_k are
+                                # keyed over the SAME ladder, so the dump remains
+                                # self-consistent at the pinned rung and emits the
+                                # DRAFT committed set from identical scan state.
+                                _draft_bump = _stage2_draft_bump()
+                                if _draft_bump is not None:
+                                    ki = min(int(start_ki) + int(_draft_bump), len(k_budgets) - 1)
+                                    _k_target = float(k_budgets[int(ki)])
+                                    _v_target = max(float(v_budgets[0]), _k_target * 0.25)
+                                    vi = next(
+                                        (j for j, b in enumerate(v_budgets) if int(b) >= _v_target),
+                                        len(v_budgets) - 1,
+                                    )
+                                    vi = min(max(0, int(vi)), len(v_budgets) - 1)
+                                    steps = 0
+                                    final_k_delta = 0.0
+                                    final_v_delta = 0.0
+                                    policy_trace = [f"draft_start{int(_draft_bump)}"]
                                 if not temporal_reuse_now:
                                     temporal_budget_cache[prev_key] = (int(ki), int(vi))
                                 previous_fraction[prev_key] = (
