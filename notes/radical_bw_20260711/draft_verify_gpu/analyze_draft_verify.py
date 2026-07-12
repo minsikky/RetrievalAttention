@@ -125,6 +125,60 @@ def expected_accepted_prefix(match_lists: list[list[bool]], k: int) -> float:
 def windows_at_k(match_lists: list[list[bool]], k: int) -> int:
     return sum(max(0, len(m) - k + 1) for m in match_lists)
 
+def renewal_stats(match_lists: list[list[bool]], k: int) -> dict:
+    """Exact k-round speculative-decode renewal walk over per-sample bitmaps.
+
+    PRIMARY acceptance metric (2026-07-12 methodology order): from position
+    t, accept the run of matches up to k, emit accepted_len, advance
+    t += accepted_len + 1 (the verifier-corrected token), repeat; never
+    crosses sample boundaries. Exact for the deterministic greedy loop.
+    Sliding windows (kept as secondary) average all offsets uniformly, but
+    real round starts are renewal-biased toward just-after-a-miss positions.
+    """
+    rounds: list[int] = []
+    for m in match_lists:
+        t = 0
+        n = len(m)
+        while t < n:
+            acc = 0
+            while acc < k and t + acc < n and m[t + acc]:
+                acc += 1
+            rounds.append(acc)
+            t += acc + 1
+    if not rounds:
+        return {"k": k, "n_rounds": 0}
+    rs = sorted(rounds)
+
+    def q(p: float) -> int:
+        return rs[min(len(rs) - 1, max(0, int(round(p * (len(rs) - 1)))))]
+
+    return {
+        "k": k,
+        "n_rounds": len(rounds),
+        "mean_accepted_per_round": sum(rounds) / len(rounds),
+        "p25": q(0.25),
+        "p50": q(0.50),
+        "p75": q(0.75),
+        "full_rounds_frac": sum(1 for r in rounds if r == k) / len(rounds),
+    }
+
+
+def clopper_pearson_ci(successes: int, n: int, alpha: float = 0.05) -> list[float]:
+    """Exact binomial CI for per-position acceptance (scipy if available)."""
+    if n <= 0:
+        return [float("nan"), float("nan")]
+    try:
+        from scipy.stats import beta as _beta
+        lo = 0.0 if successes <= 0 else float(_beta.ppf(alpha / 2, successes, n - successes + 1))
+        hi = 1.0 if successes >= n else float(_beta.ppf(1 - alpha / 2, successes + 1, n - successes))
+        return [lo, hi]
+    except Exception:
+        import math as _math
+        p = successes / n
+        se = _math.sqrt(max(p * (1 - p), 1e-12) / n)
+        return [max(0.0, p - 1.96 * se), min(1.0, p + 1.96 * se)]
+
+
 
 def analyze_pair(frozen_rows, draft_rows, task, tokenizer):
     per_sample = []
@@ -170,6 +224,11 @@ def analyze_pair(frozen_rows, draft_rows, task, tokenizer):
         "n_samples": len(per_sample),
         "pooled_aligned_tokens": len(all_matches),
         "pooled_agreement_rate": (sum(all_matches) / len(all_matches)) if all_matches else float("nan"),
+        "n_positions": len(all_matches),
+        "per_position_agreement_ci95": clopper_pearson_ci(sum(all_matches), len(all_matches)),
+        # PRIMARY: exact renewal-loop statistics (see renewal_stats docstring).
+        "renewal_at_k": {str(k): renewal_stats(match_lists, k) for k in ACCEPT_KS},
+        # SECONDARY (continuity): sliding-window stats, offset-uniform proxy.
         "acceptance_at_k": {str(k): acceptance_at_k(match_lists, k) for k in ACCEPT_KS},
         "expected_accepted_prefix_at_k": {
             str(k): expected_accepted_prefix(match_lists, k) for k in ACCEPT_KS
