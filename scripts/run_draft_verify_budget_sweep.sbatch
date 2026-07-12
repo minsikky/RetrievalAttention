@@ -15,32 +15,15 @@ set -euo pipefail
 # tokens), run from the PINNED draft-budget worktree (draft-gpu stays byte-
 # frozen for its in-flight jobs).
 #
-# GRID NOTE (dedup pass, revised on GPU counter evidence): the GPU
-# lineage's de facto start mass is 0.5 (the GPU-side suffix parse always
-# returns the default). On the L16 trace, mass-0.5 counts sit at/below the
-# GPU floor k0=4096 — but the 32k matrix counters show qa_1 mass-0.5
-# starts are NOT floor-clamped (start1 mean committed ~13.1k rows = rung
-# mix well above floor), so floor collapse is data-dependent and the
-# down-mass axis IS live on qa_1: m0p35/m0p2 arms are kept at 32k. The
-# grid: start0 (one-rung-cheaper pin), legacy start1 anchor, down-mass
-# probes, the mass-0.9 upward probe at bump 0 (= the CPU-spec operating
-# point, for the divergence reconciliation), and v_ratio {0.125, 0.5}
-# probes at the off-floor arms. Mass overrides use the DRAFT-ONLY env
-# SELECTOR_PQ_JOINT_DRAFT_PROXY_MASS (cannot engage in off/frozen runs).
-# Per-arm draft_histo.json records the realized (layer,ki,vi) mix, which
-# settles the floor-clamp question empirically per arm.
-#
-# All draft arms are pin-rung (walk skipped) with the start1 shape: exact-K
-# logits on the committed set + exact/corrected V (full frozen finalize).
-# Knobs, draft-branch only:
-#   SELECTOR_PQ_JOINT_DRAFT_MODE       start1|start0|start-1 (bump +1/0/-1)
-#   SELECTOR_PQ_JOINT_DRAFT_PROXY_MASS coverage mass for the start rung
-#   SELECTOR_PQ_JOINT_DRAFT_V_RATIO    v_target coupling (frozen rule: 0.25)
-#   SELECTOR_PQ_JOINT_DRAFT_HISTO_FILE realized (layer,ki,vi) histogram, for
-#                                      the ladder-floor-clamp analysis
-#                                      (k0=4096 at 32k = 12.5% of ctx; flag
-#                                      floor-clamped arms — the 1M ladder
-#                                      floor is 0.4% so 32k understates room)
+# GRID NOTE (op-fix lineage, contract OP): with the parser fixed, legacy
+# proxy_mass_m0p9 actually parses 0.9 on GPU, so the anchor arm (start1, no
+# mass override) IS the contract-OP start+1 drafter, and the original
+# mass x bump grid is meaningful: at 0.9 starts the walk settles at start
+# (89.7% of golden walks never move), so mass and bump are the budget
+# dials. Masses are swept via the DRAFT-ONLY env
+# SELECTOR_PQ_JOINT_DRAFT_PROXY_MASS (cannot engage in frozen/off runs);
+# per-arm draft_histo.json records the realized (layer,ki,vi) mix and
+# flags ladder-floor clamping (k0=4096 = 12.5% of 32k ctx vs 0.4% at 1M).
 # Passes: dense reference (dumps trace; max_new=64 differs from the matrix
 # bundle so its dense trace is NOT reusable) then per draft arm free-run +
 # teacher-forced-on-dense, all with logit traces.
@@ -128,30 +111,31 @@ run_arm() {
   echo "DV-BUDGET-ARM bundle=${BUNDLE} name=${arm_name} run=${run_name} wall=${wall}s"
 }
 
-# name           mode     mass   v_ratio
+# name           mode     mass   v_ratio   (legacy mass "" = 0.9 post-fix)
 if [ "${BUNDLE}" = "32k" ]; then
-  # 9 draft arms x 2 passes + dense = 19 passes (~3.2h at ~10 min/pass).
+  # Priority diagonal of mass {0.9,0.8,0.7,0.5} x bump {+1,0,-1} + v_ratio
+  # probes at (0.9, 0): 9 draft arms x 2 passes + dense = 19 passes.
   GRID="\
-start0:start0::0.25 \
 anchor_b1:start1::0.25 \
-m0p35_b0:start0:0.35:0.25 \
-m0p2_b0:start0:0.2:0.25 \
 m0p9_b0:start0:0.9:0.25 \
-s1_vr0p125:start1::0.125 \
-s1_vr0p5:start1::0.5 \
-m0p9_vr0p125:start0:0.9:0.125 \
-m0p9_vr0p5:start0:0.9:0.5"
+m0p9_bm1:start-1:0.9:0.25 \
+m0p8_b0:start0:0.8:0.25 \
+m0p7_b0:start0:0.7:0.25 \
+m0p7_bm1:start-1:0.7:0.25 \
+m0p5_bm1:start-1:0.5:0.25 \
+m0p9_b0_vr0p125:start0:0.9:0.125 \
+m0p9_b0_vr0p5:start0:0.9:0.5"
 else
-  # 128k passes cost ~40 min each; drop the two m0p9 v_ratio probes to fit
-  # the 12h limit (7 draft arms x 2 + dense = 15 passes).
+  # 128k arms at the contract OP cost ~off-class (~44 min); 7 arms x 2 +
+  # dense = 15 passes ~= 10.5h inside the 12h limit.
   GRID="\
-start0:start0::0.25 \
 anchor_b1:start1::0.25 \
-m0p35_b0:start0:0.35:0.25 \
-m0p2_b0:start0:0.2:0.25 \
 m0p9_b0:start0:0.9:0.25 \
-s1_vr0p125:start1::0.125 \
-s1_vr0p5:start1::0.5"
+m0p9_bm1:start-1:0.9:0.25 \
+m0p8_b0:start0:0.8:0.25 \
+m0p7_b0:start0:0.7:0.25 \
+m0p5_bm1:start-1:0.5:0.25 \
+m0p9_b0_vr0p125:start0:0.9:0.125"
 fi
 
 run_arm dense off "" 0.25 ""
