@@ -182,18 +182,39 @@ def main():
     ap.add_argument("--output_root", required=True)
     ap.add_argument("--tokenizer", required=True)
     ap.add_argument("--out_json", required=True)
+    ap.add_argument(
+        "--arm_set",
+        choices=["round1", "round2"],
+        default="round1",
+        help=(
+            "round1: start1/start2 vs off (2260711 bundle). "
+            "round2: pq_only/middle vs off + off-vs-off sanity (2260712 bundle)."
+        ),
+    )
     args = ap.parse_args()
 
     root = Path(args.output_root)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
     # (label, ctx, task, frozen_run, draft_run)
-    arms = [
-        ("32k_start1", "32k", "qa_1", "qa1_32k_n4_off", "qa1_32k_n4_start1"),
-        ("32k_start2", "32k", "qa_1", "qa1_32k_n4_off", "qa1_32k_n4_start2"),
-        ("128k_start1", "128k", "niah_multikey_3", "mk3_128k_n2_off", "mk3_128k_n2_start1"),
-        ("128k_start2", "128k", "niah_multikey_3", "mk3_128k_n2_off", "mk3_128k_n2_start2"),
-    ]
+    if args.arm_set == "round2":
+        arms = [
+            # off-vs-off is the harness sanity: same run compared to itself must
+            # be a perfectly identical stream (agree 1.000, eap@8 = 8).
+            ("32k_off_vs_off", "32k", "qa_1", "qa1_32k_n4_off", "qa1_32k_n4_off"),
+            ("32k_pq_only", "32k", "qa_1", "qa1_32k_n4_off", "qa1_32k_n4_pq_only"),
+            ("32k_middle", "32k", "qa_1", "qa1_32k_n4_off", "qa1_32k_n4_middle"),
+            ("128k_off_vs_off", "128k", "niah_multikey_3", "mk3_128k_n2_off", "mk3_128k_n2_off"),
+            ("128k_pq_only", "128k", "niah_multikey_3", "mk3_128k_n2_off", "mk3_128k_n2_pq_only"),
+            ("128k_middle", "128k", "niah_multikey_3", "mk3_128k_n2_off", "mk3_128k_n2_middle"),
+        ]
+    else:
+        arms = [
+            ("32k_start1", "32k", "qa_1", "qa1_32k_n4_off", "qa1_32k_n4_start1"),
+            ("32k_start2", "32k", "qa_1", "qa1_32k_n4_off", "qa1_32k_n4_start2"),
+            ("128k_start1", "128k", "niah_multikey_3", "mk3_128k_n2_off", "mk3_128k_n2_start1"),
+            ("128k_start2", "128k", "niah_multikey_3", "mk3_128k_n2_off", "mk3_128k_n2_start2"),
+        ]
 
     results = {}
     for label, ctx, task, frozen_run, draft_run in arms:

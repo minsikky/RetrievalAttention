@@ -25,7 +25,10 @@ REPO=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttent
 cd "${REPO}"
 
 : "${BUNDLE:?set BUNDLE=32k or 128k}"
-OUTPUT_ROOT="benchmark_suite_result/draft_verify_gpu_20260711"
+# Round 2 (issue #21): PQ-approximation draft arms (pq_only, middle) vs the
+# frozen off reference. New output dir so the 20260711 start1/start2 runs are
+# not overwritten.
+OUTPUT_ROOT="${OUTPUT_ROOT:-benchmark_suite_result/draft_verify_gpu_20260712}"
 mkdir -p logs
 
 echo "[draft-verify-bundle] head=$(git rev-parse --short HEAD) bundle=${BUNDLE} node=$(hostname)"
@@ -39,7 +42,7 @@ case "${BUNDLE}" in
     MAX_NEW_TOKENS=0
     DATA_FILE="${REPO}/benchmark_suite_result/ktcache_ab_20260709/qa1_32k_n4_ktON/data/qa_1/validation.jsonl"
     RUN_PREFIX=qa1_32k_n4
-    ARMS="off start1 start2"
+    ARMS="${ARMS:-off pq_only middle}"
     ;;
   128k)
     TASK_NAME=niah_multikey_3
@@ -48,7 +51,7 @@ case "${BUNDLE}" in
     MAX_NEW_TOKENS=64
     DATA_FILE="${REPO}/benchmark_suite_result/frozen_sim_20260707/runs/frozensim_mk3_128k_n16/data/niah_multikey_3/validation.jsonl"
     RUN_PREFIX=mk3_128k_n2
-    ARMS="off start2 start1"
+    ARMS="${ARMS:-off pq_only middle}"
     ;;
   *)
     echo "unknown BUNDLE=${BUNDLE}; expected 32k or 128k" >&2

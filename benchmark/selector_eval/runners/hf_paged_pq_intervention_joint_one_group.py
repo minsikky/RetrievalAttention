@@ -29,6 +29,7 @@ from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_fused_policy
 )
 from benchmark.selector_eval.runners.hf_paged_pq_intervention_joint_policy import (
     JointPolicyRuntime,
+    _joint_draft_mode,
     finish_prepared_torch_policy,
     prepare_batched_torch_policies,
     select_joint_kv_budgets,
@@ -1519,6 +1520,67 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
         sorted_dense_score_rows_t=sorted_ranked_score_rows_t,
         budget_tensors=start_budget_tensors,
     )
+
+    # ------------------------------------------------------------------
+    # Draft-then-verify PQ-approximation arms (issue #21, RTL "PQ-only draft"
+    # ask). These bypass the frozen exact-correction stages of the draft
+    # forward pass and write the head-group output directly, short-circuiting
+    # the grid/policy/finalize machinery below. off/start1/start2 never enter
+    # here, so the frozen path (and its byte-identity) is untouched.
+    #
+    # Frozen decode stages, in order (per the #9/#20 contracts):
+    #   (1) scan          - PQ approximate logits over the indexed tail
+    #   (2) select        - top tokens by risk => committed set
+    #   (3) exact-K logits - recompute exact QK for the committed tail tokens
+    #                        (the "exact-K gather"; precision hi/lo tiers apply)
+    #   (4) exact/corr V  - add the V-PQ residual for the V-budget top-risk rows
+    #                        (the "exact-V gather")
+    # The base/local window (`base_t`) is always resident (not a gather) and is
+    # scored exactly in every arm; "PQ-only" refers to the compressed *tail*.
+    #
+    #   pq_only : bypass BOTH (3) and (4). The committed set for exact scoring
+    #             is the base/local window ONLY, so every indexed tail token
+    #             keeps its PQ logit (no exact-K gather), and V = probs @ vhat
+    #             (no exact-V gather). Draft-side incremental DRAM ~ scan bytes.
+    #   middle  : keep (3) on start1's one-shot committed set (start rung + 1,
+    #             including the frozen K hi/lo precision tiers), bypass (4)
+    #             only. V = probs @ vhat (no exact-V gather).
+    #
+    # This is a slow-but-semantics-exact torch fallback (acceptance, not perf):
+    # it reuses the same scoring (mixed_scores_for_selected_batch, incl. the K
+    # lo tier) and the same V-PQ reconstruction (vhat_all_t) the grid uses.
+    _draft_mode = _joint_draft_mode()
+    if _draft_mode in {"pq_only", "middle"}:
+        n_k_draft = len(active_joint_k_budgets)
+        if _draft_mode == "pq_only":
+            # (3) bypassed: committed set = base/local window only (take=0), so
+            # every tail token keeps its PQ logit. Same for all heads in group.
+            selected_base_t = selected_for_budget_batch(0)
+            probs_draft_t = mixed_probs_for_selected_batch(selected_base_t)
+            # (4) bypassed: V straight from the V-PQ reconstruction (vhat).
+            draft_out_t = probs_draft_t.to(torch.float32) @ vhat_all_t.float()
+        else:  # middle
+            # (3) kept on start1's per-head one-shot committed set (start+1).
+            draft_ki_by_head = [
+                min(int(start_ki_by_head[h]) + 1, max(0, n_k_draft - 1))
+                for h in range(group_heads_i)
+            ]
+            draft_out_t = torch.empty(
+                (group_heads_i, int(self.head_dim)),
+                dtype=torch.float32,
+                device=device,
+            )
+            for ki_draft in sorted(set(draft_ki_by_head)):
+                # k_core_batch returns base_output_t = probs @ vhat for the
+                # whole group at budget ki_draft: exact-K on committed, V=vhat.
+                # (4) is bypassed by taking base_output_t (no prefix_delta).
+                _sel, _mb, _probs, base_output_draft_t, _risk = k_core_batch(int(ki_draft))
+                for h in range(group_heads_i):
+                    if draft_ki_by_head[h] == int(ki_draft):
+                        draft_out_t[h] = base_output_draft_t[h]
+        outputs_all[head_start_i:head_end_i] = draft_out_t.to(dtype=outputs_all.dtype)
+        return True
+
     final_ki_by_head: list[int] = []
     final_vi_by_head: list[int] = []
     final_idx_t_for_output: torch.Tensor | None = None

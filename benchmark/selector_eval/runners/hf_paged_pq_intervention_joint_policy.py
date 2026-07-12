@@ -25,19 +25,35 @@ _compiled_adjacent_rel_l2 = None
 def _joint_draft_mode() -> str | None:
     """Draft-then-verify one-shot selection mode.
 
-    SELECTOR_PQ_JOINT_DRAFT_MODE={off,start1,start2}. Default off leaves the
-    escalation walk untouched (byte-identical to the frozen algorithm). When
-    ``start1``/``start2`` is set, the controller skips the stability walk
-    entirely and pins the K-budget rung to (proxy-mass start rung + 1 / + 2),
-    clamped to the ladder, then applies the frozen v_target rule to that rung.
+    SELECTOR_PQ_JOINT_DRAFT_MODE={off,start1,start2,pq_only,middle}. Default off
+    leaves the escalation walk untouched (byte-identical to the frozen
+    algorithm).
+
+    - ``start1``/``start2``: skip the stability walk entirely and pin the
+      K-budget rung to (proxy-mass start rung + 1 / + 2), clamped to the ladder,
+      then apply the frozen v_target rule to that rung (full frozen finalize:
+      exact-K logits on the committed set + exact/corrected V on the V budget).
+    - ``pq_only``: draft forward passes attend from the PQ approximation
+      machinery alone. NO exact-K gather on the committed tail (the committed
+      set for exact scoring is the base/local window only, always resident),
+      and NO exact-V (V comes from the V-PQ reconstruction ``vhat``). Handled by
+      an env-gated bypass in ``process_one_joint_kv_head`` (see one_group).
+    - ``middle``: start1's K selection + exact-K logits on that one-shot
+      committed set (no walk), but the V-side correction is bypassed (V = vhat).
+      Also handled by the one_group bypass.
+
+    ``pq_only``/``middle`` never enter ``select_joint_kv_budgets`` (the one_group
+    bypass returns before the policy is invoked); this function only classifies
+    the env value so ``off`` stays byte-identical to frozen.
     """
     mode = str(os.environ.get("SELECTOR_PQ_JOINT_DRAFT_MODE", "off")).strip().lower()
     if mode in {"", "off", "0", "false", "none"}:
         return None
-    if mode in {"start1", "start2"}:
+    if mode in {"start1", "start2", "pq_only", "middle"}:
         return mode
     raise ValueError(
-        f"unknown SELECTOR_PQ_JOINT_DRAFT_MODE={mode!r}; expected off, start1, or start2"
+        "unknown SELECTOR_PQ_JOINT_DRAFT_MODE="
+        f"{mode!r}; expected off, start1, start2, pq_only, or middle"
     )
 
 
@@ -146,12 +162,14 @@ def select_joint_kv_budgets(runtime: JointPolicyRuntime) -> JointPolicyResult:
     deferred_torch_policy: PreparedTorchPolicy | None = None
 
     draft_mode = _joint_draft_mode()
-    if draft_mode is not None:
+    if draft_mode in {"start1", "start2"}:
         # Draft-then-verify: skip the escalation walk entirely. Pin each head's
         # K rung to (proxy-mass start rung + bump), clamped to the ladder, then
         # apply the frozen v_target rule (v = max(v0, 0.25*k_target)) to that
         # rung. finalize_joint_head_outputs reconstructs the fused output for
         # these one-shot budgets via the same grid the walk would have used.
+        # NOTE: pq_only/middle are handled by the one_group bypass and never
+        # reach this policy call, so they cannot fall through to the walk.
         bump = 1 if draft_mode == "start1" else 2
         k_budgets = runtime.active_k_budgets
         v_budgets = runtime.v_budgets
