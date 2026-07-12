@@ -25,14 +25,18 @@ _compiled_adjacent_rel_l2 = None
 def _joint_draft_mode() -> str | None:
     """Draft-then-verify one-shot selection mode.
 
-    SELECTOR_PQ_JOINT_DRAFT_MODE={off,start1,start2,pq_only,middle,v_exact}.
-    Default off leaves the escalation walk untouched (byte-identical to the
-    frozen algorithm).
+    SELECTOR_PQ_JOINT_DRAFT_MODE={off,start1,start2,start0,start-1,pq_only,
+    middle,v_exact}. Default off leaves the escalation walk untouched
+    (byte-identical to the frozen algorithm).
 
-    - ``start1``/``start2``: skip the stability walk entirely and pin the
-      K-budget rung to (proxy-mass start rung + 1 / + 2), clamped to the ladder,
-      then apply the frozen v_target rule to that rung (full frozen finalize:
-      exact-K logits on the committed set + exact/corrected V on the V budget).
+    - ``start1``/``start2``/``start0``/``start-1``: skip the stability walk
+      entirely and pin the K-budget rung to (proxy-mass start rung + bump) with
+      bump = +1/+2/0/-1, clamped to the ladder (floor 0), then apply the
+      v_target rule (v = max(v0, ratio*k_target); ratio from
+      SELECTOR_PQ_JOINT_DRAFT_V_RATIO, default the frozen 0.25) to that rung
+      (full frozen finalize: exact-K logits on the committed set +
+      exact/corrected V on the V budget). Draft-path knobs only: the frozen
+      walk's own v_target constant is untouched.
     - ``pq_only``: draft forward passes attend from the PQ approximation
       machinery alone. NO exact-K gather on the committed tail (the committed
       set for exact scoring is the base/local window only, always resident),
@@ -53,12 +57,62 @@ def _joint_draft_mode() -> str | None:
     mode = str(os.environ.get("SELECTOR_PQ_JOINT_DRAFT_MODE", "off")).strip().lower()
     if mode in {"", "off", "0", "false", "none"}:
         return None
-    if mode in {"start1", "start2", "pq_only", "middle", "v_exact"}:
+    if mode in _DRAFT_PIN_BUMPS or mode in {"pq_only", "middle", "v_exact"}:
         return mode
     raise ValueError(
         "unknown SELECTOR_PQ_JOINT_DRAFT_MODE="
-        f"{mode!r}; expected off, start1, start2, pq_only, middle, or v_exact"
+        f"{mode!r}; expected off, start1, start2, start0, start-1, pq_only, "
+        "middle, or v_exact"
     )
+
+
+# Pin-rung bump per draft mode (issue #21 bundle C budget sweep).
+_DRAFT_PIN_BUMPS = {"start1": 1, "start2": 2, "start0": 0, "start-1": -1}
+
+_draft_v_ratio_cache: float | None = None
+
+
+def _draft_v_ratio() -> float:
+    """Draft-branch-only v_target coupling (default: the frozen 0.25)."""
+    global _draft_v_ratio_cache
+    if _draft_v_ratio_cache is None:
+        _draft_v_ratio_cache = float(
+            os.environ.get("SELECTOR_PQ_JOINT_DRAFT_V_RATIO", "0.25") or "0.25"
+        )
+    return _draft_v_ratio_cache
+
+
+_draft_histo: dict | None = None
+
+
+def _draft_histo_record(layer_id: int, ki_by_head: list[int], vi_by_head: list[int]) -> None:
+    """Accumulate the realized (layer, ki, vi) histogram for draft pin arms.
+
+    Enabled by SELECTOR_PQ_JOINT_DRAFT_HISTO_FILE; flushed once at process
+    exit as JSON {"layer,ki,vi": count}. Shows where the ladder floor binds
+    (e.g. k0=4096 at 32k ctx = 12.5% of ctx)."""
+    path = os.environ.get("SELECTOR_PQ_JOINT_DRAFT_HISTO_FILE", "")
+    if not path:
+        return
+    global _draft_histo
+    if _draft_histo is None:
+        _draft_histo = {}
+        import atexit
+
+        def _flush() -> None:
+            import json
+
+            try:
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(_draft_histo, fh, indent=1, sort_keys=True)
+            except Exception:
+                pass
+
+        atexit.register(_flush)
+    for ki, vi in zip(ki_by_head, vi_by_head):
+        key = f"{int(layer_id)},{int(ki)},{int(vi)}"
+        _draft_histo[key] = _draft_histo.get(key, 0) + 1
 
 
 def _draft_budget_index_at_least(budgets, target: float) -> int:
@@ -166,28 +220,32 @@ def select_joint_kv_budgets(runtime: JointPolicyRuntime) -> JointPolicyResult:
     deferred_torch_policy: PreparedTorchPolicy | None = None
 
     draft_mode = _joint_draft_mode()
-    if draft_mode in {"start1", "start2"}:
+    if draft_mode in _DRAFT_PIN_BUMPS:
         # Draft-then-verify: skip the escalation walk entirely. Pin each head's
-        # K rung to (proxy-mass start rung + bump), clamped to the ladder, then
-        # apply the frozen v_target rule (v = max(v0, 0.25*k_target)) to that
-        # rung. finalize_joint_head_outputs reconstructs the fused output for
+        # K rung to (proxy-mass start rung + bump), clamped to the ladder
+        # (floor 0 matters for the negative bump), then apply the v_target
+        # rule (v = max(v0, ratio*k_target); ratio env-swept in the draft
+        # branch only, frozen default 0.25) to that rung.
+        # finalize_joint_head_outputs reconstructs the fused output for
         # these one-shot budgets via the same grid the walk would have used.
-        # NOTE: pq_only/middle are handled by the one_group bypass and never
-        # reach this policy call, so they cannot fall through to the walk.
-        bump = 1 if draft_mode == "start1" else 2
+        # NOTE: pq_only/middle/v_exact are handled by the one_group bypass and
+        # never reach this policy call, so they cannot fall through to the walk.
+        bump = _DRAFT_PIN_BUMPS[draft_mode]
+        v_ratio = _draft_v_ratio()
         k_budgets = runtime.active_k_budgets
         v_budgets = runtime.v_budgets
         n_k = len(k_budgets)
         n_v = len(v_budgets)
         for local_head_i in range(runtime.group_heads):
             start_ki, _start_vi = _head_start_indices(runtime, local_head_i)
-            ki = min(int(start_ki) + int(bump), max(0, n_k - 1))
+            ki = max(0, min(int(start_ki) + int(bump), max(0, n_k - 1)))
             k_target = float(k_budgets[int(ki)])
-            v_target = max(float(v_budgets[0]), k_target * 0.25)
+            v_target = max(float(v_budgets[0]), k_target * float(v_ratio))
             vi = _draft_budget_index_at_least(v_budgets, v_target)
             vi = min(max(0, int(vi)), max(0, n_v - 1))
             final_ki_by_head.append(int(ki))
             final_vi_by_head.append(int(vi))
+        _draft_histo_record(int(runtime.layer_id), final_ki_by_head, final_vi_by_head)
         return JointPolicyResult(
             final_ki_by_head=final_ki_by_head,
             final_vi_by_head=final_vi_by_head,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 
 import torch
@@ -256,6 +257,16 @@ def _joint_start_indices_for_heads(
         return [int(ki) for _ in range(group_heads)], [int(vi) for _ in range(group_heads)]
     if name.startswith("proxy_mass_m"):
         mass = min(max(_fraction_suffix(name, "m", 0.5), 0.0), 0.999999)
+        # Issue #21 bundle C (draft-budget lineage): the legacy suffix parse
+        # above resolves proxy_mass_m0p9 to the DEFAULT 0.5 — the first "m"
+        # of "proxy_mass" consumes the marker, so the suffix never parses and
+        # the de facto blessed operating point is mass=0.5. That behavior is
+        # frozen (all goldens/identity gates were produced with it), so the
+        # budget sweep uses a DRAFT-ONLY env override that cannot engage in
+        # frozen (off) runs.
+        draft_mass = os.environ.get("SELECTOR_PQ_JOINT_DRAFT_PROXY_MASS", "")
+        if draft_mass and _joint_draft_mode() is not None:
+            mass = min(max(float(draft_mass), 0.0), 0.999999)
         sorted_logits = (
             sorted_dense_score_rows_t.to(dtype=torch.float32) / float(sqrt_dim)
             if sorted_dense_score_rows_t is not None
