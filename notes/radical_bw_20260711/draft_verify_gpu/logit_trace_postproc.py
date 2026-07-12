@@ -43,7 +43,7 @@ import numpy as np
 import torch
 
 TOPK = 32
-WINDOW_KS = (4, 8, 16)
+WINDOW_KS = (4, 8, 16, 32)
 PREFIXES = ("qa1_32k_n4", "mk3_128k_n2")
 
 
@@ -175,6 +175,13 @@ def main():
             ),
             "acceptance_at_k": {
                 str(k): acceptance_at_k(all_flags, k) for k in WINDOW_KS
+            },
+            "expected_accepted_prefix_at_k": {
+                str(k): expected_accepted_prefix(all_flags, k) for k in WINDOW_KS
+            },
+            # window counts alongside so large-k thinness is visible
+            "windows_at_k": {
+                str(k): max(0, len(all_flags) - k + 1) for k in WINDOW_KS
             },
             "expected_accepted_prefix_k8": expected_accepted_prefix(all_flags, 8),
             "fork_margin_quantiles": quantiles(fork_margins),

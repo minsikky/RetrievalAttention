@@ -159,7 +159,15 @@ def analyze_pair(frozen_rows, draft_rows, task, tokenizer):
         "n_samples": len(per_sample),
         "pooled_aligned_tokens": len(all_matches),
         "pooled_agreement_rate": (sum(all_matches) / len(all_matches)) if all_matches else float("nan"),
-        "acceptance_at_k": {str(k): acceptance_at_k(all_matches, k) for k in (4, 8, 16)},
+        "acceptance_at_k": {str(k): acceptance_at_k(all_matches, k) for k in ACCEPT_KS},
+        "expected_accepted_prefix_at_k": {
+            str(k): expected_accepted_prefix(all_matches, k) for k in ACCEPT_KS
+        },
+        # Window counts alongside so large-k thinness is visible (streams are
+        # 64-128 positions; k=32 windows are few).
+        "windows_at_k": {
+            str(k): max(0, len(all_matches) - k + 1) for k in ACCEPT_KS
+        },
         "expected_accepted_prefix_k8": expected_accepted_prefix(all_matches, 8),
         "mean_first_divergence": (
             statistics.mean(
@@ -177,12 +185,63 @@ def analyze_pair(frozen_rows, draft_rows, task, tokenizer):
     return {"aggregate": agg, "per_sample": per_sample}
 
 
+ACCEPT_KS = (4, 8, 16, 32)
+
 MATRIX_ARMS = ["dense", "off", "start1", "pq_only", "middle", "v_exact"]
 MATRIX_REFS = ["dense", "off"]
 # Free-running gray zone (RTL methodology note on #21): pairs landing here
 # should get one teacher-forced confirmation before architecture is bet on
 # them, since spec-decode acceptance is formally prefix-conditioned.
 GRAY_ZONE = (0.6, 0.85)
+
+
+def run_bytes_per_token(run_dir: Path, task: str) -> dict | None:
+    """Committed-bytes-per-token from a run's summary cost counters.
+
+    Sums over layers: mean_logical_frontier_{component}_MB_per_head_query x
+    heads-per-layer (heads = head_query_calls / approx_attention_calls), so
+    the result is model-wide MB per generated token, split by component
+    (total / exact_kv / selector scan / tail estimator). This is the per-arm
+    draft-bytes input to the (tau, k) objective
+    (k*draft_bytes + D) / E[prefix]@k. Returns None for runs without cost
+    counters (dense_batched arms)."""
+    path = run_dir / "summary" / f"{task}.json"
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
+    layers = d.get("cost_proxy")
+    if not isinstance(layers, dict) or not layers:
+        return None
+    comps = {
+        "total": "mean_logical_frontier_total_MB_per_head_query",
+        "exact_kv": "mean_logical_frontier_exact_KV_MB_per_head_query",
+        "selector": "mean_logical_frontier_selector_MB_per_head_query",
+        "tail_estimator": "mean_logical_frontier_tail_estimator_MB_per_head_query",
+    }
+    out = {k: 0.0 for k in comps}
+    seen = False
+    for layer in layers.values():
+        if not isinstance(layer, dict):
+            continue
+        calls = float(layer.get("approx_attention_calls") or 0)
+        hq = float(layer.get("head_query_calls") or 0)
+        if calls <= 0 or hq <= 0:
+            continue
+        heads = hq / calls
+        for name, key in comps.items():
+            v = layer.get(key)
+            if v is not None:
+                out[name] += float(v) * heads
+                seen = True
+    if not seen:
+        return None
+    out["mean_selected_tokens_l0"] = float(
+        layers.get("0", {}).get("mean_selected_tokens", float("nan"))
+    )
+    return {
+        (f"logical_{k}_MB_per_token" if not k.startswith("mean_") else k): v
+        for k, v in out.items()
+    }
 
 
 def run_matrix(root: Path, tokenizer, out_json: str) -> None:
@@ -215,6 +274,7 @@ def run_matrix(root: Path, tokenizer, out_json: str) -> None:
         "headline": "off_vs_dense",
         "gray_zone": list(GRAY_ZONE),
         "teacher_forced_confirmation_recommended": [],
+        "bytes_per_token": {},
         "pairs": {},
     }
     for ctx, task, prefix in contexts:
@@ -223,6 +283,9 @@ def run_matrix(root: Path, tokenizer, out_json: str) -> None:
             run_dir = root / f"{prefix}_{arm}"
             if (run_dir / "pred" / f"{task}.jsonl").exists():
                 rows_by_arm[arm] = load_rows(run_dir, task)
+                bpt = run_bytes_per_token(run_dir, task)
+                if bpt is not None:
+                    results["bytes_per_token"][f"{ctx}:{arm}"] = bpt
         for ref in MATRIX_REFS:
             if ref not in rows_by_arm:
                 for arm in MATRIX_ARMS:
