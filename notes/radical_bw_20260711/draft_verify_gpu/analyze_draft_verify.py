@@ -87,39 +87,49 @@ def run_lengths(matches: list[bool]) -> list[int]:
     return runs
 
 
-def acceptance_at_k(matches: list[bool], k: int) -> float:
-    n = len(matches)
-    if n < k:
-        return float("nan")
-    windows = n - k + 1
-    good = 0
-    for i in range(windows):
-        if all(matches[i : i + k]):
-            good += 1
-    return good / windows
+def acceptance_at_k(match_lists: list[list[bool]], k: int) -> float:
+    """Fraction of length-k windows that match fully.
 
-
-def expected_accepted_prefix(matches: list[bool], k: int) -> float:
-    """Mean over length-k windows of leading-match count before first mismatch."""
-    n = len(matches)
-    if n < k:
-        return float("nan")
-    windows = n - k + 1
+    AUDIT FIX (2026-07-12): windows slide WITHIN each sample's stream and
+    window counts are pooled across samples. The previous version slid over
+    the concatenated pooled list, so windows straddled sample boundaries —
+    spurious cross-stream windows that inflated acc@k, worst at thin
+    k=16/32 stats."""
     total = 0
-    for i in range(windows):
-        c = 0
-        for j in range(k):
-            if matches[i + j]:
-                c += 1
-            else:
-                break
-        total += c
-    return total / windows
+    good = 0
+    for m in match_lists:
+        for i in range(max(0, len(m) - k + 1)):
+            total += 1
+            if all(m[i: i + k]):
+                good += 1
+    return good / total if total else float("nan")
+
+
+def expected_accepted_prefix(match_lists: list[list[bool]], k: int) -> float:
+    """Mean accepted-prefix length over per-sample length-k windows.
+
+    Same per-sample windowing as acceptance_at_k (audit fix)."""
+    total_w = 0
+    total_len = 0
+    for m in match_lists:
+        for i in range(max(0, len(m) - k + 1)):
+            total_w += 1
+            for j in range(k):
+                if m[i + j]:
+                    total_len += 1
+                else:
+                    break
+    return total_len / total_w if total_w else float("nan")
+
+
+def windows_at_k(match_lists: list[list[bool]], k: int) -> int:
+    return sum(max(0, len(m) - k + 1) for m in match_lists)
 
 
 def analyze_pair(frozen_rows, draft_rows, task, tokenizer):
     per_sample = []
     all_matches: list[bool] = []
+    match_lists: list[list[bool]] = []
     for idx in sorted(set(frozen_rows) & set(draft_rows)):
         fz = frozen_rows[idx]
         dr = draft_rows[idx]
@@ -154,21 +164,22 @@ def analyze_pair(frozen_rows, draft_rows, task, tokenizer):
             }
         )
         all_matches.extend(matches)
+        match_lists.append(matches)
 
     agg = {
         "n_samples": len(per_sample),
         "pooled_aligned_tokens": len(all_matches),
         "pooled_agreement_rate": (sum(all_matches) / len(all_matches)) if all_matches else float("nan"),
-        "acceptance_at_k": {str(k): acceptance_at_k(all_matches, k) for k in ACCEPT_KS},
+        "acceptance_at_k": {str(k): acceptance_at_k(match_lists, k) for k in ACCEPT_KS},
         "expected_accepted_prefix_at_k": {
-            str(k): expected_accepted_prefix(all_matches, k) for k in ACCEPT_KS
+            str(k): expected_accepted_prefix(match_lists, k) for k in ACCEPT_KS
         },
         # Window counts alongside so large-k thinness is visible (streams are
-        # 64-128 positions; k=32 windows are few).
+        # 64-128 positions; k=32 windows are few). Per-sample windowing.
         "windows_at_k": {
-            str(k): max(0, len(all_matches) - k + 1) for k in ACCEPT_KS
+            str(k): windows_at_k(match_lists, k) for k in ACCEPT_KS
         },
-        "expected_accepted_prefix_k8": expected_accepted_prefix(all_matches, 8),
+        "expected_accepted_prefix_k8": expected_accepted_prefix(match_lists, 8),
         "mean_first_divergence": (
             statistics.mean(
                 [s["first_divergence"] for s in per_sample if s["first_divergence"] is not None]

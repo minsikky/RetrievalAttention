@@ -28,6 +28,8 @@ CASES = [
     ("proxy_mass_m0p35", "m", 0.5, 0.35),
     ("fixed_f0p05", "f", 0.05, 0.05),
     ("fixed_f0p1", "f", 0.05, 0.1),
+    # Value != default: the old split parser returned 0.05 here silently.
+    ("fixed_f0p20", "f", 0.05, 0.20),
     ("proxy_entropy_f0p25", "f", 0.05, 0.25),
     # No parsable suffix -> default (both sides).
     ("min", "m", 0.5, 0.5),

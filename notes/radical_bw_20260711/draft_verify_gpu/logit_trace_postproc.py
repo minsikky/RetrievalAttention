@@ -47,28 +47,39 @@ WINDOW_KS = (4, 8, 16, 32)
 PREFIXES = ("qa1_32k_n4", "mk3_128k_n2")
 
 
-def acceptance_at_k(matches: list[bool], k: int) -> float:
-    n = len(matches)
-    if n < k:
-        return float("nan")
-    windows = n - k + 1
-    good = sum(1 for i in range(windows) if all(matches[i: i + k]))
-    return good / windows
+def acceptance_at_k(match_lists: list[list[bool]], k: int) -> float:
+    """Fraction of length-k windows fully accepted.
 
-
-def expected_accepted_prefix(matches: list[bool], k: int) -> float:
-    n = len(matches)
-    if n < k:
-        return float("nan")
-    windows = n - k + 1
+    AUDIT FIX (2026-07-12): windows slide WITHIN each sample's stream and
+    counts pool across samples (previously windows straddled sample
+    boundaries in the pooled list, inflating acc@k at thin k=16/32)."""
     total = 0
-    for i in range(windows):
-        for j in range(k):
-            if matches[i + j]:
-                total += 1
-            else:
-                break
-    return total / windows
+    good = 0
+    for m in match_lists:
+        for i in range(max(0, len(m) - k + 1)):
+            total += 1
+            if all(m[i: i + k]):
+                good += 1
+    return good / total if total else float("nan")
+
+
+def expected_accepted_prefix(match_lists: list[list[bool]], k: int) -> float:
+    """Mean accepted-prefix length over per-sample length-k windows."""
+    total_w = 0
+    total_len = 0
+    for m in match_lists:
+        for i in range(max(0, len(m) - k + 1)):
+            total_w += 1
+            for j in range(k):
+                if m[i + j]:
+                    total_len += 1
+                else:
+                    break
+    return total_len / total_w if total_w else float("nan")
+
+
+def windows_at_k(match_lists: list[list[bool]], k: int) -> int:
+    return sum(max(0, len(m) - k + 1) for m in match_lists)
 
 
 def convert_trace(run_dir: Path) -> list[dict]:
@@ -147,6 +158,7 @@ def main():
             continue
         # Teacher-forced pass: prefix-conditioned greedy acceptance + margins.
         all_flags: list[bool] = []
+        flag_lists: list[list[bool]] = []
         fork_margins: list[float] = []
         per_sample = []
         for s in samples:
@@ -167,6 +179,7 @@ def main():
                 }
             )
             all_flags.extend(flags)
+            flag_lists.append(flags)
             fork_margins.extend(margins)
         results["teacher_forced"][run_dir.name] = {
             "pooled_positions": len(all_flags),
@@ -174,16 +187,17 @@ def main():
                 sum(all_flags) / len(all_flags) if all_flags else float("nan")
             ),
             "acceptance_at_k": {
-                str(k): acceptance_at_k(all_flags, k) for k in WINDOW_KS
+                str(k): acceptance_at_k(flag_lists, k) for k in WINDOW_KS
             },
             "expected_accepted_prefix_at_k": {
-                str(k): expected_accepted_prefix(all_flags, k) for k in WINDOW_KS
+                str(k): expected_accepted_prefix(flag_lists, k) for k in WINDOW_KS
             },
             # window counts alongside so large-k thinness is visible
+            # (per-sample windowing, audit fix)
             "windows_at_k": {
-                str(k): max(0, len(all_flags) - k + 1) for k in WINDOW_KS
+                str(k): windows_at_k(flag_lists, k) for k in WINDOW_KS
             },
-            "expected_accepted_prefix_k8": expected_accepted_prefix(all_flags, 8),
+            "expected_accepted_prefix_k8": expected_accepted_prefix(flag_lists, 8),
             "fork_margin_quantiles": quantiles(fork_margins),
             "fork_margins": fork_margins,
             "per_sample": per_sample,
