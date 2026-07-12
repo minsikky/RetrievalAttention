@@ -45,7 +45,7 @@ set -euo pipefail
 # bundle so its dense trace is NOT reusable) then per draft arm free-run +
 # teacher-forced-on-dense, all with logit traces.
 
-REPO=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/worktrees/draft-budget
+REPO=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/worktrees/op-fix
 DGPU=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/worktrees/draft-gpu
 cd "${REPO}"
 

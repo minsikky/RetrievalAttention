@@ -29,7 +29,7 @@ set -euo pipefail
 # Optional:
 #   MAX_NEW_TOKENS        default 0 (task default); 128k uses 64
 
-REPO=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/worktrees/draft-budget
+REPO=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/worktrees/op-fix
 cd "${REPO}"
 
 : "${DRAFT_MODE:?set DRAFT_MODE}"

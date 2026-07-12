@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import time
 
 import torch
@@ -216,10 +217,22 @@ def _budget_index_at_least(budgets: list[int], target: float) -> int:
 
 
 def _fraction_suffix(name: str, marker: str, default: float) -> float:
-    tail = str(name).split(str(marker), 1)[-1]
-    token = tail.split("_", 1)[0].replace("p", ".")
+    """Parse the numeric suffix of a strategy string (e.g. proxy_mass_m0p9).
+
+    Matches the CPU runner's _parse_fraction_suffix semantics
+    (run_joint_kv_budget_policy_eval.py): the marker must sit at a token
+    boundary and be immediately followed by digits/p/dot. The previous
+    split-based version matched the FIRST occurrence of the marker anywhere
+    -- for proxy_mass_mXpY that was the m of proxy_Mass, so the suffix
+    never parsed and the GPU path silently ran the DEFAULT (mass 0.5 ->
+    floor-clamped starts) at every blessed operating point. fixed_f had the
+    same bug shape with a coincidentally-correct default.
+    """
+    match = re.search(rf"(?:^|_){re.escape(str(marker))}([0-9p.]+)", str(name))
+    if not match:
+        return float(default)
     try:
-        return float(token)
+        return float(match.group(1).replace("p", "."))
     except ValueError:
         return float(default)
 
@@ -257,13 +270,12 @@ def _joint_start_indices_for_heads(
         return [int(ki) for _ in range(group_heads)], [int(vi) for _ in range(group_heads)]
     if name.startswith("proxy_mass_m"):
         mass = min(max(_fraction_suffix(name, "m", 0.5), 0.0), 0.999999)
-        # Issue #21 bundle C (draft-budget lineage): the legacy suffix parse
-        # above resolves proxy_mass_m0p9 to the DEFAULT 0.5 — the first "m"
-        # of "proxy_mass" consumes the marker, so the suffix never parses and
-        # the de facto blessed operating point is mass=0.5. That behavior is
-        # frozen (all goldens/identity gates were produced with it), so the
-        # budget sweep uses a DRAFT-ONLY env override that cannot engage in
-        # frozen (off) runs.
+        # Issue #21 bundle C: draft-only mass override for the budget sweep
+        # (cannot engage in frozen/off runs). NOTE: on the op-fix lineage the
+        # suffix parse above is FIXED (proxy_mass_m0p9 -> 0.9, matching the
+        # CPU runner and the RTL contract); pre-fix GPU lineages ran the
+        # default mass 0.5 (floor-start operating point) — results from
+        # those lineages are marked accordingly.
         draft_mass = os.environ.get("SELECTOR_PQ_JOINT_DRAFT_PROXY_MASS", "")
         if draft_mass and _joint_draft_mode() is not None:
             mass = min(max(float(draft_mass), 0.0), 0.999999)

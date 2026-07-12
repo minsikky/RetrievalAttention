@@ -13,7 +13,7 @@ set -euo pipefail
 # Benchmark-ready frontier preset for one RULER task.
 # Submit with: sbatch scripts/run_frontier_ruler_batched_one.sh
 
-cd /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/worktrees/draft-budget
+cd /gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttention/worktrees/op-fix
 
 # The prebuilt selector_paged_pq CUDA extension is ABI-matched to the
 # cu128 venv (torch 2.11.0+cu128); .venv (torch 2.5.1+cu124) fails its
