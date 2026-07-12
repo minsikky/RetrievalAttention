@@ -15,19 +15,20 @@ set -euo pipefail
 # tokens), run from the PINNED draft-budget worktree (draft-gpu stays byte-
 # frozen for its in-flight jobs).
 #
-# GRID NOTE (re-scoped after the parser-divergence finding): the GPU
+# GRID NOTE (dedup pass, revised on GPU counter evidence): the GPU
 # lineage's de facto start mass is 0.5 (the GPU-side suffix parse always
-# returns the default), and measured mass-0.5 counts sit at/below the GPU
-# ladder floor k0=4096 at these contexts — so every mass below 0.5 clamps
-# to the same floor start, start-1 == start0 at the floor, and v_target
-# probes at floored arms are no-ops (0.25*4096 = 1024 = v floor). The
-# informative axis collapses to: start0 (floor pin — the cheap point below
-# start1), the legacy start1 anchor, the mass-0.9 upward probe at bump 0
-# (= the CPU-spec operating point, for the divergence reconciliation), and
-# v_ratio {0.125, 0.5} probes at the two off-floor arms (start1 and the
-# 0.9 probe) where k_target > k0 keeps the coupling live. Mass overrides
-# use the DRAFT-ONLY env SELECTOR_PQ_JOINT_DRAFT_PROXY_MASS (cannot engage
-# in off/frozen runs).
+# returns the default). On the L16 trace, mass-0.5 counts sit at/below the
+# GPU floor k0=4096 — but the 32k matrix counters show qa_1 mass-0.5
+# starts are NOT floor-clamped (start1 mean committed ~13.1k rows = rung
+# mix well above floor), so floor collapse is data-dependent and the
+# down-mass axis IS live on qa_1: m0p35/m0p2 arms are kept at 32k. The
+# grid: start0 (one-rung-cheaper pin), legacy start1 anchor, down-mass
+# probes, the mass-0.9 upward probe at bump 0 (= the CPU-spec operating
+# point, for the divergence reconciliation), and v_ratio {0.125, 0.5}
+# probes at the off-floor arms. Mass overrides use the DRAFT-ONLY env
+# SELECTOR_PQ_JOINT_DRAFT_PROXY_MASS (cannot engage in off/frozen runs).
+# Per-arm draft_histo.json records the realized (layer,ki,vi) mix, which
+# settles the floor-clamp question empirically per arm.
 #
 # All draft arms are pin-rung (walk skipped) with the start1 shape: exact-K
 # logits on the committed set + exact/corrected V (full frozen finalize).
@@ -128,14 +129,30 @@ run_arm() {
 }
 
 # name           mode     mass   v_ratio
-GRID="\
+if [ "${BUNDLE}" = "32k" ]; then
+  # 9 draft arms x 2 passes + dense = 19 passes (~3.2h at ~10 min/pass).
+  GRID="\
 start0:start0::0.25 \
 anchor_b1:start1::0.25 \
+m0p35_b0:start0:0.35:0.25 \
+m0p2_b0:start0:0.2:0.25 \
 m0p9_b0:start0:0.9:0.25 \
 s1_vr0p125:start1::0.125 \
 s1_vr0p5:start1::0.5 \
 m0p9_vr0p125:start0:0.9:0.125 \
 m0p9_vr0p5:start0:0.9:0.5"
+else
+  # 128k passes cost ~40 min each; drop the two m0p9 v_ratio probes to fit
+  # the 12h limit (7 draft arms x 2 + dense = 15 passes).
+  GRID="\
+start0:start0::0.25 \
+anchor_b1:start1::0.25 \
+m0p35_b0:start0:0.35:0.25 \
+m0p2_b0:start0:0.2:0.25 \
+m0p9_b0:start0:0.9:0.25 \
+s1_vr0p125:start1::0.125 \
+s1_vr0p5:start1::0.5"
+fi
 
 run_arm dense off "" 0.25 ""
 for spec in ${GRID}; do
