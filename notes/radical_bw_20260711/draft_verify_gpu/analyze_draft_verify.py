@@ -177,6 +177,114 @@ def analyze_pair(frozen_rows, draft_rows, task, tokenizer):
     return {"aggregate": agg, "per_sample": per_sample}
 
 
+MATRIX_ARMS = ["dense", "off", "start1", "pq_only", "middle", "v_exact"]
+MATRIX_REFS = ["dense", "off"]
+# Free-running gray zone (RTL methodology note on #21): pairs landing here
+# should get one teacher-forced confirmation before architecture is bet on
+# them, since spec-decode acceptance is formally prefix-conditioned.
+GRAY_ZONE = (0.6, 0.85)
+
+
+def run_matrix(root: Path, tokenizer, out_json: str) -> None:
+    """Full pairwise per-token agreement matrix (issue #21 round 3).
+
+    Every arm is scored against BOTH references (dense stream and off/frozen
+    stream); self-pairs (dense_vs_dense, off_vs_off) are kept as harness
+    sanity rows and must be identical streams. The headline number is
+    off_vs_dense (the dense verify tier's acceptance rate).
+
+    Methodology flag carried in the JSON: free-running alignment is a PROXY
+    for prefix-conditioned spec-decode acceptance. Any non-self pair whose
+    pooled agreement lands in GRAY_ZONE is listed under
+    teacher_forced_confirmation_recommended.
+    """
+    contexts = [
+        ("32k", "qa_1", "qa1_32k_n4"),
+        ("128k", "niah_multikey_3", "mk3_128k_n2"),
+    ]
+    results: dict = {
+        "methodology_note": (
+            "Free-running alignment: each arm greedy-decodes independently and "
+            "streams are aligned position-by-position from the start. This is a "
+            "proxy for prefix-conditioned speculative-decode acceptance (which "
+            "would force the reference prefix before each draft window). It was "
+            "predictive for the start1/start2 arms, but pairs in the "
+            f"{GRAY_ZONE} agreement gray zone should get one teacher-forced "
+            "confirmation before architecture decisions are made on them."
+        ),
+        "headline": "off_vs_dense",
+        "gray_zone": list(GRAY_ZONE),
+        "teacher_forced_confirmation_recommended": [],
+        "pairs": {},
+    }
+    for ctx, task, prefix in contexts:
+        rows_by_arm = {}
+        for arm in MATRIX_ARMS:
+            run_dir = root / f"{prefix}_{arm}"
+            if (run_dir / "pred" / f"{task}.jsonl").exists():
+                rows_by_arm[arm] = load_rows(run_dir, task)
+        for ref in MATRIX_REFS:
+            if ref not in rows_by_arm:
+                for arm in MATRIX_ARMS:
+                    results["pairs"][f"{ctx}:{arm}_vs_{ref}"] = {
+                        "skipped": f"missing reference run {prefix}_{ref}"
+                    }
+                continue
+            for arm in MATRIX_ARMS:
+                label = f"{ctx}:{arm}_vs_{ref}"
+                if arm not in rows_by_arm:
+                    results["pairs"][label] = {
+                        "skipped": f"missing arm run {prefix}_{arm}"
+                    }
+                    continue
+                pair = analyze_pair(
+                    rows_by_arm[ref], rows_by_arm[arm], task, tokenizer
+                )
+                entry = {
+                    "ctx": ctx,
+                    "task": task,
+                    "reference_run": f"{prefix}_{ref}",
+                    "arm_run": f"{prefix}_{arm}",
+                    "self_pair": arm == ref,
+                    **pair,
+                }
+                agree = entry["aggregate"]["pooled_agreement_rate"]
+                in_gray = (
+                    arm != ref
+                    and agree == agree  # not NaN
+                    and GRAY_ZONE[0] <= agree <= GRAY_ZONE[1]
+                )
+                entry["teacher_forced_confirmation_recommended"] = bool(in_gray)
+                if in_gray:
+                    results["teacher_forced_confirmation_recommended"].append(label)
+                results["pairs"][label] = entry
+
+    Path(out_json).write_text(json.dumps(results, indent=2))
+
+    print(
+        f"{'pair':<26} {'agree':>7} {'acc@4':>7} {'acc@8':>7} {'acc@16':>7} "
+        f"{'eap@8':>7} {'armOK':>6} {'gray':>5}"
+    )
+    for label, r in results["pairs"].items():
+        if "aggregate" not in r:
+            print(f"{label:<26} {r.get('skipped', '?')}")
+            continue
+        a = r["aggregate"]
+        acc = a["acceptance_at_k"]
+        print(
+            f"{label:<26} {a['pooled_agreement_rate']:>7.3f} "
+            f"{acc['4']:>7.3f} {acc['8']:>7.3f} {acc['16']:>7.3f} "
+            f"{a['expected_accepted_prefix_k8']:>7.3f} "
+            f"{a['draft_standalone_correct']}/{a['n_samples']:<4} "
+            f"{'YES' if r['teacher_forced_confirmation_recommended'] else '':>5}"
+        )
+    if results["teacher_forced_confirmation_recommended"]:
+        print(
+            "gray-zone pairs (teacher-forced confirmation recommended): "
+            + ", ".join(results["teacher_forced_confirmation_recommended"])
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--output_root", required=True)
@@ -184,17 +292,24 @@ def main():
     ap.add_argument("--out_json", required=True)
     ap.add_argument(
         "--arm_set",
-        choices=["round1", "round2"],
+        choices=["round1", "round2", "matrix"],
         default="round1",
         help=(
-            "round1: start1/start2 vs off (2260711 bundle). "
-            "round2: pq_only/middle vs off + off-vs-off sanity (2260712 bundle)."
+            "round1: start1/start2 vs off (20260711 bundle). "
+            "round2: pq_only/middle vs off + off-vs-off sanity (20260712 bundle). "
+            "matrix: full pairwise matrix over {dense,off,start1,pq_only,middle,"
+            "v_exact} scored against BOTH the dense and the off (frozen) "
+            "references (20260712_matrix bundles)."
         ),
     )
     args = ap.parse_args()
 
     root = Path(args.output_root)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+
+    if args.arm_set == "matrix":
+        run_matrix(root, tokenizer, args.out_json)
+        return
 
     # (label, ctx, task, frozen_run, draft_run)
     if args.arm_set == "round2":

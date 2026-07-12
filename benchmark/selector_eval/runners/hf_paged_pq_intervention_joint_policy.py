@@ -25,9 +25,9 @@ _compiled_adjacent_rel_l2 = None
 def _joint_draft_mode() -> str | None:
     """Draft-then-verify one-shot selection mode.
 
-    SELECTOR_PQ_JOINT_DRAFT_MODE={off,start1,start2,pq_only,middle}. Default off
-    leaves the escalation walk untouched (byte-identical to the frozen
-    algorithm).
+    SELECTOR_PQ_JOINT_DRAFT_MODE={off,start1,start2,pq_only,middle,v_exact}.
+    Default off leaves the escalation walk untouched (byte-identical to the
+    frozen algorithm).
 
     - ``start1``/``start2``: skip the stability walk entirely and pin the
       K-budget rung to (proxy-mass start rung + 1 / + 2), clamped to the ladder,
@@ -41,19 +41,23 @@ def _joint_draft_mode() -> str | None:
     - ``middle``: start1's K selection + exact-K logits on that one-shot
       committed set (no walk), but the V-side correction is bypassed (V = vhat).
       Also handled by the one_group bypass.
+    - ``v_exact``: the reverse-middle cell. PQ-K logits on the compressed tail
+      (no exact-K gather, same K bypass as pq_only) + the exact-V correction on
+      start1's one-shot V set (frozen v_target rule at the start+1 rung, frozen
+      hi/lo tier composition). Also handled by the one_group bypass.
 
-    ``pq_only``/``middle`` never enter ``select_joint_kv_budgets`` (the one_group
-    bypass returns before the policy is invoked); this function only classifies
-    the env value so ``off`` stays byte-identical to frozen.
+    ``pq_only``/``middle``/``v_exact`` never enter ``select_joint_kv_budgets``
+    (the one_group bypass returns before the policy is invoked); this function
+    only classifies the env value so ``off`` stays byte-identical to frozen.
     """
     mode = str(os.environ.get("SELECTOR_PQ_JOINT_DRAFT_MODE", "off")).strip().lower()
     if mode in {"", "off", "0", "false", "none"}:
         return None
-    if mode in {"start1", "start2", "pq_only", "middle"}:
+    if mode in {"start1", "start2", "pq_only", "middle", "v_exact"}:
         return mode
     raise ValueError(
         "unknown SELECTOR_PQ_JOINT_DRAFT_MODE="
-        f"{mode!r}; expected off, start1, start2, pq_only, or middle"
+        f"{mode!r}; expected off, start1, start2, pq_only, middle, or v_exact"
     )
 
 

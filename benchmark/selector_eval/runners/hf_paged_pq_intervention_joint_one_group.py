@@ -1545,20 +1545,104 @@ def process_one_joint_kv_head(runtime, kv_head_i: int) -> bool:
     #   middle  : keep (3) on start1's one-shot committed set (start rung + 1,
     #             including the frozen K hi/lo precision tiers), bypass (4)
     #             only. V = probs @ vhat (no exact-V gather).
+    #   v_exact : the reverse-middle cell. Bypass (3) exactly like pq_only
+    #             (tail keeps PQ logits, no exact-K gather), but keep (4) on
+    #             start1's one-shot V set: per head, v_target =
+    #             max(v_budgets[0], 0.25 * k_budgets[start_ki+1]) (the frozen
+    #             v_target rule at the start+1 rung), rows risk-ranked by
+    #             probs^2 * code_error from the PQ-only probs, with the frozen
+    #             hi/lo tier composition (top ceil(0.1*c) rows read the full
+    #             residual, the rest read residual_lo_commit, pre-zeroed on
+    #             failed commits) — mirrors _sorted_vprefix_outputs_precision_tiers.
     #
     # This is a slow-but-semantics-exact torch fallback (acceptance, not perf):
     # it reuses the same scoring (mixed_scores_for_selected_batch, incl. the K
     # lo tier) and the same V-PQ reconstruction (vhat_all_t) the grid uses.
     _draft_mode = _joint_draft_mode()
-    if _draft_mode in {"pq_only", "middle"}:
+    if _draft_mode in {"pq_only", "middle", "v_exact"}:
         n_k_draft = len(active_joint_k_budgets)
-        if _draft_mode == "pq_only":
+        if _draft_mode in {"pq_only", "v_exact"}:
             # (3) bypassed: committed set = base/local window only (take=0), so
             # every tail token keeps its PQ logit. Same for all heads in group.
             selected_base_t = selected_for_budget_batch(0)
-            probs_draft_t = mixed_probs_for_selected_batch(selected_base_t)
-            # (4) bypassed: V straight from the V-PQ reconstruction (vhat).
-            draft_out_t = probs_draft_t.to(torch.float32) @ vhat_all_t.float()
+            probs_draft_t = mixed_probs_for_selected_batch(selected_base_t).to(
+                torch.float32
+            )
+            # V base term straight from the V-PQ reconstruction (vhat).
+            draft_out_t = probs_draft_t @ vhat_all_t.float()
+            if _draft_mode == "v_exact":
+                # (4) restored on start1's one-shot V set, from PQ-only probs.
+                risk_draft_t = (probs_draft_t * probs_draft_t) * code_error_t.to(
+                    dtype=torch.float32
+                ).reshape(1, -1)
+                n_v_draft = len(joint_v_budgets)
+                for h in range(group_heads_i):
+                    ki_h = min(int(start_ki_by_head[h]) + 1, max(0, n_k_draft - 1))
+                    v_target_h = max(
+                        float(joint_v_budgets[0]),
+                        float(active_joint_k_budgets[int(ki_h)]) * 0.25,
+                    )
+                    vi_h = _budget_index_at_least(joint_v_budgets, v_target_h)
+                    vi_h = min(max(0, int(vi_h)), max(0, n_v_draft - 1))
+                    exact_count_h = max(
+                        0, min(int(joint_v_budgets[int(vi_h)]), context_len_i)
+                    )
+                    if exact_count_h <= 0:
+                        continue
+                    if exact_count_h >= context_len_i:
+                        order_h = torch.argsort(
+                            risk_draft_t[h], descending=True, stable=True
+                        )
+                    else:
+                        order_h = torch.topk(
+                            risk_draft_t[h],
+                            k=int(exact_count_h),
+                            largest=True,
+                            sorted=True,
+                        ).indices
+                    probs_sel_t = probs_draft_t[h].index_select(0, order_h).reshape(-1, 1)
+                    if residual_lo_commit_t is not None:
+                        # Frozen tier composition: hi rows read the full
+                        # residual, lo rows the committed int8 residual
+                        # (pre-zeroed on failed commits). delta =
+                        # sum_hi p*(res - lo) + sum_allexact p*lo, identical
+                        # to the grid's hi + (lo_exact - lo_hi) form.
+                        hi_count_h = min(
+                            int(exact_count_h),
+                            int(
+                                math.ceil(
+                                    float(exact_count_h)
+                                    * _FROZEN_PRECISION_V_HI_FRAC
+                                )
+                            ),
+                        )
+                        hi_order_h = order_h[:hi_count_h]
+                        probs_hi_t = (
+                            probs_draft_t[h]
+                            .index_select(0, hi_order_h)
+                            .reshape(-1, 1)
+                        )
+                        delta_h = (
+                            probs_hi_t
+                            * (
+                                residual_t.index_select(0, hi_order_h).to(
+                                    torch.float32
+                                )
+                                - residual_lo_commit_t.index_select(0, hi_order_h)
+                            )
+                        ).sum(dim=0)
+                        delta_h = delta_h + (
+                            probs_sel_t
+                            * residual_lo_commit_t.index_select(0, order_h)
+                        ).sum(dim=0)
+                    else:
+                        # Single-tier fallback (tiers disabled): full residual
+                        # on the whole exact set.
+                        delta_h = (
+                            probs_sel_t
+                            * residual_t.index_select(0, order_h).to(torch.float32)
+                        ).sum(dim=0)
+                    draft_out_t[h] = draft_out_t[h] + delta_h
         else:  # middle
             # (3) kept on start1's per-head one-shot committed set (start+1).
             draft_ki_by_head = [

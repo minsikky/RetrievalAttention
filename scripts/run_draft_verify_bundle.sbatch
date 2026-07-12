@@ -25,10 +25,15 @@ REPO=/gpfs/accounts/zhengya_root/zhengya98/minsikky/long_context/RetrievalAttent
 cd "${REPO}"
 
 : "${BUNDLE:?set BUNDLE=32k or 128k}"
-# Round 2 (issue #21): PQ-approximation draft arms (pq_only, middle) vs the
-# frozen off reference. New output dir so the 20260711 start1/start2 runs are
-# not overwritten.
-OUTPUT_ROOT="${OUTPUT_ROOT:-benchmark_suite_result/draft_verify_gpu_20260712}"
+# Round 3 (issue #21, RTL pairwise-matrix request): all arms sequential on one
+# card so the whole agreement matrix is internally consistent. The `dense` arm
+# is the vanilla model (MODE=dense_batched — the same dense reference path the
+# hard-RULER/HELMET dense runs use, cf. scripts/run_hard_ruler_dense_one.sh;
+# no PQ patch is applied there, so the SELECTOR_PQ_JOINT_* env is inert). All
+# other arms run pagedpq_batched with SELECTOR_PQ_JOINT_DRAFT_MODE per arm.
+# Fresh output root; the 20260711/20260712 round-1/round-2 dirs stay untouched
+# as the interim record.
+OUTPUT_ROOT="${OUTPUT_ROOT:-benchmark_suite_result/draft_verify_gpu_20260712_matrix}"
 mkdir -p logs
 
 echo "[draft-verify-bundle] head=$(git rev-parse --short HEAD) bundle=${BUNDLE} node=$(hostname)"
@@ -42,7 +47,7 @@ case "${BUNDLE}" in
     MAX_NEW_TOKENS=0
     DATA_FILE="${REPO}/benchmark_suite_result/ktcache_ab_20260709/qa1_32k_n4_ktON/data/qa_1/validation.jsonl"
     RUN_PREFIX=qa1_32k_n4
-    ARMS="${ARMS:-off pq_only middle}"
+    ARMS="${ARMS:-dense off start1 pq_only middle v_exact}"
     ;;
   128k)
     TASK_NAME=niah_multikey_3
@@ -51,7 +56,7 @@ case "${BUNDLE}" in
     MAX_NEW_TOKENS=64
     DATA_FILE="${REPO}/benchmark_suite_result/frozen_sim_20260707/runs/frozensim_mk3_128k_n16/data/niah_multikey_3/validation.jsonl"
     RUN_PREFIX=mk3_128k_n2
-    ARMS="${ARMS:-off pq_only middle}"
+    ARMS="${ARMS:-dense off start1 pq_only middle v_exact}"
     ;;
   *)
     echo "unknown BUNDLE=${BUNDLE}; expected 32k or 128k" >&2
@@ -65,8 +70,17 @@ run_arm() {
   local draft_mode=$1
   local run_name="${RUN_PREFIX}_${draft_mode}"
   local t0=${SECONDS}
-  echo "[draft-verify-bundle] arm start mode=${draft_mode} run=${run_name}"
+  # dense arm: vanilla model, no PQ patch; every other arm: pagedpq_batched
+  # with the per-arm draft mode.
+  local arm_mode=pagedpq_batched
+  local arm_draft="${draft_mode}"
+  if [ "${draft_mode}" = "dense" ]; then
+    arm_mode=dense_batched
+    arm_draft=off
+  fi
+  echo "[draft-verify-bundle] arm start mode=${draft_mode} run=${run_name} exec_mode=${arm_mode}"
   env \
+    MODE="${arm_mode}" \
     TASK_NAME="${TASK_NAME}" \
     CONTEXT_LEN="${CONTEXT_LEN}" \
     NUM_SAMPLES="${NUM_SAMPLES}" \
@@ -86,7 +100,7 @@ run_arm() {
     SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR=0 \
     SELECTOR_PQ_JOINT_MEMORY_TRACE=0 \
     SELECTOR_PQ_JOINT_TIME_TRACE=0 \
-    SELECTOR_PQ_JOINT_DRAFT_MODE="${draft_mode}" \
+    SELECTOR_PQ_JOINT_DRAFT_MODE="${arm_draft}" \
     SKIP_RULER_EVAL=1 \
     bash scripts/run_frontier_ruler_batched_one.sh
   local wall=$(( SECONDS - t0 ))
