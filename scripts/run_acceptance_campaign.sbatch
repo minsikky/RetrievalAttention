@@ -40,6 +40,21 @@ else
 fi
 NUM_SAMPLES="${NUM_SAMPLES:-8}"
 MAX_NEW_TOKENS=64
+# Execution class per context: 32k runs the TOKPAR=0 identity-gate env
+# (as staged); 128k runs TOKPAR=1 for throughput. NOTE (coordinator
+# correction, do not mis-cite): TOKPAR=1 vs the TOKPAR=0 env is CLASS-2 —
+# math-exact but bit-different (score+drift gate 53304627, worst counter
+# drift 0.572%, near-tie pred forks allowed); gate 53323928 validated
+# BATCHED-vs-TOKPAR, not TOKPAR-vs-non-TOKPAR. Class-2 is accepted for
+# acceptance measurement because near-tie forks are implementation-order
+# noise any implementation (incl. RTL, with its 1e-7 tie floor) exhibits,
+# and at N>=5k positions they sit inside the CI. The EXTRA_TOKPAR0_ARM
+# duplicate measures the fork delta at large N instead of assuming it.
+if [ "${CTXTAG}" = "128k" ]; then
+  CAMPAIGN_TOKPAR="${CAMPAIGN_TOKPAR:-1}"
+else
+  CAMPAIGN_TOKPAR="${CAMPAIGN_TOKPAR:-0}"
+fi
 CAMPAIGN_ROOT="$(readlink -f benchmark_suite_result)/acceptance_campaign_20260712"
 DATA_ROOT="${CAMPAIGN_ROOT}/data_${CTXTAG}"
 OUTPUT_ROOT="${CAMPAIGN_ROOT}/runs_${CTXTAG}"
@@ -49,7 +64,7 @@ echo "[acc-campaign] head=$(git rev-parse --short HEAD) ctx=${CTXTAG} tasks='${T
 nvidia-smi -L
 
 run_pass() {
-  local task=$1 arm=$2 tau=$3 draft_mode=$4 tf_ref=$5
+  local task=$1 arm=$2 tau=$3 draft_mode=$4 tf_ref=$5 tokpar=${6:-${CAMPAIGN_TOKPAR}}
   local prefix="${task}_${CTXTAG}_n${NUM_SAMPLES}"
   local run_name="${prefix}_${arm}"
   [ -n "${tf_ref}" ] && run_name="${prefix}_${arm}_tf_${tf_ref}"
@@ -88,13 +103,13 @@ run_pass() {
     FRONTIER_EMPTY_CACHE_AFTER_PREFILL_CHUNK=1 \
     SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX=1 \
     SELECTOR_PQ_JOINT_FROZENSIM_FUSED_RISK_SORT=1 \
-    SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR=0 \
+    SELECTOR_PQ_JOINT_FROZENSIM_FUSED_VPREFIX_TOKPAR="${tokpar}" \
     SELECTOR_PQ_JOINT_MEMORY_TRACE=0 \
     SELECTOR_PQ_JOINT_TIME_TRACE=0 \
     SELECTOR_PQ_JOINT_DRAFT_MODE="${draft_mode}" \
     SKIP_RULER_EVAL=1 \
     bash scripts/run_frontier_ruler_batched_one.sh
-  echo "ACC-CAMPAIGN-PASS ctx=${CTXTAG} task=${task} arm=${arm} run=${run_name} wall=$(( SECONDS - t0 ))s"
+  echo "ACC-CAMPAIGN-PASS ctx=${CTXTAG} task=${task} arm=${arm} tokpar=${tokpar} run=${run_name} wall=$(( SECONDS - t0 ))s"
 }
 
 for task in ${TASKS}; do
@@ -102,6 +117,11 @@ for task in ${TASKS}; do
   run_pass "${task}" off_t0p004 0.004 off    dense
   run_pass "${task}" off_t0p05  0.05  off    dense
   run_pass "${task}" start1     0.004 start1 dense
+  if [ "${EXTRA_TOKPAR0_ARM:-0}" = "1" ]; then
+    # TOKPAR fork-delta validation arm: same forced stream, same data,
+    # TOKPAR=0 — isolates the class-2 implementation-order fork effect.
+    run_pass "${task}" off_t0p004_tokpar0 0.004 off dense 0
+  fi
 done
 
 echo "ACC-CAMPAIGN: COMPLETED ctx=${CTXTAG} tasks='${TASKS}'"
