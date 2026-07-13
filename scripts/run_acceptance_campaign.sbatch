@@ -76,8 +76,11 @@ run_pass() {
   local prefix="${task}_${CTXTAG}_n${NUM_SAMPLES}"
   local run_name="${prefix}_${arm}"
   [ -n "${tf_ref}" ] && run_name="${prefix}_${arm}_tf_${tf_ref}"
-  if [ -s "${OUTPUT_ROOT}/${run_name}/pred/${task}.jsonl" ]; then
-    echo "[acc-campaign] SKIP ${run_name} (exists)"
+  # Completeness marker is the logit trace: it is written once at pass END,
+  # while preds stream line-buffered — a timed-out pass leaves a partial
+  # pred that must NOT trigger the skip (sweep 53399355 no-op'd on this).
+  if [ -s "${OUTPUT_ROOT}/${run_name}/logit_trace.pt" ]; then
+    echo "[acc-campaign] SKIP ${run_name} (complete)"
     return 0
   fi
   local forced_trace=""
