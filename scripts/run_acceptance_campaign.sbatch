@@ -55,6 +55,14 @@ if [ "${CTXTAG}" = "128k" ]; then
 else
   CAMPAIGN_TOKPAR="${CAMPAIGN_TOKPAR:-0}"
 fi
+# Relaxed-tau arm. Default 0.05 = what the 32k wave ran. The 128k wave is
+# resubmitted with RELAXED_TAU=0.1 per the knee ruling (job 53380159,
+# qa_1 32k floor-OP: tau=0.1 is the last point on the acceptance plateau —
+# TF 0.992, renewal 7.25/8 at 43% fewer bytes than 0.004; tau>=0.2 loses
+# acceptance with no byte savings because selection saturates at the
+# start-rung budget). Arm name derives from the value (0.1 -> off_t0p1).
+RELAXED_TAU="${RELAXED_TAU:-0.05}"
+RELAXED_ARM="off_t$(printf '%s' "${RELAXED_TAU}" | tr '.' 'p')"
 CAMPAIGN_ROOT="$(readlink -f benchmark_suite_result)/acceptance_campaign_20260712"
 DATA_ROOT="${CAMPAIGN_ROOT}/data_${CTXTAG}"
 OUTPUT_ROOT="${CAMPAIGN_ROOT}/runs_${CTXTAG}"
@@ -115,7 +123,7 @@ run_pass() {
 for task in ${TASKS}; do
   run_pass "${task}" dense      0.004 off    ""
   run_pass "${task}" off_t0p004 0.004 off    dense
-  run_pass "${task}" off_t0p05  0.05  off    dense
+  run_pass "${task}" "${RELAXED_ARM}" "${RELAXED_TAU}" off dense
   run_pass "${task}" start1     0.004 start1 dense
   if [ "${EXTRA_TOKPAR0_ARM:-0}" = "1" ]; then
     # TOKPAR fork-delta validation arm: same forced stream, same data,
