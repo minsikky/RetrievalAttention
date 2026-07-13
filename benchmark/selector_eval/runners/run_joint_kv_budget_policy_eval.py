@@ -2812,6 +2812,86 @@ def _epoch_events_from_walk(
     return events
 
 
+# Pinned RTL contract for the pass-1 scan-domain V-risk key grid (issue #24 /
+# #9): signed fixed point int_bits=7, frac_bits=6 -> Q7.6, 13-bit total
+# signed, RNE, clamp +-64 (dead on observed data). This is INDEPENDENT of the
+# runner's --two_pass_cutoff_* flags (which drive the ACTUAL two-pass V rule
+# and stay at frac_bits=0 in the epoch OP so committed sets are unchanged); the
+# stream below is a pure additive observer emitted only when requested.
+_EPOCH_PASS1_Q76_INT_BITS = 7
+_EPOCH_PASS1_Q76_FRAC_BITS = 6
+
+
+def _compute_epoch_pass1_vrisk_stream(
+    *,
+    context_len: int,
+    resident_base: np.ndarray,
+    ranked_cpu: np.ndarray,
+    ranked_scores_cpu: np.ndarray,
+    exact_scores_np: np.ndarray,
+    code_error: np.ndarray,
+    exact_count_v: int,
+    head_dim: int,
+    calibrate: bool,
+) -> dict[str, object]:
+    """Full per-token pass-1 scan-domain V-risk key stream at one position.
+
+    Reproduces the item-8 (`two_pass_risk`) pass-1 operand construction
+    EXACTLY -- same mixed_scores inputs (resident base, variant ranked stream,
+    exact-score fallback, calibrate flag), same signed log-risk
+    `2*pass1_logit + log(V-error)`, same Q7.6 fixed-point grid via
+    `_quantize_log_risk_fixed_point` -- but emits the DENSE context-length
+    stream (with the -inf sentinel for zero-V-error tokens) plus the packed
+    finite mask, rather than only the finite tokens. Pure observer: reads
+    already-computed arrays, mutates nothing. Fields are all namespaced
+    `pass1_*`.
+    """
+    n = int(context_len)
+    frac_bits = int(_EPOCH_PASS1_Q76_FRAC_BITS)
+    int_bits = int(_EPOCH_PASS1_Q76_INT_BITS)
+    code_error_f64 = np.asarray(code_error, dtype=np.float64).reshape(-1)
+    log_code_error = np.full((n,), -np.inf, dtype=np.float64)
+    positive_err = code_error_f64 > 0.0
+    log_code_error[positive_err] = np.log(code_error_f64[positive_err])
+    pass1_scores, _p1m, _p1s, _p1b = mixed_scores(
+        context_len=n,
+        selected_cpu=np.asarray(resident_base, dtype=np.int64),
+        ranked_cpu=np.asarray(ranked_cpu, dtype=np.int64),
+        ranked_scores_cpu=np.asarray(ranked_scores_cpu, dtype=np.float32),
+        exact_scores_np=exact_scores_np,
+        query_dim=int(head_dim),
+        calibrate=bool(calibrate),
+    )
+    pass1_log_risk_raw = 2.0 * np.asarray(pass1_scores, dtype=np.float64) + log_code_error
+    raw_finite = pass1_log_risk_raw[np.isfinite(pass1_log_risk_raw)]
+    lr_min = float(np.min(raw_finite)) if raw_finite.size else float("inf")
+    lr_max = float(np.max(raw_finite)) if raw_finite.size else float("-inf")
+    pass1_log_risk = _quantize_log_risk_fixed_point(pass1_log_risk_raw, frac_bits, int_bits)
+    finite_mask = np.isfinite(pass1_log_risk)
+    # Cutoff at the settled exact-V budget (f_mult 1.0), mirrors item-8; carried
+    # here so RTL can rebuild the pass-1 scalar cutoff from the dense stream.
+    finite_sorted = np.sort(pass1_log_risk[finite_mask])[::-1]
+    cutoff_rank = min(n, int(round(float(max(0, int(exact_count_v))) * 1.0)))
+    if int(exact_count_v) <= 0 or cutoff_rank <= 0 or finite_sorted.size == 0:
+        tp_cutoff = float("inf")
+    else:
+        tp_cutoff = float(finite_sorted[min(int(cutoff_rank), int(finite_sorted.size)) - 1])
+    return {
+        # dense Q7.6 quantized signed log-risk key, -inf where V-error == 0.
+        "pass1_vrisk_q76": pass1_log_risk.astype(np.float64, copy=False),
+        # packed finite/committable bit per token (np.unpackbits[:context_len]).
+        "pass1_finite_mask_packed": np.packbits(finite_mask),
+        "pass1_n_tokens": np.int64(n),
+        "pass1_n_finite": np.int64(int(np.count_nonzero(finite_mask))),
+        "pass1_q76_int_bits": np.int64(int_bits),
+        "pass1_q76_frac_bits": np.int64(frac_bits),
+        "pass1_logrisk_min_fp64": np.float64(lr_min),
+        "pass1_logrisk_max_fp64": np.float64(lr_max),
+        "pass1_cutoff_rank": np.int64(int(cutoff_rank)),
+        "pass1_cutoff_q_fp64": np.float64(tp_cutoff),
+    }
+
+
 def _write_epoch_trace(
     out_root: Path,
     *,
@@ -2858,6 +2938,7 @@ def _write_epoch_trace(
     code_stat_bytes: int,
     n_pages: int,
     lo_tokens_fn,
+    pass1_fields: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Build + write one per-(qidx, head) epoch-trace npz; return an index row.
 
@@ -3102,8 +3183,11 @@ def _write_epoch_trace(
         start_v_tokens=start_v,
         k_hi_tokens=k_hi_settled,
         k_hi_tokens_start=k_hi_start,
+        # ---- optional additive pass-1 V-risk stream (issue #24, namespaced
+        # pass1_*; present only at the designated --epoch_pass1_stream_position)
+        **(pass1_fields or {}),
     )
-    return {
+    row = {
         "file": fname,
         "qidx": int(qidx),
         "position": int(position),
@@ -3126,7 +3210,9 @@ def _write_epoch_trace(
         "walk_step_MB_per_head": float(walk_total_mb),
         "walk_mb_reconstructed_sum": float(recon_sum),
         "walk_mb_reconstruction_abs_err": float(recon_abs_err),
+        "has_pass1_stream": bool(pass1_fields),
     }
+    return row
 
 
 def _finalize_epoch_trace(out_root: Path, index_rows: list[dict[str, object]], config_meta: dict[str, object]) -> None:
@@ -3238,6 +3324,29 @@ Phase-2 physical-replay fields (trace_format_version >= 2): start_v_tokens
 k_hi_tokens / k_hi_tokens_start (K hi-tier = plane A+B token identity at the
 settled / start rung; equal under --precision_split_freeze start, both stored
 so the consumer verifies constancy instead of assuming it).
+
+## Pass-1 scan-domain V-risk key stream (issue #24, additive)
+Present ONLY at the designated position(s) selected by
+`--epoch_pass1_stream_position` (>=0 = that absolute decode position; -1 =
+every traced position; -2 default = absent, baseline byte-identical). Pure
+observer, `pass1_*`-namespaced, committed sets unchanged. This is the FULL
+per-token pass-1 stream (today's marginal/boundary CSR sets carry only the
+walk-basis bands) reproducing the item-8 `two_pass_risk` pass-1 operand
+EXACTLY (same mixed_scores inputs and `2*pass1_logit + log(V-error)` signed
+log-risk), on the pinned Q7.6 grid. Fields:
+- `pass1_vrisk_q76` -- dense (context_len,) fp64 signed log-risk key,
+  RNE-quantized on the Q7.6 fixed-point grid (int_bits=7, frac_bits=6, LSB
+  2^-6, clamp +-64); `-inf` is the structural sentinel for zero-V-error
+  (never-committable) tokens, copied through unquantized.
+- `pass1_finite_mask_packed` -- np.packbits of isfinite(pass1_vrisk_q76);
+  recover with `np.unpackbits(...)[:pass1_n_tokens]`. The finite bit marks the
+  committable tokens (the RTL "finite bit stream").
+- `pass1_q76_int_bits` (7), `pass1_q76_frac_bits` (6) -- the pinned grid.
+- `pass1_logrisk_min_fp64` / `pass1_logrisk_max_fp64` -- UNquantized finite
+  log-risk range (sizes the RTL integer field; both finite iff any finite).
+- `pass1_cutoff_rank` -- settled exact-V budget (f_mult 1.0);
+  `pass1_cutoff_q_fp64` -- the pass-1 scalar cutoff (cutoff_rank-th largest
+  finite quantized value), so the pass-1 pick is rebuildable from the stream.
 
 ## Frozen run config
 ```json
@@ -3604,6 +3713,19 @@ def run() -> None:
             "plus a cross-head index (CSV/JSONL) and a README. Observer only: "
             "does not change any numeric output. Run with a single (policy, "
             "threshold, start) combination."
+        ),
+    )
+    parser.add_argument(
+        "--epoch_pass1_stream_position",
+        type=int,
+        default=-2,
+        help=(
+            "Issue #24: emit the full per-token pass-1 scan-domain V-risk key "
+            "(Q7.6 signed fixed point) + packed finite bit stream into the "
+            "epoch npz. -2 disables (default; baseline byte-identical); -1 "
+            "emits for EVERY traced position; >=0 emits only at that absolute "
+            "decode position (e.g. the newest of a consecutive run). Additive "
+            "pass1_* fields only; committed sets are unchanged."
         ),
     )
     parser.add_argument(
@@ -5543,9 +5665,29 @@ def run() -> None:
                                             hi_frac=precision_k_hi_frac,
                                             frozen_hi_count=frozen_hi_count,
                                         )
+                                    _p1_pos = int(args.epoch_pass1_stream_position)
+                                    _emit_pass1 = _p1_pos == -1 or (
+                                        _p1_pos >= 0 and int(position) == _p1_pos
+                                    )
+                                    _pass1_fields = None
+                                    if _emit_pass1:
+                                        _pass1_fields = _compute_epoch_pass1_vrisk_stream(
+                                            context_len=int(context_len),
+                                            resident_base=base,
+                                            ranked_cpu=variant_ranked_cpu,
+                                            ranked_scores_cpu=variant_ranked_scores_cpu,
+                                            exact_scores_np=scores_np,
+                                            code_error=code_error,
+                                            exact_count_v=int(v_budgets[int(vi)]),
+                                            head_dim=int(trace.head_dim),
+                                            calibrate=(
+                                                str(args.tail_score_calibration) == "affine_selected"
+                                            ),
+                                        )
                                     epoch_trace_index_rows.append(
                                         _write_epoch_trace(
                                             epoch_trace_dir,
+                                            pass1_fields=_pass1_fields,
                                             qidx=int(qidx),
                                             head=int(head),
                                             kv_head=int(kv_head),
