@@ -74,6 +74,10 @@ run_arm() {
     forced_trace="${OUTPUT_ROOT}/${RUN_PREFIX}_${tf_ref}/logit_trace.pt"
     [ -s "${forced_trace}" ] || { echo "missing ref trace ${forced_trace}" >&2; exit 1; }
   fi
+  if [ -s "${OUTPUT_ROOT}/${run_name}/pred/${TASK_NAME}.jsonl" ]; then
+    echo "[dv-budget-swp] SKIP ${run_name} (exists)"
+    return 0
+  fi
   local arm_mode=pagedpq_batched
   if [ "${arm_name}" = "dense" ]; then arm_mode=dense_batched; fi
   local t0=${SECONDS}
