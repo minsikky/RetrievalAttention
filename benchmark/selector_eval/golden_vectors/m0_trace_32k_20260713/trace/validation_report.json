@@ -1,0 +1,11 @@
+{
+  "gate2_max_abs_err_MB": 0.0,
+  "gate2_n_fail": 0,
+  "gate2_reconciliation_pass": true,
+  "gate3_gqa_union_pass": true,
+  "gate3_groups_checked": 64,
+  "gate3_n_fail": 0,
+  "mean_epochs_per_head": 1.03125,
+  "mean_k_escalations_per_step": 0.0234375,
+  "traced_files": 256
+}
