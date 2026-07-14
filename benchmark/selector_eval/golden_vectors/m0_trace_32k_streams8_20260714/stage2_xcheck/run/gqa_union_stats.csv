@@ -1,0 +1,2 @@
+qidx,position,decode_length,kv_head,score_proxy_variant,v_selection_rule,policy,threshold,start_strategy,group_heads,k_sum_tokens,k_union_tokens,k_union_over_sum,v_sum_tokens,v_union_tokens,v_union_over_sum
+7,38837,32000,0,baseline,global_residual_risk,k_first_alternating,0.004,proxy_mass_m0p9,1,24465,24465,1.0,7768,7768,1.0

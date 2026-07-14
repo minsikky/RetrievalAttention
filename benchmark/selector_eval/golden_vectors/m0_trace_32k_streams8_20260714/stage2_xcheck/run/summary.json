@@ -1,0 +1,112 @@
+{
+  "budget_mode": "relative",
+  "decode_lengths": "32000",
+  "elapsed_seconds": 7.126665787771344,
+  "heads": [
+    0
+  ],
+  "include_v_selection_state_in_step_mb": false,
+  "k_budget_fracs": [
+    0.1,
+    0.3,
+    0.5,
+    0.7,
+    0.9,
+    1.0
+  ],
+  "k_budgets": [
+    4096,
+    8192,
+    14336,
+    32768
+  ],
+  "oracle_rel_l2_targets": [],
+  "start_strategies": [
+    "proxy_mass_m0p9"
+  ],
+  "summary": [
+    {
+      "attn_concat_relative_L2_mean": 0.002217844856835534,
+      "attn_o_proj_relative_L2_max": 0.0021213738887988537,
+      "attn_o_proj_relative_L2_mean": 0.0021213738887988537,
+      "attn_o_proj_relative_L2_p95": 0.0021213738887988537,
+      "attn_o_proj_relative_L2_p99": 0.0021213738887988537,
+      "max_logit_relL2": 0.03096694104593544,
+      "max_prob_JS": 0.0008000835451615661,
+      "max_prob_KL_dense_to_approx": 0.0037420989700658546,
+      "max_prob_TV": 0.00680590407162908,
+      "max_step_MB_per_head": 5.476764678955078,
+      "mean_calibration_extra_MB": 0.0,
+      "mean_calibration_probe_tokens": 0.0,
+      "mean_chosen_nprobe": 0.0,
+      "mean_iterations": 0.0,
+      "mean_k_budget": 19419.0,
+      "mean_logit_relL2": 0.03096694104593544,
+      "mean_prob_JS": 0.0008000835451615661,
+      "mean_prob_KL_dense_to_approx": 0.0037420989700658546,
+      "mean_prob_TV": 0.00680590407162908,
+      "mean_prob_top512_mass_recall": 0.9997870784622181,
+      "mean_prob_top512_overlap": 0.998046875,
+      "mean_score_proxy_extra_MB": 0.0,
+      "mean_selector_coverage": 1.0,
+      "mean_start_k_budget": 19419.0,
+      "mean_start_v_budget": 7768.0,
+      "mean_step_MB_no_v_state_per_head": 5.476764678955078,
+      "mean_step_MB_per_head": 5.476764678955078,
+      "mean_step_MB_with_v_state_per_head": 5.476764678955078,
+      "mean_v_budget": 7768.0,
+      "mean_v_exact_reads": 7768.0,
+      "mean_v_selection_state_MB": 0.0,
+      "mean_walk_step_MB_per_head": 7.460689544677734,
+      "min_prob_top512_mass_recall": 0.9997870784622181,
+      "min_prob_top512_overlap": 0.998046875,
+      "p95_logit_relL2": 0.03096694104593544,
+      "p95_prob_JS": 0.0008000835451615661,
+      "p95_prob_KL_dense_to_approx": 0.0037420989700658546,
+      "p95_prob_TV": 0.00680590407162908,
+      "p99_logit_relL2": 0.03096694104593544,
+      "p99_prob_JS": 0.0008000835451615661,
+      "p99_prob_KL_dense_to_approx": 0.0037420989700658546,
+      "p99_prob_TV": 0.00680590407162908,
+      "policy": "k_first_alternating",
+      "queries": 1,
+      "quest_rank": 16,
+      "score_proxy_variant": "baseline",
+      "selector_mode": "fullscan",
+      "start_strategy": "proxy_mass_m0p9",
+      "threshold": 0.004,
+      "v_selection_rule": "global_residual_risk"
+    }
+  ],
+  "survivor_logit_bytes": 2,
+  "threshold_max_scale": 1.5,
+  "threshold_min_scale": 0.0,
+  "threshold_mode": "budget_delta_frac",
+  "threshold_reference_frac": 0.2,
+  "threshold_scale_shape": "sqrt",
+  "thresholds": [
+    0.004
+  ],
+  "v_budget_fracs": [
+    0.05,
+    0.1,
+    0.2,
+    0.4,
+    0.6,
+    0.8,
+    1.0
+  ],
+  "v_budgets": [
+    1024,
+    2048,
+    4096,
+    6144,
+    8192,
+    12288,
+    16384
+  ],
+  "v_local_block_size": 1024,
+  "v_selection_rules": [
+    "global_residual_risk"
+  ]
+}
